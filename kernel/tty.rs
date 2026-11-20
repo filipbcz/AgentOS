@@ -1,12 +1,17 @@
 //! First canonical TTY. All state lives in one owned writable frame; only its
 //! BSP and same-CPU descriptors may access it, with interrupts masked.
 #![allow(non_snake_case)]
-use crate::{acpi::Platform, input, ioapic::Route, line::{LineInput, Read}, out, COM};
+use crate::{acpi::Platform, input, ioapic::Route, keyboard::Keyboard,
+            line::{LineInput, Read}, out, ps2, COM};
 
 pub const VECTOR: u32 = 0xe1;
+pub const KEYBOARD_VECTOR: u32 = 0xe2;
 pub struct Terminal {
     fInput: LineInput,
     fRoute: Route,
+    fKeyboardRoute: Option<Route>,
+    fKeyboard: Keyboard,
+    fKeyboardConfig: Option<u8>,
     fErrors: u8,
     fLastCr: bool,
     fEnabled: bool,
@@ -16,6 +21,8 @@ const _: () = assert!(core::mem::size_of::<Terminal>() <= 4096);
 impl Terminal {
     pub unsafe fn new(aPlatform: &Platform, aCpu: u8) -> Result<Self, &'static [u8]> {
         Ok(Self { fInput: LineInput::new(), fRoute: Route::serial(aPlatform, aCpu, VECTOR)?,
+                  fKeyboardRoute: Route::keyboard(aPlatform, aCpu, KEYBOARD_VECTOR).ok(),
+                  fKeyboard: Keyboard::new(), fKeyboardConfig: None,
                   fErrors: 0, fLastCr: false, fEnabled: false })
     }
 
@@ -29,11 +36,19 @@ impl Terminal {
         self.fEnabled = true;
         self.fRoute.enable();
         out(COM + 1, 0x05); // receive data and line-status errors; no TX IRQ.
+        if let Some(route) = &self.fKeyboardRoute {
+            // Failure to initialize PS/2 must not prevent serial recovery.
+            self.fKeyboardConfig = ps2::enable();
+            if self.fKeyboardConfig.is_some() { route.enable(); }
+        }
     }
 
     pub unsafe fn disable(&mut self) {
         out(COM + 1, 0);
         self.fRoute.disable();
+        if let Some(route) = &self.fKeyboardRoute { route.disable(); }
+        if let Some(config) = self.fKeyboardConfig.take() { ps2::restore(config); }
+        self.fKeyboard.reset();
         self.fEnabled = false;
     }
 
@@ -92,6 +107,21 @@ impl Terminal {
         };
         self.fInput.consume(pCount);
         Ok(Some(pCount))
+    }
+
+    pub unsafe fn keyboard_interrupt(&mut self) {
+        ps2::drain(|result| match result {
+            Ok(scan) => {
+                if let Some(byte) = self.fKeyboard.feed(scan) {
+                    let echo = self.fInput.push(byte);
+                    self.diagnostic(echo.asBytes());
+                }
+            }
+            Err(()) => {
+                self.fKeyboard.reset();
+                self.fInput.invalidate();
+            }
+        });
     }
 
     pub unsafe fn interrupt(&mut self) {
