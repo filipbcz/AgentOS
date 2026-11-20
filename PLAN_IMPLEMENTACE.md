@@ -123,3 +123,6 @@ Každý řádek odpovídá jednomu měřicímu oknu. Stopky hostitele zaznamenal
 | Výkon při práci | Na VM a HP změřit start procesu, zápis 1 MiB s `fsync` a lokální volání nástroje. Po 10 zahřátích provést 100 měření, uvést medián, 95. percentil, špičku RAM a chyby. První vydání vytvoří srovnávací základ. |
 
 Ke každému povinnému kritériu se přiřadí platforma, konkrétní test a protokol z daného kandidáta. Chybějící fyzická zkouška, neověřený bezpečnostní požadavek nebo nesplněný limit ponechá vydání otevřené.
+
+
+**Aktualizace 2026-11-20 – etapa 3:** PS/2 Set 1 dekodér je napojen na experimentální ovladač 8042, IRQ1 přes MADT/I/O APIC a stávající kanonický TTY; chyba inicializace ponechá sériový shell. Bootovací logy mají konfigurovatelnou úroveň a cíle COM1/framebuffer přes `EFI/BOOT/BOOT.LOG`. Podrobný postup a omezení jsou v `README.md` a `docs/HANDOFF_STAGE3_INPUT_LOGGING_2026-11-20.md`. Hardwarové PS/2, nové CI, integrační VM běhy, framebuffer TTY, centrální runtime logger a PID 1 zůstávají neověřené nebo nedokončené. Etapa 3 není akceptována.
