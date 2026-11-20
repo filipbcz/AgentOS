@@ -19,6 +19,7 @@ mod tty;
 mod keyboard;
 mod ps2;
 mod log_policy;
+mod log_ring;
 
 // Version 3, shared with boot/loader.c. Addresses are identity mapped at handoff.
 #[repr(C)]
