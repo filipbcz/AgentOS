@@ -1,0 +1,204 @@
+//! Descriptor tables belong to processes. Shared descriptions are reachable
+//! only by dup2 and inheritance on the same CPU, with local IRQs masked.
+use crate::{frames::{Frame, Frames}, paging::UserSpace, process::EFAULT, serial};
+use core::mem;
+use crate::ipc::{Channel, Operation};
+
+const SLOTS: usize = 32;
+const PIPE_SIZE: usize = 1024;
+struct OpenFile { data: &'static [u8], offset: usize, refs: usize }
+struct Pipe { readers: usize, writers: usize, head: usize, used: usize, buf: [u8; PIPE_SIZE] }
+
+#[derive(Clone, Copy)]
+enum Handle { Empty, Console, File(*mut OpenFile), Reader(*mut Pipe), Writer(*mut Pipe), Socket(*mut Channel, usize) }
+pub struct Descriptors(Frame);
+const _: () = assert!(mem::size_of::<[Handle; SLOTS]>() <= 4096 && mem::size_of::<Pipe>() <= 4096);
+
+#[derive(Clone, Copy)]
+pub enum Wait { Pipe { end: PipeWait, need: usize }, Socket(*mut Channel, usize, Operation) }
+#[derive(Clone, Copy)]
+pub struct PipeWait(Handle);
+pub enum Io { Bytes(usize), Sleep(Wait) }
+
+impl Wait {
+    pub fn ready(self) -> bool {
+        // The sleeping process still owns this endpoint until its call returns.
+        let (end, need) = match self {
+            Self::Socket(p, side, op) => return unsafe { (*p).ready(side, op) },
+            Self::Pipe { end, need } => (end.0, need),
+        };
+        unsafe { match end {
+            Handle::Reader(p) => (*p).used != 0 || (*p).writers == 0,
+            Handle::Writer(p) => PIPE_SIZE - (*p).used >= need || (*p).readers == 0,
+            _ => unreachable!(),
+        } }
+    }
+}
+
+impl Handle {
+    unsafe fn retain(self) -> Self {
+        match self {
+            Self::File(p) => (*p).refs += 1,
+            Self::Reader(p) => (*p).readers += 1,
+            Self::Writer(p) => (*p).writers += 1,
+            Self::Socket(p, side) => (*p).refs[side] += 1,
+            _ => (),
+        }
+        self
+    }
+
+    unsafe fn release(self, frames: &mut Frames<'_>) {
+        let dead = match self {
+            Self::Socket(p, side) => {
+                (*p).refs[side] -= 1;
+                ((*p).refs == [0, 0]).then_some(p as usize)
+            }
+            Self::File(p) => { (*p).refs -= 1; ((*p).refs == 0).then_some(p as usize) }
+            Self::Reader(p) | Self::Writer(p) => {
+                if matches!(self, Self::Reader(_)) { (*p).readers -= 1; } else { (*p).writers -= 1; }
+                ((*p).readers == 0 && (*p).writers == 0).then_some(p as usize)
+            }
+            _ => None,
+        };
+        if let Some(addr) = dead { frames.release(Frame::from_owned_address(addr)); }
+    }
+}
+
+impl Descriptors {
+    pub fn new(frames: &mut Frames<'_>) -> Option<Self> {
+        let frame = frames.alloc()?;
+        let slots = frame.address() as *mut Handle;
+        for i in 0..SLOTS { unsafe { slots.add(i).write(Handle::Empty); } }
+        unsafe { slots.add(1).write(Handle::Console); }
+        Some(Self(frame))
+    }
+    fn slots(&self) -> &[Handle; SLOTS] { unsafe { &*(self.0.address() as *const _) } }
+    fn slots_mut(&mut self) -> &mut [Handle; SLOTS] { unsafe { &mut *(self.0.address() as *mut _) } }
+    fn handle(&self, fd: usize) -> Result<Handle, isize> {
+        match self.slots().get(fd) { None | Some(Handle::Empty) => Err(-9), Some(&h) => Ok(h) }
+    }
+    fn free_slots(&self) -> impl Iterator<Item=usize> + '_ {
+        self.slots().iter().enumerate().filter_map(|(i, h)| matches!(h, Handle::Empty).then_some(i))
+    }
+
+    // Called once on a newly created child's table, before it becomes runnable.
+    pub fn inherit(&mut self, parent: &Self) {
+        for (slot, &h) in self.slots_mut().iter_mut().zip(parent.slots()) { *slot = unsafe { h.retain() }; }
+    }
+    pub fn close(&mut self, frames: &mut Frames<'_>, fd: usize) -> Result<usize, isize> {
+        let h = self.handle(fd)?;
+        self.slots_mut()[fd] = Handle::Empty;
+        unsafe { h.release(frames); }
+        Ok(0)
+    }
+    pub fn close_all(&mut self, frames: &mut Frames<'_>) {
+        for slot in self.slots_mut() { unsafe { mem::replace(slot, Handle::Empty).release(frames); } }
+    }
+    pub fn release(mut self, frames: &mut Frames<'_>) {
+        self.close_all(frames);
+        frames.release(self.0);
+    }
+    pub fn dup2(&mut self, frames: &mut Frames<'_>, old: usize, new: usize) -> Result<usize, isize> {
+        let h = self.handle(old)?;
+        let target = self.slots_mut().get_mut(new).ok_or(-9isize)?;
+        if old != new { unsafe { mem::replace(target, h.retain()).release(frames); } }
+        Ok(new)
+    }
+    pub fn open(&mut self, frames: &mut Frames<'_>, data: &'static [u8]) -> Result<usize, isize> {
+        let fd = self.free_slots().next().ok_or(-24isize)?;
+        let p = frames.alloc().ok_or(-12isize)?.into_address() as *mut OpenFile;
+        unsafe { p.write(OpenFile { data, offset: 0, refs: 1 }); }
+        self.slots_mut()[fd] = Handle::File(p);
+        Ok(fd)
+    }
+    pub fn pair(&mut self, frames: &mut Frames<'_>, space: &UserSpace, output: usize, socket: bool) -> Result<usize, isize> {
+        let (r, w) = {
+            let mut free = self.free_slots();
+            (free.next().ok_or(-24isize)?, free.next().ok_or(-24isize)?)
+        };
+        let frame = frames.alloc_zeroed().ok_or(-12isize)?;
+        let pair = (r as u64 | ((w as u64) << 32)).to_le_bytes();
+        if space.write(output, &pair).is_none() { frames.release(frame); return Err(EFAULT); }
+        let address = frame.into_address();
+        let (first, second) = if socket {
+            let p = address as *mut Channel;
+            unsafe { (*p).refs = [1, 1]; }
+            (Handle::Socket(p, 0), Handle::Socket(p, 1))
+        } else {
+            let p = address as *mut Pipe;
+            unsafe { (*p).readers = 1; (*p).writers = 1; }
+            (Handle::Reader(p), Handle::Writer(p))
+        };
+        self.slots_mut()[r] = first;
+        self.slots_mut()[w] = second;
+        Ok(0)
+    }
+
+    pub fn message(&self, op: Operation, process: &crate::process::Process, fd: usize,
+                   address: usize, len: usize) -> Result<Io, isize> {
+        let Handle::Socket(p, side) = self.handle(fd)? else { return Err(-88); };
+        let channel = unsafe { &mut *p };
+        let result = match op {
+            Operation::Send => channel.send(side, process.pid, process.credentials, &process.space, address, len),
+            Operation::Receive => channel.receive(side, &process.space, address, len),
+        }?;
+        Ok(result.map_or(Io::Sleep(Wait::Socket(p, side, op)), Io::Bytes))
+    }
+
+    pub fn read(&self, space: &UserSpace, fd: usize, va: usize, len: usize) -> Result<Io, isize> {
+        let end = self.handle(fd)?;
+        match end {
+            Handle::File(p) => {
+                let file = unsafe { &mut *p };
+                let n = len.min(file.data.len() - file.offset);
+                space.write(va, &file.data[file.offset..file.offset+n]).ok_or(EFAULT)?;
+                file.offset += n;
+                Ok(Io::Bytes(n))
+            }
+            Handle::Reader(p) => {
+                let pipe = unsafe { &mut *p };
+                if len == 0 { return Ok(Io::Bytes(0)); }
+                if pipe.used == 0 && pipe.writers != 0 { return Ok(Io::Sleep(Wait::Pipe { end: PipeWait(end), need: 1 })); }
+                let n = len.min(pipe.used);
+                space.writable(va, n).ok_or(EFAULT)?;
+                let first = n.min(PIPE_SIZE - pipe.head);
+                space.write(va, &pipe.buf[pipe.head..pipe.head+first]).ok_or(EFAULT)?;
+                space.write(va+first, &pipe.buf[..n-first]).ok_or(EFAULT)?;
+                pipe.head = (pipe.head+n) % PIPE_SIZE;
+                pipe.used -= n;
+                Ok(Io::Bytes(n))
+            }
+            _ => Err(-9),
+        }
+    }
+
+    pub fn write(&self, space: &UserSpace, fd: usize, va: usize, len: usize) -> Result<Io, isize> {
+        let end = self.handle(fd)?;
+        match end {
+            Handle::Console => {
+                let mut buf = [0; 256];
+                if len > buf.len() { return Err(-22); }
+                space.read(va, &mut buf[..len]).ok_or(EFAULT)?;
+                unsafe { serial(&buf[..len]); }
+                Ok(Io::Bytes(len))
+            }
+            Handle::Writer(p) => {
+                let pipe = unsafe { &mut *p };
+                if len == 0 { return Ok(Io::Bytes(0)); }
+                if pipe.readers == 0 { return Err(-32); }
+                let free = PIPE_SIZE - pipe.used;
+                let need = if len <= PIPE_SIZE { len } else { 1 };
+                if free < need { return Ok(Io::Sleep(Wait::Pipe { end: PipeWait(end), need })); }
+                let n = len.min(free);
+                va.checked_add(n).ok_or(EFAULT)?;
+                let tail = (pipe.head + pipe.used) % PIPE_SIZE;
+                let first = n.min(PIPE_SIZE - tail);
+                space.read(va, &mut pipe.buf[tail..tail+first]).ok_or(EFAULT)?;
+                space.read(va+first, &mut pipe.buf[..n-first]).ok_or(EFAULT)?;
+                pipe.used += n;
+                Ok(Io::Bytes(n))
+            }
+            _ => Err(-9),
+        }
+    }
+}

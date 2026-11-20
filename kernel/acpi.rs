@@ -1,0 +1,110 @@
+use crate::BootInfo;
+use core::slice;
+
+fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(bytes.get(offset..offset+4)?.try_into().ok()?))
+}
+
+fn u64_at(bytes: &[u8], offset: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(bytes.get(offset..offset+8)?.try_into().ok()?))
+}
+
+fn checksum(bytes: &[u8]) -> bool {
+    bytes.iter().fold(0u8, |sum, b| sum.wrapping_add(*b)) == 0
+}
+
+struct Firmware<'a> { map: &'a [u8], stride: usize }
+
+impl Firmware<'_> {
+    // Firmware identity mappings are still active. Only read within a described
+    // firmware allocation. No references to the tables survive the CR3 switch.
+    unsafe fn bytes(&self, address: u64, size: usize) -> Option<&[u8]> {
+        let end = address.checked_add(size as u64)?;
+        if address == 0 || end > 1 << 47 { return None; }
+        for d in self.map.chunks_exact(self.stride) {
+            if !matches!(u32_at(d, 0)?, 2 | 4 | 6 | 9 | 10) { continue; }
+            let first = u64_at(d, 8)?;
+            let limit = first.checked_add(u64_at(d, 24)?.checked_mul(4096)?)?;
+            if first <= address && end <= limit {
+                return Some(slice::from_raw_parts(address as *const u8, size));
+            }
+        }
+        None
+    }
+
+    unsafe fn table(&self, address: u64) -> Option<&[u8]> {
+        let header = self.bytes(address, 36)?;
+        let length = u32_at(header, 4)? as usize;
+        if length < 36 { return None; }
+        let bytes = self.bytes(address, length)?;
+        checksum(bytes).then_some(bytes)
+    }
+}
+
+pub struct Platform {
+    pub lapic: usize,
+    pub timer_port: u16,
+    pub ids: [u8; 255],
+    pub count: usize,
+    pub legacy_pic: bool,
+}
+
+impl Platform {
+    fn madt(&mut self, bytes: &[u8]) -> Option<()> {
+        self.lapic = u32_at(bytes, 36)? as usize;
+        self.legacy_pic = u32_at(bytes, 40)? & 1 != 0;
+        let mut rest = bytes.get(44..)?;
+        while !rest.is_empty() {
+            let length = *rest.get(1)? as usize;
+            if length < 2 { return None; }
+            let e = rest.get(..length)?;
+            let id = match e[0] {
+                0 if u32_at(e, 4)? & 1 != 0 => Some(e[3] as u32),
+                9 if u32_at(e, 8)? & 1 != 0 => Some(u32_at(e, 4)?),
+                5 => { self.lapic = u64_at(e, 4)? as usize; None }
+                _ => None,
+            };
+            if let Some(id) = id {
+                if id >= 255 || self.ids[..self.count].contains(&(id as u8)) { return None; }
+                *self.ids.get_mut(self.count)? = id as u8;
+                self.count += 1;
+            }
+            rest = &rest[length..];
+        }
+        (self.count > 0 && self.lapic != 0 && self.lapic % 4096 == 0).then_some(())
+    }
+}
+
+pub unsafe fn discover(info: &BootInfo, map: &[u8]) -> Option<Platform> {
+    let fw = Firmware { map, stride: info.descriptor_size as usize };
+    let rsdp = fw.bytes(info.rsdp, 36)?;
+    if &rsdp[..8] != b"RSD PTR " || rsdp[15] < 2 || !checksum(&rsdp[..20]) { return None; }
+    let length = u32_at(rsdp, 20)? as usize;
+    if length < 36 || !checksum(fw.bytes(info.rsdp, length)?) { return None; }
+    let xsdt = u64_at(rsdp, 24)?;
+    let (root, width) = if xsdt != 0 {
+        (fw.table(xsdt)?, 8)
+    } else {
+        (fw.table(u32_at(rsdp, 16)? as u64)?, 4)
+    };
+    if &root[..4] != (if width == 8 { b"XSDT" } else { b"RSDT" }) ||
+        (root.len()-36) % width != 0 { return None; }
+    let mut p = Platform { lapic: 0, timer_port: 0, ids: [0; 255], count: 0, legacy_pic: false };
+    for entry in root[36..].chunks_exact(width) {
+        let address = if width == 8 { u64_at(entry, 0)? } else { u32_at(entry, 0)? as u64 };
+        match fw.bytes(address, 4)? {
+            b"APIC" => p.madt(fw.table(address)?)?,
+            b"FACP" => {
+                let fadt = fw.table(address)?;
+                let extended = u64_at(fadt, 212).unwrap_or(0);
+                let port = if extended != 0 {
+                    if fadt[208] != 1 || fadt[210] != 0 { return None; }
+                    extended
+                } else { u32_at(fadt, 76)? as u64 };
+                p.timer_port = u16::try_from(port).ok()?;
+            }
+            _ => (),
+        }
+    }
+    (p.lapic != 0 && p.timer_port != 0).then_some(p)
+}

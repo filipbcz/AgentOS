@@ -1,0 +1,5 @@
+binutils=2.42-4ubuntu2.10
+cpio=2.15+dfsg-1ubuntu2.1
+gcc-13=13.3.0-6ubuntu2~24.04.1
+gnu-efi=3.0.15-1build1
+rustc=1.75.0+dfsg0ubuntu1-0ubuntu7.4
