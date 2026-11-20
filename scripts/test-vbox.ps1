@@ -61,13 +61,13 @@ function Send-Serial($State,[string]$Command) {
         Start-Sleep -Milliseconds 10
     }
 }
-# Inject text through the VM's PS/2 keyboard, NOT through COM1. The
-# controller reports set-2 make/break bytes to the emulated first port.
+# Exercise the actual PS/2 path rather than writing through the COM1 socket.
 function Send-Keyboard([string]$Command) {
     VBox controlvm $vm keyboardputstring $Command
     VBox controlvm $vm keyboardputscancode 5a f0 5a
 }
-# Compare actual visible pixels rather than PNG metadata or text in COM1.
+
+# Compare visible pixels and the exact PS/2 shell command response raster.
 function Verify-ShellScreen([string]$Before,[string]$After) {
     Add-Type -AssemblyName System.Drawing
     $a=[Drawing.Bitmap]::new((Resolve-Path $Before).Path)
@@ -87,9 +87,8 @@ function Verify-ShellScreen([string]$Before,[string]$After) {
             }
         }
         if ($changes -lt 20) { throw "PS/2 command did not change visible GOP text: $After" }
-        # Check the actual 5x7 raster of the command's response "ps2-ok"
-        # on the third text row, not merely any framebuffer difference.
-        # These rows match kernel/fb_console.rs (6x9 fixed-width cells).
+
+        # Five-bit font rows for 'ps2-ok' at third 6x9 text row.
         $glyphs=@(
             '0,30,17,17,30,16,16'
             '0,0,15,16,14,1,30'
@@ -98,7 +97,9 @@ function Verify-ShellScreen([string]$Before,[string]$After) {
             '0,0,14,17,17,17,14'
             '16,16,18,20,24,20,18'
         )
-        if ($b.Width -lt 36 -or $b.Height -lt 27) { throw "GOP too small to verify response text: $After" }
+        if ($b.Width -lt 36 -or $b.Height -lt 27) {
+            throw "GOP too small to verify response text: $After"
+        }
         for ($index=0;$index -lt $glyphs.Length;$index++) {
             $raster=$glyphs[$index].Split(',')
             for ($row=0;$row -lt 7;$row++) {
@@ -230,38 +231,12 @@ try {
         if ($Shell) {
             Wait-Serial $serial 'AGENTOS SHELL READY\r\nagentos> $'
             if ($Keyboard) {
-                # Separate acceptance case: one shell session with PS/2-only
-                # commands; preserve the unchanged strict serial transcript
-                # verifier for the normal -Shell run.
+                # PS/2 keyboard and COM1 have independent input sources.
+                # Keep the strict serial-only verifier unchanged.
                 VBox controlvm $vm screenshotpng "$dir\shell-before.png"
                 $offset=$serial.Text.Length
                 Send-Keyboard 'echo ps2-ok'
-                Wait-Serial $serial '(?m)^ps2-ok\r\nagentos> 
-        }
-    } elseif (!(Select-String -LiteralPath "$dir\com1.log" -Pattern 'BdsDxe: failed to load .*HARDDISK.*(Access Denied|Security Violation)' -Quiet)) {
-        throw "Missing firmware rejection; timeout is inconclusive: $dir"
-    }
-    Write-Output "Captured $Case ($Cpus vCPUs): $dir"
-    $runSucceeded=$true
-} finally {
-    try { VBox controlvm $vm poweroff } catch {
-        if ($runSucceeded) { throw }
-        Write-Warning "VM power-off after a failed run also failed: $_"
-    }
-}
-} finally {
-    try {
-        if ($null -ne $serial) {
-            foreach ($handle in @($serial.Stream,$serial.Client,$serial.Log,$serial.Input)) {
-                if ($null -ne $handle) {
-                    try { $handle.Dispose() } catch { Write-Warning "COM1 cleanup failed: $_" }
-                }
-            }
-            if ($null -ne $serial.Listener) { $serial.Listener.Stop() }
-        }
-    } finally { $lock.Dispose() }
-}
- $offset
+                Wait-Serial $serial '(?m)^ps2-ok\r\nagentos> $' $offset
                 Start-Sleep -Milliseconds 150
                 VBox controlvm $vm screenshotpng "$dir\shell-keyboard.png"
                 Verify-ShellScreen "$dir\shell-before.png" "$dir\shell-keyboard.png"
@@ -273,32 +248,7 @@ try {
                 foreach ($command in $commands) {
                     $offset=$serial.Text.Length
                     Send-Serial $serial $command
-                    Wait-Serial $serial 'agentos> 
-        }
-    } elseif (!(Select-String -LiteralPath "$dir\com1.log" -Pattern 'BdsDxe: failed to load .*HARDDISK.*(Access Denied|Security Violation)' -Quiet)) {
-        throw "Missing firmware rejection; timeout is inconclusive: $dir"
-    }
-    Write-Output "Captured $Case ($Cpus vCPUs): $dir"
-    $runSucceeded=$true
-} finally {
-    try { VBox controlvm $vm poweroff } catch {
-        if ($runSucceeded) { throw }
-        Write-Warning "VM power-off after a failed run also failed: $_"
-    }
-}
-} finally {
-    try {
-        if ($null -ne $serial) {
-            foreach ($handle in @($serial.Stream,$serial.Client,$serial.Log,$serial.Input)) {
-                if ($null -ne $handle) {
-                    try { $handle.Dispose() } catch { Write-Warning "COM1 cleanup failed: $_" }
-                }
-            }
-            if ($null -ne $serial.Listener) { $serial.Listener.Stop() }
-        }
-    } finally { $lock.Dispose() }
-}
- $offset
+                    Wait-Serial $serial 'agentos> $' $offset
                 }
                 $offset=$serial.Text.Length
                 Send-Serial $serial 'exit'
