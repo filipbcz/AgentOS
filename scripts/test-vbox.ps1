@@ -1,6 +1,8 @@
 param([ValidateSet('signed','loader','kernel','initrd')][string]$Case='signed',
       [ValidateSet(1,2)][int]$Cpus=2,
-      [switch]$Shell)
+      [switch]$Shell,
+      [ValidateSet('quiet','info','debug')][string]$LogLevel='info',
+      [ValidateSet('serial','screen','both','none')][string]$LogOutput='both')
 $ErrorActionPreference='Stop'
 if ($Shell -and $Case -ne 'signed') { throw '-Shell requires the signed case' }
 $root=Split-Path $PSScriptRoot
@@ -67,7 +69,7 @@ if ($Case -ne 'signed') {
     if ($LASTEXITCODE) { throw 'mutation failed' }
     $efi="$relative/changed.efi"
 }
-& wsl -d Ubuntu-24.04 -- bash scripts/disk.sh $relative $efi
+& wsl -d Ubuntu-24.04 -- bash scripts/disk.sh $relative $efi "$LogLevel $LogOutput"
 if ($LASTEXITCODE) { throw 'disk build failed' }
 VBox convertfromraw "$dir\esp.raw" "$dir\esp.vdi" --format VDI
 VBox createvm --name $vm --basefolder $dir --ostype Other_64 --register
