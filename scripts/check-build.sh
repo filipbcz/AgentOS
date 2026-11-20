@@ -65,6 +65,10 @@ printf 'Testing SMP/IRQ safe runtime logger with %s\n' "$pRustc"
 "$pRustc" --edition 2021 --test "$pRoot/scripts/tests/logger-host.rs" -o "$pOut/logger-tests"
 "$pOut/logger-tests"
 
+printf 'Testing GOP text console bounds, ASCII and scrolling with %s\n' "$pRustc"
+"$pRustc" --edition 2021 --test "$pRoot/scripts/tests/fb-console-host.rs" -o "$pOut/fb-console-tests"
+"$pOut/fb-console-tests"
+
 printf 'Compiling and linking the kernel with %s and %s\n' "$pRustc" "$pCc"
 "$pRustc" --version
 "$pCc" --version
