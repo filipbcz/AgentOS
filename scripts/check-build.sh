@@ -53,6 +53,10 @@ printf 'Testing early kernel logging policy with %s\n' "$pRustc"
 "$pRustc" --edition 2021 --test "$pRoot/kernel/log_policy.rs" -o "$pOut/log-policy-tests"
 "$pOut/log-policy-tests"
 
+printf 'Testing bounded kernel log history with %s\n' "$pRustc"
+"$pRustc" --edition 2021 --test "$pRoot/scripts/tests/log-ring-host.rs" -o "$pOut/log-ring-tests"
+"$pOut/log-ring-tests"
+
 printf 'Compiling and linking the kernel with %s and %s\n' "$pRustc" "$pCc"
 "$pRustc" --version
 "$pCc" --version
