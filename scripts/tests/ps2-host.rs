@@ -6,7 +6,7 @@ use std::{cell::RefCell, collections::VecDeque};
 struct Device {
     config: u8, disabled: bool, command_byte_pending: bool,
     response: VecDeque<u8>, writes: Vec<(u16,u8)>,
-    fail_config_reply: bool, nack_device: bool,
+    fail_config_reply: bool, nack_device: bool, block_commands: bool,
 }
 thread_local! { static DEVICE: RefCell<Device> = RefCell::new(Device::default()); }
 fn device<T>(f: impl FnOnce(&mut Device)->T)->T {
@@ -14,7 +14,7 @@ fn device<T>(f: impl FnOnce(&mut Device)->T)->T {
 }
 unsafe fn input(port: u16)->u8 {
     device(|d| match port {
-        0x64 => u8::from(!d.response.is_empty()),
+        0x64 => u8::from(!d.response.is_empty()) | if d.block_commands { 2 } else { 0 },
         0x60 => d.response.pop_front().unwrap_or(0),
         _ => panic!("invalid port"),
     })
@@ -75,4 +75,17 @@ fn originallyEnabledPortRestoredAfterNack() {
     device(|d| *d=Device{config:0x00,disabled:false,nack_device:true,..Device::default()});
     assert_eq!(unsafe{ps2::enable()},None);
     device(|d| {assert!(!d.disabled);assert_eq!(d.config,0);});
+}
+
+#[test]
+fn controllerBusyDoesNotMutateState() {
+    device(|d| *d=Device{config:0x10,disabled:true,block_commands:true,..Device::default()});
+    assert_eq!(unsafe{ps2::enable()},None);
+    device(|d| {assert!(d.disabled);assert_eq!(d.config,0x10);assert!(d.writes.is_empty());});
+}
+#[test]
+fn restoreReportsControllerTimeout() {
+    device(|d| *d=Device{config:0x41,disabled:false,block_commands:true,..Device::default()});
+    assert!(!unsafe{ps2::restore(0x10)});
+    device(|d| assert!(d.writes.is_empty()));
 }
