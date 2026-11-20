@@ -21,6 +21,8 @@ mod ps2;
 mod log_policy;
 mod log_ring;
 mod logger;
+mod fb_console;
+use fb_console::glyph;
 
 // Version 3, shared with boot/loader.c. Addresses are identity mapped at handoff.
 #[repr(C)]
@@ -84,27 +86,6 @@ unsafe fn serial(message: &[u8]) {
     }
 }
 
-// Five-bit rows, most significant pixel on the left.
-fn glyph(c: u8) -> [u8; 7] {
-    match c {
-        b'A' => [14,17,17,31,17,17,17], b'G' => [14,17,16,23,17,17,14],
-        b'E' => [31,16,16,30,16,16,31], b'N' => [17,25,25,21,19,19,17],
-        b'T' => [31,4,4,4,4,4,4], b'O' => [14,17,17,17,17,17,14],
-        b'S' => [15,16,16,14,1,1,30], b'K' => [17,18,20,24,20,18,17],
-        b'R' => [30,17,17,30,20,18,17], b'L' => [16,16,16,16,16,16,31],
-        b'B' => [30,17,17,30,17,17,30], b'C' => [14,17,16,16,16,17,14],
-        b'D' => [30,17,17,17,17,17,30], b'F' => [31,16,16,30,16,16,16],
-        b'H' => [17,17,17,31,17,17,17], b'I' => [14,4,4,4,4,4,14],
-        b'J' => [7,2,2,2,2,18,12], b'M' => [17,27,21,21,17,17,17],
-        b'P' => [30,17,17,30,16,16,16], b'Q' => [14,17,17,17,21,18,13],
-        b'U' => [17,17,17,17,17,17,14], b'V' => [17,17,17,17,17,10,4],
-        b'W' => [17,17,17,21,21,27,17], b'X' => [17,17,10,4,10,17,17],
-        b'Y' => [17,17,10,4,4,4,4], b'Z' => [31,1,2,4,8,16,31],
-        b'[' => [14,8,8,8,8,8,14], b']' => [14,2,2,2,2,2,14],
-        b'1' => [4,12,4,4,4,4,14], _ => [0; 7],
-    }
-}
-
 #[no_mangle]
 pub unsafe extern "sysv64" fn kernel_main(info: &BootInfo) -> ! {
     const MESSAGE: &[u8] = b"AGENTOS KERNEL OK STAGE 1";
@@ -149,7 +130,7 @@ pub unsafe extern "sysv64" fn kernel_main(info: &BootInfo) -> ! {
     let scale = ((info.width as usize - 16) / (MESSAGE.len() * 6)).clamp(1, 4);
     draw(info, MESSAGE, 8, 16, scale);
     log.event(1, b"STARTING INTERACTIVE SHELL");
-    if let Err(reason) = smp::shell(&platform) {
+    if let Err(reason) = smp::shell(&platform, info) {
         log.event(0, b"SHELL FAILED");
         serial(b"SHELL FAILED: "); serial(reason); serial(b"\r\n");
     } else { log.event(1, b"INTERACTIVE SHELL STOPPED"); }
