@@ -126,3 +126,6 @@ Ke každému povinnému kritériu se přiřadí platforma, konkrétní test a pr
 
 
 **Aktualizace 2026-11-20 – etapa 3:** PS/2 Set 1 dekodér je napojen na experimentální ovladač 8042, IRQ1 přes MADT/I/O APIC a stávající kanonický TTY; chyba inicializace ponechá sériový shell. Bootovací logy mají konfigurovatelnou úroveň a cíle COM1/framebuffer přes `EFI/BOOT/BOOT.LOG`. Podrobný postup a omezení jsou v `README.md` a `docs/HANDOFF_STAGE3_INPUT_LOGGING_2026-11-20.md`. Hardwarové PS/2, nové CI, integrační VM běhy, framebuffer TTY, centrální runtime logger a PID 1 zůstávají neověřené nebo nedokončené. Etapa 3 není akceptována.
+
+
+**Aktualizace 2026-11-20 – evidence dalšího kroku:** Přidána samostatná, pevně omezená historie logů (`kernel/log_ring.rs`) a šest hostitelských testů (`scripts/tests/log-ring-host.rs`). Struktura je zatím single-owner a není napojena na runtime; současně se nemění konzole ani ABI. Přesný stav implementace, ověření a předávací kroky: [`docs/STAGE3_STATUS_2026-11-20.md`](docs/STAGE3_STATUS_2026-11-20.md). Úspěch CI posledního SHA a VM integrace je třeba ověřit samostatně.
