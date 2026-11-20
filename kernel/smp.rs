@@ -442,7 +442,7 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
         0x10005 => cpu.load.frames.with(|f| q.collect(f, pid, a)).map(|v| v as isize).unwrap_or_else(|e| e),
         0x1000f => {
             let result = cpu.load.frames.with(|f| q.kill_child(f, pid, a));
-            if result.is_ok() {
+            if matches!(result, Ok(0)) {
                 cpu.output(b"AGENTOS USER KILL PID="); cpu.hex(a as u64);
                 cpu.output(b" PARENT="); cpu.hex(pid as u64);
                 cpu.output(b" STATUS=0000000000000089\r\n");
