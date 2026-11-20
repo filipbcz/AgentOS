@@ -1,8 +1,8 @@
 //! First canonical TTY. All state lives in one owned writable frame; only its
 //! BSP and same-CPU descriptors may access it, with interrupts masked.
 #![allow(non_snake_case)]
-use crate::{acpi::Platform, input, ioapic::Route, keyboard::Keyboard,
-            line::{LineInput, Read}, out, ps2, COM};
+use crate::{acpi::Platform, fb_console::Console, input, ioapic::Route, keyboard::Keyboard,
+            line::{LineInput, Read}, log_policy::Level, logger::LOGGER, out, ps2, COM};
 
 pub const VECTOR: u32 = 0xe1;
 pub const KEYBOARD_VECTOR: u32 = 0xe2;
@@ -12,6 +12,8 @@ pub struct Terminal {
     fKeyboardRoute: Option<Route>,
     fKeyboard: Keyboard,
     fKeyboardConfig: Option<ps2::Saved>,
+    fScreen: Option<Console>,
+    fCpu: u8,
     fErrors: u8,
     fLastCr: bool,
     fEnabled: bool,
@@ -23,8 +25,12 @@ impl Terminal {
         Ok(Self { fInput: LineInput::new(), fRoute: Route::serial(aPlatform, aCpu, VECTOR)?,
                   fKeyboardRoute: Route::keyboard(aPlatform, aCpu, KEYBOARD_VECTOR).ok(),
                   fKeyboard: Keyboard::new(), fKeyboardConfig: None,
+                  fScreen: None, fCpu: aCpu,
                   fErrors: 0, fLastCr: false, fEnabled: false })
     }
+
+    /// Sole BSP owner; attach before starting the shell's IRQ routes.
+    pub fn attach_screen(&mut self, console: Console) { self.fScreen = Some(console); }
 
     pub unsafe fn enable(&mut self) {
         out(COM + 1, 0);
@@ -49,6 +55,7 @@ impl Terminal {
         if let Some(route) = &self.fKeyboardRoute { route.disable(); }
         if let Some(config) = self.fKeyboardConfig.take() {
             if !ps2::restore(config) {
+                let _ = LOGGER.record(0, self.fCpu as u32, Level::Error, b"PS2 restore failed");
                 // Controller recovery failure must be visible even when the
                 // canonical input device is being torn down.
                 self.diagnostic(b"AGENTOS PS2 RESTORE FAILED\r\n");
@@ -69,6 +76,7 @@ impl Terminal {
         if self.fErrors == 0 { return false; }
         self.fErrors = 0;
         self.fInput.invalidate();
+        let _ = LOGGER.record(0, self.fCpu as u32, Level::Error, b"UART RX error");
         true
     }
 
@@ -89,6 +97,7 @@ impl Terminal {
             if (aCooked && pByte == b'\n' && !self.fLastCr && !self.byte(b'\r')) || !self.byte(pByte) {
                 return if pWritten == 0 { Err(-5) } else { Ok(pWritten) };
             }
+            if let Some(screen) = &mut self.fScreen { screen.write(&[pByte]); }
             pWritten += 1;
         }
         Ok(pWritten)
@@ -126,6 +135,7 @@ impl Terminal {
             Err(()) => {
                 self.fKeyboard.reset();
                 self.fInput.invalidate();
+                let _ = LOGGER.record(0, self.fCpu as u32, Level::Error, b"PS2 RX error");
             }
         });
     }
