@@ -59,6 +59,9 @@ collected:
     test %eax, %eax
     jne finished
     call run_ipc
+    test %eax, %eax
+    jne finished
+    call run_supervisor
 finished:
     mov %eax, %edi
     jmp terminate
