@@ -101,7 +101,7 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *table) {
     s = BS->HandleProtocol(image, &LoadedImageProtocol, (void **)&loaded);
     if (EFI_ERROR(s)) return s;
     info.log_level = boot_log_level(loaded->DeviceHandle);
-    if ((info.log_level & LOG_SERIAL) && (info.log_level & 3)) Print(L"[INFO] UEFI SECURE BOOT ACTIVE\r\n");
+    if ((info.log_level & LOG_SCREEN) && (info.log_level & 3)) Print(L"[INFO] UEFI SECURE BOOT ACTIVE\r\n");
     info.image_base = (UINTN)loaded->ImageBase;
     info.image_size = loaded->ImageSize;
     info.archive = (UINTN)archive_start;
