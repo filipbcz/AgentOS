@@ -634,7 +634,7 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
 
 /// Start only after the boot tests, idle measurements and framebuffer marker.
 /// The BSP owns this terminal until all session descriptors have been reaped.
-pub unsafe fn shell(platform: &Platform) -> Result<(), Error> {
+pub unsafe fn shell(platform: &Platform, info: &crate::BootInfo) -> Result<(), Error> {
     let cpu = current_cpu();
     let snapshot = cpu.load.frames.with(|f| f.snapshot()).ok_or(b"shell snapshot" as Error)?;
     let Some(storage) = cpu.load.frames.with(|f| f.alloc()) else {
@@ -646,9 +646,22 @@ pub unsafe fn shell(platform: &Platform) -> Result<(), Error> {
     let started = (|| -> Result<usize, Error> {
         terminal.write(crate::tty::Terminal::new(platform, cpu.expected_id)?);
         initialized = true;
+        // The BSP TTY owns the mapped GOP framebuffer for the entire shell
+        // session; the serial path remains available if GOP validation fails.
+        if let Some(screen) = crate::fb_console::Console::new(
+            info.framebuffer, info.width as usize, info.height as usize,
+            info.stride as usize, info.pixel_format
+        ) {
+            (*terminal).attach_screen(screen);
+        } else {
+            let _ = crate::logger::LOGGER.record(timestamp(), cpu.expected_id as u32,
+                crate::log_policy::Level::Error, b"TTY GOP unavailable");
+        }
         let pid = cpu.load.frames.with(|f| (*cpu.queue.get()).spawn_process(f, cpu.programs, b"shell", 0))
             .map_err(|_| b"shell ELF" as Error)?;
         (*cpu.queue.get()).terminal(pid, terminal).map_err(|_| b"shell descriptors" as Error)?;
+        let _ = crate::logger::LOGGER.record(timestamp(), cpu.expected_id as u32,
+            crate::log_policy::Level::Info, b"shell started");
         serial(b"AGENTOS SHELL START PID="); hex(pid as u64); serial(b"\r\n");
         cpu.terminal.get().write(terminal);
         (*terminal).enable();
@@ -669,6 +682,8 @@ pub unsafe fn shell(platform: &Platform) -> Result<(), Error> {
         if matched && f.probe() { status } else { Err(b"shell frame leak" as Error) }
     });
     let pid = result?;
+    let _ = crate::logger::LOGGER.record(timestamp(), cpu.expected_id as u32,
+        crate::log_policy::Level::Info, b"shell stopped");
     serial(b"AGENTOS SHELL STOP PID="); hex(pid as u64);
     serial(b" STATUS=0000000000000000 FRAMES=OK\r\n");
     Ok(())
