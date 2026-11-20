@@ -47,7 +47,13 @@ impl Terminal {
         out(COM + 1, 0);
         self.fRoute.disable();
         if let Some(route) = &self.fKeyboardRoute { route.disable(); }
-        if let Some(config) = self.fKeyboardConfig.take() { ps2::restore(config); }
+        if let Some(config) = self.fKeyboardConfig.take() {
+            if !ps2::restore(config) {
+                // Controller recovery failure must be visible even when the
+                // canonical input device is being torn down.
+                self.diagnostic(b"AGENTOS PS2 RESTORE FAILED\r\n");
+            }
+        }
         self.fKeyboard.reset();
         self.fEnabled = false;
     }
