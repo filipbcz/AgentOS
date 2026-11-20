@@ -91,18 +91,19 @@ function Verify-ShellScreen([string]$Before,[string]$After) {
         # on the third text row, not merely any framebuffer difference.
         # These rows match kernel/fb_console.rs (6x9 fixed-width cells).
         $glyphs=@(
-            @(0,30,17,17,30,16,16),  # p
-            @(0,0,15,16,14,1,30),    # s
-            @(14,17,1,2,4,8,31),     # 2
-            @(0,0,0,31,0,0,0),       # -
-            @(0,0,14,17,17,17,14),   # o
-            @(16,16,18,20,24,20,18) # k
+            '0,30,17,17,30,16,16'
+            '0,0,15,16,14,1,30'
+            '14,17,1,2,4,8,31'
+            '0,0,0,31,0,0,0'
+            '0,0,14,17,17,17,14'
+            '16,16,18,20,24,20,18'
         )
         if ($b.Width -lt 36 -or $b.Height -lt 27) { throw "GOP too small to verify response text: $After" }
         for ($index=0;$index -lt $glyphs.Length;$index++) {
+            $raster=$glyphs[$index].Split(',')
             for ($row=0;$row -lt 7;$row++) {
                 for ($col=0;$col -lt 5;$col++) {
-                    $expectedWhite=($glyphs[$index][$row] -band (16 -shr $col)) -ne 0
+                    $expectedWhite=([int]$raster[$row] -band (16 -shr $col)) -ne 0
                     $pixel=$b.GetPixel($index*6+$col,18+$row)
                     $actualWhite=$pixel.R -gt 200 -and $pixel.G -gt 200 -and $pixel.B -gt 200
                     if ($expectedWhite -ne $actualWhite) {
