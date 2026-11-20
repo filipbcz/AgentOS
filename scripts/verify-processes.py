@@ -63,6 +63,8 @@ def verify(text, apic_ids):
             if begin:
                 require(supervisor_open is None,
                         f"Nested supervisor boundary at line {number}")
+                require(events and events[-1][0] == "reply",
+                        f"Supervisor must follow authenticated IPC test at line {number}")
                 supervisor_open = int(begin[1], 16)
                 require(supervisor_open > 0,
                         f"Zero supervisor PID at line {number}")
