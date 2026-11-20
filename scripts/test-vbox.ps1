@@ -250,6 +250,8 @@ try {
         # The stage-1 boot logo is overwritten when GOP is handed to TTY.
         if (!$Shell) { & "$PSScriptRoot/verify-display.ps1" "$dir\display.png" }
         & "$PSScriptRoot/verify-processes.ps1" -Log "$dir\com1.log" -ApicIds $ids
+        & python "$PSScriptRoot/verify-supervisor.py" --log "$dir\com1.log" --cpus $Cpus
+        if ($LASTEXITCODE -ne 0) { throw "Service supervision verification failed: $dir" }
         & "$PSScriptRoot/verify-idle.ps1" -RunDir $dir -ApicIds $ids -HostSeconds $hostIdleSeconds
         if ($Shell) {
             Wait-Serial $serial 'AGENTOS SHELL READY\r\nagentos> $'
