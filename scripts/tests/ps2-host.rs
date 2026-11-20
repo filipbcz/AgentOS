@@ -7,12 +7,13 @@ struct Device {
     set_pending:bool, responses:VecDeque<u8>, fail_query:bool,
     busy:bool, nack:bool, resend_once:bool, resend_sent:bool,
     irq_during_command:bool, writes:Vec<(u16,u8)>,
+    fail_irq_publish:bool,
 }
 impl Default for Device {
     fn default()->Self {Self {config:0,scan_set:2,enabled:true,
         command_pending:false,set_pending:false,responses:VecDeque::new(),
         fail_query:false,busy:false,nack:false,resend_once:false,
-        resend_sent:false,irq_during_command:false,writes:Vec::new()}}
+        resend_sent:false,irq_during_command:false,writes:Vec::new(),fail_irq_publish:false}}
 }
 thread_local! {static DEVICE:RefCell<Device>=RefCell::new(Device::default());}
 fn device<T>(f:impl FnOnce(&mut Device)->T)->T {DEVICE.with(|d|f(&mut d.borrow_mut()))}
@@ -31,7 +32,11 @@ unsafe fn out(port:u16,value:u8) {
             (0x64,0xae)=>d.config&=!0x10,
             (0x64,0x20)=>{if !d.fail_query {d.responses.push_back(d.config);}},
             (0x64,0x60)=>d.command_pending=true,
-            (0x60,v) if d.command_pending=>{d.config=v;d.command_pending=false;},
+            (0x60,v) if d.command_pending=>{
+                d.command_pending=false;
+                if d.fail_irq_publish && v & 0x41 == 0x41 { d.config=v | 0x02; d.busy=true; }
+                else { d.config=v; }
+            },
             (0x60,v)=>{
                 if d.config&1!=0 {d.irq_during_command=true;}
                 if d.nack {d.responses.push_back(0xfc);return;}
@@ -95,4 +100,13 @@ fn reset(config:u8,scan_set:u8) {
 #[test] fn restoreTimeoutReported() {
     reset(0,2);device(|d|d.busy=true);
     assert!(!unsafe{ps2::restore(ps2::Saved{controller:0,scan_set:2})});
+}
+
+#[test] fn lateControllerFailureAttemptsKeyboardRollback() {
+    reset(0x10,3);
+    device(|d| d.fail_irq_publish=true);
+    assert!(unsafe{ps2::enable()}.is_none());
+    // The controller has become permanently busy after the last config write.
+    // Neither device state nor controller state can be guaranteed recoverable.
+    device(|d| {assert_eq!(d.scan_set,2);assert!(d.busy);});
 }
