@@ -20,13 +20,13 @@ static unsigned log_used, spawns, collected, kills, yields, writes;
 static unsigned spawn_error_at, write_error_at, yield_error_at, wait_error_at;
 static long live_child;
 static char live_kind; // 'o': success, 'f': failure, 'h': hung
-static int killed;
+static int killed, completed_before_kill;
 
 static void reset(void) {
     memset(log_text,0,sizeof(log_text));
     log_used=spawns=collected=kills=yields=writes=0;
     spawn_error_at=write_error_at=yield_error_at=wait_error_at=0;
-    live_child=0; live_kind=0; killed=0;
+    live_child=0; live_kind=0; killed=0; completed_before_kill=0;
 }
 
 static long mock_call(long op,long a,long b,long c) {
@@ -51,8 +51,8 @@ static long mock_call(long op,long a,long b,long c) {
             wait_error_at=0;
             return -10;
         }
-        if (live_kind=='h' && !killed) return -11;
-        long status=killed?137:live_kind=='o'?0:42;
+        if (live_kind=='h' && !killed && !completed_before_kill) return -11;
+        long status=killed?137:(live_kind=='o' || completed_before_kill)?0:42;
         collected++;live_child=0;
         return status;
     }
@@ -64,6 +64,7 @@ static long mock_call(long op,long a,long b,long c) {
         if (a==0 || a==1) return -22;
         if (a==0x7fffffff) return -3;
         if (a!=live_child || !live_child) abort();
+        if (completed_before_kill && live_kind=='h') return 1;
         kills++;
         killed=1;
         return 0;
@@ -127,6 +128,13 @@ int main(void) {
     assert(run_supervisor()==64 && spawns==5 && collected==5 && kills==1 && !live_child);
     reset();wait_error_at=1;
     assert(run_supervisor()==62 && spawns==1 && collected==1 && kills==1 && !live_child);
+    // Simulate the race where the final yield completes the worker and the
+    // kernel finds an already-zombie child at kill time. Do not log TIME.
+    reset();completed_before_kill=1;
+    assert(supervise("svc_hang",8,1,1)==0);
+    assert(spawns==1 && collected==1 && kills==0 && !live_child);
+    assert(strstr(log_text,"SERVICE DONE")!=NULL);
+    assert(strstr(log_text,"SERVICE TIME")==NULL);
     puts("Supervisor host acceptance: success, restart cap, stalled child kill, "
          "spawn/write/yield/wait failures passed");
     return 0;
