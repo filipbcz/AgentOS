@@ -39,7 +39,7 @@ static int record(const char event[4], unsigned long parent,
  * A permanently failed kernel operation cannot guarantee recovery; report it.
  */
 static void cancel_and_collect(long pid) {
-    if (os_call(SYS_KILL,pid,0,0)==0)
+    if (os_call(SYS_KILL,pid,0,0)>=0)
         (void)os_call(SYS_TRY_WAIT,pid,0,0);
 }
 
@@ -58,11 +58,15 @@ static int collect_child(long child, unsigned long *exit_status) {
             return -1;
         }
     }
-    if (os_call(SYS_KILL,child,0,0)!=0) return -1;
+    // A worker may exit between the final poll and SYS_KILL. The kernel
+    // returns 1 for an existing zombie; do not mislabel its clean exit as a
+    // forced termination or overwrite the original exit status.
+    long killed=os_call(SYS_KILL,child,0,0);
+    if (killed<0) return -1;
     long status=os_call(SYS_TRY_WAIT,child,0,0);
     if (status<0) return -1;
     *exit_status=(unsigned long)status;
-    return 1;
+    return killed==0 ? 1 : 0;
 }
 
 /* 0 = clean completion; 1 = failure budget reached; 2 = stalled child killed;
