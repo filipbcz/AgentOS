@@ -136,6 +136,7 @@ impl Queue {
     {
         if pid == 0 || pid == parent { return Err(-22); }
         let mut found = false;
+        let mut already_exited = false;
         for task in self.tasks.iter_mut().flatten() {
             let Some(process) = task.process.as_mut() else { continue; };
             if process.pid != pid { continue; }
@@ -145,6 +146,8 @@ impl Queue {
                 process.status = Some(137); // forced termination, SIGKILL convention
                 task.runnable = false;
                 task.waiting = None;
+            } else {
+                already_exited = true;
             }
             found = true;
             break;
@@ -152,7 +155,7 @@ impl Queue {
         if !found { return Err(-3); }
         // A closed channel or pipe can unblock other tasks on this CPU.
         self.wake_io();
-        Ok(0)
+        Ok(usize::from(already_exited))
     }
 
     pub fn collect(&mut self, frames: &mut Frames<'_>, parent: usize, pid: usize) -> Result<usize, isize> {
