@@ -9,7 +9,7 @@ done < "$root/scripts/toolchain.lock"
 out="$root/build"
 mkdir -p "$out"
 work=$(mktemp -d)
-trap 'rm -f "$work"/{libkernel.a,ap-start.o,kernel.elf,initramfs.cpio,layout.ld,loader.o,payload.o,loader.so,stage,user.o,transfer.o,client.o,receive.o,service.o,shell.o,init,fault,receiver,service,shell,data/transfer.bin}; rmdir "$work/data" "$work"' EXIT
+trap 'rm -f "$work"/{libkernel.a,ap-start.o,kernel.elf,initramfs.cpio,layout.ld,loader.o,payload.o,loader.so,stage,user.o,transfer.o,client.o,receive.o,service.o,shell.o,supervisor.o,init,fault,receiver,service,shell,svc_ok,svc_fail,svc_hang,data/transfer.bin}; rmdir "$work/data" "$work"' EXIT
 cd "$work"
 mkdir data
 [[ $(rustc --version) == "rustc 1.75.0 "* ]]
@@ -19,10 +19,10 @@ rustc --edition 2021 --crate-type staticlib -C lto=fat -C opt-level=2 -C panic=a
 gcc-13 -c -o ap-start.o "$root/kernel/ap-start.S"
 ld --build-id=none --gc-sections -T "$root/kernel/kernel.ld" -o kernel.elf libkernel.a ap-start.o
 printf 'AgentOS stage 1\n' > stage
-for app in init fault receiver service shell; do
+for app in init fault receiver service shell svc_ok svc_fail svc_hang; do
     gcc-13 -c "$root/user/$app.S" -o user.o
     objects=(user.o)
-    case "$app" in init) sources=(transfer client);; receiver) sources=(receive);; service) sources=(service);; shell) sources=(shell);; *) sources=();; esac
+    case "$app" in init) sources=(transfer client supervisor);; receiver) sources=(receive);; service) sources=(service);; shell) sources=(shell);; *) sources=();; esac
     for src in "${sources[@]}"; do
         gcc-13 -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
             -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large -c "$root/user/$src.c" -o "$src.o"
@@ -31,8 +31,8 @@ for app in init fault receiver service shell; do
     ld --build-id=none -z noexecstack -s -T "$root/user/user.ld" -o "$app" "${objects[@]}"
 done
 awk 'BEGIN {for (i=0;i<8193;i++) printf "%c",(i*73+int(i/251)*19)%256}' > data/transfer.bin
-touch -d @0 stage init fault receiver service shell data/transfer.bin data
-printf '%s\n' stage init fault receiver service shell data data/transfer.bin | cpio --quiet --reproducible --owner=0:0 -o -H newc > initramfs.cpio
+touch -d @0 stage init fault receiver service shell svc_ok svc_fail svc_hang data/transfer.bin data
+printf '%s\n' stage init fault receiver service shell svc_ok svc_fail svc_hang data data/transfer.bin | cpio --quiet --reproducible --owner=0:0 -o -H newc > initramfs.cpio
 gcc-13 -I/usr/include/efi -I/usr/include/efi/x86_64 -DGNU_EFI_USE_MS_ABI \
     -O2 -Wall -Wextra -Werror -fpic -ffreestanding -fno-stack-protector -fshort-wchar \
     -mno-red-zone -c "$root/boot/loader.c" -o loader.o
