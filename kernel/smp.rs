@@ -131,6 +131,7 @@ struct Cpu {
     idle: UnsafeCell<IdleSample>,
     descriptors: Option<Descriptors>,
     queue: UnsafeCell<Queue>,
+    terminal: UnsafeCell<*mut crate::tty::Terminal>,
     load: &'static Load,
     released: [AtomicUsize; stress::TASKS],
 }
@@ -149,7 +150,7 @@ impl Cpu {
         cpu.write(Self { self_address: addr, syscall_user_rsp: UnsafeCell::new(0), syscall_stack: UnsafeCell::new(0),
                          rsp0, programs, apic, expected_id: id, interval, tsc_hz,
                          interrupts: AtomicU32::new(0), hlt_wakes: AtomicU32::new(0),
-                         complete: AtomicU32::new(0), phase: AtomicU32::new(0),
+                         complete: AtomicU32::new(0), phase: AtomicU32::new(0), terminal: UnsafeCell::new(ptr::null_mut()),
                          idle: UnsafeCell::new(IdleSample::default()), descriptors, load, queue: UnsafeCell::new(Queue::new()),
                          released: core::array::from_fn(|_| AtomicUsize::new(0)) });
         for i in 0..stress::TASKS {
@@ -196,7 +197,21 @@ impl Cpu {
 
     unsafe fn switch(&self, outgoing: usize, timer: bool) -> usize {
         let queue = &mut *self.queue.get();
+        let scheduled = queue.active;
+        let running = queue.running();
         let next = queue.select(outgoing, timer);
+        // Boot/idle probes own their one-shot timers while queue.active=false.
+        // Only scheduled work uses time slices, and no tick is needed when all
+        // tasks sleep on I/O. The UART can wake and select a reader directly.
+        if scheduled {
+            if !queue.running() {
+                self.apic.write(0x320, MASK | TIMER);
+                self.apic.write(0x380, 0);
+            } else if !running {
+                self.apic.write(0x320, TIMER | (1 << 17));
+                self.apic.write(0x380, self.interval);
+            }
+        }
         let root = if let Some(p) = queue.process() {
             let top = queue.user_stack_top().unwrap();
             ptr::write_unaligned(self.rsp0 as *mut usize, top);
@@ -205,6 +220,17 @@ impl Cpu {
         } else { self.programs.kernel_root };
         if root != active_root() { asm!("mov cr3, {}", in(reg) root); }
         next
+    }
+
+    unsafe fn output(&self, bytes: &[u8]) {
+        let terminal = *self.terminal.get();
+        if terminal.is_null() { serial(bytes); } else { (*terminal).diagnostic(bytes); }
+    }
+
+    unsafe fn hex(&self, value: u64) {
+        let mut digits = [b'0'; 16];
+        for (i, d) in digits.iter_mut().enumerate() { *d = b"0123456789abcdef"[((value >> (60 - i*4)) & 15) as usize]; }
+        self.output(&digits);
     }
 
     unsafe fn process_test(&self) -> Result<(), Error> {
@@ -331,14 +357,28 @@ unsafe extern "C" fn timer_interrupt(context: *mut Context) -> usize {
     cpu.switch(context as usize, true)
 }
 
+#[no_mangle]
+unsafe extern "C" fn serial_interrupt(context: *mut Context) -> usize {
+    let cpu = current_cpu();
+    let terminal = *cpu.terminal.get();
+    if cpu.apic.read(0x170) & 2 == 0 || terminal.is_null() {
+        serial(b"SMP FAILED: unexpected serial interrupt\r\n"); halt();
+    }
+    (*terminal).interrupt();
+    cpu.apic.write(0xb0, 0); // Device deasserted/rearmed before EOI.
+    if (*context).user() && (*context).rsp >= 1usize << 47 { return user_fault(13, 0, 0); }
+    (*cpu.queue.get()).wake_io();
+    cpu.switch(context as usize, false)
+}
+
 pub unsafe fn user_fault(vector: u64, error: u64, addr: u64) -> usize {
     let cpu = current_cpu();
     let q = &mut *cpu.queue.get();
     let p = q.process().unwrap();
-    serial(b"AGENTOS USER FAULT PID="); hex(p.pid as u64);
-    serial(b" PARENT="); hex(p.parent as u64); serial(b" CR3="); hex(active_root() as u64);
-    serial(b" VECTOR="); hex(vector); serial(b" ERROR="); hex(error);
-    serial(b" ADDRESS="); hex(addr); serial(b"\r\n");
+    cpu.output(b"AGENTOS USER FAULT PID="); cpu.hex(p.pid as u64);
+    cpu.output(b" PARENT="); cpu.hex(p.parent as u64); cpu.output(b" CR3="); cpu.hex(active_root() as u64);
+    cpu.output(b" VECTOR="); cpu.hex(vector); cpu.output(b" ERROR="); cpu.hex(error);
+    cpu.output(b" ADDRESS="); cpu.hex(addr); cpu.output(b"\r\n");
     cpu.load.frames.with(|f| q.terminate(256 + vector as usize, f));
     cpu.switch(0, false)
 }
@@ -369,12 +409,12 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
                     q.block(wait);
                     return cpu.switch(ctx as *mut Context as usize, false);
                 }
-                Err(error) => error,
+                Err(error) => { q.wake_io(); error }
             }
         }
         0x10003 => {
-            serial(b"AGENTOS USER EXIT PID="); hex(pid as u64);
-            serial(b" CR3="); hex(active_root() as u64); serial(b" STATUS="); hex((a & 255) as u64); serial(b"\r\n");
+            cpu.output(b"AGENTOS USER EXIT PID="); cpu.hex(pid as u64);
+            cpu.output(b" CR3="); cpu.hex(active_root() as u64); cpu.output(b" STATUS="); cpu.hex((a & 255) as u64); cpu.output(b"\r\n");
             cpu.load.frames.with(|f| q.terminate(a & 255, f));
             return cpu.switch(0, false);
         }
@@ -575,5 +615,47 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
         serial(b" TSC-TOTAL="); hex(sample.elapsed);
         serial(b" TSC-ACTIVE="); hex(sample.active); serial(b"\r\n");
     }
+    Ok(())
+}
+
+/// Start only after the boot tests, idle measurements and framebuffer marker.
+/// The BSP owns this terminal until all session descriptors have been reaped.
+pub unsafe fn shell(platform: &Platform) -> Result<(), Error> {
+    let cpu = current_cpu();
+    let snapshot = cpu.load.frames.with(|f| f.snapshot()).ok_or(b"shell snapshot" as Error)?;
+    let Some(storage) = cpu.load.frames.with(|f| f.alloc()) else {
+        cpu.load.frames.with(|f| snapshot.release(f));
+        return Err(b"TTY allocation");
+    };
+    let terminal = storage.address() as *mut crate::tty::Terminal;
+    let mut initialized = false;
+    let started = (|| -> Result<usize, Error> {
+        terminal.write(crate::tty::Terminal::new(platform, cpu.expected_id)?);
+        initialized = true;
+        let pid = cpu.load.frames.with(|f| (*cpu.queue.get()).spawn_process(f, cpu.programs, b"shell", 0))
+            .map_err(|_| b"shell ELF" as Error)?;
+        (*cpu.queue.get()).terminal(pid, terminal).map_err(|_| b"shell descriptors" as Error)?;
+        serial(b"AGENTOS SHELL START PID="); hex(pid as u64); serial(b"\r\n");
+        cpu.terminal.get().write(terminal);
+        (*terminal).enable();
+        cpu.schedule();
+        Ok(pid)
+    })();
+    if initialized { (*terminal).disable(); }
+    cpu.terminal.get().write(ptr::null_mut());
+    let result = cpu.load.frames.with(|f| {
+        let q = &mut *cpu.queue.get();
+        let status = started.and_then(|pid| {
+            if q.collect(f, 0, pid) == Ok(0) { Ok(pid) } else { Err(b"shell exit status" as Error) }
+        });
+        q.reap(f);
+        f.release(storage);
+        let matched = snapshot.matches(f);
+        snapshot.release(f);
+        if matched && f.probe() { status } else { Err(b"shell frame leak" as Error) }
+    });
+    let pid = result?;
+    serial(b"AGENTOS SHELL STOP PID="); hex(pid as u64);
+    serial(b" STATUS=0000000000000000 FRAMES=OK\r\n");
     Ok(())
 }

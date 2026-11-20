@@ -92,6 +92,13 @@ impl Queue {
 
     pub fn process(&self) -> Option<&Process> { self.tasks[self.current?].as_ref()?.process.as_ref() }
     pub fn process_mut(&mut self) -> Option<&mut Process> { self.tasks[self.current?].as_mut()?.process.as_mut() }
+    pub fn running(&self) -> bool { self.current.is_some() }
+
+    pub fn terminal(&mut self, pid: usize, terminal: *mut crate::tty::Terminal) -> Result<(), isize> {
+        if self.active || self.current.is_some() { return Err(-16); }
+        self.tasks.iter_mut().flatten().filter_map(|task| task.process.as_mut())
+            .find(|p| p.pid == pid).ok_or(-3isize)?.files.terminal(terminal)
+    }
 
     pub fn block(&mut self, wait: crate::files::Wait) {
         let t = self.tasks[self.current.unwrap()].as_mut().unwrap();

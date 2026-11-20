@@ -10,12 +10,13 @@ struct OpenFile { data: &'static [u8], offset: usize, refs: usize }
 struct Pipe { readers: usize, writers: usize, head: usize, used: usize, buf: [u8; PIPE_SIZE] }
 
 #[derive(Clone, Copy)]
-enum Handle { Empty, Console, File(*mut OpenFile), Reader(*mut Pipe), Writer(*mut Pipe), Socket(*mut Channel, usize) }
+enum Handle { Empty, Console, File(*mut OpenFile), Reader(*mut Pipe), Writer(*mut Pipe), Socket(*mut Channel, usize),
+              TerminalInput(*mut crate::tty::Terminal), TerminalOutput(*mut crate::tty::Terminal) }
 pub struct Descriptors(Frame);
 const _: () = assert!(mem::size_of::<[Handle; SLOTS]>() <= 4096 && mem::size_of::<Pipe>() <= 4096);
 
 #[derive(Clone, Copy)]
-pub enum Wait { Pipe { end: PipeWait, need: usize }, Socket(*mut Channel, usize, Operation) }
+pub enum Wait { Pipe { end: PipeWait, need: usize }, Socket(*mut Channel, usize, Operation), Terminal(*mut crate::tty::Terminal) }
 #[derive(Clone, Copy)]
 pub struct PipeWait(Handle);
 pub enum Io { Bytes(usize), Sleep(Wait) }
@@ -24,6 +25,7 @@ impl Wait {
     pub fn ready(self) -> bool {
         // The sleeping process still owns this endpoint until its call returns.
         let (end, need) = match self {
+            Self::Terminal(p) => return unsafe { (*p).ready() },
             Self::Socket(p, side, op) => return unsafe { (*p).ready(side, op) },
             Self::Pipe { end, need } => (end.0, need),
         };
@@ -84,6 +86,17 @@ impl Descriptors {
     // Called once on a newly created child's table, before it becomes runnable.
     pub fn inherit(&mut self, parent: &Self) {
         for (slot, &h) in self.slots_mut().iter_mut().zip(parent.slots()) { *slot = unsafe { h.retain() }; }
+    }
+
+    // Attach only to the fresh shell, preserving the acceptance programs' fd0.
+    // The session owner outlives all inherited descriptors and sleeping tasks.
+    pub fn terminal(&mut self, terminal: *mut crate::tty::Terminal) -> Result<(), isize> {
+        if !matches!(self.slots()[0], Handle::Empty) || !matches!(self.slots()[1], Handle::Console) ||
+            !matches!(self.slots()[2], Handle::Empty) { return Err(-22); }
+        self.slots_mut()[0] = Handle::TerminalInput(terminal);
+        self.slots_mut()[1] = Handle::TerminalOutput(terminal);
+        self.slots_mut()[2] = Handle::TerminalOutput(terminal);
+        Ok(())
     }
     pub fn close(&mut self, frames: &mut Frames<'_>, fd: usize) -> Result<usize, isize> {
         let h = self.handle(fd)?;
@@ -148,6 +161,10 @@ impl Descriptors {
     pub fn read(&self, space: &UserSpace, fd: usize, va: usize, len: usize) -> Result<Io, isize> {
         let end = self.handle(fd)?;
         match end {
+            Handle::TerminalInput(p) => {
+                let n = unsafe { (*p).read(len, |bytes| space.write(va, bytes).ok_or(EFAULT))? };
+                Ok(n.map_or(Io::Sleep(Wait::Terminal(p)), Io::Bytes))
+            }
             Handle::File(p) => {
                 let file = unsafe { &mut *p };
                 let n = len.min(file.data.len() - file.offset);
@@ -175,6 +192,12 @@ impl Descriptors {
     pub fn write(&self, space: &UserSpace, fd: usize, va: usize, len: usize) -> Result<Io, isize> {
         let end = self.handle(fd)?;
         match end {
+            Handle::TerminalOutput(p) => {
+                let mut buf = [0; 256];
+                let n = len.min(buf.len());
+                space.read(va, &mut buf[..n]).ok_or(EFAULT)?;
+                unsafe { (*p).write(&buf[..n]).map(Io::Bytes) }
+            }
             Handle::Console => {
                 let mut buf = [0; 256];
                 if len > buf.len() { return Err(-22); }

@@ -13,6 +13,9 @@ mod process;
 mod files;
 mod ipc;
 mod vfs;
+mod line;
+mod ioapic;
+mod tty;
 
 // Version 3, shared with boot/loader.c. Addresses are identity mapped at handoff.
 #[repr(C)]
@@ -46,6 +49,12 @@ fn panic(_: &PanicInfo) -> ! { halt() }
 
 unsafe fn out(port: u16, value: u8) {
     asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack));
+}
+
+unsafe fn input(port: u16) -> u8 {
+    let value: u8;
+    asm!("in al, dx", in("dx") port, out("al") value, options(nomem, nostack));
+    value
 }
 
 const COM: u16 = 0x3f8;
@@ -112,7 +121,7 @@ pub unsafe extern "sysv64" fn kernel_main(info: &BootInfo) -> ! {
     let Some(descriptors) = exceptions::Descriptors::new(&mut frames) else { log.event(0, b"IDT INIT FAILED"); halt(); };
     descriptors.load();
     smp::copy_startup(info.ap_boot);
-    let Some(root) = paging::install(info, map, &mut frames, platform.lapic) else {
+    let Some(root) = paging::install(info, map, &mut frames, &platform) else {
         log.event(0, b"PAGING INIT FAILED"); halt();
     };
     serial(b"AGENTOS OWN CR3="); exceptions::hex(root as u64); serial(b"\r\n");
@@ -134,6 +143,10 @@ pub unsafe extern "sysv64" fn kernel_main(info: &BootInfo) -> ! {
     serial(b"\r\n");
     let scale = ((info.width as usize - 16) / (MESSAGE.len() * 6)).clamp(1, 4);
     draw(info, MESSAGE, 8, 16, scale);
+    if let Err(reason) = smp::shell(&platform) {
+        log.event(0, b"SHELL FAILED");
+        serial(b"SHELL FAILED: "); serial(reason); serial(b"\r\n");
+    }
     halt()
 }
 

@@ -38,6 +38,7 @@ PATTERNS = {kind: re.compile(pattern) for kind, pattern in PATTERNS.items()}
 PREFIXES = ("AGENTOS USER ", "AGENTOS PIPE ", "AGENTOS IPC ", "AGENTOS PROCESS ")
 ORDER = ("fault", "survived", "received", "exit", "sent", "service", "exit",
          "reply", "exit", "check")
+SHELL_START = re.compile(r"AGENTOS SHELL START PID=([0-9a-f]{16})")
 
 
 def require(condition, message):
@@ -52,6 +53,13 @@ def verify(text, apic_ids):
             "Expected APIC IDs must be nonempty and unique")
     events = []
     for number, line in enumerate(text.splitlines(), 1):
+        if line.startswith("AGENTOS SHELL START"):
+            match = SHELL_START.fullmatch(line)
+            require(match is not None and int(match[1], 16) != 0,
+                    f"Malformed shell phase boundary at line {number}")
+            # The shell has its own exit and verifier. Earlier required process
+            # counts and identities below must still pass before this boundary.
+            break
         if not line.startswith(PREFIXES):
             continue
         for kind, pattern in PATTERNS.items():

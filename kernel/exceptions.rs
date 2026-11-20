@@ -10,6 +10,7 @@ extern "C" {
     static nx_target: u8;
     static probe_pass: u8;
     fn timer_gate();
+    fn serial_gate();
     fn spurious_gate();
     fn load_descriptors(gdt: &Descriptor, idt: &Descriptor);
     fn probe_break() -> u64;
@@ -50,6 +51,7 @@ impl Descriptors {
         };
         for (i, &addr) in vectors.iter().enumerate() { install_gate(i, addr); }
         install_gate(0xe0, timer_gate as usize as u64);
+        install_gate(crate::tty::VECTOR as usize, serial_gate as usize as u64);
         install_gate(0xff, spurious_gate as usize as u64);
         Some(Self { gdt, idt })
     }

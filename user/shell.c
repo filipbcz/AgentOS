@@ -1,0 +1,156 @@
+#include "abi.h"
+
+enum { commandCapacity = 256, inputChunk = 64, outputChunk = 256 };
+
+static unsigned textLength(const char *aText) {
+    unsigned pLength = 0;
+    while (aText[pLength]) pLength++;
+    return pLength;
+}
+
+static int writeAll(const char *aData, unsigned aLength) {
+    while (aLength) {
+        unsigned pCount = aLength < outputChunk ? aLength : outputChunk;
+        long pWritten = os_call(SYS_WRITE, 1, (long)aData, pCount);
+        if (pWritten <= 0 || (unsigned long)pWritten > pCount) return 0;
+        aData += pWritten;
+        aLength -= (unsigned)pWritten;
+    }
+    return 1;
+}
+
+static int writeText(const char *aText) { return writeAll(aText, textLength(aText)); }
+
+static int writeNumber(unsigned long aNumber) {
+    char pDigits[20];
+    unsigned pFirst = sizeof(pDigits);
+    do {
+        pDigits[--pFirst] = '0' + aNumber % 10;
+        aNumber /= 10;
+    } while (aNumber);
+    return writeAll(pDigits + pFirst, sizeof(pDigits) - pFirst);
+}
+
+static int writeError(const char *aOperation, long aError) {
+    return writeText(aOperation) && writeText(" (") &&
+        (aError >= 0 || writeText("-")) &&
+        writeNumber(aError < 0 ? -(unsigned long)aError : (unsigned long)aError) &&
+        writeText(")\r\n");
+}
+
+static int isSpace(char aByte) { return aByte == ' ' || aByte == '\t'; }
+static char *skipSpaces(char *aText) {
+    while (isSpace(*aText)) aText++;
+    return aText;
+}
+static int equals(const char *aLeft, const char *aRight) {
+    while (*aLeft && *aLeft == *aRight) { aLeft++; aRight++; }
+    return *aLeft == *aRight;
+}
+
+static int catFile(const char *aPath) {
+    long pFd = os_call(SYS_OPEN, (long)aPath, textLength(aPath), 0);
+    if (pFd < 0) return writeError("cat: open failed", pFd);
+    char pBuffer[outputChunk];
+    int pOutputOk = 1;
+    for (;;) {
+        long pRead = os_call(SYS_READ, pFd, (long)pBuffer, sizeof(pBuffer));
+        if (pRead < 0) { pOutputOk = writeError("cat: read failed", pRead); break; }
+        if (!pRead) break;
+        if ((unsigned long)pRead > sizeof(pBuffer) || !writeAll(pBuffer, (unsigned)pRead)) {
+            pOutputOk = 0;
+            break;
+        }
+    }
+    long pClosed = os_call(SYS_CLOSE, pFd, 0, 0);
+    if (pOutputOk && pClosed < 0) pOutputOk = writeError("cat: close failed", pClosed);
+    return pOutputOk;
+}
+
+// Returns 1 to continue, 0 for an explicit exit and -1 after an output failure.
+static int executeLine(char *aLine) {
+    char *pCommand = skipSpaces(aLine);
+    if (!*pCommand) return 1;
+    char *pArgs = pCommand;
+    while (*pArgs && !isSpace(*pArgs)) pArgs++;
+    if (*pArgs) *pArgs++ = 0;
+    pArgs = skipSpaces(pArgs);
+    int pOk;
+    if (equals(pCommand, "echo")) {
+        pOk = writeText(pArgs) && writeText("\r\n");
+    } else if (equals(pCommand, "cat")) {
+        char *pEnd = pArgs;
+        while (*pEnd && !isSpace(*pEnd)) pEnd++;
+        char *pRest = pEnd;
+        if (*pEnd) { *pEnd = 0; pRest = skipSpaces(pEnd + 1); }
+        pOk = !*pArgs || *pRest ? writeText("usage: cat PATH\r\n") : catFile(pArgs);
+    } else if (equals(pCommand, "help") && !*pArgs) {
+        pOk = writeText("help       List commands\r\npid        Show process ID\r\n"
+                       "echo TEXT  Print text\r\ncat PATH   Read an initramfs file\r\n"
+                       "exit       Close the shell\r\n");
+    } else if (equals(pCommand, "pid") && !*pArgs) {
+        long pPid = os_call(SYS_GETPID, 0, 0, 0);
+        pOk = pPid < 0 ? writeError("pid: failed", pPid) :
+            writeNumber((unsigned long)pPid) && writeText("\r\n");
+    } else if (equals(pCommand, "exit") && !*pArgs) {
+        return 0;
+    } else {
+        pOk = writeText("error: unknown command or arguments; use help\r\n");
+    }
+    return pOk ? 1 : -1;
+}
+
+static int finishLine(char *aLine, unsigned aLength, int aRejected) {
+    if (aRejected) {
+        return writeText(aRejected == 1 ? "error: command too long\r\n" :
+                                         "error: invalid command byte\r\n") ? 1 : -1;
+    }
+    aLine[aLength] = 0;
+    return executeLine(aLine);
+}
+
+// TTY supplies canonical LF-terminated input. The extra framing here handles
+// short reads and preserves command boundaries if stdin later becomes a pipe.
+int runShell(void) {
+    char pLine[commandCapacity];
+    char pInput[inputChunk];
+    unsigned pUsed = 0;
+    int pRejected = 0;
+    if (!writeText("AGENTOS SHELL READY\r\nagentos> ")) return 2;
+    for (;;) {
+        long pRead = os_call(SYS_READ, 0, (long)pInput, sizeof(pInput));
+        if (pRead == -75) {
+            // Canonical TTY owns discard-through-newline overflow quarantine.
+            pUsed = 0;
+            pRejected = 0;
+            if (!writeText("error: input line too long\r\nagentos> ")) return 2;
+            continue;
+        }
+        if (pRead < 0) {
+            return writeError("shell: input failed", pRead) ? 1 : 2;
+        }
+        if ((unsigned long)pRead > sizeof(pInput)) return 1;
+        if (!pRead) {
+            if (pUsed || pRejected) {
+                int pResult = finishLine(pLine, pUsed, pRejected);
+                if (pResult < 0) return 2;
+            }
+            return writeText("\r\nAGENTOS SHELL EXIT\r\n") ? 0 : 2;
+        }
+        for (long pIndex = 0; pIndex < pRead; pIndex++) {
+            unsigned char pByte = (unsigned char)pInput[pIndex];
+            if (pByte == '\n') {
+                int pResult = finishLine(pLine, pUsed, pRejected);
+                if (pResult < 0) return 2;
+                if (!pResult) return writeText("AGENTOS SHELL EXIT\r\n") ? 0 : 2;
+                pUsed = 0;
+                pRejected = 0;
+                if (!writeText("agentos> ")) return 2;
+            } else if (!pRejected) {
+                if ((pByte < 32 && pByte != '\t') || pByte > 126) pRejected = 2;
+                else if (pUsed == sizeof(pLine) - 1) pRejected = 1;
+                else pLine[pUsed++] = (char)pByte;
+            }
+        }
+    }
+}

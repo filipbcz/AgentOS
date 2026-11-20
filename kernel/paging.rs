@@ -135,7 +135,7 @@ impl Tables<'_, '_> {
 }
 
 /// Called once by the BSP with interrupts disabled, on the loader-provided stack.
-pub unsafe fn install(info: &BootInfo, map: &[u8], frames: &mut Frames<'_>, lapic: usize) -> Option<usize> {
+pub unsafe fn install(info: &BootInfo, map: &[u8], frames: &mut Frames<'_>, platform: &crate::acpi::Platform) -> Option<usize> {
     let cr4: usize;
     asm!("mov {}, cr4", out(reg) cr4);
     if cr4 & (1 << 12) != 0 || __cpuid(0x80000000).eax < 0x80000001 ||
@@ -157,7 +157,8 @@ pub unsafe fn install(info: &BootInfo, map: &[u8], frames: &mut Frames<'_>, lapi
     tables.identity(info.stack_base as usize + PAGE, 7*PAGE, WRITE | NX)?;
     tables.identity(info.ap_boot, PAGE, 0)?;
     tables.identity(info.ap_boot + PAGE, PAGE, WRITE | NX)?;
-    tables.identity(lapic, PAGE, MMIO)?;
+    tables.identity(platform.lapic, PAGE, MMIO)?;
+    for io in &platform.io_apics[..platform.io_count] { tables.identity(io.address, PAGE, MMIO)?; }
     tables.identity(info.framebuffer as usize, info.stride as usize * info.height as usize * 4, MMIO)?;
 
     // Firmware may leave global translations in the TLB. Flush those as well.

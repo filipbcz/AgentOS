@@ -2,7 +2,7 @@
 
 Vlastní operační systém podle [technického zadání](ZADANI.md). Dosavadní implementaci, historické výsledky z VirtualBoxu a dosud neověřené kroky rozlišuje [plán implementace](PLAN_IMPLEMENTACE.md).
 
-Rustové jádro po převzetí řízení od vlastního loaderu provede bootovací a procesové zkoušky, vypíše `AGENTOS KERNEL OK STAGE 1` přes UART 16550 a vykreslí stejný text přímo do framebufferu. Poté zastaví CPU. Obraz obsahuje ELF jádra a deterministický archiv newc. Minimální loader v C používá GNU-EFI pro volání firmwaru. Kernelový vstup, vlastní zásobník a textový výstup běží po `ExitBootServices`. Aktuální profil jádra potřebuje jeden segment na fyzické adrese 32 MiB.
+Rustové jádro po převzetí řízení od vlastního loaderu provede bootovací a procesové zkoušky, vypíše `AGENTOS KERNEL OK STAGE 1` přes UART 16550 a vykreslí stejný text přímo do framebufferu. Poté spustí jednoduchý shell na COM1; po jeho ukončení zastaví CPU. Obraz obsahuje ELF jádra a deterministický archiv newc. Minimální loader v C používá GNU-EFI pro volání firmwaru. Kernelový vstup, vlastní zásobník a textový výstup běží po `ExitBootServices`. Aktuální profil jádra potřebuje jeden segment na fyzické adrese 32 MiB.
 
 ## Sestavení a spuštění
 
@@ -108,4 +108,50 @@ Testy používají syntetické logy pro jeden a dva CPU a poškozené varianty. 
 python scripts/verify-processes.py --log build/runs/<nazev-VM>/com1.log --apic-ids 0000000000000000 0000000000000001
 ```
 
-Kontrola záměrně odmítne starší log bez IPC, chybějící či opakované záznamy, nesprávné identity a neúspěšná ukončení. Samotný soubor logu nedokládá původ obrazu; protokol musí dál uvádět verzi zdrojů, hash EFI a konfiguraci VM.
+Kontrola záměrně odmítne starší log bez IPC, chybějící či opakované záznamy, nesprávné identity a neúspěšná ukončení. Bootovací část končí případným záznamem `AGENTOS SHELL START`; pozdější interakci kontroluje samostatný scénář níže. Samotný soubor logu nedokládá původ obrazu; protokol musí dál uvádět verzi zdrojů, hash EFI a konfiguraci VM.
+
+## První sériový TTY a shell
+
+Po původních zkouškách včetně měření klidu jádro spustí na BSP statický ELF `shell`. Pouze tomuto procesu připojí fd 0 jako vstup TTY a fd 1 a 2 jako výstup. Bootovací programy dál začínají s volným fd 0. Shell běží v CPL3 a používá stávající nativní `read`, `write`, `open`, `close`, `getpid` a `exit`; nepotřebuje nové číslo syscallu.
+
+| Příkaz | Chování |
+|---|---|
+| `help` | Vypíše dostupné příkazy. |
+| `pid` | Vypíše PID shellu jako desetinné číslo. |
+| `echo TEXT` | Vypíše zadaný text. |
+| `cat PATH` | Přečte soubor z initramfs přes VFS a po dokončení i chybě zavře fd. |
+| `exit` | Ukončí shell; jádro převezme stav, uvolní prostředky a porovná bitmapu volných stránek. |
+
+Jde o první nativní sériový profil. Zatím neposkytuje přihlášení, spouštění dalších programů, uvozovky, roury či přesměrování v syntaxi shellu ani řízení úloh. Obsah se zobrazuje v připojeném sériovém terminálu. Framebuffer nadále slouží pro bootovací diagnostiku; klávesnice PS/2, terminál na displeji a správce služeb PID 1 jsou další práce.
+
+### Vstup, čekání a hranice dat
+
+COM1 používá dosavadní nastavení 115 200 baudů, 8N1. IRQ4 je směrované přes I/O APIC na BSP. Adresy řadičů a případné přemapování IRQ4 včetně polarity a spouštění se čtou z ACPI MADT; MMIO zůstává supervisor-only a NX. Sériové přerušení se zapne až po původních testech. Při prázdném vstupu plánovač uspí čtenáře, a pokud nemá jinou spustitelnou úlohu, vypne svůj periodický časovač. Nové znaky probudí CPU přerušením; hotový řádek vrátí čekající proces do běhu.
+
+Řádková vrstva přijímá ASCII, nejvýše 255 znaků před Enterem, a drží nejvýše čtyři dokončené záznamy. CR i LF odesílají řádek, CRLF se bere jako jediný Enter. Backspace a Delete opravují poslední znak, Tab vloží jednu mezeru. Ctrl-D na prázdném řádku vrátí jednorázové EOF; při rozepsaném řádku pouze zazní zvonek a text zůstane čekat na Enter. Další řídicí a ne-ASCII bajty se ignorují. Výstup TTY doplňuje CR před samotné LF a zachovává již vytvořené CRLF. Jeden `write` přijme nejvýše 256 vstupních bajtů a může vrátit dílčí počet.
+
+Příliš dlouhý řádek, plná fronta nebo chyba příjmu UART zneplatní čekající vstup a vrátí −75 (`EOVERFLOW`). Zbytek poškozeného vstupu se zahodí až po další CR/LF. Shell také zahodí případný prefix získaný dřívějším krátkým čtením, takže nemůže vykonat zkrácenou část příkazu. Při chybné cílové adrese (`EFAULT`) zůstává platný záznam zachovaný pro další čtení. Stav TTY je v přidělené zapisovatelné stránce, jejíž životnost zahrnuje všechny popisovače a čekající úlohy relace.
+
+### Odložený integrační test ve VirtualBoxu
+
+Volitelný přepínač `-Shell` nejprve provede původní bootovací kontroly a potom skutečně pošle příkazy do COM1:
+
+```powershell
+wsl -d Ubuntu-24.04 -- bash scripts/build.sh
+.\scripts\test-vbox.ps1 -Cpus 1 -Shell
+.\scripts\test-vbox.ps1 -Cpus 2 -Shell
+```
+
+Hostitel otevře TCP posluchač pouze na `127.0.0.1` a nechá VirtualBox připojit UART jako `tcpclient`. Zkouška prověří nápovědu, PID, `echo` s opravou Backspace, čtení `/stage`, chybějící soubor, neznámý příkaz a ukončení. `com1.log` zachová přijaté bajty a `com1-input.bin` skutečně odeslané bajty. Kontrola vyžaduje oddělené odpovědi příkazů, shodné PID mezi relací a ukončením, stav 0 a kernelový záznam `FRAMES=OK`; samotné echo vstupu nestačí. Běžný běh bez `-Shell` dál přijímá jen bootovací část. **Běh nového TTY a shellu ve VM zatím čeká na ověření.**
+
+## Hostitelské kontroly a CI
+
+Samostatný kompilátorový test sestaví a slinkuje skutečné jádro i všech pět uživatelských ELF a spustí dostupné hostitelské testy:
+
+```powershell
+wsl -d Ubuntu-24.04 -- bash scripts/check-build.sh
+```
+
+Vyžaduje Rust, GCC, binutils a Python 3; proměnné `RUSTC`, `CC`, `LD` a `PYTHON` mohou vybrat jiné spustitelné soubory. Sám nic nestahuje. Testy řádkové vrstvy a skutečného ovladače TTY používají náhradní portové I/O; testy shellu spouštějí jeho skutečný C kód s nahrazenými systémovými voláními. Testy kontrol logů pracují se syntetickými vstupy. Výstupy jsou v `build/check`.
+
+Workflow `Host checks` spouští tento postup na GitHubu a kontroluje také syntaxi PowerShell skriptů. Tato kontrola nebootuje OS, nevytváří podpis ani nepotvrzuje reprodukovatelnost s přesnými verzemi z `scripts/toolchain.lock`. Pro úplný obraz dál slouží `scripts/build.sh` a pro přijetí nové funkce oba běhy `-Shell`.

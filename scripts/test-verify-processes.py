@@ -131,6 +131,21 @@ class ProcessEvidenceTests(unittest.TestCase):
         self.rejected(self.log + "AGENTOS USER EXIT PID=0000000000000099 "
                       "CR3=0000000000500000 STATUS=0000000000000000\n")
 
+    def test_shell_phase_is_separate_after_complete_boot(self):
+        boundary = "AGENTOS SHELL START PID=0000000000000005\n"
+        shell = "AGENTOS SHELL READY\nAGENTOS USER EXIT PID=0000000000000005 "
+        shell += "CR3=0000000000600000 STATUS=0000000000000000\n"
+        verifier.verify(self.log + boundary + shell, [0])
+        self.rejected(boundary + self.log)
+        self.rejected("\n".join(self.lines[:-1]) + "\n" + boundary + shell)
+
+    def test_malformed_shell_phase_boundary(self):
+        for boundary in ("AGENTOS SHELL START", "AGENTOS SHELL START PID=bad",
+                         "AGENTOS SHELL START PID=0000000000000000",
+                         "AGENTOS SHELL START PID=0000000000000005 extra"):
+            with self.subTest(boundary=boundary):
+                self.rejected(self.log + boundary + "\n")
+
     def test_cli_accepts_multiple_apics_and_propagates_errors(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "synthetic COM1.log"
