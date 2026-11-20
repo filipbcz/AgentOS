@@ -128,6 +128,33 @@ impl Queue {
         self.wake_io();
     }
 
+    /// Terminate a direct child without switching to its address space.
+    /// A stopped child remains a zombie until its parent collects the status.
+    /// Only the owner CPU may call this with interrupts masked.
+    pub fn kill_child(&mut self, frames: &mut Frames<'_>, parent: usize, pid: usize)
+        -> Result<usize, isize>
+    {
+        if pid == 0 || pid == parent { return Err(-22); }
+        let mut found = false;
+        for task in self.tasks.iter_mut().flatten() {
+            let Some(process) = task.process.as_mut() else { continue; };
+            if process.pid != pid { continue; }
+            if process.parent != parent { return Err(-1); }
+            if process.status.is_none() {
+                process.files.close_all(frames);
+                process.status = Some(137); // forced termination, SIGKILL convention
+                task.runnable = false;
+                task.waiting = None;
+            }
+            found = true;
+            break;
+        }
+        if !found { return Err(-3); }
+        // A closed channel or pipe can unblock other tasks on this CPU.
+        self.wake_io();
+        Ok(0)
+    }
+
     pub fn collect(&mut self, frames: &mut Frames<'_>, parent: usize, pid: usize) -> Result<usize, isize> {
         let (i, process) = self.tasks.iter().enumerate()
             .filter_map(|(i, task)| Some((i, task.as_ref()?.process.as_ref()?)))
