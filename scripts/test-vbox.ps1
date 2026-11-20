@@ -1,10 +1,12 @@
 param([ValidateSet('signed','loader','kernel','initrd')][string]$Case='signed',
       [ValidateSet(1,2)][int]$Cpus=2,
       [switch]$Shell,
+      [switch]$Keyboard,
       [ValidateSet('quiet','info','debug')][string]$LogLevel='info',
       [ValidateSet('serial','screen','both','none')][string]$LogOutput='both')
 $ErrorActionPreference='Stop'
 if ($Shell -and $Case -ne 'signed') { throw '-Shell requires the signed case' }
+if ($Keyboard -and !$Shell) { throw '-Keyboard requires -Shell' }
 $root=Split-Path $PSScriptRoot
 Set-Location $root
 # Prevent simultaneous VirtualBox/NEM power-on from this workspace.
@@ -59,6 +61,37 @@ function Send-Serial($State,[string]$Command) {
         Start-Sleep -Milliseconds 10
     }
 }
+# Inject text through the VM's PS/2 keyboard, NOT through COM1. The
+# controller reports set-2 make/break bytes to the emulated first port.
+function Send-Keyboard([string]$Command) {
+    VBox controlvm $vm keyboardputstring $Command
+    VBox controlvm $vm keyboardputscancode 5a f0 5a
+}
+# Compare actual visible pixels rather than PNG metadata or text in COM1.
+function Verify-ShellScreen([string]$Before,[string]$After) {
+    Add-Type -AssemblyName System.Drawing
+    $a=[Drawing.Bitmap]::new((Resolve-Path $Before).Path)
+    $b=[Drawing.Bitmap]::new((Resolve-Path $After).Path)
+    try {
+        if ($a.Width -ne $b.Width -or $a.Height -ne $b.Height) {
+            throw 'Shell screenshots have inconsistent geometry'
+        }
+        $changes=0
+        $limitX=[Math]::Min($a.Width,600)
+        $limitY=[Math]::Min($a.Height,180)
+        for ($y=0;$y -lt $limitY;$y+=2) {
+            for ($x=0;$x -lt $limitX;$x+=2) {
+                if ($a.GetPixel($x,$y).ToArgb() -ne $b.GetPixel($x,$y).ToArgb()) {
+                    $changes++
+                }
+            }
+        }
+        if ($changes -lt 20) { throw "PS/2 command did not change visible GOP text: $After" }
+    } finally {
+        $a.Dispose()
+        $b.Dispose()
+    }
+}
 $tag=[Guid]::NewGuid().ToString('N').Substring(0,10)
 $vm="AgentOS-$Case-$tag"
 $relative="build/runs/$vm"
@@ -74,6 +107,7 @@ if ($LASTEXITCODE) { throw 'disk build failed' }
 VBox convertfromraw "$dir\esp.raw" "$dir\esp.vdi" --format VDI
 VBox createvm --name $vm --basefolder $dir --ostype Other_64 --register
 VBox modifyvm $vm --memory 256 --cpus $Cpus --firmware efi64 --paravirt-provider minimal --graphicscontroller vmsvga --vram 16 --ioapic on --nic1 none --audio-enabled off --boot1 disk --boot2 none --boot3 none --boot4 none --uart1 0x3f8 4
+if ($Keyboard) { VBox modifyvm $vm --keyboard ps2 }
 if ($Shell) {
     $serial=@{Listener=$null; Client=$null; Stream=$null; Log=$null; Input=$null;
               Buffer=(New-Object byte[] 4096); Text=(New-Object Text.StringBuilder)}
@@ -170,17 +204,83 @@ try {
         & "$PSScriptRoot/verify-idle.ps1" -RunDir $dir -ApicIds $ids -HostSeconds $hostIdleSeconds
         if ($Shell) {
             Wait-Serial $serial 'AGENTOS SHELL READY\r\nagentos> $'
-            $commands=@('help','pid',("echo shell-ox"+[char]8+'k'),'cat /stage','cat /missing','no-such-command')
-            foreach ($command in $commands) {
+            if ($Keyboard) {
+                # Separate acceptance case: one shell session with PS/2-only
+                # commands; preserve the unchanged strict serial transcript
+                # verifier for the normal -Shell run.
+                VBox controlvm $vm screenshotpng "$dir\shell-before.png"
                 $offset=$serial.Text.Length
-                Send-Serial $serial $command
-                Wait-Serial $serial 'agentos> $' $offset
+                Send-Keyboard 'echo ps2-ok'
+                Wait-Serial $serial '(?m)^ps2-ok\r\nagentos> 
+        }
+    } elseif (!(Select-String -LiteralPath "$dir\com1.log" -Pattern 'BdsDxe: failed to load .*HARDDISK.*(Access Denied|Security Violation)' -Quiet)) {
+        throw "Missing firmware rejection; timeout is inconclusive: $dir"
+    }
+    Write-Output "Captured $Case ($Cpus vCPUs): $dir"
+    $runSucceeded=$true
+} finally {
+    try { VBox controlvm $vm poweroff } catch {
+        if ($runSucceeded) { throw }
+        Write-Warning "VM power-off after a failed run also failed: $_"
+    }
+}
+} finally {
+    try {
+        if ($null -ne $serial) {
+            foreach ($handle in @($serial.Stream,$serial.Client,$serial.Log,$serial.Input)) {
+                if ($null -ne $handle) {
+                    try { $handle.Dispose() } catch { Write-Warning "COM1 cleanup failed: $_" }
+                }
             }
-            $offset=$serial.Text.Length
-            Send-Serial $serial 'exit'
-            Wait-Serial $serial '(?m)^AGENTOS SHELL STOP PID=[0-9a-f]{16} STATUS=[0-9a-f]{16} FRAMES=OK\r\n' $offset
-            & python "$PSScriptRoot/verify-shell.py" --log "$dir\com1.log" --input "$dir\com1-input.bin"
-            if ($LASTEXITCODE -ne 0) { throw "Shell verification failed: $dir" }
+            if ($null -ne $serial.Listener) { $serial.Listener.Stop() }
+        }
+    } finally { $lock.Dispose() }
+}
+ $offset
+                Start-Sleep -Milliseconds 150
+                VBox controlvm $vm screenshotpng "$dir\shell-keyboard.png"
+                Verify-ShellScreen "$dir\shell-before.png" "$dir\shell-keyboard.png"
+                $offset=$serial.Text.Length
+                Send-Keyboard 'exit'
+                Wait-Serial $serial '(?m)^AGENTOS SHELL STOP PID=[0-9a-f]{16} STATUS=0000000000000000 FRAMES=OK\r\n' $offset
+            } else {
+                $commands=@('help','pid',("echo shell-ox"+[char]8+'k'),'cat /stage','cat /missing','no-such-command')
+                foreach ($command in $commands) {
+                    $offset=$serial.Text.Length
+                    Send-Serial $serial $command
+                    Wait-Serial $serial 'agentos> 
+        }
+    } elseif (!(Select-String -LiteralPath "$dir\com1.log" -Pattern 'BdsDxe: failed to load .*HARDDISK.*(Access Denied|Security Violation)' -Quiet)) {
+        throw "Missing firmware rejection; timeout is inconclusive: $dir"
+    }
+    Write-Output "Captured $Case ($Cpus vCPUs): $dir"
+    $runSucceeded=$true
+} finally {
+    try { VBox controlvm $vm poweroff } catch {
+        if ($runSucceeded) { throw }
+        Write-Warning "VM power-off after a failed run also failed: $_"
+    }
+}
+} finally {
+    try {
+        if ($null -ne $serial) {
+            foreach ($handle in @($serial.Stream,$serial.Client,$serial.Log,$serial.Input)) {
+                if ($null -ne $handle) {
+                    try { $handle.Dispose() } catch { Write-Warning "COM1 cleanup failed: $_" }
+                }
+            }
+            if ($null -ne $serial.Listener) { $serial.Listener.Stop() }
+        }
+    } finally { $lock.Dispose() }
+}
+ $offset
+                }
+                $offset=$serial.Text.Length
+                Send-Serial $serial 'exit'
+                Wait-Serial $serial '(?m)^AGENTOS SHELL STOP PID=[0-9a-f]{16} STATUS=[0-9a-f]{16} FRAMES=OK\r\n' $offset
+                & python "$PSScriptRoot/verify-shell.py" --log "$dir\com1.log" --input "$dir\com1-input.bin"
+                if ($LASTEXITCODE -ne 0) { throw "Shell verification failed: $dir" }
+            }
         }
     } elseif (!(Select-String -LiteralPath "$dir\com1.log" -Pattern 'BdsDxe: failed to load .*HARDDISK.*(Access Denied|Security Violation)' -Quiet)) {
         throw "Missing firmware rejection; timeout is inconclusive: $dir"
