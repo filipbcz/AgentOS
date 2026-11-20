@@ -65,12 +65,12 @@ pub unsafe fn restore(previous: u8) {
 }
 /// Drain at most 64 bytes in one interrupt; caller invalidates input if more
 /// data remain or if parity/timeout errors are observed.
-pub unsafe fn drain(mut feed: impl FnMut(u8), mut invalid: impl FnMut()) {
+pub unsafe fn drain(mut feed: impl FnMut(Result<u8, ()>)) {
     for _ in 0..64 {
         let status = input(STATUS);
         if status & 1 == 0 { return; }
         let byte = input(DATA);
-        if status & 0xe0 != 0 { invalid(); } else { feed(byte); }
+        if status & 0xe0 != 0 { feed(Err(())); } else { feed(Ok(byte)); }
     }
-    if input(STATUS) & 1 != 0 { invalid(); }
+    if input(STATUS) & 1 != 0 { feed(Err(())); }
 }
