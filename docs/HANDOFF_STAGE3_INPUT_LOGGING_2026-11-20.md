@@ -49,3 +49,11 @@ Samostatný PS/2 VM test zatím neexistuje: je nutné poslat skutečné scan kó
 ## Stav
 
 Implementace zapsaná do vývojové větve; akceptace VM a funkčnost PS/2 zatím nepotvrzeny. Poslední CI je třeba vyhodnotit zvlášť. Další vývojář má pokračovat podle pořadí v `PLAN_IMPLEMENTACE.md`.
+
+
+## Dodatečné změny testovacího prostředí
+
+- `scripts/disk.sh`: přijímá validovanou kombinaci úrovně a cíle, zapisuje přesný obsah do `EFI/BOOT/BOOT.LOG`.
+- `scripts/test-vbox.ps1`: přepínače `-LogLevel quiet|info|debug` a `-LogOutput serial|screen|both|none`; výchozí `info both`.
+- `scripts/tests/tty-host.rs`: doplněny dva integrační hostitelské testy pro sdílený sériový/PS2 vstup a odmítnutí poškozeného příkazu. PS/2 port je v hostitelském testu simulovaný; nejde o důkaz IRQ1 ve VM.
+- Poznámka k CI: během postupného zápisu souborů mohly průběžné commity dočasně selhat, protože nový `tty.rs` předběhl úpravu testovacího harnessu. Rozhodující je výsledek posledního commitu celé změny.
