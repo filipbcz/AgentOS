@@ -39,7 +39,22 @@ fn flush() {
 }
 /// Saved controller config for restoring the pre-shell state.
 /// We require translation enabled; without it the decoder would misread set 2.
-pub unsafe fn enable() -> Option<u8> {
+pub struct Saved { pub controller: u8, pub scan_set: u8 }
+
+unsafe fn keyboard_command(value: u8) -> bool {
+    // Keyboard can request resend (0xfe); retries are strictly bounded.
+    for _ in 0..3 {
+        if !send(value) { return false; }
+        match recv() { Some(0xfa) => return true, Some(0xfe) => continue, _ => return false }
+    }
+    false
+}
+
+unsafe fn keyboard_set(set: u8) -> bool {
+    keyboard_command(0xf0) && keyboard_command(set)
+}
+
+pub unsafe fn enable() -> Option<Saved> {
     // Read the original configuration BEFORE changing the clock state. In
     // particular, bit 4 tells us whether the first port was already disabled.
     // If this read fails, leave the controller unchanged.
@@ -54,14 +69,30 @@ pub unsafe fn enable() -> Option<u8> {
     // after the final ACK has been consumed.
     let configured = cmd(0x60) && send((previous | 0x40) & !0x11) && cmd(0xae);
     if !configured {
-        let _ = restore(previous);
+        let _ = restore_controller(previous);
         return None;
     }
-    // Device ACKs must be consumed before unmasking IRQ1.
-    if !send(0xf0) || recv() != Some(0xfa) ||
-       !send(0x02) || recv() != Some(0xfa) ||
-       !send(0xf4) || recv() != Some(0xfa) {
-        let _ = restore(previous);
+    // Query the original scan-code set (F0 00). Query results are encoded
+    // as 0x43=set1, 0x41=set2, 0x3f=set3 by common PS/2 keyboards.
+    // With controller translation enabled, the response may be translated;
+    // temporarily clear translation while querying and setting the device.
+    if !cmd(0xad) || !cmd(0x60) || !send(previous & !0x51) || !cmd(0xae) {
+        let _ = restore_controller(previous);
+        return None;
+    }
+    if !keyboard_command(0xf0) || !keyboard_command(0x00) {
+        let _ = restore_controller(previous);
+        return None;
+    }
+    let scan_set = match recv() {
+        Some(0x43) | Some(1) => 1,
+        Some(0x41) | Some(2) => 2,
+        Some(0x3f) | Some(3) => 3,
+        _ => { let _ = restore_controller(previous); return None; }
+    };
+    if !keyboard_set(2) || !keyboard_command(0xf4) {
+        let _ = keyboard_set(scan_set);
+        let _ = restore_controller(previous);
         return None;
     }
     flush();
@@ -70,17 +101,26 @@ pub unsafe fn enable() -> Option<u8> {
         let _ = restore(previous);
         return None;
     }
-    Some(previous)
+    Some(Saved { controller: previous, scan_set })
 }
 
 /// Best-effort restore with an explicit success result. The caller can report
 /// failures; a controller that no longer accepts commands cannot be repaired
 /// in software. Restoring the original command byte also restores IRQ1 state.
-pub unsafe fn restore(previous: u8) -> bool {
+unsafe fn restore_controller(previous: u8) -> bool {
     if !cmd(0xad) { return false; }
     flush();
     if !cmd(0x60) || !send(previous) { return false; }
     if previous & 0x10 == 0 { cmd(0xae) } else { true }
+}
+/// Restore keyboard mode first with IRQ masked, then controller config.
+/// A failed keyboard command still attempts controller recovery.
+pub unsafe fn restore(saved: Saved) -> bool {
+    let previous = saved.controller;
+    let ready = cmd(0xad) && cmd(0x60) && send(previous & !0x51) && cmd(0xae);
+    let keyboard_ok = ready && keyboard_set(saved.scan_set);
+    let controller_ok = restore_controller(previous);
+    keyboard_ok && controller_ok
 }
 /// Drain at most 64 bytes in one interrupt; caller invalidates input if more
 /// data remain or if parity/timeout errors are observed.
