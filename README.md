@@ -170,3 +170,31 @@ rustc --edition 2021 --test kernel/keyboard.rs -o /tmp/agentos-keyboard-tests
 Jsou take soucasti `scripts/check-build.sh` a CI `Host checks`. Zahrnuji uvolneni klaves, Shift/Caps, rozsirene sekvence, Ctrl-D, Pause, reset stavu a omezeni vystupu na povolene ASCII.
 
 **Dalsi krok:** po potvrzeni skutecneho VM behu stavajiciho serioveho shellu implementovat 8042 prvni port s konecnymi timeouty a detekci, kontrolu scan setu/translatoru, trasu IRQ1 pres MADT/I/O APIC, omezeny odber dat a predani prelozenych znaku do `LineInput`. Pri chybe prijmu zneplatnit rozepsany radek, aby nemohl byt vykonan zkraceny prikaz. Testovat bez PS/2 i s PS/2 na 1/2 vCPU, vcetne odpojeni, vadnych scan kodu, opakovanych preruseni a navratu do serioveho rezimu. Zobrazovani TTY na framebufferu a spravce sluzeb PID 1 zustavaji otevrene.
+
+## PS/2 IRQ1 a konfigurovatelné bootovací logy (2026-11-20)
+
+Po prvním dekodéru byl doplněn experimentální ovladač prvního portu řadiče 8042 (`kernel/ps2.rs`). Inicializace s omezeným čekáním vypne první port, načte původní konfiguraci, zapne překlad Set 2 -> Set 1 a IRQ1, požádá klávesnici o Set 2 a zahájí skenování. Pokud řadič nebo klávesnice neodpoví, COM1 shell zůstane dostupný. Přerušení IRQ1 je směrováno podle ACPI MADT (včetně ISA override) přes I/O APIC na BSP, do samostatného vektoru 0xe2. Obsluha přečte maximálně 64 bajtů a předá dekódované ASCII existující řádkové vrstvě TTY; čtenář se může probudit. Při chybě parity/timeoutu nebo přetečení vstupu se dekodér resetuje a rozepsaný řádek zneplatní. Při ukončení shellu se IRQ1 maskuje a původní konfigurace řadiče se obnoví.
+
+**Omezení:** ovladač předpokládá emulovaný 8042 s prvním portem a podporou překladu; není to USB HID, nepodporuje české rozložení, více klávesnic ani pokročilou enumeraci. Neověřené hardwarové stavy a chybové odpovědi mohou vyžadovat další opravy. Zatím nebyl proveden integrační běh PS/2 ve VirtualBoxu. Výstup shellu nadále běží přes COM1, nikoli přes framebuffer. Sériová a PS/2 klávesnice zapisují do stejné kanonické vstupní fronty.
+
+### Nastavení výpisů jádra
+
+EFI loader čte soubor `EFI/BOOT/BOOT.LOG` z EFI oddílu (bez BOM; přesná malá písmena). Jediný řádek má tvar `<úroveň> [cíl]`, kde úroveň je `quiet`, `info`, `debug` a cíl je `serial`, `screen`, `both` nebo `none`. Příklady:
+
+```text
+debug serial
+```
+
+```text
+info both
+```
+
+Chybějící nebo neplatný soubor znamená `info both`. Konfigurace je předána přes existující `BootInfo.log_level` (nižší dva bity úroveň, bit 8 COM1, bit 9 framebuffer), bez změny verze ABI handoffu. `BootLog::event` filtruje podle úrovně a nezávisle vybírá oba výstupy. Záznamy obsahují prefix `[ERROR]`, `[INFO]` nebo `[DEBUG]` a popis etapy startu. Kritické diagnostiky, historické akceptační markery a přímé výpisy subsystémů zatím **zůstávají na COM1 bez ohledu na filtr**; vypnutí serial v BOOT.LOG proto neznamená zcela tichý COM1. Bootovací výpis na framebufferu není plnohodnotná interaktivní textová konzole a nemusí zobrazit všechny znaky.
+
+Příkaz pro hostitelské kontroly:
+
+```bash
+bash scripts/check-build.sh
+```
+
+Před převzetím je nutné doložit poslední úspěšný CI běh a `test-vbox.ps1 -Cpus 1 -Shell`, `-Cpus 2 -Shell`. Pro PS/2 doplnit VM test se vstupem přes virtuální klávesnici a kontrolou obsahu shellu. Úplný centrální runtime logger (souběžnost, ring buffer, časová razítka, syscall pro čtení logů, per-subsystem masky) je samostatný nedokončený úkol; současná implementace pokrývá filtrované bootovací události.
