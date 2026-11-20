@@ -50,7 +50,9 @@ pub unsafe fn enable() -> Option<u8> {
 
     // Only change controller configuration after preserving its original value.
     // A failure after this point always attempts to restore the saved state.
-    let configured = cmd(0x60) && send((previous | 0x41) & !0x10) && cmd(0xae);
+    // Keep IRQ1 masked while exchanging device commands; route IRQ1 only
+    // after the final ACK has been consumed.
+    let configured = cmd(0x60) && send((previous | 0x40) & !0x11) && cmd(0xae);
     if !configured {
         let _ = restore(previous);
         return None;
@@ -63,6 +65,11 @@ pub unsafe fn enable() -> Option<u8> {
         return None;
     }
     flush();
+    // Publish the final IRQ1-enabled configuration only after device ACKs.
+    if !cmd(0xad) || !cmd(0x60) || !send((previous | 0x41) & !0x10) || !cmd(0xae) {
+        let _ = restore(previous);
+        return None;
+    }
     Some(previous)
 }
 
