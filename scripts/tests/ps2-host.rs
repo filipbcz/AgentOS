@@ -7,6 +7,7 @@ struct Device {
     config: u8, disabled: bool, command_byte_pending: bool,
     response: VecDeque<u8>, writes: Vec<(u16,u8)>,
     fail_config_reply: bool, nack_device: bool, block_commands: bool,
+    irq_while_device_command: bool,
 }
 thread_local! { static DEVICE: RefCell<Device> = RefCell::new(Device::default()); }
 fn device<T>(f: impl FnOnce(&mut Device)->T)->T {
@@ -34,6 +35,7 @@ unsafe fn out(port:u16,value:u8) {
                 d.command_byte_pending=false;
             }
             (0x60,0xf0 | 0x02 | 0xf4) => {
+                if d.config & 1 != 0 { d.irq_while_device_command = true; }
                 d.response.push_back(if d.nack_device { 0xfe } else { 0xfa });
             }
             _ => (),
@@ -47,7 +49,7 @@ fn normalEnableAndRestore() {
     device(|d| *d=Device{config:0x10,disabled:true,..Device::default()});
     let old=unsafe{ps2::enable()}.expect("enable");
     assert_eq!(old,0x10);
-    device(|d| {assert_eq!(d.config & 0x41,0x41);assert!(!d.disabled);});
+    device(|d| {assert_eq!(d.config & 0x41,0x41);assert!(!d.disabled);assert!(!d.irq_while_device_command);});
     assert!(unsafe{ps2::restore(old)});
     device(|d| {assert_eq!(d.config,0x10);assert!(d.disabled);});
 }
@@ -88,4 +90,16 @@ fn restoreReportsControllerTimeout() {
     device(|d| *d=Device{config:0x41,disabled:false,block_commands:true,..Device::default()});
     assert!(!unsafe{ps2::restore(0x10)});
     device(|d| assert!(d.writes.is_empty()));
+}
+
+#[test]
+fn deviceCommandsRunWithIrqMaskedEvenIfOriginallyEnabled() {
+    device(|d| *d=Device{config:0x01,disabled:false,..Device::default()});
+    let saved=unsafe{ps2::enable()}.expect("enable");
+    device(|d| {
+        assert!(!d.irq_while_device_command);
+        assert_eq!(d.config & 0x41,0x41);
+    });
+    assert!(unsafe{ps2::restore(saved)});
+    device(|d| assert_eq!(d.config,0x01));
 }
