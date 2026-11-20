@@ -40,39 +40,40 @@ fn flush() {
 /// Saved controller config for restoring the pre-shell state.
 /// We require translation enabled; without it the decoder would misread set 2.
 pub unsafe fn enable() -> Option<u8> {
-    if !cmd(0xad) { return None; } // first-port clock off
+    // Read the original configuration BEFORE changing the clock state. In
+    // particular, bit 4 tells us whether the first port was already disabled.
+    // If this read fails, leave the controller unchanged.
+    if !cmd(0x20) { return None; }
+    let previous = recv()?;
+    if !cmd(0xad) { return None; }
     flush();
-    if !cmd(0x20) {
-        // The first-port clock was already disabled; restore it if the
-        // controller cannot provide its original configuration.
-        let _ = cmd(0xae);
+
+    // Only change controller configuration after preserving its original value.
+    // A failure after this point always attempts to restore the saved state.
+    let configured = cmd(0x60) && send((previous | 0x41) & !0x10) && cmd(0xae);
+    if !configured {
+        let _ = restore(previous);
         return None;
     }
-    let previous = match recv() {
-        Some(value) => value,
-        None => { let _ = cmd(0xae); return None; }
-    };
-    // Enable IRQ1 and translation, clear first-port clock disable.
-    if !cmd(0x60) || !send((previous | 0x41) & !0x10) || !cmd(0xae) {
-        restore(previous);
-        return None;
-    }
-    // Explicitly request scan-code set 2 on the device. Controller translation
-    // turns this into set 1. Acknowledgements must be consumed before IRQ1.
+    // Device ACKs must be consumed before unmasking IRQ1.
     if !send(0xf0) || recv() != Some(0xfa) ||
        !send(0x02) || recv() != Some(0xfa) ||
        !send(0xf4) || recv() != Some(0xfa) {
-        restore(previous);
+        let _ = restore(previous);
         return None;
     }
     flush();
     Some(previous)
 }
-pub unsafe fn restore(previous: u8) {
-    if !cmd(0xad) { return; }
+
+/// Best-effort restore with an explicit success result. The caller can report
+/// failures; a controller that no longer accepts commands cannot be repaired
+/// in software. Restoring the original command byte also restores IRQ1 state.
+pub unsafe fn restore(previous: u8) -> bool {
+    if !cmd(0xad) { return false; }
     flush();
-    if !cmd(0x60) || !send(previous) { return; }
-    if previous & 0x10 == 0 { let _ = cmd(0xae); }
+    if !cmd(0x60) || !send(previous) { return false; }
+    if previous & 0x10 == 0 { cmd(0xae) } else { true }
 }
 /// Drain at most 64 bytes in one interrupt; caller invalidates input if more
 /// data remain or if parity/timeout errors are observed.
