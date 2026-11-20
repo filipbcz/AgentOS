@@ -67,3 +67,6 @@ Implementace zapsaná do vývojové větve; akceptace VM a funkčnost PS/2 zatí
 - Kompatibilita: EFI parser `BOOT.LOG` a předávání bitů přes `BootInfo` zůstaly beze změny; `none` nadále vypíná pouze běžné události, nikoliv všechny přímé COM1 diagnostiky.
 - Pro reprodukci: `rustc --edition 2021 --test kernel/log_policy.rs -o /tmp/agentos-log-policy-tests && /tmp/agentos-log-policy-tests`; nebo celý `bash scripts/check-build.sh`.
 - Tato změna byla zapsána do vývojové větve bez čekání na CI. Její vlastní výsledek CI a VM ověření je nutné zkontrolovat na posledním SHA před akceptací. Zatím nejde o runtime logovací subsystém s časem, bufferem či bezpečným souběhem CPU.
+
+
+**Aktualizace 2026-11-20 – evidence dalšího kroku:** Přidána samostatná, pevně omezená historie logů (`kernel/log_ring.rs`) a šest hostitelských testů (`scripts/tests/log-ring-host.rs`). Struktura je zatím single-owner a není napojena na runtime; současně se nemění konzole ani ABI. Přesný stav implementace, ověření a předávací kroky: [`docs/STAGE3_STATUS_2026-11-20.md`](docs/STAGE3_STATUS_2026-11-20.md). Úspěch CI posledního SHA a VM integrace je třeba ověřit samostatně.
