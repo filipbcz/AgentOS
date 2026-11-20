@@ -42,8 +42,16 @@ fn flush() {
 pub unsafe fn enable() -> Option<u8> {
     if !cmd(0xad) { return None; } // first-port clock off
     flush();
-    if !cmd(0x20) { return None; }
-    let previous = recv()?;
+    if !cmd(0x20) {
+        // The first-port clock was already disabled; restore it if the
+        // controller cannot provide its original configuration.
+        let _ = cmd(0xae);
+        return None;
+    }
+    let previous = match recv() {
+        Some(value) => value,
+        None => { let _ = cmd(0xae); return None; }
+    };
     // Enable IRQ1 and translation, clear first-port clock disable.
     if !cmd(0x60) || !send((previous | 0x41) & !0x10) || !cmd(0xae) {
         restore(previous);
