@@ -280,7 +280,7 @@ fn shellAndKeyboardOutputAreMirroredToFramebuffer() {
     unsafe{term.keyboard_interrupt();}
     assert_eq!(read(&mut term,64),Ok((Some(3),b"xc\n".to_vec())));
     assert!(pixels.iter().any(|&v|v==0xffffff),"no rendered glyph pixels");
-    ports(|p|assert!(p.fTransmit.ends_with(b"xc\n")));
+    ports(|p|assert!(p.fTransmit.ends_with(b"xc\r\n")));
 }
 
 #[test]
