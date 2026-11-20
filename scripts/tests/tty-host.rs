@@ -8,6 +8,14 @@ use std::{cell::RefCell, collections::VecDeque};
 mod line;
 #[path = "../../kernel/tty.rs"]
 mod tty;
+#[path = "../../kernel/keyboard.rs"]
+mod keyboard;
+
+mod ps2 {
+    pub unsafe fn enable() -> Option<u8> { None }
+    pub unsafe fn restore(_: u8) {}
+    pub unsafe fn drain(_: impl FnMut(Result<u8, ()>)) {}
+}
 
 const COM: u16 = 0x3f8;
 
@@ -18,6 +26,9 @@ mod ioapic {
     impl Route {
         pub unsafe fn serial(_: &crate::acpi::Platform, _: u8, _: u32) -> Result<Self, &'static [u8]> {
             Ok(Self)
+        }
+        pub unsafe fn keyboard(_: &crate::acpi::Platform, _: u8, _: u32) -> Result<Self, &'static [u8]> {
+            Err(b"PS/2 not emulated by UART host harness")
         }
         pub unsafe fn enable(&self) { super::ports(|p| p.fRouteEnabled = true); }
         pub unsafe fn disable(&self) { super::ports(|p| p.fRouteEnabled = false); }
