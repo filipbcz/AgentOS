@@ -142,7 +142,7 @@ impl Console {
     fn toggle_cursor(&self) {
         let y = self.y*H + 7;
         let x = self.x*W;
-        if y < self.height && x + 5 <= self.width {
+        if self.x < self.cols && y < self.height && x + 5 <= self.width {
             for dx in 0..5 {
                 unsafe {
                     let p=self.base.add(y*self.stride+x+dx);
@@ -188,12 +188,13 @@ impl Console {
         match b {
             b'\r'=>self.x=0,
             b'\n'=>self.newline(),
-            8=>{if self.x>0{self.x-=1;}},
+            8=>{if self.x>0{self.x-=1;}else if self.y>0{self.y-=1;self.x=self.cols-1;}},
             b'\t'=>{let spaces=4-(self.x%4);for _ in 0..spaces {self.put(b' ');}},
             0x20..=0x7e=>{
+                // Defer wrapping so the bottom-right glyph remains visible.
+                if self.x==self.cols {self.newline();}
                 self.cell(self.x,self.y,b);
                 self.x+=1;
-                if self.x==self.cols {self.newline();}
             }
             _=>(),
         }
