@@ -61,6 +61,10 @@ printf 'Testing bounded kernel log history with %s\n' "$pRustc"
 "$pRustc" --edition 2021 --test "$pRoot/scripts/tests/log-ring-host.rs" -o "$pOut/log-ring-tests"
 "$pOut/log-ring-tests"
 
+printf 'Testing SMP/IRQ safe runtime logger with %s\n' "$pRustc"
+"$pRustc" --edition 2021 --test "$pRoot/scripts/tests/logger-host.rs" -o "$pOut/logger-tests"
+"$pOut/logger-tests"
+
 printf 'Compiling and linking the kernel with %s and %s\n' "$pRustc" "$pCc"
 "$pRustc" --version
 "$pCc" --version
