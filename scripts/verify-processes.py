@@ -39,6 +39,8 @@ PREFIXES = ("AGENTOS USER ", "AGENTOS PIPE ", "AGENTOS IPC ", "AGENTOS PROCESS "
 ORDER = ("fault", "survived", "received", "exit", "sent", "service", "exit",
          "reply", "exit", "check")
 SHELL_START = re.compile(r"AGENTOS SHELL START PID=([0-9a-f]{16})")
+SUPERVISOR_BEGIN = re.compile(r"AGENTOS SUPERVISOR BEGIN PARENT=([0-9a-f]{16})")
+SUPERVISOR_END = re.compile(r"AGENTOS SUPERVISOR ENDED PARENT=([0-9a-f]{16})")
 
 
 def require(condition, message):
@@ -52,7 +54,31 @@ def verify(text, apic_ids):
     require(expected_cpus and len(expected_cpus) == len(apic_ids),
             "Expected APIC IDs must be nonempty and unique")
     events = []
+    supervisor_open = None
+    supervised_parents = []
     for number, line in enumerate(text.splitlines(), 1):
+        if line.startswith("AGENTOS SUPERVISOR "):
+            begin = SUPERVISOR_BEGIN.fullmatch(line)
+            end = SUPERVISOR_END.fullmatch(line)
+            if begin:
+                require(supervisor_open is None,
+                        f"Nested supervisor boundary at line {number}")
+                supervisor_open = int(begin[1], 16)
+                require(supervisor_open > 0,
+                        f"Zero supervisor PID at line {number}")
+            elif end:
+                require(supervisor_open is not None and
+                        supervisor_open == int(end[1], 16),
+                        f"Unmatched supervisor end at line {number}")
+                supervised_parents.append(supervisor_open)
+                supervisor_open = None
+            else:
+                raise VerificationError(f"Malformed supervisor boundary at line {number}")
+            continue
+        if supervisor_open is not None:
+            # The independently validated supervisor test owns this subtrace.
+            # We must not interpret its service-child exits as IPC child exits.
+            continue
         if line.startswith("AGENTOS SHELL START"):
             match = SHELL_START.fullmatch(line)
             require(match is not None and int(match[1], 16) != 0,
@@ -71,6 +97,9 @@ def verify(text, apic_ids):
         else:
             raise VerificationError(f"Malformed process evidence at line {number}: {line}")
 
+    require(supervisor_open is None, "Unterminated supervisor interval")
+    require(not supervised_parents or len(supervised_parents) == len(expected_cpus),
+            "Missing supervisor interval on one or more CPUs")
     require(len(events) == len(ORDER) * len(expected_cpus),
             f"Incomplete or extra process evidence: expected {len(ORDER) * len(expected_cpus)} "
             f"records, found {len(events)}")
@@ -85,6 +114,9 @@ def verify(text, apic_ids):
         child, receiver, server = fault["pid"], received["pid"], service["pid"]
         context = f"APIC {cpu:016x}, parent {parent:016x}"
         pids = {parent, child, receiver, server}
+        if supervised_parents:
+            require(supervised_parents[len(seen_cpus)] == parent,
+                    f"Supervisor interval does not belong to this parent: {context}")
         require(cpu in expected_cpus and cpu not in seen_cpus,
                 f"Unexpected or repeated CPU: {context}")
         require(len(pids) == 4 and 0 not in pids and not (pids & seen_pids),
