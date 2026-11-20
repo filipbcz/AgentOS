@@ -2,6 +2,20 @@
 
 Rozsah a závazné podmínky převzetí určuje [technické zadání AgentOS](ZADANI.md). Čísla etap udávají doporučené pořadí. U každé etapy je uvedena její skutečná závislost, aby se například vývoj sítě mohl rozběhnout souběžně s úložištěm. Průběžný stav implementace a dostupné důkazy jsou uvedeny u jednotlivých etap. Historické výsledky platí pro uvedené obrazy; automaticky nepotvrzují pozdější změny.
 
+## Závazná pravidla implementace a předávání
+
+Tato pravidla platí pro všechny etapy, změny zdrojového kódu, testy a předání práce. Jsou závazná vedle `ZADANI.md`; technické zadání a akceptační kritéria nelze obejít zjednodušením implementace.
+
+1. **Jediný řídicí dokument.** `PLAN_IMPLEMENTACE.md` je autoritativní plán implementace. Postupovat podle jeho etap, skutečných závislostí a kritérií převzetí. Doplňkové dokumenty mohou obsahovat technické podrobnosti, ale nenahrazují stav a rozhodnutí zde.
+2. **Průběžný zápis přímo do plánu.** Každá podstatná změna se zaznamená u příslušné etapy: dotčené soubory a rozhraní, rozsah funkce, důvody rozhodnutí, provedené testy, konkrétní výsledky a odkazy na důkazy, známá omezení, rizika a další krok. Starší neplatné informace opravit nebo výslovně označit jako historické; nevytvářet rozporné paralelní přehledy.
+3. **Žádné polovičaté funkce vydávané za hotové.** Návrh musí zahrnovat běžný provoz, selhání, hraniční stavy, obnovu a uvolňování prostředků. Částečný přírůstek je přípustný pouze jako výslovně rozpracovaná součást větší funkce, s vymezením toho, co chybí; nesmí se označit za dokončenou nebo akceptovanou.
+4. **Dlouhodobě udržitelná architektura.** Před změnou zhodnotit modularitu, jasná a stabilní rozhraní, budoucí rozšiřování, kompatibilitu ABI a formátů, izolaci, bezpečnost, vlastnictví paměti a prostředků, synchronizaci, více CPU a chování v přerušeních. Nepřidávat skryté globální závislosti ani provizorní řešení bez zaznamenaného migračního plánu.
+5. **Testy jsou součástí dodávky.** Připravit automatické jednotkové, integrační a regresní testy odpovídající riziku změny, včetně chybných vstupů, limitů a souběhu. Ověřit, že se nezhoršily dříve funkční subsystémy. Pouhé napsání testu, úspěšný překlad nebo zelené CI samy neprokazují běh ve VM či na fyzickém zařízení.
+6. **Důkaz před označením „hotovo“.** Rozlišovat `navrženo`, `implementováno`, `host-test ověřeno`, `CI ověřeno`, `VM ověřeno`, `fyzicky ověřeno` a `akceptováno`. Uvést commit SHA, verzi nástrojů, konfiguraci, hash obrazu a odkazy na logy/protokoly tam, kde je to relevantní. Neprovedené kontroly uvést jako neověřené, nikoliv jako úspěšné.
+7. **Bezpečné změny a stabilní větev.** Vyvíjet na určené pracovní větvi, zachovat stabilitu `main`, neporušovat existující API a akceptované funkce. Změny ABI nebo chování vyžadují zdůvodnění, aktualizaci konzumentů, testy a explicitní evidenci v plánu.
+8. **Předatelnost.** Po každé pracovní dávce musí další vývojář pouze ze zdrojů a tohoto plánu zjistit, co je hotové, co se změnilo, jak to reprodukovat, co zůstává neověřené a jaký je následující krok. Nepředpokládat znalost předchozí konverzace.
+9. **Dokončovat ucelené funkce.** Upřednostnit dokončení a ověření jedné funkční oblasti před paralelním otevíráním dalších nedokončených částí. Pokud dostupné prostředí neumožňuje přejímku, připravit úplné testy a přesný postup ověření, ale ponechat stav otevřený.
+
 ## Jak budeme ověřovat postup
 
 Vývoj může pokračovat i v prostředí bez VirtualBoxu. U změn se zvlášť evidují provedené kontroly zdrojů, sestavení a hostitelské testy; běh jádra a integrační akceptace zůstávají neověřené do skutečného spuštění ve VM. Fyzické zkoušky HP v následujících etapách jsou odložené do budoucí fyzické přejímky a neblokují pokračování vývoje.
