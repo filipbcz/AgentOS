@@ -1,3 +1,6 @@
+#ifndef AGENTOS_ABI_H
+#define AGENTOS_ABI_H
+
 #define SYS_GETPID   0x10001
 #define SYS_WRITE    0x10002
 #define SYS_EXIT     0x10003
@@ -13,7 +16,17 @@
 #define SYS_IPC_SEND 0x1000d
 #define SYS_IPC_RECV 0x1000e
 
+#define IPC_MAX_MESSAGE 1024
+
 #ifndef __ASSEMBLER__
+/* IPC_PAIR stores two 32-bit descriptors. Each endpoint can send and receive.
+ * IPC_SEND accepts 1..IPC_MAX_MESSAGE payload bytes and returns their count.
+ * IPC_RECV's capacity and return value count only payload bytes. Its destination
+ * must reserve sizeof(struct ipc_peer) + capacity bytes: kernel-derived identity
+ * first, then one complete payload. A short capacity (-90) or invalid destination
+ * (-14) leaves the message queued. A drained, closed peer returns 0; send returns
+ * -32 after the peer's last descriptor closes. dup2/spawn retain endpoint refs.
+ */
 struct ipc_peer { unsigned long pid; unsigned uid, gid; };
 _Static_assert(sizeof(struct ipc_peer) == 16, "IPC peer layout");
 static inline long os_call(long op, long a, long b, long c) {
@@ -26,4 +39,5 @@ static inline void format_hex(char *out, unsigned long value, unsigned digits) {
         value >>= 4;
     }
 }
+#endif
 #endif
