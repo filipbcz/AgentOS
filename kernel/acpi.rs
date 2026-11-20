@@ -55,7 +55,9 @@ pub struct Platform {
     pub io_apics: [IoApic; 8],
     pub io_count: usize,
     pub serial_irq: IsaInterrupt,
+    pub keyboard_irq: IsaInterrupt,
     serial_override: bool,
+    keyboard_override: bool,
 }
 
 impl Platform {
@@ -78,13 +80,15 @@ impl Platform {
                     self.io_count += 1;
                     None
                 }
-                2 if e.get(2) == Some(&0) && e.get(3) == Some(&4) => {
-                    if self.serial_override { return None; }
+                2 if e.get(2) == Some(&0) && (e.get(3) == Some(&4) || e.get(3) == Some(&1)) => {
+                    let keyboard = e[3] == 1;
+                    if if keyboard { self.keyboard_override } else { self.serial_override } { return None; }
                     let flags = u16::from_le_bytes(e.get(8..10)?.try_into().ok()?);
                     if flags & !15 != 0 || flags & 3 == 2 || (flags >> 2) & 3 == 2 { return None; }
-                    self.serial_irq = IsaInterrupt { gsi: u32_at(e, 4)?, low: flags & 3 == 3,
-                                                     level: (flags >> 2) & 3 == 3 };
-                    self.serial_override = true;
+                    let irq = IsaInterrupt { gsi: u32_at(e, 4)?, low: flags & 3 == 3,
+                                             level: (flags >> 2) & 3 == 3 };
+                    if keyboard { self.keyboard_irq = irq; self.keyboard_override = true; }
+                    else { self.serial_irq = irq; self.serial_override = true; }
                     None
                 }
                 9 if u32_at(e, 8)? & 1 != 0 => Some(u32_at(e, 4)?),
@@ -118,7 +122,8 @@ pub unsafe fn discover(info: &BootInfo, map: &[u8]) -> Option<Platform> {
         (root.len()-36) % width != 0 { return None; }
     let mut p = Platform { lapic: 0, timer_port: 0, ids: [0; 255], count: 0, legacy_pic: false,
         io_apics: [IoApic { address: 0, gsi: 0 }; 8], io_count: 0,
-        serial_irq: IsaInterrupt { gsi: 4, low: false, level: false }, serial_override: false };
+        serial_irq: IsaInterrupt { gsi: 4, low: false, level: false }, serial_override: false,
+        keyboard_irq: IsaInterrupt { gsi: 1, low: false, level: false }, keyboard_override: false };
     for entry in root[36..].chunks_exact(width) {
         let address = if width == 8 { u64_at(entry, 0)? } else { u32_at(entry, 0)? as u64 };
         match fw.bytes(address, 4)? {
