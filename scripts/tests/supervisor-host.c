@@ -79,6 +79,13 @@ static long mock_call(long op,long a,long b,long c) {
     abort();
 }
 
+static void append_phase(char *out,size_t capacity,const char *kind) {
+    size_t n=strlen(out);
+    int written=snprintf(out+n,capacity-n,
+        "AGENTOS SUPERVISOR %.5s PARENT=%016x\r\n",kind,1u);
+    assert(written>0 && (size_t)written<capacity-n);
+}
+
 static void append_expected(char *out,size_t capacity,const char *kind,
                             unsigned child,unsigned status,unsigned attempt) {
     size_t n=strlen(out);
@@ -93,6 +100,7 @@ static void success_case(void) {
     assert(run_supervisor()==0);
     assert(spawns==5 && collected==5 && kills==1 && yields==128 && !live_child);
     char expected[LOG_BYTES]={0};
+    append_phase(expected,sizeof(expected),"BEGIN");
     append_expected(expected,sizeof(expected),"DONE",101,0,1);
     append_expected(expected,sizeof(expected),"REAP",102,42,1);
     append_expected(expected,sizeof(expected),"REAP",103,42,2);
@@ -100,6 +108,7 @@ static void success_case(void) {
     append_expected(expected,sizeof(expected),"STOP",104,42,3);
     append_expected(expected,sizeof(expected),"TIME",105,137,1);
     append_expected(expected,sizeof(expected),"STOP",105,137,1);
+    append_phase(expected,sizeof(expected),"ENDED");
     if (strcmp(expected,log_text)) {
         fprintf(stderr,"Unexpected supervisor transcript:\n%s\nExpected:\n%s\n",log_text,expected);
         abort();
@@ -110,7 +119,7 @@ int main(void) {
     success_case();
     reset();spawn_error_at=3;
     assert(run_supervisor()==63 && spawns==3 && collected==2 && !live_child);
-    reset();write_error_at=1;
+    reset();write_error_at=2;
     assert(run_supervisor()==62 && spawns==1 && collected==1 && !live_child);
     reset();yield_error_at=1;
     assert(run_supervisor()==64 && spawns==5 && collected==5 && kills==1 && !live_child);
