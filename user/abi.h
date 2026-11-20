@@ -15,7 +15,12 @@
 #define SYS_IPC_PAIR 0x1000c
 #define SYS_IPC_SEND 0x1000d
 #define SYS_IPC_RECV 0x1000e
+#define SYS_KILL     0x1000f
 
+/* SYS_KILL(pid): a process may terminate only its direct child.
+ * The child becomes a reapable zombie with exit status 137.
+ * Repeated kill on that zombie succeeds; unknown PID returns -3,
+ * unrelated PID -1, zero/self -22. This is not a general signal ABI. */
 #define IPC_MAX_MESSAGE 1024
 
 #ifndef __ASSEMBLER__
