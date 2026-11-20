@@ -20,6 +20,7 @@ mod keyboard;
 mod ps2;
 mod log_policy;
 mod log_ring;
+mod logger;
 
 // Version 3, shared with boot/loader.c. Addresses are identity mapped at handoff.
 #[repr(C)]
@@ -192,6 +193,10 @@ impl<'a> BootLog<'a> {
             1 => log_policy::Level::Info,
             _ => log_policy::Level::Debug,
         };
+        // History is independent of display policy: even BOOT.LOG=none leaves
+        // bounded diagnostics for later kernel inspection. The logger never
+        // performs UART/MMIO while holding its nonblocking SMP/IRQ gate.
+        let _ = logger::LOGGER.record(0, 0, severity, message);
         let policy = log_policy::Policy::new(self.info.log_level);
         let serial_enabled = policy.enabled(severity, log_policy::Sink::Serial);
         let screen_enabled = policy.enabled(severity, log_policy::Sink::Screen);
