@@ -57,3 +57,13 @@ Implementace zapsaná do vývojové větve; akceptace VM a funkčnost PS/2 zatí
 - `scripts/test-vbox.ps1`: přepínače `-LogLevel quiet|info|debug` a `-LogOutput serial|screen|both|none`; výchozí `info both`.
 - `scripts/tests/tty-host.rs`: doplněny dva integrační hostitelské testy pro sdílený sériový/PS2 vstup a odmítnutí poškozeného příkazu. PS/2 port je v hostitelském testu simulovaný; nejde o důkaz IRQ1 ve VM.
 - Poznámka k CI: během postupného zápisu souborů mohly průběžné commity dočasně selhat, protože nový `tty.rs` předběhl úpravu testovacího harnessu. Rozhodující je výsledek posledního commitu celé změny.
+
+
+## Pokračování bez čekání na CI: izolace pravidel boot logování
+
+- Přidán `kernel/log_policy.rs`: čistý `no_std` modul bez I/O a alokací. Typované úrovně `Error/Info/Debug`, cíle `Serial/Screen`, masky kompatibilní s `BootInfo.log_level` verze 3 a stabilní prefixy pro parser logů.
+- `kernel/main.rs`: `BootLog::event` nově používá jednu společnou politiku pro rozhodnutí o obou cílech. Formát stávajících výpisů a přímé povinné diagnostiky se nemění.
+- `scripts/check-build.sh`: spouští pět hostitelských regresních testů logování. Testy pokrývají výchozí nastavení, `quiet`, `debug serial`, `none` a stabilitu prefixů.
+- Kompatibilita: EFI parser `BOOT.LOG` a předávání bitů přes `BootInfo` zůstaly beze změny; `none` nadále vypíná pouze běžné události, nikoliv všechny přímé COM1 diagnostiky.
+- Pro reprodukci: `rustc --edition 2021 --test kernel/log_policy.rs -o /tmp/agentos-log-policy-tests && /tmp/agentos-log-policy-tests`; nebo celý `bash scripts/check-build.sh`.
+- Tato změna byla zapsána do vývojové větve bez čekání na CI. Její vlastní výsledek CI a VM ověření je nutné zkontrolovat na posledním SHA před akceptací. Zatím nejde o runtime logovací subsystém s časem, bufferem či bezpečným souběhem CPU.
