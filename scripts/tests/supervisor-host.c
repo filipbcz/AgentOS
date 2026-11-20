@@ -61,6 +61,8 @@ static long mock_call(long op,long a,long b,long c) {
         return yields==yield_error_at?-5:0;
     }
     if (op==SYS_KILL) {
+        if (a==0 || a==1) return -22;
+        if (a==0x7fffffff) return -3;
         if (a!=live_child || !live_child) abort();
         kills++;
         killed=1;
