@@ -17,8 +17,9 @@ mod ps2 {
     pub fn inject(codes: &[Result<u8, ()>]) {
         SCANS.with(|s| s.borrow_mut().extend(codes.iter().copied()));
     }
-    pub unsafe fn enable() -> Option<u8> { None } // absent hardware in UART tests
-    pub unsafe fn restore(_: u8) {}
+    pub struct Saved { pub controller: u8, pub scan_set: u8 }
+    pub unsafe fn enable() -> Option<Saved> { None } // absent hardware in UART tests
+    pub unsafe fn restore(_: Saved) -> bool { true }
     pub unsafe fn drain(mut feed: impl FnMut(Result<u8, ()>)) {
         SCANS.with(|s| {
             for code in s.borrow_mut().drain(..) { feed(code); }
