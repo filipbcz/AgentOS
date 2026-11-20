@@ -16,17 +16,17 @@ static long mock_call(long op,long a,long b,long c);
 
 enum { MAX_CHILDREN=16, LOG_BYTES=4096 };
 static char log_text[LOG_BYTES];
-static unsigned log_used, spawns, collected, kills, yields, writes;
+static unsigned log_used, spawns, collected, kills, kill_attempts, yields, writes;
 static unsigned spawn_error_at, write_error_at, yield_error_at, wait_error_at;
 static long live_child;
 static char live_kind; // 'o': success, 'f': failure, 'h': hung
-static int killed, completed_before_kill;
+static int killed, completed_before_kill, complete_on_last_yield;
 
 static void reset(void) {
     memset(log_text,0,sizeof(log_text));
-    log_used=spawns=collected=kills=yields=writes=0;
+    log_used=spawns=collected=kills=kill_attempts=yields=writes=0;
     spawn_error_at=write_error_at=yield_error_at=wait_error_at=0;
-    live_child=0; live_kind=0; killed=0; completed_before_kill=0;
+    live_child=0; live_kind=0; killed=0; completed_before_kill=0; complete_on_last_yield=0;
 }
 
 static long mock_call(long op,long a,long b,long c) {
@@ -58,12 +58,15 @@ static long mock_call(long op,long a,long b,long c) {
     }
     if (op==SYS_YIELD) {
         yields++;
+        if (complete_on_last_yield && yields==MAX_IDLE_YIELDS)
+            completed_before_kill=1;
         return yields==yield_error_at?-5:0;
     }
     if (op==SYS_KILL) {
         if (a==0 || a==1) return -22;
         if (a==0x7fffffff) return -3;
         if (a!=live_child || !live_child) abort();
+        kill_attempts++;
         if (completed_before_kill && live_kind=='h') return 1;
         kills++;
         killed=1;
@@ -130,9 +133,10 @@ int main(void) {
     assert(run_supervisor()==62 && spawns==1 && collected==1 && kills==1 && !live_child);
     // Simulate the race where the final yield completes the worker and the
     // kernel finds an already-zombie child at kill time. Do not log TIME.
-    reset();completed_before_kill=1;
+    reset();complete_on_last_yield=1;
     assert(supervise("svc_hang",8,1,1)==0);
-    assert(spawns==1 && collected==1 && kills==0 && !live_child);
+    assert(spawns==1 && collected==1 && kills==0 && kill_attempts==1 &&
+           yields==MAX_IDLE_YIELDS && !live_child);
     assert(strstr(log_text,"SERVICE DONE")!=NULL);
     assert(strstr(log_text,"SERVICE TIME")==NULL);
     puts("Supervisor host acceptance: success, restart cap, stalled child kill, "
