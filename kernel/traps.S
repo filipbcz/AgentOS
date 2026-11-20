@@ -38,7 +38,7 @@ isr_common:
     add rsp, 16
     iretq
 
-.global timer_gate, serial_gate, spurious_gate, wait_for_irq, after_hlt
+.global timer_gate, serial_gate, keyboard_gate, spurious_gate, wait_for_irq, after_hlt
 // Only the measured HLT path leaves RDI pointing at a pair of timestamps.
 // Timestamp before saving SIMD state or acknowledging the interrupt, so its
 // handler and return path are charged to active time.
@@ -87,6 +87,15 @@ serial_gate:
     cld
     save_context
     call serial_interrupt
+    jmp restore_context
+keyboard_gate:
+    test byte ptr [rsp+8], 3
+    jz 1f
+    swapgs
+1:
+    cld
+    save_context
+    call keyboard_interrupt
 restore_context:
     mov rsp, rax
     fxrstor64 [rsp]
