@@ -246,6 +246,17 @@ mod tests {
         }}
     }
     #[test]
+    fn lastCellIsVisibleUntilAnotherGlyphRequiresWrapping() {
+        let mut buffer=vec![0u32;6*9];
+        let mut console=unsafe{Console::new(buffer.as_mut_ptr(),6,9,6,0)}.unwrap();
+        console.write(b"A");
+        // A's top row is 01110: at x=1 it must remain illuminated.
+        assert_eq!(buffer[1],FG,"the last-cell character was scrolled away");
+        console.write(b"B");
+        // A subsequent character is allowed to scroll; B starts 11110.
+        assert_eq!(buffer[0],FG);
+    }
+    #[test]
     fn scrollingRetainsLastVisibleLines() {
         let mut a=vec![0;12*18];
         let mut b=vec![0;12*18];
