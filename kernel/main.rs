@@ -172,7 +172,7 @@ pub struct BootLog<'a> { info: &'a BootInfo, row: usize, scale: usize }
 impl<'a> BootLog<'a> {
     fn new(info: &'a BootInfo) -> Self {
         let mut log = Self { info, row: 52, scale: ((info.width as usize - 16)/240).clamp(1, 2) };
-        log.clear_from(0);
+        if info.log_level & 0x200 != 0 { log.clear_from(0); }
         log
     }
     fn clear_from(&mut self, top: usize) {
@@ -183,9 +183,12 @@ impl<'a> BootLog<'a> {
         }
     }
     fn event(&mut self, level: u64, message: &[u8]) {
-        if level > self.info.log_level { return; }
+        if level > (self.info.log_level & 3) { return; }
         let prefix: &[u8] = match level { 0 => b"[ERROR] ", 1 => b"[INFO] ", _ => b"[DEBUG] " };
-        unsafe { serial(prefix); serial(message); serial(b"\r\n"); }
+        if self.info.log_level & 0x100 != 0 {
+            unsafe { serial(prefix); serial(message); serial(b"\r\n"); }
+        }
+        if self.info.log_level & 0x200 == 0 { return; }
         if self.row+7*self.scale > self.info.height as usize { self.clear_from(52); self.row = 52; }
         draw(self.info, prefix, 8, self.row, self.scale);
         draw(self.info, message, 8+6*self.scale*prefix.len(), self.row, self.scale);
