@@ -7,19 +7,20 @@ struct Device {
     set_pending:bool, responses:VecDeque<u8>, fail_query:bool,
     busy:bool, nack:bool, resend_once:bool, resend_sent:bool,
     irq_during_command:bool, writes:Vec<(u16,u8)>,
-    fail_irq_publish:bool,
+    fail_irq_publish:bool, status_error:bool,
 }
 impl Default for Device {
     fn default()->Self {Self {config:0,scan_set:2,enabled:true,
         command_pending:false,set_pending:false,responses:VecDeque::new(),
         fail_query:false,busy:false,nack:false,resend_once:false,
-        resend_sent:false,irq_during_command:false,writes:Vec::new(),fail_irq_publish:false}}
+        resend_sent:false,irq_during_command:false,writes:Vec::new(),fail_irq_publish:false,status_error:false}}
 }
 thread_local! {static DEVICE:RefCell<Device>=RefCell::new(Device::default());}
 fn device<T>(f:impl FnOnce(&mut Device)->T)->T {DEVICE.with(|d|f(&mut d.borrow_mut()))}
 unsafe fn input(port:u16)->u8 {
     device(|d|match port {
-        0x64 => u8::from(!d.responses.is_empty()) | if d.busy {2} else {0},
+        0x64 => u8::from(!d.responses.is_empty()) | if d.busy {2} else {0} |
+            if d.status_error && !d.responses.is_empty() {0x80} else {0},
         0x60 => d.responses.pop_front().unwrap_or(0),
         _ => panic!("invalid port")
     })
@@ -109,4 +110,31 @@ fn reset(config:u8,scan_set:u8) {
     // The controller has become permanently busy after the last config write.
     // Neither device state nor controller state can be guaranteed recoverable.
     device(|d| {assert_eq!(d.scan_set,2);assert!(d.busy);});
+}
+
+#[test] fn staleScanCodeIsNotMistakenForControllerConfig() {
+    reset(0x10,3);
+    device(|d|{d.responses.push_back(0x1c);d.responses.push_back(0x45);});
+    let saved=unsafe{ps2::enable()}.expect("stale bytes should be flushed");
+    assert_eq!(saved.controller,0x10);
+    assert_eq!(saved.scan_set,3);
+    assert!(unsafe{ps2::restore(saved)});
+}
+#[test] fn outputFloodFailsBeforeChangingControllerState() {
+    reset(0x10,3);
+    device(|d|{for _ in 0..33 {d.responses.push_back(0x1c);}});
+    assert!(unsafe{ps2::enable()}.is_none());
+    device(|d|{
+        assert_eq!(d.config,0x10);
+        assert!(d.writes.is_empty());
+    });
+}
+#[test] fn corruptControllerReplyIsRejectedWithoutPortMutation() {
+    reset(0x10,3);
+    device(|d|d.status_error=true);
+    assert!(unsafe{ps2::enable()}.is_none());
+    device(|d|{
+        assert_eq!(d.config,0x10);
+        assert!(!d.writes.contains(&(0x64,0xad)));
+    });
 }
