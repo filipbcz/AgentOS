@@ -198,3 +198,14 @@ bash scripts/check-build.sh
 ```
 
 Před převzetím je nutné doložit poslední úspěšný CI běh a `test-vbox.ps1 -Cpus 1 -Shell`, `-Cpus 2 -Shell`. Pro PS/2 doplnit VM test se vstupem přes virtuální klávesnici a kontrolou obsahu shellu. Úplný centrální runtime logger (souběžnost, ring buffer, časová razítka, syscall pro čtení logů, per-subsystem masky) je samostatný nedokončený úkol; současná implementace pokrývá filtrované bootovací události.
+
+### Volba logování přímo při testu VirtualBox
+
+Testovací skript vytváří `EFI/BOOT/BOOT.LOG` automaticky. Nyní lze nastavení předat bez ruční úpravy EFI oddílu:
+
+```powershell
+.\scripts\test-vbox.ps1 -Cpus 1 -Shell -LogLevel debug -LogOutput serial
+.\scripts\test-vbox.ps1 -Cpus 2 -Shell -LogLevel info -LogOutput both
+```
+
+Parametry `-LogLevel` (`quiet`, `info`, `debug`) a `-LogOutput` (`serial`, `screen`, `both`, `none`) se předávají skriptu `scripts/disk.sh`; ten jejich kombinaci validuje a uloží na ESP. Bez parametrů je `info both`. Přímé sériové akceptační markery zůstávají pro validátor zachované.
