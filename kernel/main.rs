@@ -17,6 +17,7 @@ mod line;
 mod ioapic;
 mod tty;
 mod keyboard;
+mod ps2;
 
 // Version 3, shared with boot/loader.c. Addresses are identity mapped at handoff.
 #[repr(C)]
