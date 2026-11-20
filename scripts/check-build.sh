@@ -53,6 +53,10 @@ printf 'Testing early kernel logging policy with %s\n' "$pRustc"
 "$pRustc" --edition 2021 --test "$pRoot/kernel/log_policy.rs" -o "$pOut/log-policy-tests"
 "$pOut/log-policy-tests"
 
+printf 'Testing PS/2 controller rollback with %s\n' "$pRustc"
+"$pRustc" --edition 2021 --test "$pRoot/scripts/tests/ps2-host.rs" -o "$pOut/ps2-tests"
+"$pOut/ps2-tests"
+
 printf 'Testing bounded kernel log history with %s\n' "$pRustc"
 "$pRustc" --edition 2021 --test "$pRoot/scripts/tests/log-ring-host.rs" -o "$pOut/log-ring-tests"
 "$pOut/log-ring-tests"
