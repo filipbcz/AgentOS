@@ -98,7 +98,7 @@ pub unsafe fn enable() -> Option<Saved> {
     }
     // Publish the final IRQ1-enabled configuration only after device ACKs.
     if !cmd(0xad) || !cmd(0x60) || !send((previous | 0x41) & !0x10) || !cmd(0xae) {
-        let _ = restore(previous);
+        let _ = restore(Saved { controller: previous, scan_set });
         return None;
     }
     Some(Saved { controller: previous, scan_set })
