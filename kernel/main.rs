@@ -145,10 +145,11 @@ pub unsafe extern "sysv64" fn kernel_main(info: &BootInfo) -> ! {
     serial(b"\r\n");
     let scale = ((info.width as usize - 16) / (MESSAGE.len() * 6)).clamp(1, 4);
     draw(info, MESSAGE, 8, 16, scale);
+    log.event(1, b"STARTING INTERACTIVE SHELL");
     if let Err(reason) = smp::shell(&platform) {
         log.event(0, b"SHELL FAILED");
         serial(b"SHELL FAILED: "); serial(reason); serial(b"\r\n");
-    }
+    } else { log.event(1, b"INTERACTIVE SHELL STOPPED"); }
     halt()
 }
 
