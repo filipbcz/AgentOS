@@ -12,9 +12,18 @@ mod tty;
 mod keyboard;
 
 mod ps2 {
-    pub unsafe fn enable() -> Option<u8> { None }
+    use std::{cell::RefCell, collections::VecDeque};
+    thread_local! { static SCANS: RefCell<VecDeque<Result<u8, ()>>> = RefCell::new(VecDeque::new()); }
+    pub fn inject(codes: &[Result<u8, ()>]) {
+        SCANS.with(|s| s.borrow_mut().extend(codes.iter().copied()));
+    }
+    pub unsafe fn enable() -> Option<u8> { None } // absent hardware in UART tests
     pub unsafe fn restore(_: u8) {}
-    pub unsafe fn drain(_: impl FnMut(Result<u8, ()>)) {}
+    pub unsafe fn drain(mut feed: impl FnMut(Result<u8, ()>)) {
+        SCANS.with(|s| {
+            for code in s.borrow_mut().drain(..) { feed(code); }
+        });
+    }
 }
 
 const COM: u16 = 0x3f8;
@@ -28,7 +37,7 @@ mod ioapic {
             Ok(Self)
         }
         pub unsafe fn keyboard(_: &crate::acpi::Platform, _: u8, _: u32) -> Result<Self, &'static [u8]> {
-            Err(b"PS/2 not emulated by UART host harness")
+            Ok(Self) // route exists but 8042 enable() reports no hardware
         }
         pub unsafe fn enable(&self) { super::ports(|p| p.fRouteEnabled = true); }
         pub unsafe fn disable(&self) { super::ports(|p| p.fRouteEnabled = false); }
@@ -223,4 +232,26 @@ fn cookedOutputHandlesSplitCrlfAndPartialWrites() {
     ports(|p| p.fTransmitRemaining = None);
     assert_eq!(unsafe { pTerminal.write(b"y") }, Ok(1));
     ports(|p| assert!(p.fTransmit.ends_with(b"xy")));
+}
+
+#[test]
+fn keyboardAndSerialShareCanonicalLine() {
+    let mut terminal = terminal();
+    ps2::inject(&[Ok(0x12), Ok(0x2e), Ok(0x23), Ok(0x18)]); // echo
+    unsafe { terminal.keyboard_interrupt(); }
+    receive(&mut terminal, b" test");
+    ps2::inject(&[Ok(0x1c)]);
+    unsafe { terminal.keyboard_interrupt(); }
+    assert_eq!(read(&mut terminal, 64), Ok((Some(10), b"echo test\n".to_vec())));
+}
+
+#[test]
+fn damagedKeyboardInputCannotExecuteTruncatedCommand() {
+    let mut terminal = terminal();
+    ps2::inject(&[Ok(0x12), Ok(0x2d), Ok(0x17), Ok(0x14), Err(()), Ok(0x1c)]);
+    unsafe { terminal.keyboard_interrupt(); }
+    assert_eq!(terminal.read(64, |_| panic!("damaged command executed")), Err(-75));
+    ps2::inject(&[Ok(0x23), Ok(0x12), Ok(0x26), Ok(0x19), Ok(0x1c)]); // help
+    unsafe { terminal.keyboard_interrupt(); }
+    assert_eq!(read(&mut terminal, 64), Ok((Some(5), b"help\n".to_vec())));
 }
