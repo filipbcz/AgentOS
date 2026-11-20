@@ -67,6 +67,28 @@ function Send-Keyboard([string]$Command) {
     VBox controlvm $vm keyboardputscancode 5a f0 5a
 }
 
+# Shell clears the boot framebuffer before displaying its prompt. For a shell
+# run the correct image acceptance criterion is its first rendered 'A' glyph.
+function Verify-ShellPrompt([string]$Path) {
+    Add-Type -AssemblyName System.Drawing
+    $bitmap=[Drawing.Bitmap]::new((Resolve-Path $Path).Path)
+    try {
+        if ($bitmap.Width -lt 6 -or $bitmap.Height -lt 9) {
+            throw "Framebuffer too small for shell prompt: $Path"
+        }
+        $rows=@(14,17,17,31,17,17,17)
+        for ($y=0;$y -lt 7;$y++) {
+            for ($x=0;$x -lt 5;$x++) {
+                $expectedWhite=($rows[$y] -band (16 -shr $x)) -ne 0
+                $pixel=$bitmap.GetPixel($x,$y)
+                $actualWhite=$pixel.R -gt 200 -and $pixel.G -gt 200 -and $pixel.B -gt 200
+                if ($expectedWhite -ne $actualWhite) {
+                    throw "Shell prompt framebuffer glyph mismatch at ($x,$y): $Path"
+                }
+            }
+        }
+    } finally { $bitmap.Dispose() }
+}
 # Compare visible pixels and the exact PS/2 shell command response raster.
 function Verify-ShellScreen([string]$Before,[string]$After) {
     Add-Type -AssemblyName System.Drawing
@@ -225,15 +247,18 @@ try {
         if (!(Select-String -LiteralPath "$dir\com1.log" -SimpleMatch 'AGENTOS PHYSICAL FRAMES OK' -Quiet)) {
             throw "Physical frame probe missing: $dir"
         }
-        & "$PSScriptRoot/verify-display.ps1" "$dir\display.png"
+        # Stage-1 image verification is meaningful only before a shell
+        # takes ownership of GOP. The shell branch checks its own prompt.
+        if (!$Shell) { & "$PSScriptRoot/verify-display.ps1" "$dir\display.png" }
         & "$PSScriptRoot/verify-processes.ps1" -Log "$dir\com1.log" -ApicIds $ids
         & "$PSScriptRoot/verify-idle.ps1" -RunDir $dir -ApicIds $ids -HostSeconds $hostIdleSeconds
         if ($Shell) {
             Wait-Serial $serial 'AGENTOS SHELL READY\r\nagentos> $'
+            VBox controlvm $vm screenshotpng "$dir\shell-before.png"
+            Verify-ShellPrompt "$dir\shell-before.png"
             if ($Keyboard) {
                 # PS/2 keyboard and COM1 have independent input sources.
                 # Keep the strict serial-only verifier unchanged.
-                VBox controlvm $vm screenshotpng "$dir\shell-before.png"
                 $offset=$serial.Text.Length
                 Send-Keyboard 'echo ps2-ok'
                 Wait-Serial $serial '(?m)^ps2-ok\r\nagentos> $' $offset
