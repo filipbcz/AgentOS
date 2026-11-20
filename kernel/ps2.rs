@@ -45,7 +45,10 @@ pub unsafe fn enable() -> Option<u8> {
     if !cmd(0x20) { return None; }
     let previous = recv()?;
     // Enable IRQ1 and translation, clear first-port clock disable.
-    if !cmd(0x60) || !send((previous | 0x41) & !0x10) || !cmd(0xae) { return None; }
+    if !cmd(0x60) || !send((previous | 0x41) & !0x10) || !cmd(0xae) {
+        restore(previous);
+        return None;
+    }
     // Explicitly request scan-code set 2 on the device. Controller translation
     // turns this into set 1. Acknowledgements must be consumed before IRQ1.
     if !send(0xf0) || recv() != Some(0xfa) ||
