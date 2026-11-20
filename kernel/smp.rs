@@ -358,6 +358,20 @@ unsafe extern "C" fn timer_interrupt(context: *mut Context) -> usize {
 }
 
 #[no_mangle]
+unsafe extern "C" fn keyboard_interrupt(context: *mut Context) -> usize {
+    let cpu = current_cpu();
+    let terminal = *cpu.terminal.get();
+    if cpu.apic.read(0x170) & 4 == 0 || terminal.is_null() {
+        serial(b"SMP FAILED: unexpected keyboard interrupt\r\n"); halt();
+    }
+    (*terminal).keyboard_interrupt();
+    cpu.apic.write(0xb0, 0);
+    if (*context).user() && (*context).rsp >= 1usize << 47 { return user_fault(13, 0, 0); }
+    (*cpu.queue.get()).wake_io();
+    cpu.switch(context as usize, false)
+}
+
+#[no_mangle]
 unsafe extern "C" fn serial_interrupt(context: *mut Context) -> usize {
     let cpu = current_cpu();
     let terminal = *cpu.terminal.get();
