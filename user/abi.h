@@ -19,7 +19,7 @@
 
 /* SYS_KILL(pid): a process may terminate only its direct child.
  * The child becomes a reapable zombie with exit status 137.
- * Repeated kill on that zombie succeeds; unknown PID returns -3,
+ * Returns 0 when newly terminated and 1 if already a zombie; unknown PID -3,
  * unrelated PID -1, zero/self -22. This is not a general signal ABI. */
 #define IPC_MAX_MESSAGE 1024
 
