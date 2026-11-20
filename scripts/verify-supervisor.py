@@ -38,6 +38,8 @@ def require(ok, message):
 def event(line):
     match = EXIT.fullmatch(line)
     if match:
+        cr3 = int(match[2], 16)
+        require(cr3 != 0 and cr3 % 4096 == 0, "Child exit has invalid CR3")
         return ("exit", int(match[1], 16), 0, int(match[3], 16), 0)
     match = KILL.fullmatch(line)
     if match:
