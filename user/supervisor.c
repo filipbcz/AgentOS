@@ -97,7 +97,12 @@ static int supervise(const char *name, unsigned name_length,
  */
 int run_supervisor(void) {
     long parent=os_call(SYS_GETPID,0,0,0);
-    if (parent<=0 || !phase("BEGIN",(unsigned long)parent)) return 61;
+    // Prove that forced termination cannot target zero/self or an unknown PID.
+    // These checks run before any worker is spawned.
+    if (parent<=0 || os_call(SYS_KILL,0,0,0)!=-22 ||
+        os_call(SYS_KILL,parent,0,0)!=-22 ||
+        os_call(SYS_KILL,0x7fffffff,0,0)!=-3 ||
+        !phase("BEGIN",(unsigned long)parent)) return 61;
     if (supervise("svc_ok",6,1,(unsigned long)parent)!=0) return 62;
     if (supervise("svc_fail",8,MAX_ATTEMPTS,(unsigned long)parent)!=1) return 63;
     if (supervise("svc_hang",8,1,(unsigned long)parent)!=2) return 64;
