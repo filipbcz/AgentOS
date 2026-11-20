@@ -92,13 +92,27 @@ impl Terminal {
     }
 
     unsafe fn output(&mut self, aData: &[u8], aCooked: bool) -> Result<usize, isize> {
+        // A display-only shell must remain usable if UART TX is wedged. A byte
+        // counts as written if at least one of its two sinks accepted it.
+        // Without GOP, preserve the original partial-write UART contract.
         let mut pWritten = 0;
+        let mut serial_failed = false;
         for &pByte in aData {
-            if (aCooked && pByte == b'\n' && !self.fLastCr && !self.byte(b'\r')) || !self.byte(pByte) {
+            let sent = if serial_failed { false } else {
+                ( !aCooked || pByte != b'\n' || self.fLastCr || self.byte(b'\r') )
+                    && self.byte(pByte)
+            };
+            if !sent { serial_failed = true; }
+            if let Some(screen) = &mut self.fScreen {
+                screen.write(&[pByte]);
+            } else if !sent {
                 return if pWritten == 0 { Err(-5) } else { Ok(pWritten) };
             }
-            if let Some(screen) = &mut self.fScreen { screen.write(&[pByte]); }
             pWritten += 1;
+        }
+        if serial_failed {
+            let _ = LOGGER.record(0, self.fCpu as u32, Level::Error,
+                b"UART TX failed; GOP fallback active");
         }
         Ok(pWritten)
     }
