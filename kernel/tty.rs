@@ -55,7 +55,7 @@ impl Terminal {
         if let Some(route) = &self.fKeyboardRoute { route.disable(); }
         if let Some(config) = self.fKeyboardConfig.take() {
             if !ps2::restore(config) {
-                let _ = LOGGER.record(0, self.fCpu as u32, Level::Error, b"PS2 restore failed");
+                let _ = LOGGER.record(crate::logger::ticks(), self.fCpu as u32, Level::Error, b"PS2 restore failed");
                 // Controller recovery failure must be visible even when the
                 // canonical input device is being torn down.
                 self.diagnostic(b"AGENTOS PS2 RESTORE FAILED\r\n");
@@ -76,7 +76,7 @@ impl Terminal {
         if self.fErrors == 0 { return false; }
         self.fErrors = 0;
         self.fInput.invalidate();
-        let _ = LOGGER.record(0, self.fCpu as u32, Level::Error, b"UART RX error");
+        let _ = LOGGER.record(crate::logger::ticks(), self.fCpu as u32, Level::Error, b"UART RX error");
         true
     }
 
@@ -111,7 +111,7 @@ impl Terminal {
             pWritten += 1;
         }
         if serial_failed {
-            let _ = LOGGER.record(0, self.fCpu as u32, Level::Error,
+            let _ = LOGGER.record(crate::logger::ticks(), self.fCpu as u32, Level::Error,
                 b"UART TX failed; GOP fallback active");
         }
         Ok(pWritten)
@@ -149,7 +149,7 @@ impl Terminal {
             Err(()) => {
                 self.fKeyboard.reset();
                 self.fInput.invalidate();
-                let _ = LOGGER.record(0, self.fCpu as u32, Level::Error, b"PS2 RX error");
+                let _ = LOGGER.record(crate::logger::ticks(), self.fCpu as u32, Level::Error, b"PS2 RX error");
             }
         });
     }
