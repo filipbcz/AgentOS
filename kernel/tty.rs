@@ -11,7 +11,7 @@ pub struct Terminal {
     fRoute: Route,
     fKeyboardRoute: Option<Route>,
     fKeyboard: Keyboard,
-    fKeyboardConfig: Option<u8>,
+    fKeyboardConfig: Option<ps2::Saved>,
     fErrors: u8,
     fLastCr: bool,
     fEnabled: bool,
