@@ -49,6 +49,10 @@ printf 'Testing PS/2 scan-code decoder with %s\n' "$pRustc"
 "$pRustc" --edition 2021 --test "$pRoot/kernel/keyboard.rs" -o "$pOut/keyboard-tests"
 "$pOut/keyboard-tests"
 
+printf 'Testing early kernel logging policy with %s\n' "$pRustc"
+"$pRustc" --edition 2021 --test "$pRoot/kernel/log_policy.rs" -o "$pOut/log-policy-tests"
+"$pOut/log-policy-tests"
+
 printf 'Compiling and linking the kernel with %s and %s\n' "$pRustc" "$pCc"
 "$pRustc" --version
 "$pCc" --version
