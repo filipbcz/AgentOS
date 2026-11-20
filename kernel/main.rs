@@ -18,6 +18,7 @@ mod ioapic;
 mod tty;
 mod keyboard;
 mod ps2;
+mod log_policy;
 
 // Version 3, shared with boot/loader.c. Addresses are identity mapped at handoff.
 #[repr(C)]
@@ -185,12 +186,20 @@ impl<'a> BootLog<'a> {
         }
     }
     fn event(&mut self, level: u64, message: &[u8]) {
-        if level > (self.info.log_level & 3) { return; }
-        let prefix: &[u8] = match level { 0 => b"[ERROR] ", 1 => b"[INFO] ", _ => b"[DEBUG] " };
-        if self.info.log_level & 0x100 != 0 {
+        let severity = match level {
+            0 => log_policy::Level::Error,
+            1 => log_policy::Level::Info,
+            _ => log_policy::Level::Debug,
+        };
+        let policy = log_policy::Policy::new(self.info.log_level);
+        let serial_enabled = policy.enabled(severity, log_policy::Sink::Serial);
+        let screen_enabled = policy.enabled(severity, log_policy::Sink::Screen);
+        if !serial_enabled && !screen_enabled { return; }
+        let prefix = log_policy::Policy::prefix(severity);
+        if serial_enabled {
             unsafe { serial(prefix); serial(message); serial(b"\r\n"); }
         }
-        if self.info.log_level & 0x200 == 0 { return; }
+        if !screen_enabled { return; }
         if self.row+7*self.scale > self.info.height as usize { self.clear_from(52); self.row = 52; }
         draw(self.info, prefix, 8, self.row, self.scale);
         draw(self.info, message, 8+6*self.scale*prefix.len(), self.row, self.scale);
