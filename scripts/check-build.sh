@@ -45,6 +45,10 @@ printf 'Testing canonical input and the actual TTY driver with %s\n' "$pRustc"
 "$pRustc" --edition 2021 --test "$pRoot/scripts/tests/tty-host.rs" -o "$pOut/tty-tests"
 "$pOut/tty-tests"
 
+printf 'Testing PS/2 scan-code decoder with %s\n' "$pRustc"
+"$pRustc" --edition 2021 --test "$pRoot/kernel/keyboard.rs" -o "$pOut/keyboard-tests"
+"$pOut/keyboard-tests"
+
 printf 'Compiling and linking the kernel with %s and %s\n' "$pRustc" "$pCc"
 "$pRustc" --version
 "$pCc" --version
