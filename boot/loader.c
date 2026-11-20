@@ -45,22 +45,39 @@ static EFI_STATUS load_kernel(UINT64 *entry) {
     return EFI_SUCCESS;
 }
 
-// This ESP file controls verbosity only. Unknown/missing values select info.
+// EFI/BOOT/BOOT.LOG configures structured boot diagnostics.
+// Accepted values (case-sensitive): quiet|info|debug, optionally followed
+// by a space and serial|screen|both|none. Missing/invalid -> info both.
+// Bits 0..1: level, bit 8: serial, bit 9: framebuffer.
+// Raw acceptance markers and fatal crash diagnostics remain on COM1.
+#define LOG_SERIAL 0x100
+#define LOG_SCREEN 0x200
 static UINT64 boot_log_level(EFI_HANDLE device) {
     EFI_FILE_HANDLE root = LibOpenRoot(device), file;
-    if (!root) return 1;
+    if (!root) return 1 | LOG_SERIAL | LOG_SCREEN;
     EFI_STATUS s = root->Open(root, &file, L"\\EFI\\BOOT\\BOOT.LOG", EFI_FILE_MODE_READ, 0);
     root->Close(root);
-    if (EFI_ERROR(s)) return 1;
-    CHAR8 value[10];
+    if (EFI_ERROR(s)) return 1 | LOG_SERIAL | LOG_SCREEN;
+    CHAR8 value[32];
     UINTN n = sizeof(value);
     s = file->Read(file, &n, value);
     file->Close(file);
-    if (EFI_ERROR(s) || n == sizeof(value)) return 1;
-    while (n && (value[n-1]=='\r' || value[n-1]=='\n')) --n;
-    if (n == 5 && !CompareMem(value, "quiet", 5)) return 0;
-    if (n == 5 && !CompareMem(value, "debug", 5)) return 2;
-    return 1;
+    if (EFI_ERROR(s) || n == sizeof(value)) return 1 | LOG_SERIAL | LOG_SCREEN;
+    while (n && (value[n-1]=='\r' || value[n-1]=='\n' || value[n-1]==' ')) --n;
+    UINTN split = 0;
+    while (split < n && value[split] != ' ') ++split;
+    UINT64 level;
+    if (split == 5 && !CompareMem(value, "quiet", 5)) level = 0;
+    else if (split == 4 && !CompareMem(value, "info", 4)) level = 1;
+    else if (split == 5 && !CompareMem(value, "debug", 5)) level = 2;
+    else return 1 | LOG_SERIAL | LOG_SCREEN;
+    if (split == n) return level | LOG_SERIAL | LOG_SCREEN;
+    UINTN offset = split + 1, size = n - offset;
+    if (size == 6 && !CompareMem(value+offset, "serial", 6)) return level | LOG_SERIAL;
+    if (size == 6 && !CompareMem(value+offset, "screen", 6)) return level | LOG_SCREEN;
+    if (size == 4 && !CompareMem(value+offset, "both", 4)) return level | LOG_SERIAL | LOG_SCREEN;
+    if (size == 4 && !CompareMem(value+offset, "none", 4)) return level;
+    return 1 | LOG_SERIAL | LOG_SCREEN;
 }
 
 static BootInfo info = {.version = 3};
@@ -84,7 +101,7 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *table) {
     s = BS->HandleProtocol(image, &LoadedImageProtocol, (void **)&loaded);
     if (EFI_ERROR(s)) return s;
     info.log_level = boot_log_level(loaded->DeviceHandle);
-    if (info.log_level) Print(L"[INFO] UEFI SECURE BOOT ACTIVE\r\n");
+    if ((info.log_level & LOG_SERIAL) && (info.log_level & 3)) Print(L"[INFO] UEFI SECURE BOOT ACTIVE\r\n");
     info.image_base = (UINTN)loaded->ImageBase;
     info.image_size = loaded->ImageSize;
     info.archive = (UINTN)archive_start;
@@ -96,7 +113,7 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *table) {
     UINT64 entry;
     s=load_kernel(&entry);
     if (EFI_ERROR(s)) return s;
-    if (info.log_level) Print(L"[INFO] KERNEL ELF LOADED\r\n");
+    if ((info.log_level & LOG_SERIAL) && (info.log_level & 3)) Print(L"[INFO] KERNEL ELF LOADED\r\n");
     s=BS->AllocatePages(AllocateAnyPages, EfiLoaderData, 8, &info.stack_base);
     if (EFI_ERROR(s)) return s;
     // SIPI vector names a 4 KiB page below 1 MiB. Reserve its mailbox too.
