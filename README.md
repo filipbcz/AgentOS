@@ -155,3 +155,18 @@ wsl -d Ubuntu-24.04 -- bash scripts/check-build.sh
 Vyžaduje Rust, GCC, binutils a Python 3; proměnné `RUSTC`, `CC`, `LD` a `PYTHON` mohou vybrat jiné spustitelné soubory. Sám nic nestahuje. Testy řádkové vrstvy a skutečného ovladače TTY používají náhradní portové I/O; testy shellu spouštějí jeho skutečný C kód s nahrazenými systémovými voláními. Testy kontrol logů pracují se syntetickými vstupy. Výstupy jsou v `build/check`.
 
 Workflow `Host checks` spouští tento postup na GitHubu a kontroluje také syntaxi PowerShell skriptů. Tato kontrola nebootuje OS, nevytváří podpis ani nepotvrzuje reprodukovatelnost s přesnými verzemi z `scripts/toolchain.lock`. Pro úplný obraz dál slouží `scripts/build.sh` a pro přijetí nové funkce oba běhy `-Shell`.
+
+## PS/2 Set 1: priprava dekoderu (etapa 3)
+
+Modul `kernel/keyboard.rs` obsahuje cisty `no_std` stavovy dekoder scan kodu Set 1 pro americke rozlozeni US-QWERTY. Preklada pouze MAKE udalosti na ASCII (pismena, cislice, interpunkce, Enter, Backspace, Tab, Delete a Ctrl-D). Sleduje levou a pravou klavesu Shift/Ctrl/Alt, Caps Lock, prefix E0 a sekvenci Pause E1. Nepodporovane klavesy a BREAK udalosti nevydavaji zadny znak. Po ztrate scan kodu lze resetovat prechodny stav pomoci `Keyboard::reset()`; to je povinne pred obnovou vstupu po chybe radice.
+
+**Rozsah teto zmeny:** dekoder je zarazen do kerneloveho prekladu, ale zatim **neni pripojen k portum 0x60/0x64, IRQ1 ani TTY**. V bezicim OS se nic nemeni a interaktivni vstup nadale poskytuje jen COM1. Samotny dekoder nedokazuje pritomnost ani funkcnost PS/2 zarizeni. Neobsahuje mapovani ceske klavesnice ani USB HID.
+
+Hostitelske jednotkove testy:
+```bash
+rustc --edition 2021 --test kernel/keyboard.rs -o /tmp/agentos-keyboard-tests
+/tmp/agentos-keyboard-tests
+```
+Jsou take soucasti `scripts/check-build.sh` a CI `Host checks`. Zahrnuji uvolneni klaves, Shift/Caps, rozsirene sekvence, Ctrl-D, Pause, reset stavu a omezeni vystupu na povolene ASCII.
+
+**Dalsi krok:** po potvrzeni skutecneho VM behu stavajiciho serioveho shellu implementovat 8042 prvni port s konecnymi timeouty a detekci, kontrolu scan setu/translatoru, trasu IRQ1 pres MADT/I/O APIC, omezeny odber dat a predani prelozenych znaku do `LineInput`. Pri chybe prijmu zneplatnit rozepsany radek, aby nemohl byt vykonan zkraceny prikaz. Testovat bez PS/2 i s PS/2 na 1/2 vCPU, vcetne odpojeni, vadnych scan kodu, opakovanych preruseni a navratu do serioveho rezimu. Zobrazovani TTY na framebufferu a spravce sluzeb PID 1 zustavaji otevrene.
