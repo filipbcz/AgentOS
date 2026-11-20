@@ -5,6 +5,19 @@
 use core::{cell::UnsafeCell, sync::atomic::{AtomicBool, AtomicU64, Ordering}};
 use crate::{log_policy::Level, log_ring::{ReadResult, Ring}};
 
+/// Raw local TSC ticks. Compare only within a CPU until a synchronized
+/// cross-CPU timebase exists; records carry their originating CPU ID.
+#[inline]
+pub fn ticks() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    unsafe {
+        core::arch::asm!("lfence", "rdtsc", "lfence",
+            out("eax") lo, out("edx") hi, options(nostack));
+    }
+    ((hi as u64) << 32) | lo as u64
+}
+
 pub static LOGGER: Logger = Logger::new();
 
 pub struct Logger {
