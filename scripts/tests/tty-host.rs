@@ -282,3 +282,19 @@ fn shellAndKeyboardOutputAreMirroredToFramebuffer() {
     assert!(pixels.iter().any(|&v|v==0xffffff),"no rendered glyph pixels");
     ports(|p|assert!(p.fTransmit.ends_with(b"xc\n")));
 }
+
+#[test]
+fn framebufferShellStaysUsableWhenUartTransmitStalls() {
+    let width=60usize;let height=27usize;
+    let mut pixels=vec![0u32;width*height];
+    let screen=unsafe{fb_console::Console::new(pixels.as_mut_ptr(),width,height,width,0)}.unwrap();
+    let initial=pixels.clone();
+    let mut term=terminal();
+    term.attach_screen(screen);
+    ports(|p|p.fTransmitRemaining=Some(0));
+    assert_eq!(unsafe{term.write(b"hello\n")},Ok(6));
+    assert_ne!(pixels,initial,"serial failure must not suppress screen output");
+    ports(|p|assert!(p.fTransmit.is_empty()));
+    receive(&mut term,b"ok\r");
+    assert_eq!(read(&mut term,16),Ok((Some(3),b"ok\n".to_vec())));
+}
