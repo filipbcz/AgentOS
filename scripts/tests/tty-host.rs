@@ -10,6 +10,14 @@ mod line;
 mod tty;
 #[path = "../../kernel/keyboard.rs"]
 mod keyboard;
+#[path = "../../kernel/fb_console.rs"]
+mod fb_console;
+#[path = "../../kernel/log_policy.rs"]
+mod log_policy;
+#[path = "../../kernel/log_ring.rs"]
+mod log_ring;
+#[path = "../../kernel/logger.rs"]
+mod logger;
 
 mod ps2 {
     use std::{cell::RefCell, collections::VecDeque};
@@ -255,4 +263,22 @@ fn damagedKeyboardInputCannotExecuteTruncatedCommand() {
     ps2::inject(&[Ok(0x23), Ok(0x12), Ok(0x26), Ok(0x19), Ok(0x1c)]); // help
     unsafe { terminal.keyboard_interrupt(); }
     assert_eq!(read(&mut terminal, 64), Ok((Some(5), b"help\n".to_vec())));
+}
+
+#[test]
+fn shellAndKeyboardOutputAreMirroredToFramebuffer() {
+    let width=96usize;let height=27usize;
+    let mut pixels=vec![0u32;width*height];
+    let screen=unsafe{fb_console::Console::new(pixels.as_mut_ptr(),width,height,width,0)}.unwrap();
+    let before=pixels.clone();
+    let mut term=terminal();
+    term.attach_screen(screen);
+    assert_eq!(unsafe{term.write(b"shell> ")},Ok(7));
+    assert_ne!(pixels,before,"shell prompt never reached framebuffer");
+    receive(&mut term,b"x");
+    ps2::inject(&[Ok(0x2e),Ok(0x1c)]); // 'c', Enter
+    unsafe{term.keyboard_interrupt();}
+    assert_eq!(read(&mut term,64),Ok((Some(3),b"xc\n".to_vec())));
+    assert!(pixels.iter().any(|&v|v==0xffffff),"no rendered glyph pixels");
+    ports(|p|assert!(p.fTransmit.ends_with(b"xc\n")));
 }
