@@ -8,6 +8,16 @@
  */
 enum { MAX_ATTEMPTS = 3, MAX_IDLE_YIELDS = 128 };
 
+/* Bound the evidence of the supervised interval for independent verifiers.
+ * User-mode output is a diagnostic, not a secure attestation.
+ */
+static int phase(const char event[5], unsigned long parent) {
+    char line[] = "AGENTOS SUPERVISOR BEGIN PARENT=0000000000000000\r\n";
+    for (unsigned i=0;i<5;i++) line[sizeof("AGENTOS SUPERVISOR ")-1+i]=event[i];
+    format_hex(line+sizeof("AGENTOS SUPERVISOR BEGIN PARENT=")-1,parent,16);
+    return os_call(SYS_WRITE,1,(long)line,sizeof(line)-1)==sizeof(line)-1;
+}
+
 static int record(const char event[4], unsigned long parent,
                   unsigned long child, unsigned long status, unsigned attempt) {
     char line[] = "AGENTOS SERVICE REAP PARENT=0000000000000000 CHILD=0000000000000000 STATUS=0000000000000000 ATTEMPT=00000000\r\n";
@@ -87,9 +97,9 @@ static int supervise(const char *name, unsigned name_length,
  */
 int run_supervisor(void) {
     long parent=os_call(SYS_GETPID,0,0,0);
-    if (parent<=0) return 61;
+    if (parent<=0 || !phase("BEGIN",(unsigned long)parent)) return 61;
     if (supervise("svc_ok",6,1,(unsigned long)parent)!=0) return 62;
     if (supervise("svc_fail",8,MAX_ATTEMPTS,(unsigned long)parent)!=1) return 63;
     if (supervise("svc_hang",8,1,(unsigned long)parent)!=2) return 64;
-    return 0;
+    return phase("ENDED",(unsigned long)parent) ? 0 : 65;
 }
