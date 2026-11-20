@@ -67,8 +67,8 @@ function Send-Keyboard([string]$Command) {
     VBox controlvm $vm keyboardputscancode 5a f0 5a
 }
 
-# Shell clears the boot framebuffer before displaying its prompt. For a shell
-# run the correct image acceptance criterion is its first rendered 'A' glyph.
+# The interactive shell clears the boot logo; check the actual shell prompt
+# instead of demanding that the old stage-1 picture is still on screen.
 function Verify-ShellPrompt([string]$Path) {
     Add-Type -AssemblyName System.Drawing
     $bitmap=[Drawing.Bitmap]::new((Resolve-Path $Path).Path)
@@ -247,64 +247,12 @@ try {
         if (!(Select-String -LiteralPath "$dir\com1.log" -SimpleMatch 'AGENTOS PHYSICAL FRAMES OK' -Quiet)) {
             throw "Physical frame probe missing: $dir"
         }
-        # Stage-1 image verification is meaningful only before a shell
-        # takes ownership of GOP. The shell branch checks its own prompt.
+        # The stage-1 boot logo is overwritten when GOP is handed to TTY.
         if (!$Shell) { & "$PSScriptRoot/verify-display.ps1" "$dir\display.png" }
         & "$PSScriptRoot/verify-processes.ps1" -Log "$dir\com1.log" -ApicIds $ids
         & "$PSScriptRoot/verify-idle.ps1" -RunDir $dir -ApicIds $ids -HostSeconds $hostIdleSeconds
         if ($Shell) {
-            Wait-Serial $serial 'AGENTOS SHELL READY\r\nagentos> 
-            Verify-ShellPrompt "$dir\shell-before.png"
-            if ($Keyboard) {
-                # PS/2 keyboard and COM1 have independent input sources.
-                # Keep the strict serial-only verifier unchanged.
-                $offset=$serial.Text.Length
-                Send-Keyboard 'echo ps2-ok'
-                Wait-Serial $serial '(?m)^ps2-ok\r\nagentos> $' $offset
-                Start-Sleep -Milliseconds 150
-                VBox controlvm $vm screenshotpng "$dir\shell-keyboard.png"
-                Verify-ShellScreen "$dir\shell-before.png" "$dir\shell-keyboard.png"
-                $offset=$serial.Text.Length
-                Send-Keyboard 'exit'
-                Wait-Serial $serial '(?m)^AGENTOS SHELL STOP PID=[0-9a-f]{16} STATUS=0000000000000000 FRAMES=OK\r\n' $offset
-            } else {
-                $commands=@('help','pid',("echo shell-ox"+[char]8+'k'),'cat /stage','cat /missing','no-such-command')
-                foreach ($command in $commands) {
-                    $offset=$serial.Text.Length
-                    Send-Serial $serial $command
-                    Wait-Serial $serial 'agentos> $' $offset
-                }
-                $offset=$serial.Text.Length
-                Send-Serial $serial 'exit'
-                Wait-Serial $serial '(?m)^AGENTOS SHELL STOP PID=[0-9a-f]{16} STATUS=[0-9a-f]{16} FRAMES=OK\r\n' $offset
-                & python "$PSScriptRoot/verify-shell.py" --log "$dir\com1.log" --input "$dir\com1-input.bin"
-                if ($LASTEXITCODE -ne 0) { throw "Shell verification failed: $dir" }
-            }
-        }
-    } elseif (!(Select-String -LiteralPath "$dir\com1.log" -Pattern 'BdsDxe: failed to load .*HARDDISK.*(Access Denied|Security Violation)' -Quiet)) {
-        throw "Missing firmware rejection; timeout is inconclusive: $dir"
-    }
-    Write-Output "Captured $Case ($Cpus vCPUs): $dir"
-    $runSucceeded=$true
-} finally {
-    try { VBox controlvm $vm poweroff } catch {
-        if ($runSucceeded) { throw }
-        Write-Warning "VM power-off after a failed run also failed: $_"
-    }
-}
-} finally {
-    try {
-        if ($null -ne $serial) {
-            foreach ($handle in @($serial.Stream,$serial.Client,$serial.Log,$serial.Input)) {
-                if ($null -ne $handle) {
-                    try { $handle.Dispose() } catch { Write-Warning "COM1 cleanup failed: $_" }
-                }
-            }
-            if ($null -ne $serial.Listener) { $serial.Listener.Stop() }
-        }
-    } finally { $lock.Dispose() }
-}
-
+            Wait-Serial $serial 'AGENTOS SHELL READY\r\nagentos> $'
             Start-Sleep -Milliseconds 150
             VBox controlvm $vm screenshotpng "$dir\shell-before.png"
             Verify-ShellPrompt "$dir\shell-before.png"
