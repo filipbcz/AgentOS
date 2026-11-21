@@ -8,7 +8,7 @@ v=importlib.util.module_from_spec(spec)
 spec.loader.exec_module(v)
 
 def transcript():
-    root=100
+    root=1
     lines=[
         f"AGENTOS MANAGER SESSION START PID={root:016x}",
         f"AGENTOS MANAGER BEGIN ROOT={root:016x} COUNT=00000003",
@@ -33,7 +33,7 @@ def transcript():
 
 class ManagerEvidenceTests(unittest.TestCase):
     def test_good_registry_dependency_crash_budget_and_shell(self):
-        self.assertEqual(v.verify(transcript()),(100,105))
+        self.assertEqual(v.verify(transcript()),(1,105))
 
     def rejected(self,s):
         with self.assertRaises(v.VerificationError):v.verify(s)
@@ -56,7 +56,7 @@ class ManagerEvidenceTests(unittest.TestCase):
     def test_wrong_identity_and_exit_status_are_rejected(self):
         sample=transcript()
         for old,new in (
-            ("ROOT=0000000000000064","ROOT=0000000000000065"),
+            ("ROOT=0000000000000001","ROOT=0000000000000002"),
             ("SERVICE=core ","SERVICE=coreX"),
             ("SERVICE=flaky PID=0000000000000066","SERVICE=flaky PID=0000000000000065"),
             ("STATUS=000000000000002a","STATUS=0000000000000000"),

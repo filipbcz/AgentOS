@@ -43,10 +43,12 @@ const CLOCK_STALL_TICKS: u16 = 512;
 enum TimedWait {
     Sleep(u64),
     Child { pid: usize, deadline: u64 },
+    /// Wait for any watched local IPC message, a direct-child exit, or timeout.
+    Events { mask: u32, deadline: u64 },
 }
 impl TimedWait {
     fn deadline(self) -> u64 {
-        match self { Self::Sleep(ms) | Self::Child { deadline: ms, .. } => ms }
+        match self { Self::Sleep(ms) | Self::Child { deadline: ms, .. } | Self::Events { deadline: ms, .. } => ms }
     }
 }
 
@@ -215,6 +217,15 @@ impl Queue {
         self.block_timed(TimedWait::Child { pid, deadline }, now);
     }
 
+    pub fn block_events(&mut self, mask: u32, deadline: u64, now: u64) {
+        self.block_timed(TimedWait::Events { mask, deadline }, now);
+    }
+
+    pub fn has_exited_child(&self, parent: usize) -> bool {
+        self.tasks.iter().flatten().filter_map(|task| task.process.as_ref())
+            .any(|p| p.parent == parent && p.status.is_some())
+    }
+
     fn block_timed(&mut self, wait: TimedWait, now: u64) {
         let task = self.tasks[self.current.unwrap()].as_mut().unwrap();
         task.runnable = false;
@@ -243,7 +254,7 @@ impl Queue {
                 TimedWait::Child { pid, .. } =>
                     !self.tasks.iter().flatten().any(|t|
                         t.process.as_ref().map_or(false, |p| p.pid == pid && p.status.is_none())),
-                TimedWait::Sleep(_) => false,
+                TimedWait::Sleep(_) | TimedWait::Events { .. } => false,
             };
             let task = self.tasks[i].as_mut().unwrap();
             if now >= wait.deadline() || child_finished {
@@ -272,8 +283,13 @@ impl Queue {
     /// Eagerly wake parents when a child exits, independently of the APIC
     /// timer period. The syscall retries and performs authorized reaping.
     fn wake_child(&mut self, pid: usize) {
+        let parent = self.tasks.iter().flatten().filter_map(|t| t.process.as_ref())
+            .find(|p| p.pid == pid).map(|p| p.parent);
         for task in self.tasks.iter_mut().flatten() {
-            if matches!(task.timed, Some(TimedWait::Child { pid: child, .. }) if child == pid) {
+            let specified = matches!(task.timed, Some(TimedWait::Child { pid: child, .. }) if child == pid);
+            let any_child = matches!(task.timed, Some(TimedWait::Events { .. })) &&
+                task.process.as_ref().map(|p| p.pid) == parent;
+            if specified || any_child {
                 task.timed = None;
                 task.runnable = true;
             }
@@ -285,6 +301,12 @@ impl Queue {
             if t.waiting.map_or(false, |w| w.ready()) {
                 t.waiting = None;
                 t.runnable = true;
+            }
+            if let Some(TimedWait::Events { mask, .. }) = t.timed {
+                if t.process.as_ref().and_then(|p| p.files.ipc_ready_mask(mask).ok()).unwrap_or(0) != 0 {
+                    t.timed = None;
+                    t.runnable = true;
+                }
             }
         }
     }

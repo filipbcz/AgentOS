@@ -23,10 +23,18 @@
 #define SYS_FORK             0x10014
 #define SYS_IPC_TRY_RECV     0x10015
 #define SYS_BOOT_PAUSE       0x10016
+#define SYS_WAIT_EVENTS_UNTIL 0x10017
 
 /* SYS_BOOT_PAUSE(): only the original BSP PID 1, after collecting all
  * boot-test descendants, may park for the trusted-terminal handoff.
  * Resumption returns to the SAME process, with no PID reuse. */
+/* SYS_WAIT_EVENTS_UNTIL(fd_mask, cpu_local_deadline_ms, 0): atomically
+ * validates watched IPC descriptors, sleeps without userspace polling and
+ * wakes on queued messages, endpoint EOF, any direct child exit or deadline.
+ * Returns bits 0..31 for readable descriptors, bit 32 for child exit, zero
+ * at deadline; -9/-88 bad descriptor/type, -5 stalled clock, -22 arguments.
+ * Like all IPC/wait operations, it is CPU-local; no cross-CPU callbacks.
+ */
 /* SYS_MONOTONIC_MS: nonnegative milliseconds since owning CPU's epoch.
  * Per-CPU only; a process is currently pinned to its CPU. Not UTC and not
  * synchronized between CPUs. Returns -5 if the calibrated source is absent.

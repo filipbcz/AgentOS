@@ -516,6 +516,35 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
                 return cpu.switch(ctx as *mut Context as usize, false);
             }
         }
+        // Atomic, CPU-local wait on a validated set of IPC endpoints and any
+        // exited direct child. Both IPC and exit wakes occur under IF=0.
+        // Bit 32 of the positive result denotes a child exit; bits 0..31
+        // denote sockets with queued messages or EOF, 0 denotes timeout.
+        0x10017 => {
+            if a > u32::MAX as usize || b > isize::MAX as usize || c != 0 { -22 }
+            else if q.take_clock_error() { -5 }
+            else {
+                match q.process().unwrap().files.ipc_ready_mask(a as u32) {
+                    Err(error) => error,
+                    Ok(mask) => {
+                        let events = mask as usize |
+                            if q.has_exited_child(pid) { 1usize << 32 } else { 0 };
+                        if events != 0 { events as isize }
+                        else {
+                            match cpu.clock.millis(timestamp()) {
+                                None => -5,
+                                Some(now) if now >= b as u64 => 0,
+                                Some(now) => {
+                                    q.block_events(a as u32, b as u64, now);
+                                    ctx.rip -= 2;
+                                    return cpu.switch(ctx as *mut Context as usize, false);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         0x10003 => {
             cpu.output(b"AGENTOS USER EXIT PID="); cpu.hex(pid as u64);
             cpu.output(b" CR3="); cpu.hex(active_root() as u64); cpu.output(b" STATUS="); cpu.hex((a & 255) as u64); cpu.output(b"\r\n");

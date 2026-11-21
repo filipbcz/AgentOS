@@ -168,13 +168,47 @@ static long mock_call(long op,long a,long b,long c) {
             assert(w && !w->reaped && !w->killed);
             w->killed=1;total_kills++;return 0;
         }
-        case SYS_SLEEP_UNTIL:
-            assert(b==0 && c==0 && a>ticks && a-ticks<=TICK_MS);
+        case SYS_WAIT_EVENTS_UNTIL: {
+            assert(a>=0 && (unsigned long)a<=0xffffffffUL && b>ticks && c==0);
             sleeps++;
             if(clock_failure_at && sleeps==(unsigned)clock_failure_at)return -5;
-            ticks=a;
+            long next=b;
+            for(unsigned i=0;i<count;i++) {
+                const struct worker *w=&workers[i];
+                if(w->reaped || w->killed)continue;
+                long candidate=0;
+                if(!w->ready_sent && !never_ready)candidate=w->start+20;
+                else if(w->ack && w->kind==SVC_FLAKY)candidate=w->start+100;
+                else if(w->ack && w->kind==SVC_SHELL)candidate=1000;
+                if(candidate>ticks && candidate<next)next=candidate;
+                if(w->ack && w->kind==SVC_CORE && core_crash_at>ticks &&
+                   core_crash_at<next)next=core_crash_at;
+                if(w->ack && w->kind==SVC_SHELL && spoof_control &&
+                   !spoof_control_sent && w->start+80>ticks &&
+                   w->start+80<next)next=w->start+80;
+            }
+            ticks=next;
+            unsigned long events=0;
+            for(unsigned fd=0;fd<32;fd++)if(((unsigned long)a&(1UL<<fd))!=0) {
+                assert(openfds[fd]);
+                struct worker *w=from_channel(fdchannel[fd]);
+                if(w && !w->reaped &&
+                   ((!w->ready_sent && !never_ready && ticks>=w->start+20) ||
+                    (w->ack && w->kind==SVC_SHELL && spoof_control &&
+                     !spoof_control_sent && ticks>=w->start+80)))
+                    events|=1UL<<fd;
+            }
+            for(unsigned i=0;i<count;i++) {
+                const struct worker *w=&workers[i];
+                if(w->reaped || w->killed || !w->ack)continue;
+                if((w->kind==SVC_FLAKY && ticks>=w->start+100) ||
+                   (w->kind==SVC_SHELL && ticks>=1000) ||
+                   (w->kind==SVC_CORE && core_crash_at>0 && ticks>=core_crash_at))
+                    events|=1UL<<32;
+            }
             assert(sleeps<1000);
-            return 0;
+            return (long)events;
+        }
     }
     fprintf(stderr,"Unexpected manager syscall %ld(%ld,%ld,%ld)\n",op,a,b,c);
     abort();
@@ -183,7 +217,7 @@ static void normal_session(void) {
     reset();
     assert(runServiceManager()==0);
     assert(count==5 && total_exits==5 && total_kills==1);
-    assert(ticks>=1000 && sleeps>=50);
+    assert(ticks>=1000 && sleeps>0 && sleeps<50);
     assert(registry[SVC_CORE].state==SVC_STOPPED &&
            registry[SVC_FLAKY].state==SVC_STOPPED &&
            registry[SVC_SHELL].state==SVC_STOPPED);

@@ -12,7 +12,7 @@
  * reaper*, but it does not currently have the literal numeric PID 1.
  */
 #define MAX_MS 0x7fffffffffffffffUL
-enum { TICK_MS=20, READY_TIMEOUT_MS=750, RESTART_BASE_MS=40, RESTART_WINDOW_MS=5000, MAX_ATTEMPTS=3 };
+enum { QUIET_WAKE_MS=60000, READY_TIMEOUT_MS=750, RESTART_BASE_MS=40, RESTART_WINDOW_MS=5000, MAX_ATTEMPTS=3 };
 struct record {
     const char *name, *elf;
     unsigned name_length, elf_length, dependency;
@@ -329,6 +329,35 @@ static int advance_registry(long now) {
     return 0;
 }
 
+/* Compute the earliest real state transition, not an arbitrary 20 ms
+ * polling quantum. The kernel multiplexes service IPC and child exits with
+ * this deadline in one atomic wait. A long quiet deadline retains detection
+ * of a stopped clock without busy checking a stable system.
+ */
+static long event_deadline(long now) {
+    long next=deadline(now,QUIET_WAKE_MS);
+    if (next<0) return -1;
+    for (unsigned id=0;id<SVC_COUNT;id++) {
+        const struct record *service=&registry[id];
+        if (service->pid>0 && service->state==SVC_STARTING &&
+            service->ready_deadline<next) next=service->ready_deadline;
+        if (!service->pid && service->desired && service->state==SVC_BACKOFF &&
+            service->retry_at<next) next=service->retry_at;
+    }
+    return next;
+}
+static long event_mask(void) {
+    unsigned long mask=0;
+    for (unsigned id=0;id<SVC_COUNT;id++) {
+        const struct record *service=&registry[id];
+        if (service->fd<0 || (service->state!=SVC_STARTING &&
+            !(id==SVC_SHELL && service->state==SVC_RUNNING))) continue;
+        if (service->fd>=32) return -1;
+        mask|=1UL<<(unsigned)service->fd;
+    }
+    return (long)mask;
+}
+
 static int stop_all(void) {
     // Stop admissions before descending in reverse dependency order.
     for (unsigned id=0;id<SVC_COUNT;id++) registry[id].desired=0;
@@ -351,8 +380,9 @@ int runServiceManager(void) {
         if (advance_registry(now)!=0) { fatal_error=1;break; }
         if (shutdown_requested) break;
         if (check_control(now)!=0) { fatal_error=1;break; }
-        long next=deadline(now,TICK_MS);
-        if (next<0 || os_call(SYS_SLEEP_UNTIL,next,0,0)!=0)
+        long next=event_deadline(now);
+        long mask=event_mask();
+        if (next<0 || mask<0 || os_call(SYS_WAIT_EVENTS_UNTIL,mask,next,0)<0)
             { fatal_error=1;break; }
     }
     shell_active=0;

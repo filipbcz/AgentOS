@@ -147,6 +147,20 @@ impl Descriptors {
         Ok(0)
     }
 
+    /// Validate the entire watch set before going to sleep. Each selected
+    /// handle must be a live local IPC socket. Closure of its peer is readable
+    /// (EOF), so waiting callers never get stranded on a dead service.
+    pub fn ipc_ready_mask(&self, mask: u32) -> Result<u32, isize> {
+        let mut ready = 0u32;
+        for fd in 0..SLOTS {
+            let bit = 1u32 << fd;
+            if mask & bit == 0 { continue; }
+            let Handle::Socket(channel, side) = self.handle(fd)? else { return Err(-88); };
+            if unsafe { (*channel).ready(side, Operation::Receive) } { ready |= bit; }
+        }
+        Ok(ready)
+    }
+
     pub fn message(&self, frames: &mut Frames<'_>, op: Operation, process: &crate::process::Process, fd: usize,
                    address: usize, len: usize) -> Result<Io, isize> {
         let Handle::Socket(p, side) = self.handle(fd)? else { return Err(-88); };
