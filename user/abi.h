@@ -19,13 +19,15 @@
 #define SYS_MONOTONIC_MS 0x10010
 #define SYS_WAIT_CHILD_UNTIL 0x10011
 #define SYS_SLEEP_UNTIL      0x10012
+#define SYS_CHILD_AFTER      0x10013
 
 /* SYS_MONOTONIC_MS: nonnegative milliseconds since owning CPU's epoch.
  * Per-CPU only; a process is currently pinned to its CPU. Not UTC and not
  * synchronized between CPUs. Returns -5 if the calibrated source is absent.
  */
 /* SYS_WAIT_CHILD_UNTIL(child_pid, absolute_cpu_local_deadline_ms):
- * Return and reap child's nonnegative exit status (0..255 for normal exit,\n * 256+fault_vector for a trapped fault) if it has exited;
+ * Return and reap child's nonnegative exit status (0..255 for normal exit,
+ * 256+fault_vector for a trapped fault) if it has exited;
  * otherwise block until child exits or monotonic deadline is reached.
  * Returns -110 on deadline, -10 if child absent/not owned, -5 if clock stalls,
  * -22 if deadline exceeds signed syscall range. Does not reap on timeout.
@@ -35,6 +37,14 @@
  * the scheduler's 10ms LAPIC quantum. Neither syscall busy-polls or sleeps
  * while holding allocator locks. Clock-fault guard uses APIC interrupts and
  * reports failure, never a fabricated time expiration.
+ */
+/* SYS_CHILD_AFTER(last_pid): return the lowest direct child's PID
+ * greater than last_pid, or -10 if no such child exists. Includes adopted
+ * orphaned children and zombies, but never exposes another process's children.
+ * In each CPU-local process session, the first root userspace process owns
+ * the reaper role. Descendants are adopted at their parent's exit or kill.
+ * If that reaper itself dies, unattended children are stopped and their
+ * resources are reclaimed during kernel shutdown. -22 for invalid cursor.
  */
 /* SYS_KILL(pid): a process may terminate only its direct child.
  * The child becomes a reapable zombie with exit status 137.
