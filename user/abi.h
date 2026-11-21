@@ -21,6 +21,7 @@
 #define SYS_SLEEP_UNTIL      0x10012
 #define SYS_CHILD_AFTER      0x10013
 #define SYS_FORK             0x10014
+#define SYS_IPC_TRY_RECV     0x10015
 
 /* SYS_MONOTONIC_MS: nonnegative milliseconds since owning CPU's epoch.
  * Per-CPU only; a process is currently pinned to its CPU. Not UTC and not
@@ -54,6 +55,13 @@
  * stays read-only and executable, and both inherit open descriptors.
  * -11 if the CPU task table is full, -12 on frame allocation failure.
  * The parent remains unchanged on clone allocation failure.
+ */
+/* SYS_IPC_TRY_RECV(fd, address, capacity): identical to SYS_IPC_RECV
+ * except that an empty, still-open inbox returns -11 (EAGAIN) immediately.
+ * A closed and drained peer returns 0. This enables one PID-root supervisor
+ * to check independent service readiness, commands and timed exits without
+ * becoming blocked on any one endpoint. Caller buffer includes 16-byte
+ * authenticated peer prefix; no data or message is consumed on -11.
  */
 /* SYS_KILL(pid): a process may terminate only its direct child.
  * The child becomes a reapable zombie with exit status 137.
