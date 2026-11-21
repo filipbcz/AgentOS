@@ -90,6 +90,11 @@ printf 'Testing PID1 supervision and forced-child cleanup with %s\n' "$pCc"
     "$pRoot/scripts/tests/supervisor-host.c" -o "$pOut/supervisor-tests"
 "$pOut/supervisor-tests"
 
+printf 'Testing persistent service registry, authenticated readiness, capped restarts and shutdown with %s\n' "$pCc"
+"$pCc" -std=c11 -O2 -Wall -Wextra -Werror -fno-stack-protector \
+    "$pRoot/scripts/tests/service-manager-host.c" -o "$pOut/service-manager-tests"
+"$pOut/service-manager-tests"
+
 printf 'Testing actual CPU-local orphan program and failure injection with %s\n' "$pCc"
 "$pCc" -std=c11 -O2 -Wall -Wextra -Werror -fno-stack-protector \
     "$pRoot/scripts/tests/orphans-host.c" -o "$pOut/orphans-tests"
