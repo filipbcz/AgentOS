@@ -17,10 +17,24 @@
 #define SYS_IPC_RECV 0x1000e
 #define SYS_KILL     0x1000f
 #define SYS_MONOTONIC_MS 0x10010
+#define SYS_WAIT_CHILD_UNTIL 0x10011
+#define SYS_SLEEP_UNTIL      0x10012
 
 /* SYS_MONOTONIC_MS: nonnegative milliseconds since owning CPU's epoch.
  * Per-CPU only; a process is currently pinned to its CPU. Not UTC and not
  * synchronized between CPUs. Returns -5 if the calibrated source is absent.
+ */
+/* SYS_WAIT_CHILD_UNTIL(child_pid, absolute_cpu_local_deadline_ms):
+ * Return and reap child's exit status if it has exited (0..255);
+ * otherwise block until child exits or monotonic deadline is reached.
+ * Returns -110 on deadline, -10 if child absent/not owned, -5 if clock stalls,
+ * -22 if deadline exceeds signed syscall range. Does not reap on timeout.
+ * SYS_SLEEP_UNTIL(absolute_cpu_local_deadline_ms): blocks until the deadline,
+ * returns 0 on success, -5 on clock stall, -22 on invalid deadline.
+ * Timer-backed waits are local to the current CPU; duration is quantized by
+ * the scheduler's 10ms LAPIC quantum. Neither syscall busy-polls or sleeps
+ * while holding allocator locks. Clock-fault guard uses APIC interrupts and
+ * reports failure, never a fabricated time expiration.
  */
 /* SYS_KILL(pid): a process may terminate only its direct child.
  * The child becomes a reapable zombie with exit status 137.
