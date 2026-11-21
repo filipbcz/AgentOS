@@ -432,8 +432,8 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
                     Err(-11) => match cpu.clock.millis(timestamp()) {
                         None => -5,
                         Some(now) if now >= b as u64 => -110,
-                        Some(_) => {
-                            q.block_child(a, b as u64);
+                        Some(now) => {
+                            q.block_child(a, b as u64, now);
                             ctx.rip -= 2;
                             return cpu.switch(ctx as *mut Context as usize, false);
                         }
@@ -451,8 +451,8 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
                 match cpu.clock.millis(timestamp()) {
                     None => -5,
                     Some(now) if now >= a as u64 => 0,
-                    Some(_) => {
-                        q.block_sleep(a as u64);
+                    Some(now) => {
+                        q.block_sleep(a as u64, now);
                         ctx.rip -= 2;
                         return cpu.switch(ctx as *mut Context as usize, false);
                     }
