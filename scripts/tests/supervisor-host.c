@@ -20,6 +20,7 @@ static unsigned log_used, spawns, collected, kills, kill_attempts, yields, write
 static unsigned spawn_error_at, write_error_at, yield_error_at, wait_error_at, clock_error_at, clock_calls;
 static long clock_time_ms, kill_time_ms;
 static int clock_frozen;
+static unsigned freeze_on_spawn, clock_failure_after_spawn;
 static long spawn_times[MAX_CHILDREN];
 static long live_child;
 static char live_kind; // 'o': success, 'f': failure, 'h': hung
@@ -30,6 +31,7 @@ static void reset(void) {
     log_used=spawns=collected=kills=kill_attempts=yields=writes=0;
     spawn_error_at=write_error_at=yield_error_at=wait_error_at=clock_error_at=clock_calls=0;
     clock_time_ms=kill_time_ms=0;clock_frozen=0;
+    freeze_on_spawn=clock_failure_after_spawn=0;
     memset(spawn_times,0,sizeof(spawn_times));
     live_child=0; live_kind=0; killed=0; completed_before_kill=0; complete_on_last_yield=0;
 }
@@ -46,6 +48,8 @@ static long mock_call(long op,long a,long b,long c) {
         if (spawns >= MAX_CHILDREN) abort();
         if (spawns==spawn_error_at) return -12;
         spawn_times[spawns]=clock_time_ms;
+        if (spawns==freeze_on_spawn) clock_frozen=1;
+        if (spawns==clock_failure_after_spawn) clock_error_at=clock_calls+1;
         if (live_child) abort();
         const char *name=(const char *)a;
         if (b==6 && memcmp(name,"svc_ok",6)==0) live_kind='o';
@@ -161,6 +165,15 @@ int main(void) {
     reset();clock_frozen=1;
     assert(run_supervisor()==63 && spawns==2 && collected==2 && kills==0 &&
            yields==MAX_CLOCK_POLLS && !live_child);
+    // Frozen or failed clock DURING a live hanging service must fail closed,
+    // forcibly clean up the child, and never claim a measured TIME event.
+    reset();freeze_on_spawn=5;
+    assert(run_supervisor()==64 && spawns==5 && collected==5 && kills==1 &&
+           yields==6+MAX_CLOCK_POLLS && !live_child);
+    assert(strstr(log_text,"SERVICE TIME")==NULL);
+    reset();clock_failure_after_spawn=5;
+    assert(run_supervisor()==64 && spawns==5 && collected==5 && kills==1 && !live_child);
+    assert(strstr(log_text,"SERVICE TIME")==NULL);
     puts("Supervisor host acceptance: success, restart cap, stalled child kill, "
          "spawn/write/yield/wait failures passed");
     return 0;
