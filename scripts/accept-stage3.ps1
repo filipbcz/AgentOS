@@ -22,6 +22,11 @@ foreach ($mutation in @('loader','kernel','initrd')) {
 }
 if ($profiles.Count -ne 13) { throw 'Corrupted stage-3 acceptance profile matrix' }
 
+$summaryPath=Join-Path $root 'build/runs/stage3-acceptance.json'
+# Invalidate an earlier suite even when a new host build or provenance check
+# fails before the first VM starts.
+Remove-Item -LiteralPath $summaryPath -Force -ErrorAction SilentlyContinue
+
 # Use only the pinned toolchain and Secure Boot signing workflow from stage 1.
 # -SkipBuild is for retries of an already verifiably identical signed image.
 if (!$SkipBuild) {
@@ -34,10 +39,6 @@ $revision=(& git -C $root rev-parse --verify HEAD).Trim()
 if ($LASTEXITCODE -ne 0) { throw 'Source revision unavailable' }
 & python "$PSScriptRoot/verify-vm-evidence.py" --root $root --commit $revision
 if ($LASTEXITCODE -ne 0) { throw 'Signed image is stale or lacks clean-tree provenance' }
-
-$summaryPath=Join-Path $root 'build/runs/stage3-acceptance.json'
-# A previous successful matrix must never survive an unsuccessful rerun.
-Remove-Item -LiteralPath $summaryPath -Force -ErrorAction SilentlyContinue
 
 $results=@()
 foreach ($profile in $profiles) {

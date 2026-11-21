@@ -11,8 +11,11 @@ import importlib.util
 import json
 from pathlib import Path
 import re
+import subprocess
 import sys
 
+# Verification must not dirty the checkout by caching the sibling verifier.
+sys.dont_write_bytecode = True
 SPEC = importlib.util.spec_from_file_location(
     "vm_receipt", Path(__file__).with_name("verify-vm-evidence.py"))
 receipt = importlib.util.module_from_spec(SPEC)
@@ -33,6 +36,29 @@ for mutation in ("loader", "kernel", "initrd"):
 VM_NAME = re.compile(r"AgentOS-(signed|loader|kernel|initrd)-[0-9a-f]{10}\Z")
 
 
+def verify_current_checkout(root, source):
+    """Current acceptance must describe this exact, unmodified checkout.
+
+    Historical per-run receipt inspection intentionally remains available in
+    verify-vm-evidence.py; only the current complete-matrix gate owns this check.
+    """
+    def git(*arguments):
+        try:
+            return subprocess.run(
+                ["git", "-C", str(root), *arguments], check=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout.strip()
+        except (OSError, subprocess.CalledProcessError) as error:
+            raise receipt.EvidenceError(
+                "Current source checkout cannot be verified: Git must be available "
+                "and --root must be a repository with a committed HEAD") from error
+
+    current = git("rev-parse", "--verify", "HEAD")
+    receipt.require(current == source,
+                    "Stale acceptance matrix: source commit differs from current Git HEAD")
+    receipt.require(not git("status", "--porcelain", "--untracked-files=normal"),
+                    "Current acceptance requires a clean checkout without modified/untracked source")
+
+
 def verify(root, manifest_path):
     root = Path(root)
     manifest_path = Path(manifest_path)
@@ -41,6 +67,7 @@ def verify(root, manifest_path):
     source = data.get("source_commit")
     receipt.require(isinstance(source, str) and receipt.HEX_COMMIT.fullmatch(source),
                     "Invalid suite commit")
+    verify_current_checkout(root, source)
     build = receipt.verify_build(root, source)
     receipt.require(data.get("signed_efi_sha256") ==
                     build["artifacts"]["agentos.efi"],

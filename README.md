@@ -1,77 +1,121 @@
 # AgentOS
 
-Vlastní operační systém podle [technického zadání](ZADANI.md). Dosavadní implementaci, historické výsledky z VirtualBoxu a dosud neověřené kroky rozlišuje [plán implementace](PLAN_IMPLEMENTACE.md).
+Vlastní operační systém pro x86-64 podle [technického zadání](ZADANI.md). Aktuální stav, přesné ověřené revize a otevřená přejímka jsou v [plánu implementace](PLAN_IMPLEMENTACE.md). Starší výsledky se nevztahují automaticky na nový obraz.
 
-Rustové jádro po převzetí řízení od vlastního loaderu provede bootovací a procesové zkoušky, vypíše `AGENTOS KERNEL OK STAGE 1` přes UART 16550 a vykreslí stejný text přímo do framebufferu. Poté spustí jednoduchý shell na COM1; po jeho ukončení zastaví CPU. Obraz obsahuje ELF jádra a deterministický archiv newc. Minimální loader v C používá GNU-EFI pro volání firmwaru. Kernelový vstup, vlastní zásobník a textový výstup běží po `ExitBootServices`. Aktuální profil jádra potřebuje jeden segment na fyzické adrese 32 MiB.
+Etapa 3 obsahuje izolované procesy, nativní ELF ABI, COW, VFS nad initramfs, roury, autentizované lokální IPC, původní PID 1 se správou služeb a interaktivní TTY přes COM1 i PS/2/GOP. Vývoj probíhá ve větvi `dev/stage3-ipc-validation`. Povinné převzetí této verze ve VirtualBoxu zůstává otevřené; QEMU poskytuje samostatný integrační důkaz.
 
-## Sestavení a spuštění
+## Sestavení
 
-Ve druhé etapě jádro na bootovacím procesoru vytvoří bitmapový alokátor z konvenční paměti nad prvním MiB, sestaví vlastní čtyřúrovňové tabulky stránek a přepne CR3. Kód jádra lze číst a spouštět. Konstanty lze pouze číst, zásobník a pracovní RAM lze číst a zapisovat. Nulová stránka a první stránka pod zásobníkem zůstávají bez mapování. Jádro instaluje vlastní GDT, TSS a IDT pro vektory 0–31. Pro dvojitou výjimku má samostatný zásobník.
+Příkazy pro Windows se spouštějí z kořene čistého Git checkoutu v PowerShellu. Potřebné prostředí:
 
-Po přepnutí CR3 test vyvolá breakpoint a čtyři stránkové výjimky při čtení adresy nula, čtení ochranné stránky zásobníku, zápisu do konstanty a pokusu spustit instrukci ze stránky s příznakem NX. Obsluha ověří vektor, chybový kód a uložený instrukční ukazatel, u stránkových výjimek také adresu v CR2. Každý úspěšný návrat umožní pokračovat dalším testem. Neočekávaná výjimka vypíše diagnostiku na COM1 a zastaví CPU. Po testech jádro znovu prověří alokátor. Hostitel kontroluje adresu CR3, souhrn testů na COM1 a text na displeji. V obou profilech test běží na bootovacím procesoru.
-
-Jádro přečte aktivní APIC ID z tabulky ACPI MADT. Bootovací procesor zkalibruje lokální časovač xAPIC proti časovači ACPI PM a spouští další procesory pomocí INIT a Startup IPI. Každý procesor dostane vlastní zásobník, IDT, GDT a TSS. Postupně na každém z nich běží jádrová úloha, která třikrát nastaví jednorázový časovač a čeká přes `sti; hlt`. Obsluha zkontroluje aktivní vektor v lokálním APIC, potvrdí přerušení pomocí EOI a započítá probuzení podle návratové adresy za `hlt`. Skript vyžaduje záznam úlohy se třemi probuzeními pro každé z očekávaných různých APIC ID a právě jeden záznam bootovacího procesoru (BSP).
-
-Po ověření probuzení přepne každý CPU svůj lokální časovač do periodického režimu s kvantem přibližně 10 ms. Plánovač vybírá jádrová vlákna kruhově z fronty daného procesoru. Přerušení uloží celočíselné registry, stav x87/SSE a návratový rámec na zásobník vlákna. Po dokončení posledního vlákna se obnoví původní kontext a periodický časovač se vypne.
-
-Zátěžová zkouška spustí dvě vlákna na každý CPU. Každé ověří vlastní hodnoty registrů přes několik kvant bez dobrovolného předání řízení a provede 4 096 přidělení a uvolnění 4KiB stránek. V 16 bodech testu všechna vlákna současně drží po osmi stránkách a před uvolněním ověří značky vlastníka na začátku a konci každé stránky. Sdílený alokátor chrání bitmapu a počitadlo zámkem, při jehož držení jsou lokální přerušení zakázaná. Hostitel vyžaduje pro každé vlákno alespoň dvě přepnutí časovačem na jiné spustitelné vlákno, dokončení všech operací a přesnou shodu celé bitmapy i počtu volných stránek před zátěží a po ní.
-
-Při zkoušce vyčerpání jádro obsadí všechny zbývající volné 4KiB stránky alokátoru. Každý vCPU zkusí přidělit běžnou i nulovanou stránku. Po uvolnění jediné stránky se ověří vrácení částečné alokace a opětovné získání téže stránky s nulovým obsahem. Po vrácení všech stránek se porovná celá bitmapa s výchozí kopií a zopakuje se běžný dvoustránkový test.
-
-Měření klidu začíná po obnově paměti a ukončení zátěžových vláken. Každý vCPU čeká se zapnutými přerušeními v `hlt` a nastaví jediný termín přibližně za 30 sekund. Periodické přerušení plánovače je během měření vypnuté. Jádro počítá všechny návraty z `hlt` a zvlášť eviduje jednorázová přerušení měřicího časovače. Při předčasném vypršení znovu nastaví zbývající čas a započte obě probuzení. Pro odhad aktivního času odečte od celkové doby intervaly od vstupu do čekání po vstup do obsluhy přerušení. Výsledek zahrnuje obsluhu koncového přerušení a měřicí kód. Profil VirtualBox Minimal poskytuje frekvence TSC a lokálního APIC přes CPUID. Mimo tento profil je dostupná kalibrace proti ACPI PM. Hostitel nezávisle změří dobu mezi počátečním a koncovým záznamem pomocí stopek. Surové hodnoty zůstanou na COM1 a skript zapíše délku intervalu, probuzení a aktivní podíl každého vCPU do `build/runs/<název VM>/idle.csv`. Čísla popisují čas pozorovaný hostovaným jádrem.
-
-Příkazy se spouštějí z kořene projektu v PowerShellu. Sestavení používá WSL Ubuntu-24.04 s balíky ze `scripts/toolchain.lock`, dále sbsigntool, efitools a openssl. Vytvoření testovacího disku používá gdisk a mtools. Hostitel používá VirtualBox 7.1.12, Windows PowerShell nebo PowerShell 7 a Python 3 dostupný příkazem `python` pro kontrolu procesových logů i negativní testy podpisu.
+- WSL distribuce `Ubuntu-24.04`, balíky s přesnými verzemi z `scripts/toolchain.lock`, dále Python 3, OpenSSL, sbsigntool, efitools, gdisk a mtools;
+- VirtualBox **7.1.12**, Windows PowerShell nebo PowerShell 7;
+- Python 3 dostupný ve Windows příkazem `python`.
 
 ```powershell
+wsl -d Ubuntu-24.04 -- bash scripts/check-build.sh
 wsl -d Ubuntu-24.04 -- bash scripts/build.sh
-.\scripts\test-vbox.ps1 -Cpus 1
-.\scripts\test-vbox.ps1 -Cpus 2
 ```
 
-Výsledkem sestavení je `build/agentos.efi`. Při prvním sestavení se vytvoří místní testovací podpisový klíč v linuxovém adresáři `~/.local/share/agentos/stage1-test-keys` (případně pod `XDG_DATA_HOME`). Do projektu se exportují jen veřejná data pro testovací firmware. Dvě opakovaná sestavení se porovnávají podle SHA-256 souboru `build/agentos.unsigned.efi`, před připojením podpisu.
+`check-build.sh` provede hostitelské testy, překlad/linkování skutečného jádra a všech 12 uživatelských ELF, kontrolu oprávnění kernelových segmentů, trap návratů a nativní ABI note. Přepínače `RUSTC`, `CC`, `LD` a `PYTHON` vybírají spustitelné soubory; skript nic nestahuje. Výsledky jsou v `build/check/`.
 
-Spouštěcí skript vytvoří vlastní VM s novým úložištěm EFI proměnných, důvěrou k testovacímu certifikátu, virtuálním GPT diskem přes AHCI, EFI64, 256 MiB RAM, VMSVGA a COM1 do souboru. Fyzický firmware a fyzické disky nejsou součástí testu. Při úspěchu skript ověří sériovou zprávu i masku znaků na snímku displeje. VM vypne a ponechá její konfiguraci a důkazy v `build/runs/<název VM>/`. Testy spouštěj jednotlivě.
+`build.sh` kontroluje připnutý toolchain, sestaví deterministický newc initramfs a vlastní GNU-EFI loader s vloženým ELF jádra, zavolá podpis a ověří jej. Výsledkem je `build/agentos.efi`. Dvě opakovaná sestavení se porovnávají podle SHA-256 **nepodepsaného** `build/agentos.unsigned.efi`.
+
+Při prvním sestavení vznikne místní testovací podpisový klíč v `~/.local/share/agentos/stage1-test-keys`, případně pod `XDG_DATA_HOME`. Do projektu se exportují veřejná data pro firmware. `build/build-provenance.json` váže hash obrazu, initramfs, certifikátu a toolchain locku na commit a čistý pracovní strom. Jde o kontrolovatelný záznam sestavení, nikoli nezávislou kryptografickou atestaci.
+
+## Dokončení přejímky etapy 3 ve VirtualBoxu
+
+Po aktualizaci vývojové větve stačí spustit připravenou matici:
 
 ```powershell
-.\scripts\test-vbox.ps1 -Case loader
-.\scripts\test-vbox.ps1 -Case kernel
-.\scripts\test-vbox.ps1 -Case initrd
+git switch dev/stage3-ipc-validation
+git pull --ff-only
+.\scripts\accept-stage3.ps1
 ```
 
-Každý negativní test změní jeden bajt příslušné sekce v kopii již podepsaného obrazu. Vyžaduje explicitní odmítnutí zaváděcího disku od firmwaru v logu COM1. Samotný timeout ani pád hostitelského procesu nejsou důkazem odmítnutí podpisu.
+Skript nejprve provede hostitelské kontroly a sestaví podepsaný obraz. Potom postupně spustí **13 profilů** s EFI64, 256 MiB RAM, VMSVGA, AHCI a odděleným úložištěm EFI proměnných. Každá VM má vlastní nově vytvořený testovací disk a důvěru k testovacímu certifikátu.
+
+| Profil | CPU | Obsah |
+|---|---|---|
+| Podepsaný obraz, `info both` | 1 a 2 | Boot, izolace, COW, IPC, PID 1, guardy, základní klid a GOP |
+| Sériová relace, `debug serial` | 1 a 2 | Příkazy, správní IPC, restarty, provozní klid, čisté ukončení |
+| Smíšená COM1/PS/2 relace, `info serial` | 1 a 2 | Totéž, navíc skutečná virtuální klávesnice a nově vykreslená odpověď |
+| Podepsaný obraz, `quiet none` | 1 a 2 | Potlačení strukturovaných výpisů při funkčním systému |
+| Podepsaný obraz, `debug screen` | 1 a 2 | Oddělení sériového a obrazového výstupu |
+| Změněný loader, kernel, initramfs | 1 | Tři samostatná explicitní odmítnutí podpisu firmwarem |
+
+Úspěch se oznámí jako `STAGE3_VM_MATRIX_PASSED=...`. Výsledky jsou v `build/runs/`, souhrn v `build/runs/stage3-acceptance.json`. Nezávislá kontrola souhrnu:
+
+```powershell
+python scripts/verify-stage3-suite.py --root . --manifest build/runs/stage3-acceptance.json
+```
+
+Každý běh uchovává konfiguraci, verzi VirtualBoxu, skutečný COM1 log, screenshoty a JSON záznam s hashi obrazu, důkazů a testovacího skriptu. Interaktivní profil přidává skutečně odeslané UART bajty do `com1-input.bin`; klávesnicový profil zachovává snímky před příkazem a po něm. Selhání nezanechá platný souhrn z předchozího běhu. `-SkipBuild` je určen jen pro opakování nad stejným čistým commitem a odpovídajícím obrazem.
+
+Jednotlivý profil lze zopakovat samostatně:
+
+```powershell
+.\scripts\test-vbox.ps1 -Cpus 1 -Shell
+.\scripts\test-vbox.ps1 -Cpus 2 -Shell -Keyboard -LogLevel info -LogOutput serial
+.\scripts\test-vbox.ps1 -Cpus 2 -LogLevel debug -LogOutput screen
+.\scripts\test-vbox.ps1 -Case kernel
+```
+
+Pozitivní profil čeká na skutečný prompt shellu. Kontrola obrazovky porovnává glyphy aktuálního fontu, zachovanou bootovací identitu a pravidla `BOOT.LOG`. Klávesnicová odpověď musí vzniknout až po vstupu a tvořit samostatný celý řádek; pouhé echo nebo změněný pixel nestačí. VBox klávesnicové API dostává PC/XT Set 1 kódy pro Backspace a Enter. Negativní podpisový test vyžaduje `Access Denied` nebo `Security Violation`; samotný timeout není úspěch.
+
+## Jádro, paměť a plánování
+
+Loader předá konečnou mapu paměti, framebuffer a initramfs a korektně opustí UEFI Boot Services. Rustové `no_std` jádro vytvoří vlastní čtyřúrovňové stránkování, alokátor fyzických rámců a GDT/IDT/TSS. Kód je RX, konstanty RO/NX, data RW/NX; nulová stránka a loaderový stack guard nejsou mapované.
+
+Kernelová vlákna, zásobníky pro syscall/trap, AP a IST1 používají **16 KiB** nulované paměti s nezmapovanou stránkou na každé straně. Sdílené supervisor-only/NX mapování je v horní polovině adresního prostoru. Padesát tabulek vzniká před publikací kernelového CR3; samotné stack rámce se přidělují podle potřeby. Neúspěšná alokace vrací všechny rámce, reaping ruší mapování před uvolněním. Boot skutečně přečte oba guardy a ověří page fault; dokladem je `AGENTOS KERNEL STACK GUARD OK`.
+
+ACPI MADT řídí výběr CPU a IRQ routing. AP startují přes INIT/SIPI. Preemptivní round robin má CPU-local fronty a nejvýše 10ms kvantum. LAPIC se nastavuje **jednorázově** na nejbližší termín, který může kvantum zkrátit. Když vše čeká na čas, zbývá nejvýše sekundový watchdog; bez časového čekání se časovač vypne. UART, klávesnice, IPC a ukončení potomka přímo probouzejí příslušné čekající úlohy. Nezávislé počítání uplynulých LAPIC ticků odhaluje zastavené TSC po přibližně pěti sekundách; nevytváří smyšlený čas.
+
+Bootové zkoušky zachovávají preempci, souběžnou alokaci, vyčerpání paměti, návrat bitmapy a samostatné přibližně 30sekundové měření klidu. Příkaz `idle` navíc měří běžící systém s PID 1, stabilní službou a zablokovaným shellem. Toto druhé měření zachytí periodická probouzení, která by pouhý bootový test neodhalil.
 
 ## Uživatelské procesy a nativní ABI v1
 
-Procesor spouští statické ELF64 programy pro x86-64 v CPL3. Jádro je čte ze sekce initramfs podepsaného obrazu. Loader přijímá `ET_EXEC` s nepřekrývajícími se stránkami segmentů `PT_LOAD` v uživatelském rozsahu od `0x8000000000` do `0x10000000000` (horní hranice je otevřená). Pod čtyřstránkovým zásobníkem zůstává ochranná stránka. Každý proces má vlastní CR3, privátní stránky programu a zásobníku a samostatný zásobník pro vstup do jádra. Zapisovatelné uživatelské stránky mají NX, mapování jádra je přístupné pouze v privilegovaném režimu.
+Programy jsou statické ELF64 `ET_EXEC` pro x86-64, spouštěné v CPL3 z podepsaného initramfs. Každý musí obsahovat právě jednu `PT_NOTE` s vlastníkem `AgentOS\0`, typem 1 a descriptor `{u32 version=1, u32 flags=0}`. Společná [hlavička](user/abi.h) a [linker script](user/user.ld) ji přidávají automaticky. Build i loader odmítají chybějící, duplicitní, nepodporovanou nebo poškozenou note. Neoznačený ELF je vyhrazen budoucímu Linux ABI a nyní vrací `ENOEXEC`.
 
-Nativní ABI používá instrukci `syscall`. Číslo volání je v RAX, první tři argumenty v RDI, RSI a RDX. RAX vrací výsledek nebo záporné číslo chyby. RCX a R11 se přepisují. Čísla řady `0x10000` označují verzi 1 a jsou dostupná v [hlavičce pro programy](user/abi.h).
+Segmenty `PT_LOAD` musí mít nepřekrývající se stránky v rozsahu `[0x8000000000, 0x10000000000)`. Každý proces má soukromé CR3 a uživatelský zásobník s ochrannou stránkou. `fork` sdílí data přes explicitní COW; zápis uživatele i kopírování z jádra oddělí stránku, text zůstává nezapisovatelný. Chybný ukazatel vrací chybu, pád potomka se převezme bez pádu rodiče.
 
-| Volání | Argumenty | Výsledek |
+Instrukce `syscall` přijímá číslo v RAX a tři argumenty v RDI/RSI/RDX. RAX vrací výsledek nebo zápornou chybu; RCX a R11 se přepisují. Přesný kontrakt včetně návratů určuje `user/abi.h`.
+
+| Číslo | Volání | Význam |
 |---|---|---|
-| `getpid` | žádné | PID volajícího |
-| `write` | fd, adresa, délka | Počet zapsaných bajtů. Počáteční fd 1 vede na COM1 a přijímá nejvýše 256 bajtů na volání. Zápis do roury může čekat na volné místo. |
-| `exit` | stav | Ukončí proces. Rodič může převzít dolních 8 bitů stavu. |
-| `spawn` | adresa jména, délka | PID potomka. Cesta k ELF má 1–64 bajtů bez koncové nuly. Potomek dostane vlastní zásobník a zdědí popisovače pod stejnými čísly. |
-| `try_wait` | PID potomka | Převezme stav a uvolní prostředky potomka. Stav po výjimce je 256 + číslo vektoru. Běžící potomek vrací −11, cizí nebo již převzatý PID vrací −10. |
-| `yield` | žádné | Předá CPU další spustitelné úloze. Po obnovení vrátí 0. |
-| `open` | adresa cesty, délka, příznaky | Otevře běžný soubor ke čtení od začátku a vrátí nejnižší volný fd. Cesta má 1–128 bajtů bez koncové nuly. Podporované příznaky jsou 0. |
-| `read` | fd, adresa cíle, délka | Vrací počet přečtených bajtů. Při nenulové požadované délce značí 0 konec souboru nebo vyprázdněnou rouru po zavření posledního zapisujícího konce. |
-| `close` | fd | Uzavře popisovač a vrátí 0. Při ukončení procesu včetně pádu jádro zavře všechny zbývající popisovače. |
-| `pipe` | adresa dvou 32bitových celých čísel | Vytvoří anonymní rouru a vrátí 0. Na zadanou adresu uloží čtecí a poté zapisující fd. |
-| `dup2` | původní fd, cílový fd | Nahradí cílový popisovač kopií původního a vrátí cílové číslo. Duplikované i zděděné popisovače běžného souboru sdílejí pozici čtení. |
-| `ipc_pair` | adresa dvou 32bitových celých čísel | Vytvoří obousměrný lokální kanál, zapíše oba fd a vrátí 0. |
-| `ipc_send` | fd, adresa zprávy, délka | Odešle jednu zprávu o 1–1 024 bajtech a vrátí její délku. Čeká, pokud je schránka protistrany obsazená. |
-| `ipc_recv` | fd, adresa cíle, kapacita dat | Přijme jednu zprávu včetně hlavičky s identitou odesílatele. Kapacita i návratová hodnota počítají pouze data za hlavičkou. Po vyčerpání zpráv a uzavření protistrany vrátí 0. |
+| `0x10001` | `getpid` | Identita volajícího |
+| `0x10002` | `write` | COM1, TTY nebo roura; možné dílčí zápisy |
+| `0x10003` | `exit` | Ukončení a uzavření všech fd |
+| `0x10004` | `spawn` | Nový ELF proces se zděděnými fd |
+| `0x10005` | `try_wait` | Převzetí vlastního potomka; běžící vrací −11 |
+| `0x10006` | `yield` | Dobrovolné předání CPU |
+| `0x10007` | `open` | Soubor initramfs pouze ke čtení |
+| `0x10008` | `read` | Soubor, TTY nebo roura |
+| `0x10009` | `close` | Uzavření fd |
+| `0x1000a` | `pipe` | Dvojice čtecího a zapisujícího fd |
+| `0x1000b` | `dup2` | Kopie fd se sdíleným objektem/pozicí |
+| `0x1000c` | `ipc_pair` | Obousměrný lokální zprávový kanál |
+| `0x1000d` | `ipc_send` | Atomická zpráva; plná schránka uspí odesílatele |
+| `0x1000e` | `ipc_recv` | Celá zpráva a kernelová identita odesílatele |
+| `0x1000f` | `kill` | Pouze přímý potomek; stav 137, následný reaping |
+| `0x10010` | `monotonic_ms` | Monotónní čas konkrétního CPU |
+| `0x10011` | `wait_child_until` | Potomek nebo absolutní deadline |
+| `0x10012` | `sleep_until` | Uspání do absolutního deadline |
+| `0x10013` | `child_after` | Výčet vlastních, včetně adoptovaných potomků |
+| `0x10014` | `fork` | CPU-local COW klon; v dítěti návrat 0 |
+| `0x10015` | `ipc_try_recv` | Prázdná otevřená schránka vrací −11 |
+| `0x10016` | `boot_pause` | Jednorázové předání původního BSP PID 1 |
+| `0x10017` | `wait_events_until` | IPC/EOF, child exit nebo deadline bez polling smyčky |
+| `0x10018` | `timer_stats` | Čtyři u64: verze 1, čas, timer IRQ, idle timer IRQ |
+| `0x10019` | `ipc_try_send` | Plná schránka vrací −11 bez uspání a bez odeslání |
 
-Kořen VFS tvoří initramfs pouze pro čtení. Absolutní i relativní cesty se vyhodnocují od kořene po jednotlivých složkách včetně `.` a `..`. Proces má 32 míst pro popisovače. Roura zachovává pořadí bajtů a má kapacitu 1 024 bajtů. Zápisy do této velikosti jsou atomické, větší zápis může vrátit dílčí počet. Plánovač uspí čtenáře prázdné roury nebo zapisovatele čekajícího na místo a znovu jej zařadí při změně podmínek. Zápis po zavření všech čtecích konců vrátí −32. Neplatný nebo nesprávně použitý popisovač vrátí −9, nepřístupný uživatelský buffer −14 a neznámé volání −38.
+`timer_stats(buffer,32,0)` je pouze čtecí diagnostika; čítače se čtením nenulují. Čas je monotónní vůči epochě daného CPU, nikoli UTC ani synchronizovaný čas mezi CPU. CPU-local procesy v této etapě nemigrují.
 
-### Lokální zprávové IPC
+### VFS, roury a lokální zprávové IPC
 
-Volání `ipc_pair`, `ipc_send` a `ipc_recv` mají čísla `0x1000c`, `0x1000d` a `0x1000e`. Každý směr kanálu má jednu schránku pro nejvýše `IPC_MAX_MESSAGE` (1 024) bajtů. Hranice zpráv zůstávají zachované. Příjemce prázdné schránky i odesílatel čekající na místo se uspí; změna obsahu nebo poslední uzavření protistrany je znovu zařadí do plánování. `dup2` i `spawn` drží další referenci ke stejnému konci kanálu. EOF a chyba zápisu proto nastanou až po uzavření všech referencí protistrany.
+VFS čte kořenový initramfs a vyhodnocuje cesty včetně `.` a `..`. Proces má 32 fd; dvojice/zděděné fd sdílejí vlastnictví a pozici. Roura má kapacitu 1024 bajtů, zachovává pořadí a zápisy do této délky jsou atomické. Prázdná roura či plný buffer uspí proces; poslední uzavření probudí čekající a oznámí EOF nebo `EPIPE`.
 
-Přijatá zpráva začíná 16bajtovou `struct ipc_peer`: PID jako 64bitové číslo, UID a GID jako dvě 32bitová čísla, vše v pořadí little-endian. Hlavičku sestavuje jádro z identity procesu při odeslání; hodnoty uvedené v datech zprávy ji neovlivní. Současný bootovací profil přiděluje procesům UID i GID 1000. Správa účtů a změny oprávnění přijdou v dalších etapách.
-
-**Cíl příjmu musí mít místo pro hlavičku i data.** Argument kapacity a návratová hodnota hlavičku nezahrnují:
+IPC má jednu nezávislou schránku v každém směru pro 1–1024 bajtů. Před přijatými daty je 16bajtová `struct ipc_peer`: u64 PID a dvě u32 UID/GID, little-endian. Identitu doplňuje jádro; hodnoty uvnitř zprávy ji nemění. Kapacita a výsledek `ipc_recv` **nezahrnují hlavičku**:
 
 ```c
 struct {
@@ -79,133 +123,50 @@ struct {
     unsigned char data[IPC_MAX_MESSAGE];
 } message;
 long received = os_call(SYS_IPC_RECV, fd, (long)&message, sizeof(message.data));
-/* sender a data jsou platné při received > 0. */
 ```
 
-Prázdná nebo příliš velká odesílaná zpráva a nedostatečná kapacita příjmu vracejí −90 (`EMSGSIZE`). Chybný buffer vrací −14 (`EFAULT`). Neúspěšný příjem zprávu neodebere; před zápisem se ověřuje celý rozsah hlavičky a dat. Zprávu zařazenou před uzavřením odesílatele lze ještě přijmout, teprve další příjem vrátí EOF. Odeslání po uzavření protistrany vrací −32 (`EPIPE`). Neplatné číslo fd vrací −9 (`EBADF`), IPC volání nad jiným typem otevřeného popisovače −88 (`ENOTSOCK`).
+Krátký nebo neplatný buffer zprávu nespotřebuje. Zařazenou zprávu lze přečíst i po uzavření odesílatele, potom následuje EOF. Chyby zahrnují −9 `EBADF`, −14 `EFAULT`, −32 `EPIPE`, −88 `ENOTSOCK`, −90 `EMSGSIZE` a −11 `EAGAIN` pro neblokující varianty.
 
-Současné kanály propojují procesy připnuté ke stejnému vCPU, s jedním vláknem na proces. Přenos konců mezi CPU, migrace procesů a vícevláknové sdílení popisovačů zatím nejsou podporované. Toto je transportní základ; agentní protokol a správce služeb jsou samostatné další kroky.
+## Původní PID 1 a služby
 
-### Procesový akceptační scénář
+BSP `init` s numerickým **PID 1** po procesových zkouškách jednorázově zaparkuje svůj kontext. Po vytvoření TTY jej jádro obnoví ve stejném adresním prostoru; tento proces pokračuje jako správce služeb. AP testy mají vlastní konečné CPU-local procesové relace. PID 1 převezme i osiřelé potomky a při shutdownu uvolní všechny prostředky své relace.
 
-Akceptační běh na každém dostupném vCPU spustí `init`. Jeho první potomek `fault` vyvolá při čtení stránky jádra výjimku. Rodič převezme stav 270 a ověří vlastní data. Pak spustí druhého potomka `receiver`, otevře `/data/transfer.bin` a jeho obsah odešle rourou. Rodič čte po 317 bajtech střídavě přes dva popisovače téhož souboru. Potomek čte z roury po nejvýše 193 bajtech, porovná všech 8 193 bajtů s očekávanými hodnotami a dvakrát ověří EOF. Hostitel kontroluje vztahy PID, odlišné CR3, počet bajtů, FNV-1a, návratové stavy i následnou kontrolu volných stránek. Rodič a jeho potomci jsou připnuti ke stejnému vCPU.
+Podepsaný statický registr obsahuje `core`, `flaky` a `shell`. Graf závislostí se validuje včetně cyklů. READY používá verzovaný protokol s kernelovou identitou, timeout a skutečný timer/IPC self-check workeru. Automatické restarty mají tři pokusy, backoff a 5sekundové okno; dosažený limit vyžaduje explicitní správní zásah. Pád závislosti zastaví a převezme následníky a obnoví je až po její připravenosti. STOP volitelné služby zůstává platný i během takové obnovy.
 
-Následuje kontrola IPC v `init`: neplatné popisovače, chybný typ popisovače, nulová a nadlimitní délka, neplatný buffer a vrácení prostředků po neúspěšném vytvoření páru. Přenos 1 024 bajtů a současná zpráva opačným směrem ověřují obsah a samostatnost schránek. Příliš malý, nepřístupný, nezapisovatelný a přetékající cíl příjmu musí ponechat zprávu neporušenou. Duplikovaný konec musí přežít uzavření originálu a zařazená zpráva uzavření odesílatele; po jejím přečtení následují EOF a `EPIPE`.
+START/RESTART potvrdí úspěch až po vytvoření dítěte, se stavem `starting` a pokusem 1. PID 1 přijímá celou omezenou zprávu a používá neblokující odpověď, takže plná schránka klienta nezastaví ostatní dohled. Stabilní `core` po READY blokuje na IPC. `flaky` je záměrný testovací worker se stavem 42 po 100 ms. Po jeho počátečních třech pádech se zpřístupní shell.
 
-Poté `init` spustí třetího potomka `service`. Klient záměrně uvede v datech nulovou identitu. Služba ověří skutečnou identitu z hlavičky a odpoví na výzvu; klient zkontroluje odpověď i identitu služby. Záznamy `AGENTOS IPC SERVICE` a `AGENTOS IPC REPLY` obsahují protilehlé PID a UID/GID 1000. Kontrola logu vyžaduje všechny čtyři různé PID a tři úspěšná ukončení na každý CPU (`receiver`, `service`, `init`), správné pořadí událostí a privátní CR3 potomků vůči rodiči. Následuje kernelová kontrola návratu bitmapy volných stránek. Dokončení IPC scénáře ve VirtualBoxu zatím čeká na ověření.
+## TTY, shell, PS/2 a GOP
 
-### Kontrola logů bez VirtualBoxu
-
-`verify-processes.ps1` zachovává rozhraní pro VM skript a spouští přenositelnou kontrolu v Pythonu. Samotný kontrolní program lze otestovat bez VM:
-
-```powershell
-python scripts/test-verify-processes.py -v
-```
-
-Testy používají syntetické logy pro jeden a dva CPU a poškozené varianty. Ověřují kontrolní program, nikoli běh operačního systému. Skutečný zachycený log lze zkontrolovat například takto (APIC ID musí odpovídat danému běhu):
-
-```powershell
-python scripts/verify-processes.py --log build/runs/<nazev-VM>/com1.log --apic-ids 0000000000000000 0000000000000001
-```
-
-Kontrola záměrně odmítne starší log bez IPC, chybějící či opakované záznamy, nesprávné identity a neúspěšná ukončení. Bootovací část končí případným záznamem `AGENTOS SHELL START`; pozdější interakci kontroluje samostatný scénář níže. Samotný soubor logu nedokládá původ obrazu; protokol musí dál uvádět verzi zdrojů, hash EFI a konfiguraci VM.
-
-## První sériový TTY a shell
-
-Po původních zkouškách včetně měření klidu jádro spustí na BSP statický ELF `shell`. Pouze tomuto procesu připojí fd 0 jako vstup TTY a fd 1 a 2 jako výstup. Bootovací programy dál začínají s volným fd 0. Shell běží v CPL3 a používá stávající nativní `read`, `write`, `open`, `close`, `getpid` a `exit`; nepotřebuje nové číslo syscallu.
+COM1 pracuje na 115200 baudů, 8N1; IRQ4 vede přes MADT/I/O APIC na BSP. PS/2 první port 8042 zapíná překlad Set 2 → Set 1 a používá IRQ1. Inicializace má konečné timeouty a obnovu konfigurace; při její chybě zůstává dostupný COM1. Obě vstupní cesty používají společnou kanonickou frontu. TTY vykresluje ASCII na GOP a zachovává skutečnou bootovací identitu v horním pásu 88 pixelů; zbytek obrazovky scrolluje.
 
 | Příkaz | Chování |
 |---|---|
-| `help` | Vypíše dostupné příkazy. |
-| `pid` | Vypíše PID shellu jako desetinné číslo. |
-| `echo TEXT` | Vypíše zadaný text. |
-| `cat PATH` | Přečte soubor z initramfs přes VFS a po dokončení i chybě zavře fd. |
-| `exit` | Ukončí shell; jádro převezme stav, uvolní prostředky a porovná bitmapu volných stránek. |
+| `help`, `pid` | Nápověda a identita shellu |
+| `echo TEXT` | Výstup textu |
+| `cat PATH` | Čtení z initramfs a uzavření fd i při chybě |
+| `services` | Autentizovaný stav registru a počty pokusů |
+| `service start\|stop\|restart core\|flaky` | Správní operace se zachováním závislostí |
+| `idle` | Pětisekundový spánek a rozdíl timer/idle IRQ čítačů |
+| `exit` | Řádné ukončení shellu, služeb a PID 1; kontrola bitmapy |
 
-Jde o první nativní sériový profil. Zatím neposkytuje přihlášení, spouštění dalších programů, uvozovky, roury či přesměrování v syntaxi shellu ani řízení úloh. Obsah se zobrazuje v připojeném sériovém terminálu. Framebuffer nadále slouží pro bootovací diagnostiku; klávesnice PS/2, terminál na displeji a správce služeb PID 1 jsou další práce.
+Řádek má nejvýše 255 znaků a fronta čtyři dokončené záznamy. CR/LF odešle řádek, CRLF je jeden Enter, Backspace/Delete opravuje, Tab vloží mezeru, Ctrl-D na prázdném řádku vrátí jednorázové EOF. Přetečení či poškozený vstup vrátí `EOVERFLOW`; zbytek řádku se zahodí, aby se nevykonal useknutý příkaz. `EFAULT` zachová platná data pro další čtení. TTY upravuje LF na CRLF bez zdvojení existujícího CR.
 
-### Vstup, čekání a hranice dat
+Současný shell nemá přihlášení, řízení úloh, uvozovky, syntaxi rour ani trvalé přesměrování. Úplný celek C se odemčením, přihlášením a trvalým zápisem podle plánu přijde v etapě 7. Profil má jedno vlákno na proces, osm slotů úloh na CPU, CPU-local IPC a bootovací UID/GID 1000. Bloková zařízení, účty, Linux ABI a A/B aktualizace mají vlastní další etapy. PS/2 používá US ASCII rozložení; USB HID patří do etapy ovladačů.
 
-COM1 používá dosavadní nastavení 115 200 baudů, 8N1. IRQ4 je směrované přes I/O APIC na BSP. Adresy řadičů a případné přemapování IRQ4 včetně polarity a spouštění se čtou z ACPI MADT; MMIO zůstává supervisor-only a NX. Sériové přerušení se zapne až po původních testech. Při prázdném vstupu plánovač uspí čtenáře, a pokud nemá jinou spustitelnou úlohu, vypne svůj periodický časovač. Nové znaky probudí CPU přerušením; hotový řádek vrátí čekající proces do běhu.
+## Logování
 
-Řádková vrstva přijímá ASCII, nejvýše 255 znaků před Enterem, a drží nejvýše čtyři dokončené záznamy. CR i LF odesílají řádek, CRLF se bere jako jediný Enter. Backspace a Delete opravují poslední znak, Tab vloží jednu mezeru. Ctrl-D na prázdném řádku vrátí jednorázové EOF; při rozepsaném řádku pouze zazní zvonek a text zůstane čekat na Enter. Další řídicí a ne-ASCII bajty se ignorují. Výstup TTY doplňuje CR před samotné LF a zachovává již vytvořené CRLF. Jeden `write` přijme nejvýše 256 vstupních bajtů a může vrátit dílčí počet.
-
-Příliš dlouhý řádek, plná fronta nebo chyba příjmu UART zneplatní čekající vstup a vrátí −75 (`EOVERFLOW`). Zbytek poškozeného vstupu se zahodí až po další CR/LF. Shell také zahodí případný prefix získaný dřívějším krátkým čtením, takže nemůže vykonat zkrácenou část příkazu. Při chybné cílové adrese (`EFAULT`) zůstává platný záznam zachovaný pro další čtení. Stav TTY je v přidělené zapisovatelné stránce, jejíž životnost zahrnuje všechny popisovače a čekající úlohy relace.
-
-### Odložený integrační test ve VirtualBoxu
-
-Volitelný přepínač `-Shell` nejprve provede původní bootovací kontroly a potom skutečně pošle příkazy do COM1:
-
-```powershell
-wsl -d Ubuntu-24.04 -- bash scripts/build.sh
-.\scripts\test-vbox.ps1 -Cpus 1 -Shell
-.\scripts\test-vbox.ps1 -Cpus 2 -Shell
-```
-
-Hostitel otevře TCP posluchač pouze na `127.0.0.1` a nechá VirtualBox připojit UART jako `tcpclient`. Zkouška prověří nápovědu, PID, `echo` s opravou Backspace, čtení `/stage`, chybějící soubor, neznámý příkaz a ukončení. `com1.log` zachová přijaté bajty a `com1-input.bin` skutečně odeslané bajty. Kontrola vyžaduje oddělené odpovědi příkazů, shodné PID mezi relací a ukončením, stav 0 a kernelový záznam `FRAMES=OK`; samotné echo vstupu nestačí. Běžný běh bez `-Shell` dál přijímá jen bootovací část. **Běh nového TTY a shellu ve VM zatím čeká na ověření.**
-
-## Hostitelské kontroly a CI
-
-Samostatný kompilátorový test sestaví a slinkuje skutečné jádro i všech pět uživatelských ELF a spustí dostupné hostitelské testy:
-
-```powershell
-wsl -d Ubuntu-24.04 -- bash scripts/check-build.sh
-```
-
-Vyžaduje Rust, GCC, binutils a Python 3; proměnné `RUSTC`, `CC`, `LD` a `PYTHON` mohou vybrat jiné spustitelné soubory. Sám nic nestahuje. Testy řádkové vrstvy a skutečného ovladače TTY používají náhradní portové I/O; testy shellu spouštějí jeho skutečný C kód s nahrazenými systémovými voláními. Testy kontrol logů pracují se syntetickými vstupy. Výstupy jsou v `build/check`.
-
-Workflow `Host checks` spouští tento postup na GitHubu a kontroluje také syntaxi PowerShell skriptů. Tato kontrola nebootuje OS, nevytváří podpis ani nepotvrzuje reprodukovatelnost s přesnými verzemi z `scripts/toolchain.lock`. Pro úplný obraz dál slouží `scripts/build.sh` a pro přijetí nové funkce oba běhy `-Shell`.
-
-## PS/2 Set 1: priprava dekoderu (etapa 3)
-
-Modul `kernel/keyboard.rs` obsahuje cisty `no_std` stavovy dekoder scan kodu Set 1 pro americke rozlozeni US-QWERTY. Preklada pouze MAKE udalosti na ASCII (pismena, cislice, interpunkce, Enter, Backspace, Tab, Delete a Ctrl-D). Sleduje levou a pravou klavesu Shift/Ctrl/Alt, Caps Lock, prefix E0 a sekvenci Pause E1. Nepodporovane klavesy a BREAK udalosti nevydavaji zadny znak. Po ztrate scan kodu lze resetovat prechodny stav pomoci `Keyboard::reset()`; to je povinne pred obnovou vstupu po chybe radice.
-
-**Rozsah teto zmeny:** dekoder je zarazen do kerneloveho prekladu, ale zatim **neni pripojen k portum 0x60/0x64, IRQ1 ani TTY**. V bezicim OS se nic nemeni a interaktivni vstup nadale poskytuje jen COM1. Samotny dekoder nedokazuje pritomnost ani funkcnost PS/2 zarizeni. Neobsahuje mapovani ceske klavesnice ani USB HID.
-
-Hostitelske jednotkove testy:
-```bash
-rustc --edition 2021 --test kernel/keyboard.rs -o /tmp/agentos-keyboard-tests
-/tmp/agentos-keyboard-tests
-```
-Jsou take soucasti `scripts/check-build.sh` a CI `Host checks`. Zahrnuji uvolneni klaves, Shift/Caps, rozsirene sekvence, Ctrl-D, Pause, reset stavu a omezeni vystupu na povolene ASCII.
-
-**Dalsi krok:** po potvrzeni skutecneho VM behu stavajiciho serioveho shellu implementovat 8042 prvni port s konecnymi timeouty a detekci, kontrolu scan setu/translatoru, trasu IRQ1 pres MADT/I/O APIC, omezeny odber dat a predani prelozenych znaku do `LineInput`. Pri chybe prijmu zneplatnit rozepsany radek, aby nemohl byt vykonan zkraceny prikaz. Testovat bez PS/2 i s PS/2 na 1/2 vCPU, vcetne odpojeni, vadnych scan kodu, opakovanych preruseni a navratu do serioveho rezimu. Zobrazovani TTY na framebufferu a spravce sluzeb PID 1 zustavaji otevrene.
-
-## PS/2 IRQ1 a konfigurovatelné bootovací logy (2026-11-20)
-
-Po prvním dekodéru byl doplněn experimentální ovladač prvního portu řadiče 8042 (`kernel/ps2.rs`). Inicializace s omezeným čekáním vypne první port, načte původní konfiguraci, zapne překlad Set 2 -> Set 1 a IRQ1, požádá klávesnici o Set 2 a zahájí skenování. Pokud řadič nebo klávesnice neodpoví, COM1 shell zůstane dostupný. Přerušení IRQ1 je směrováno podle ACPI MADT (včetně ISA override) přes I/O APIC na BSP, do samostatného vektoru 0xe2. Obsluha přečte maximálně 64 bajtů a předá dekódované ASCII existující řádkové vrstvě TTY; čtenář se může probudit. Při chybě parity/timeoutu nebo přetečení vstupu se dekodér resetuje a rozepsaný řádek zneplatní. Při ukončení shellu se IRQ1 maskuje a původní konfigurace řadiče se obnoví.
-
-**Omezení:** ovladač předpokládá emulovaný 8042 s prvním portem a podporou překladu; není to USB HID, nepodporuje české rozložení, více klávesnic ani pokročilou enumeraci. Neověřené hardwarové stavy a chybové odpovědi mohou vyžadovat další opravy. Zatím nebyl proveden integrační běh PS/2 ve VirtualBoxu. Výstup shellu nadále běží přes COM1, nikoli přes framebuffer. Sériová a PS/2 klávesnice zapisují do stejné kanonické vstupní fronty.
-
-### Nastavení výpisů jádra
-
-EFI loader čte soubor `EFI/BOOT/BOOT.LOG` z EFI oddílu (bez BOM; přesná malá písmena). Jediný řádek má tvar `<úroveň> [cíl]`, kde úroveň je `quiet`, `info`, `debug` a cíl je `serial`, `screen`, `both` nebo `none`. Příklady:
+EFI loader čte `EFI/BOOT/BOOT.LOG` jako jeden řádek bez BOM: `<quiet|info|debug> [serial|screen|both|none]`. Chybějící nebo neplatný soubor volí `info both`. Příklad:
 
 ```text
 debug serial
 ```
 
-```text
-info both
-```
+Testovací skript nastavuje soubor pomocí `-LogLevel` a `-LogOutput`. Strukturované `[ERROR]`, `[INFO]` a `[DEBUG]` události mají nezávislý filtr obou výstupů. Omezená interní historie se uchovává i při vypnutém výstupu; runtime logger má SMP/IRQ ochranu. Přímé akceptační markery zůstávají na COM1 bez ohledu na filtr a uživatelská TTY zůstává funkční. `none` proto neznamená úplně tichý sériový port.
 
-Chybějící nebo neplatný soubor znamená `info both`. Konfigurace je předána přes existující `BootInfo.log_level` (nižší dva bity úroveň, bit 8 COM1, bit 9 framebuffer), bez změny verze ABI handoffu. `BootLog::event` filtruje podle úrovně a nezávisle vybírá oba výstupy. Záznamy obsahují prefix `[ERROR]`, `[INFO]` nebo `[DEBUG]` a popis etapy startu. Kritické diagnostiky, historické akceptační markery a přímé výpisy subsystémů zatím **zůstávají na COM1 bez ohledu na filtr**; vypnutí serial v BOOT.LOG proto neznamená zcela tichý COM1. Bootovací výpis na framebufferu není plnohodnotná interaktivní textová konzole a nemusí zobrazit všechny znaky.
+## Ověření v CI a reprodukce důkazů
 
-Příkaz pro hostitelské kontroly:
+`Host checks` spouští skutečné Rust/C host testy, negativní testy ověřovačů, kernel/user linky a PowerShell parser. Syntetické logy ověřují validátory a nikdy se nevydávají za výstup hostovaného jádra.
 
-```bash
-bash scripts/check-build.sh
-```
+`QEMU Secure Boot smoke (supplementary)` sestaví podepsaný obraz připnutým toolchainem a bootuje OVMF/QEMU TCG s 1 i 2 CPU. Každý job provede bootový běh a samostatnou rozšířenou relaci: UART příkazy, START/STOP/RESTART, tři skutečné ukončené workery, provozní idle, QMP vstup do emulované PS/2 klávesnice, přesné GOP glyphy a čisté ukončení PID 1. Artefakty `qemu-secureboot-1cpu` a `qemu-secureboot-2cpu` uchovávají obraz, build provenance, logy, snímky a `smoke.json`.
 
-Před převzetím je nutné doložit poslední úspěšný CI běh a `test-vbox.ps1 -Cpus 1 -Shell`, `-Cpus 2 -Shell`. Pro PS/2 doplnit VM test se vstupem přes virtuální klávesnici a kontrolou obsahu shellu. Úplný centrální runtime logger (souběžnost, ring buffer, časová razítka, syscall pro čtení logů, per-subsystem masky) je samostatný nedokončený úkol; současná implementace pokrývá filtrované bootovací události.
-
-### Volba logování přímo při testu VirtualBox
-
-Testovací skript vytváří `EFI/BOOT/BOOT.LOG` automaticky. Nyní lze nastavení předat bez ruční úpravy EFI oddílu:
-
-```powershell
-.\scripts\test-vbox.ps1 -Cpus 1 -Shell -LogLevel debug -LogOutput serial
-.\scripts\test-vbox.ps1 -Cpus 2 -Shell -LogLevel info -LogOutput both
-```
-
-Parametry `-LogLevel` (`quiet`, `info`, `debug`) a `-LogOutput` (`serial`, `screen`, `both`, `none`) se předávají skriptu `scripts/disk.sh`; ten jejich kombinaci validuje a uloží na ESP. Bez parametrů je `info both`. Přímé sériové akceptační markery zůstávají pro validátor zachované.
+Přesné dokončené běhy a jejich rozsah jsou evidovány v [etapě 3 plánu](PLAN_IMPLEMENTACE.md#3-izolované-procesy-vfs-ipc-a-terminál). Po jakékoli změně kódu či testovacího scénáře je nutný nový výsledek odpovídající revize. QEMU nepřepisuje stav povinné matice VirtualBoxu.

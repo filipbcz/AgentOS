@@ -1,7 +1,10 @@
 """Negative tests of all-or-nothing stage-3 acceptance matrix completeness."""
 import importlib.util
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -43,6 +46,11 @@ class SuiteTests(unittest.TestCase):
             }
         self.summary_file = self.runs / "stage3-acceptance.json"
         self.save()
+        # Matrix fixtures isolate receipt/profile checks. The real Git gate
+        # has separate temporary-repository tests below.
+        current = mock.patch.object(suite, "verify_current_checkout")
+        self.checkout = current.start()
+        self.addCleanup(current.stop)
 
     def save(self):
         self.summary_file.write_text(json.dumps(self.summary), encoding="utf-8")
@@ -61,6 +69,7 @@ class SuiteTests(unittest.TestCase):
     def test_exact_thirteen_profiles_pass(self):
         self.assertEqual(len(suite.EXPECTED), 13)
         self.assertEqual(self.verify(), 13)
+        self.checkout.assert_called_once_with(self.root, SHA)
 
     def test_missing_run_or_duplicate_run_fails(self):
         original = self.summary["runs"].pop()
@@ -108,6 +117,76 @@ class SuiteTests(unittest.TestCase):
         self.summary["runs"][0]["vm"] = "../AgentOS-signed-aaaaaaaaaa"
         self.save()
         self.rejects()
+
+
+class CurrentCheckoutTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.git("init", "--quiet", "--template=")
+        (self.root / ".gitignore").write_text("/build/\n", encoding="utf-8")
+        self.source = self.root / "source.txt"
+        self.source.write_text("initial\n", encoding="utf-8")
+        self.git("add", ".gitignore", "source.txt")
+        self.commit()
+        self.revision = self.git("rev-parse", "HEAD")
+
+    def git(self, *arguments):
+        return subprocess.run(
+            ["git", "-C", str(self.root), *arguments], check=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout.strip()
+
+    def commit(self):
+        self.git("-c", "user.name=AgentOS Test", "-c", "user.email=test@example.invalid",
+                 "commit", "--quiet", "--no-gpg-sign", "--no-verify", "-m", "test fixture")
+
+    def test_current_clean_checkout_allows_ignored_vm_artifacts(self):
+        (self.root / "build").mkdir()
+        (self.root / "build/receipt.json").write_text("{}\n", encoding="utf-8")
+        suite.verify_current_checkout(self.root, self.revision)
+
+    def test_verifier_import_does_not_create_untracked_bytecode(self):
+        scripts = self.root / "scripts"
+        scripts.mkdir()
+        for name in ("verify-stage3-suite.py", "verify-vm-evidence.py"):
+            (scripts / name).write_bytes(Path(__file__).with_name(name).read_bytes())
+        self.git("add", "scripts")
+        self.commit()
+        revision = self.git("rev-parse", "HEAD")
+        environment = dict(os.environ)
+        environment.pop("PYTHONDONTWRITEBYTECODE", None)
+        subprocess.run([sys.executable, str(scripts / "verify-stage3-suite.py"), "--help"],
+                       check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment)
+        suite.verify_current_checkout(self.root, revision)
+
+    def test_previous_commit_is_not_current_acceptance(self):
+        self.source.write_text("next revision\n", encoding="utf-8")
+        self.git("add", "source.txt")
+        self.commit()
+        with self.assertRaisesRegex(suite.receipt.EvidenceError, "current Git HEAD"):
+            suite.verify_current_checkout(self.root, self.revision)
+
+    def test_tracked_staged_and_untracked_source_changes_fail(self):
+        self.source.write_text("uncommitted\n", encoding="utf-8")
+        for staged in (False, True):
+            if staged:
+                self.git("add", "source.txt")
+            with self.subTest(staged=staged), self.assertRaisesRegex(
+                    suite.receipt.EvidenceError, "modified/untracked"):
+                suite.verify_current_checkout(self.root, self.revision)
+        self.git("reset", "--hard", "HEAD")
+        (self.root / "new-source.txt").write_text("untracked\n", encoding="utf-8")
+        with self.assertRaisesRegex(suite.receipt.EvidenceError, "modified/untracked"):
+            suite.verify_current_checkout(self.root, self.revision)
+
+    def test_missing_git_and_nonrepository_fail_clearly(self):
+        with mock.patch.object(suite.subprocess, "run", side_effect=FileNotFoundError):
+            with self.assertRaisesRegex(suite.receipt.EvidenceError, "Git must be available"):
+                suite.verify_current_checkout(self.root, self.revision)
+        with tempfile.TemporaryDirectory() as other:
+            with self.assertRaisesRegex(suite.receipt.EvidenceError, "repository with a committed HEAD"):
+                suite.verify_current_checkout(Path(other), self.revision)
 
 
 if __name__ == "__main__":

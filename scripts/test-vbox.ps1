@@ -271,6 +271,12 @@ try {
                 }
             }
             Wait-Serial $serial $sessionPlan.stop_pattern 0 15
+            if ($LogLevel -in @('info','debug') -and $LogOutput -in @('serial','both')) {
+                # This structured write follows the native stop record.
+                # Drain it completely before hashing or powering off; a TCP
+                # read can otherwise end halfway through the final line.
+                Wait-Serial $serial '\[INFO\] INTERACTIVE SHELL STOPPED\r\n$' 0 15
+            }
             $verifyArgs=@('--log',"$dir\com1.log",'--input',"$dir\com1-input.bin")
             if ($Keyboard) { $verifyArgs+='--keyboard' }
             & python "$PSScriptRoot/verify-stage3-session.py" @verifyArgs

@@ -21,6 +21,9 @@ import time
 import threading
 
 
+# Loading sibling evidence modules must not leave untracked bytecode in the
+# source checkout; a later VirtualBox acceptance requires a clean tree.
+sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parent.parent
 
 
