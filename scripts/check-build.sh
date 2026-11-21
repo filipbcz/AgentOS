@@ -111,7 +111,7 @@ printf 'Compiling and linking the kernel with %s and %s\n' "$pRustc" "$pCc"
 "$pPython" "$pRoot/scripts/verify-kernel-layout.py" "$pOut/kernel.elf"
 "$pPython" "$pRoot/scripts/verify-trap-return.py" "$pOut/kernel.elf"
 
-for pApp in init fault receiver service shell svc_ok svc_fail svc_hang orphan_parent; do
+for pApp in init fault receiver service shell svc_ok svc_fail svc_hang orphan_parent manager svc_alive svc_flaky; do
     printf 'Compiling and linking user program %s\n' "$pApp"
     "$pCc" -c "$pRoot/user/$pApp.S" -o "$pOut/$pApp-entry.o"
     pObjects=("$pOut/$pApp-entry.o")
