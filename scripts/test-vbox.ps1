@@ -84,6 +84,32 @@ function Send-Keyboard([string]$Command,[string]$Correction='') {
     VBox controlvm $vm keyboardputscancode 5a f0 5a
 }
 
+# Boot marker drawing is mandatory even when BOOT.LOG disables the screen
+# sink. In that case the firmware background is intentionally preserved, so
+# test white glyph pixels without assuming a black surrounding framebuffer.
+function Verify-RawBootMarker([string]$Path) {
+    Add-Type -AssemblyName System.Drawing
+    $bitmap=[Drawing.Bitmap]::new((Resolve-Path $Path).Path)
+    try {
+        $scale=[Math]::Max(1,[Math]::Min(4,[Math]::Floor(($bitmap.Width-16)/150)))
+        if ($bitmap.Width -lt 16+12*$scale -or $bitmap.Height -lt 16+7*$scale) {
+            throw "Framebuffer too small for the raw boot glyphs: $Path"
+        }
+        $letters=@('14,17,17,31,17,17,17','14,17,16,23,17,17,14')
+        for ($letter=0;$letter -lt 2;$letter++) {
+            $rows=$letters[$letter].Split(',')
+            for ($y=0;$y -lt 7;$y++) {
+                for ($x=0;$x -lt 5;$x++) {
+                    if (([int]$rows[$y] -band (16 -shr $x)) -eq 0) { continue }
+                    $pixel=$bitmap.GetPixel(8+($letter*6+$x)*$scale,16+$y*$scale)
+                    if ($pixel.R -lt 200 -or $pixel.G -lt 200 -or $pixel.B -lt 200) {
+                        throw "Raw boot glyph pixel missing at ($letter,$x,$y): $Path"
+                    }
+                }
+            }
+        }
+    } finally { $bitmap.Dispose() }
+}
 # The first structured BOOT.LOG event starts with '[' at (8,52) when
 # framebuffer output is enabled at severity info/debug. Verify its actual
 # 5x7 raster, not just that a screenshot file was created.
@@ -309,7 +335,11 @@ try {
         }
         # The stage-1 boot logo is overwritten when GOP is handed to TTY.
         if (!$Shell) {
-            & "$PSScriptRoot/verify-display.ps1" "$dir\display.png"
+            if ($LogOutput -in @('screen','both')) {
+                & "$PSScriptRoot/verify-display.ps1" "$dir\display.png"
+            } else {
+                Verify-RawBootMarker "$dir\display.png"
+            }
             if ($LogLevel -in @('info','debug') -and $LogOutput -in @('screen','both')) {
                 Verify-StructuredBootScreen "$dir\display.png"
             }
