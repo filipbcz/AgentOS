@@ -464,3 +464,4 @@ try {
     }
 }
 Write-Output "Verified $Case ($Cpus vCPUs): $dir"
+Write-Output "VM_ACCEPTANCE_JSON=$dir\acceptance.json"
