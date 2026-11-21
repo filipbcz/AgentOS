@@ -32,20 +32,24 @@ python3 "$root/scripts/verify-trap-return.py" kernel.elf
 # Preserve the exact linked ELF for symbolization of a real guest fault.
 cp kernel.elf "$out/kernel.elf"
 printf 'AgentOS stage 1\n' > stage
-for app in init fault receiver service shell svc_ok svc_fail svc_hang orphan_parent; do
-    gcc-13 -c "$root/user/$app.S" -o user.o
+for app in init fault receiver service shell svc_ok svc_fail svc_hang orphan_parent manager svc_alive svc_flaky; do
+    entry="$app"
+    if [[ "$app" == svc_alive || "$app" == svc_flaky ]]; then entry=svc_worker; fi
+    gcc-13 -c "$root/user/$entry.S" -o user.o
     objects=(user.o)
-    case "$app" in init) sources=(transfer client supervisor orphans forktest);; receiver) sources=(receive);; service) sources=(service);; shell) sources=(shell);; *) sources=();; esac
+    case "$app" in init) sources=(transfer client supervisor orphans forktest);; receiver) sources=(receive);; service) sources=(service);; shell) sources=(shell service_client);; manager) sources=(service_manager);; svc_alive|svc_flaky) sources=(svc_worker);; *) sources=();; esac
     for src in "${sources[@]}"; do
+        defines=()
+        if [[ "$app" == svc_flaky ]]; then defines=(-DAGENTOS_FLAKY); fi
         gcc-13 -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
-            -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large -c "$root/user/$src.c" -o "$src.o"
+            -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large "${defines[@]}" -c "$root/user/$src.c" -o "$src.o"
         objects+=("$src.o")
     done
     ld --build-id=none -z noexecstack -s -T "$root/user/user.ld" -o "$app" "${objects[@]}"
 done
 awk 'BEGIN {for (i=0;i<8193;i++) printf "%c",(i*73+int(i/251)*19)%256}' > data/transfer.bin
-touch -d @0 stage init fault receiver service shell svc_ok svc_fail svc_hang orphan_parent data/transfer.bin data
-printf '%s\n' stage init fault receiver service shell svc_ok svc_fail svc_hang orphan_parent data data/transfer.bin | cpio --quiet --reproducible --owner=0:0 -o -H newc > initramfs.cpio
+touch -d @0 stage init fault receiver service shell svc_ok svc_fail svc_hang orphan_parent manager svc_alive svc_flaky data/transfer.bin data
+printf '%s\n' stage init fault receiver service shell svc_ok svc_fail svc_hang orphan_parent manager svc_alive svc_flaky data data/transfer.bin | cpio --quiet --reproducible --owner=0:0 -o -H newc > initramfs.cpio
 gcc-13 -I/usr/include/efi -I/usr/include/efi/x86_64 -DGNU_EFI_USE_MS_ABI \
     -O2 -Wall -Wextra -Werror -fpic -ffreestanding -fno-stack-protector -fshort-wchar \
     -mno-red-zone -c "$root/boot/loader.c" -o loader.o
