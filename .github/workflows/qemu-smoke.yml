@@ -59,5 +59,6 @@ jobs:
             build/check/qemu-cpu${{ matrix.cpus }}/com1.log
             build/check/qemu-cpu${{ matrix.cpus }}/qemu-stderr.log
             build/check/qemu-cpu${{ matrix.cpus }}/smoke.json
+            build/check/qemu-cpu${{ matrix.cpus }}/failure.json
             build/check/qemu-cpu${{ matrix.cpus }}/failed-screen.ppm
             build/check/qemu-cpu${{ matrix.cpus }}/shell-screen.ppm
