@@ -57,6 +57,6 @@ struct svc_received_response {
 };
 _Static_assert(sizeof(struct svc_request)==12,"versioned service request");
 _Static_assert(sizeof(struct svc_response)==16,"versioned service response");
-_Static_assert(sizeof(struct svc_received_request)==28,"IPC peer+request");
+_Static_assert(sizeof(struct svc_received_request)==32,"IPC peer+request padded to 8 bytes");
 _Static_assert(sizeof(struct svc_received_response)==32,"IPC peer+response");
 #endif
