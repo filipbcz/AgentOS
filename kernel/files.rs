@@ -131,7 +131,7 @@ impl Descriptors {
         };
         let frame = frames.alloc_zeroed().ok_or(-12isize)?;
         let pair = (r as u64 | ((w as u64) << 32)).to_le_bytes();
-        if space.write(output, &pair).is_none() { frames.release(frame); return Err(EFAULT); }
+        if space.write(frames, output, &pair).is_none() { frames.release(frame); return Err(EFAULT); }
         let address = frame.into_address();
         let (first, second) = if socket {
             let p = address as *mut Channel;
@@ -147,28 +147,28 @@ impl Descriptors {
         Ok(0)
     }
 
-    pub fn message(&self, op: Operation, process: &crate::process::Process, fd: usize,
+    pub fn message(&self, frames: &mut Frames<'_>, op: Operation, process: &crate::process::Process, fd: usize,
                    address: usize, len: usize) -> Result<Io, isize> {
         let Handle::Socket(p, side) = self.handle(fd)? else { return Err(-88); };
         let channel = unsafe { &mut *p };
         let result = match op {
             Operation::Send => channel.send(side, process.pid, process.credentials, &process.space, address, len),
-            Operation::Receive => channel.receive(side, &process.space, address, len),
+            Operation::Receive => channel.receive(frames, side, &process.space, address, len),
         }?;
         Ok(result.map_or(Io::Sleep(Wait::Socket(p, side, op)), Io::Bytes))
     }
 
-    pub fn read(&self, space: &UserSpace, fd: usize, va: usize, len: usize) -> Result<Io, isize> {
+    pub fn read(&self, frames: &mut Frames<'_>, space: &UserSpace, fd: usize, va: usize, len: usize) -> Result<Io, isize> {
         let end = self.handle(fd)?;
         match end {
             Handle::TerminalInput(p) => {
-                let n = unsafe { (*p).read(len, |bytes| space.write(va, bytes).ok_or(EFAULT))? };
+                let n = unsafe { (*p).read(len, |bytes| space.write(frames, va, bytes).ok_or(EFAULT))? };
                 Ok(n.map_or(Io::Sleep(Wait::Terminal(p)), Io::Bytes))
             }
             Handle::File(p) => {
                 let file = unsafe { &mut *p };
                 let n = len.min(file.data.len() - file.offset);
-                space.write(va, &file.data[file.offset..file.offset+n]).ok_or(EFAULT)?;
+                space.write(frames, va, &file.data[file.offset..file.offset+n]).ok_or(EFAULT)?;
                 file.offset += n;
                 Ok(Io::Bytes(n))
             }
@@ -177,10 +177,10 @@ impl Descriptors {
                 if len == 0 { return Ok(Io::Bytes(0)); }
                 if pipe.used == 0 && pipe.writers != 0 { return Ok(Io::Sleep(Wait::Pipe { end: PipeWait(end), need: 1 })); }
                 let n = len.min(pipe.used);
-                space.writable(va, n).ok_or(EFAULT)?;
+                space.writable(frames, va, n).ok_or(EFAULT)?;
                 let first = n.min(PIPE_SIZE - pipe.head);
-                space.write(va, &pipe.buf[pipe.head..pipe.head+first]).ok_or(EFAULT)?;
-                space.write(va+first, &pipe.buf[..n-first]).ok_or(EFAULT)?;
+                space.write(frames, va, &pipe.buf[pipe.head..pipe.head+first]).ok_or(EFAULT)?;
+                space.write(frames, va+first, &pipe.buf[..n-first]).ok_or(EFAULT)?;
                 pipe.head = (pipe.head+n) % PIPE_SIZE;
                 pipe.used -= n;
                 Ok(Io::Bytes(n))
