@@ -313,7 +313,11 @@ try {
         Write-Warning "VM power-off after a failed run also failed: $_"
     }
 }
+} catch {
+    $runError=$_.Exception.Message
+    throw
 } finally {
+    # Close and flush all captured COM1 bytes before measuring hashes.
     try {
         if ($null -ne $serial) {
             foreach ($handle in @($serial.Stream,$serial.Client,$serial.Log,$serial.Input)) {
@@ -323,5 +327,60 @@ try {
             }
             if ($null -ne $serial.Listener) { $serial.Listener.Stop() }
         }
-    } finally { $lock.Dispose() }
+    } finally {
+        try {
+            $artifactHashes=@{}
+            foreach ($name in @('esp.raw','esp.vdi','changed.efi','com1.log',
+                                'com1-input.bin','display.png','shell-before.png',
+                                'shell-keyboard.png')) {
+                $file=Join-Path $dir $name
+                if (Test-Path -LiteralPath $file -PathType Leaf) {
+                    $artifactHashes[$name]=(Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+                }
+            }
+            $elapsed=if ($null -ne $timer) { [math]::Round($timer.Elapsed.TotalSeconds,3) } else { 0.0 }
+            $receipt=[ordered]@{
+                schema=1
+                result=if ($runSucceeded -and $shutdownSucceeded) { 'pass' } else { 'fail' }
+                source_commit=$sourceCommit
+                build_provenance_sha256=$buildReceiptHash
+                harness_sha256=$harnessHash
+                virtualbox_version=$vboxVersion
+                vm=$vm
+                case=$Case
+                cpus=$Cpus
+                shell=[bool]$Shell
+                keyboard=[bool]$Keyboard
+                boot_log_level=$LogLevel
+                boot_log_output=$LogOutput
+                host_elapsed_seconds=$elapsed
+                boot_image_sha256=$bootImageHash
+                failure_message=$runError
+                artifacts=$artifactHashes
+            }
+            $receiptFile=Join-Path $dir 'acceptance.json'
+            $tempReceipt="$receiptFile.tmp"
+            $json=$receipt | ConvertTo-Json -Depth 6
+            [IO.File]::WriteAllText($tempReceipt,$json+[Environment]::NewLine,[Text.UTF8Encoding]::new($false))
+            Move-Item -LiteralPath $tempReceipt -Destination $receiptFile -Force
+            if ($receipt.result -eq 'pass') {
+                # Validate the completed receipt before reporting success.
+                & python "$PSScriptRoot/verify-vm-evidence.py" --root $root --run-dir $dir
+                if ($LASTEXITCODE -ne 0) {
+                    $receipt.result='fail'
+                    $receipt.failure_message='VM evidence receipt failed independent validation'
+                    [IO.File]::WriteAllText($tempReceipt,($receipt | ConvertTo-Json -Depth 6)+[Environment]::NewLine,
+                                            [Text.UTF8Encoding]::new($false))
+                    Move-Item -LiteralPath $tempReceipt -Destination $receiptFile -Force
+                    throw 'VM evidence validation failed; acceptance was not recorded'
+                }
+            }
+        } catch {
+            if ($runSucceeded) { throw }
+            Write-Warning "Unable to write failure evidence receipt: $_"
+        } finally {
+            $lock.Dispose()
+        }
+    }
 }
+Write-Output "Verified $Case ($Cpus vCPUs): $dir"
