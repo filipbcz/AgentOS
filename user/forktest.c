@@ -7,6 +7,8 @@
 static volatile unsigned long private_value = 0x19f6b5a40d73c258UL;
 static unsigned char shared_buffer[64];
 static const char data_file[] = "/data/transfer.bin";
+_Static_assert((0x07ad52c1b843e06fUL ^ 0x22ac19f0807d43beUL) ==
+               0x25014b31383ea3d1UL, "COW stack XOR vector");
 
 static int phase(const char *event, unsigned long root, unsigned long child) {
     char line[]="AGENTOS COW BEGIN ROOT=0000000000000000 CHILD=0000000000000000\r\n";
