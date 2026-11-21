@@ -312,3 +312,117 @@ impl Queue {
         self.count = 0;
     }
 }
+
+#[cfg(test)]
+mod timed_tests {
+    use super::*;
+
+    fn task(pid: usize, parent: usize) -> Task {
+        Task {
+            stack: unsafe { Frame::from_owned_address(0) }, context: pid * 4096,
+            runnable: true, waiting: None, timed: None,
+            clock_stall_ticks: 0, last_clock_ms: 0, clock_error: false,
+            preemptions: 0,
+            process: Some(Process {
+                pid, parent, status: None,
+                credentials: crate::process::Credentials::BOOT_USER,
+                entry: 0, space: crate::paging::UserSpace::test_dummy(),
+                files: crate::files::Descriptors::test_dummy(),
+            }),
+        }
+    }
+
+    fn queue() -> Queue {
+        let mut q = Queue::new();
+        q.tasks[0] = Some(task(1, 0));
+        q.tasks[1] = Some(task(2, 1));
+        q.count = 2;
+        q.active = true;
+        q.current = Some(0);
+        q
+    }
+
+    #[test]
+    fn timerKeepsAllBlockedParentRunnableAfterDeadline() {
+        let mut q = queue();
+        q.tasks[1].as_mut().unwrap().runnable = false;
+        q.block_sleep(125, 100);
+        assert_eq!(q.select(10, false), 10); // back to kernel HLT caller
+        assert!(q.active && q.has_timed_waiters() && !q.running());
+        q.wake_timed(124, true);
+        assert!(q.has_timed_waiters());
+        q.wake_timed(125, true);
+        assert!(!q.has_timed_waiters());
+        assert_eq!(q.select(11, true), 4096); // restarted parent's syscall
+        assert!(!q.take_clock_error());
+    }
+
+    #[test]
+    fn childExitWakesParentBeforeDeadlineWithoutPolling() {
+        let mut q = queue();
+        q.block_child(2, 900, 100);
+        assert_eq!(q.select(99, false), 8192); // child runs
+        assert!(q.has_timed_waiters());
+        // User-mode child exits; queue notifies parent while holding IF=0.
+        let mut frames = crate::frames::Frames::test_dummy();
+        q.terminate(42, &mut frames);
+        assert!(!q.has_timed_waiters());
+        assert!(q.tasks[0].as_ref().unwrap().runnable);
+        assert_eq!(q.select(0, false), 4096);
+        assert!(!q.take_clock_error());
+    }
+
+    #[test]
+    fn elapsedTimeIsNotConfusedWithStalledClock() {
+        let mut q = queue();
+        q.tasks[1].as_mut().unwrap().runnable = false;
+        q.block_sleep(20_000, 0);
+        q.select(1, false);
+        for tick in 1..=CLOCK_STALL_TICKS as u64 * 2 {
+            q.wake_timed(tick, true);
+        }
+        assert!(q.has_timed_waiters());
+        assert!(!q.tasks[0].as_ref().unwrap().clock_error);
+    }
+
+    #[test]
+    fn permanentlyFrozenClockEventuallyReturnsErrorNotTimeout() {
+        let mut q = queue();
+        q.tasks[1].as_mut().unwrap().runnable = false;
+        q.block_sleep(10_000, 100);
+        q.select(1, false);
+        for _ in 0..CLOCK_STALL_TICKS-1 { q.wake_timed(100, true); }
+        assert!(q.has_timed_waiters());
+        q.wake_timed(100, true);
+        assert!(!q.has_timed_waiters());
+        assert_eq!(q.select(1, true), 4096);
+        assert!(q.take_clock_error());
+        assert!(!q.take_clock_error()); // consumed exactly once
+    }
+
+    #[test]
+    fn childWaitAlsoWakesAtDeadlineWithoutCollecting() {
+        let mut q = queue();
+        q.block_child(2, 200, 100);
+        q.select(99, false);
+        q.wake_timed(200, true);
+        assert!(!q.has_timed_waiters());
+        assert!(q.tasks[1].as_ref().unwrap().process.as_ref().unwrap().status.is_none());
+        assert!(q.tasks[0].as_ref().unwrap().runnable);
+    }
+
+    #[test]
+    fn killChildRejectsUnownedTargetAndWakesParentWait() {
+        let mut q = queue();
+        let mut frames = crate::frames::Frames::test_dummy();
+        assert_eq!(q.kill_child(&mut frames, 3, 2), Err(-1));
+        assert_eq!(q.kill_child(&mut frames, 1, 1), Err(-22));
+        assert_eq!(q.kill_child(&mut frames, 1, 999), Err(-3));
+        q.block_child(2, 700, 100);
+        assert_eq!(q.select(99, false), 8192);
+        assert_eq!(q.kill_child(&mut frames, 1, 2), Ok(0));
+        assert!(q.tasks[0].as_ref().unwrap().runnable);
+        assert_eq!(q.kill_child(&mut frames, 1, 2), Ok(1));
+        assert_eq!(q.tasks[1].as_ref().unwrap().process.as_ref().unwrap().status, Some(137));
+    }
+}
