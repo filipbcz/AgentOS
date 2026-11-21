@@ -124,6 +124,7 @@ struct Cpu {
     expected_id: u8,
     interval: u32,
     tsc_hz: u64,
+    clock: crate::monotonic::Clock,
     interrupts: AtomicU32,
     hlt_wakes: AtomicU32,
     complete: AtomicU32,
@@ -149,6 +150,7 @@ impl Cpu {
         let cpu = addr as *mut Self;
         cpu.write(Self { self_address: addr, syscall_user_rsp: UnsafeCell::new(0), syscall_stack: UnsafeCell::new(0),
                          rsp0, programs, apic, expected_id: id, interval, tsc_hz,
+                         clock: crate::monotonic::Clock::new(tsc_hz),
                          interrupts: AtomicU32::new(0), hlt_wakes: AtomicU32::new(0),
                          complete: AtomicU32::new(0), phase: AtomicU32::new(0), terminal: UnsafeCell::new(ptr::null_mut()),
                          idle: UnsafeCell::new(IdleSample::default()), descriptors, load, queue: UnsafeCell::new(Queue::new()),
@@ -162,6 +164,7 @@ impl Cpu {
     unsafe fn run_task(&self) -> Result<(), Error> {
         let id = self.apic.id();
         if id != self.expected_id { return Err(b"wrong executing APIC ID"); }
+        if !self.clock.start(timestamp()) { return Err(b"monotonic clock initialization"); }
         asm!("wrmsr", in("ecx") 0xc0000101u32, in("eax") self.self_address as u32,
              in("edx") (self.self_address >> 32) as u32);
         self.apic.write(0x320, TIMER);    // one-shot, unmasked
@@ -407,6 +410,8 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
     let [a, b, c] = [ctx.registers[10], ctx.registers[11], ctx.registers[12]]; // RDI, RSI, RDX
     let result: isize = match ctx.registers[14] {
         0x10001 => pid as isize,
+        // Current CPU-local monotonic millisecond epoch; never compare across CPUs.
+        0x10010 => cpu.clock.millis(timestamp()).map(|v| v as isize).unwrap_or(-5),
         op @ (0x10002 | 0x10008 | 0x1000d | 0x1000e) => {
             let io = match op {
                 0x10002 => p.files.write(&p.space, a, b, c),
