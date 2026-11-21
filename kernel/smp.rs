@@ -492,6 +492,11 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
                        .map(|v| v as isize).unwrap_or_else(|e| e) }
         }
         0x10005 => cpu.load.frames.with(|f| q.collect(f, pid, a)).map(|v| v as isize).unwrap_or_else(|e| e),
+        // Child enumeration is owner-scoped, never global. The zero cursor
+        // returns the oldest living or zombie direct child (including
+        // grandchildren adopted when their intermediate parent exited).
+        0x10013 => if a > isize::MAX as usize { -22 }
+            else { q.child_after(pid, a).map(|v| v as isize).unwrap_or_else(|e| e) },
         0x1000f => {
             let result = cpu.load.frames.with(|f| q.kill_child(f, pid, a));
             if matches!(result, Ok(0)) {
