@@ -25,6 +25,7 @@ rust_version=$(/usr/bin/rustc --version)
     --remap-path-prefix="$root"=/agentos "$root/kernel/main.rs" -o libkernel.a
 gcc-13 -c -o ap-start.o "$root/kernel/ap-start.S"
 ld --build-id=none --gc-sections -T "$root/kernel/kernel.ld" -o kernel.elf libkernel.a ap-start.o
+python3 "$root/scripts/verify-kernel-layout.py" kernel.elf
 printf 'AgentOS stage 1\n' > stage
 for app in init fault receiver service shell svc_ok svc_fail svc_hang; do
     gcc-13 -c "$root/user/$app.S" -o user.o
