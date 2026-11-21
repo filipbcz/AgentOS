@@ -28,6 +28,8 @@ rust_version=$(/usr/bin/rustc --version)
 gcc-13 -c -o ap-start.o "$root/kernel/ap-start.S"
 ld --build-id=none --gc-sections -T "$root/kernel/kernel.ld" -o kernel.elf libkernel.a ap-start.o
 python3 "$root/scripts/verify-kernel-layout.py" kernel.elf
+# Preserve the exact linked ELF for symbolization of a real guest fault.
+cp kernel.elf "$out/kernel.elf"
 printf 'AgentOS stage 1\n' > stage
 for app in init fault receiver service shell svc_ok svc_fail svc_hang orphan_parent; do
     gcc-13 -c "$root/user/$app.S" -o user.o
