@@ -109,6 +109,7 @@ printf 'Compiling and linking the kernel with %s and %s\n' "$pRustc" "$pCc"
 "$pLd" --no-undefined --build-id=none --gc-sections -T "$pRoot/kernel/kernel.ld" \
     -o "$pOut/kernel.elf" "$pOut/libkernel.a" "$pOut/ap-start.o"
 "$pPython" "$pRoot/scripts/verify-kernel-layout.py" "$pOut/kernel.elf"
+"$pPython" "$pRoot/scripts/verify-trap-return.py" "$pOut/kernel.elf"
 
 for pApp in init fault receiver service shell svc_ok svc_fail svc_hang orphan_parent; do
     printf 'Compiling and linking user program %s\n' "$pApp"
