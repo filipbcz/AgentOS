@@ -103,6 +103,15 @@ static long mock_call(long op,long a,long b,long c) {
     abort();
 }
 
+static void append_duration(char *out,size_t capacity,
+                            unsigned child,unsigned duration_ms) {
+    size_t n=strlen(out);
+    int written=snprintf(out+n,capacity-n,
+        "AGENTOS SERVICE DURATION PARENT=%016x CHILD=%016x MS=%016x\r\n",
+        1u,child,duration_ms);
+    assert(written>0 && (size_t)written<capacity-n);
+}
+
 static void append_phase(char *out,size_t capacity,const char *kind) {
     size_t n=strlen(out);
     int written=snprintf(out+n,capacity-n,
@@ -133,6 +142,7 @@ static void success_case(void) {
     append_expected(expected,sizeof(expected),"REAP",103,42,2);
     append_expected(expected,sizeof(expected),"REAP",104,42,3);
     append_expected(expected,sizeof(expected),"STOP",104,42,3);
+    append_duration(expected,sizeof(expected),105,SERVICE_TIMEOUT_MS);
     append_expected(expected,sizeof(expected),"TIME",105,137,1);
     append_expected(expected,sizeof(expected),"STOP",105,137,1);
     append_phase(expected,sizeof(expected),"ENDED");
@@ -160,6 +170,7 @@ int main(void) {
            yields==25 && !live_child);
     assert(strstr(log_text,"SERVICE DONE")!=NULL);
     assert(strstr(log_text,"SERVICE TIME")==NULL);
+    assert(strstr(log_text,"SERVICE DURATION")==NULL);
     reset();clock_error_at=1;
     assert(run_supervisor()==62 && spawns==1 && collected==1 && kills==1 && !live_child);
     reset();clock_frozen=1;
@@ -171,9 +182,11 @@ int main(void) {
     assert(run_supervisor()==64 && spawns==5 && collected==5 && kills==1 &&
            yields==6+MAX_CLOCK_POLLS && !live_child);
     assert(strstr(log_text,"SERVICE TIME")==NULL);
+    assert(strstr(log_text,"SERVICE DURATION")==NULL);
     reset();clock_failure_after_spawn=5;
     assert(run_supervisor()==64 && spawns==5 && collected==5 && kills==1 && !live_child);
     assert(strstr(log_text,"SERVICE TIME")==NULL);
+    assert(strstr(log_text,"SERVICE DURATION")==NULL);
     puts("Supervisor host acceptance: success, restart cap, stalled child kill, "
          "spawn/write/yield/wait failures passed");
     return 0;
