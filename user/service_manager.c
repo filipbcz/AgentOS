@@ -26,7 +26,7 @@ static struct record registry[SVC_COUNT] = {
     { "shell", "shell", 5, 5, SVC_CORE, 1, SVC_DOWN, 0, MAX_ATTEMPTS, 0, 0, -1, 0, 0, 0 }
 };
 static long owner_pid;
-static int shell_active, shutdown_requested, fatal_error;
+static int shell_active, shutdown_requested, fatal_error, online_announced;
 
 static unsigned text_length(const char *text) {
     unsigned n=0;
@@ -270,7 +270,15 @@ static int advance_registry(long now) {
                    (service->state==SVC_DOWN ||
                     (service->state==SVC_BACKOFF && now>=service->retry_at)) &&
                    has_dependency(id) &&
-                   (id!=SVC_SHELL || registry[SVC_FLAKY].ready_once)) {
+                   (id!=SVC_SHELL || registry[SVC_FLAKY].state==SVC_FAILED)) {
+            // The optional unstable service gets three real attempts during
+            // boot probation. Once exhausted, the shell remains available
+            // for diagnosis and manual restart; no background crash can
+            // corrupt its initial prompt/transcript. Manager keeps running.
+            if (id==SVC_SHELL && !online_announced) {
+                if (!manager_phase("ONLIN")) return -1;
+                online_announced=1;
+            }
             if (start_entry(id,now)<0) return -1;
         }
     }
