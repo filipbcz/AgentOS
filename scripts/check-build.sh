@@ -95,6 +95,11 @@ printf 'Testing persistent service registry, authenticated readiness, capped res
     "$pRoot/scripts/tests/service-manager-host.c" -o "$pOut/service-manager-tests"
 "$pOut/service-manager-tests"
 
+printf 'Testing actual managed service worker timer readiness, IPC handshake and failure isolation with %s\\n' "$pCc"
+"$pCc" -std=c11 -O2 -Wall -Wextra -Werror -fno-stack-protector \\
+    "$pRoot/scripts/tests/service-worker-host.c" -o "$pOut/service-worker-tests"
+"$pOut/service-worker-tests"
+
 printf 'Testing actual CPU-local orphan program and failure injection with %s\n' "$pCc"
 "$pCc" -std=c11 -O2 -Wall -Wextra -Werror -fno-stack-protector \
     "$pRoot/scripts/tests/orphans-host.c" -o "$pOut/orphans-tests"
