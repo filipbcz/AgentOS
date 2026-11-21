@@ -111,7 +111,7 @@ for pApp in init fault receiver service shell svc_ok svc_fail svc_hang orphan_pa
     "$pCc" -c "$pRoot/user/$pApp.S" -o "$pOut/$pApp-entry.o"
     pObjects=("$pOut/$pApp-entry.o")
     case "$pApp" in
-        init) pSources=(transfer client supervisor orphans);;
+        init) pSources=(transfer client supervisor orphans forktest);;
         receiver) pSources=(receive);;
         service) pSources=(service);;
         shell) pSources=(shell);;
