@@ -25,11 +25,30 @@ struct Task {
     context: usize,
     runnable: bool,
     waiting: Option<crate::files::Wait>,
+    timed: Option<TimedWait>,
+    clock_stall_ticks: u16,
+    clock_error: bool,
     preemptions: usize,
     process: Option<Process>,
 }
 
 const CAPACITY: usize = 8;
+/// 512 periodic APIC ticks (~5 seconds at the measured 10ms quantum):
+/// detect a stalled TSC without pretending monotonic time has elapsed.
+/// The timeout is in APIC ticks, not guaranteed wall clock time.
+const CLOCK_STALL_TICKS: u16 = 512;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimedWait {
+    Sleep(u64),
+    Child { pid: usize, deadline: u64 },
+}
+impl TimedWait {
+    fn deadline(self) -> u64 {
+        match self { Self::Sleep(ms) | Self::Child { deadline: ms, .. } => ms }
+    }
+}
+
 pub struct Queue {
     tasks: [Option<Task>; CAPACITY],
     count: usize,
@@ -60,7 +79,8 @@ impl Queue {
             (*context).ss = 16;
             ((top - 8) as *mut usize).write(task_return as usize);
         }
-        self.tasks[self.count] = Some(Task { stack, context: context as usize, runnable: true, waiting: None, preemptions: 0, process: None });
+        self.tasks[self.count] = Some(Task { stack, context: context as usize, runnable: true, waiting: None, timed: None, clock_stall_ticks: 0,
+                                          clock_error: false, preemptions: 0, process: None });
         self.count += 1;
         Some(())
     }
@@ -84,8 +104,8 @@ impl Queue {
         (*context).rsp = STACK;
         (*context).ss = 0x2b;
         let pid = process.pid;
-        self.tasks[slot] = Some(Task { stack, context: context as usize, runnable: true, waiting: None, preemptions: 0,
-                                      process: Some(process) });
+        self.tasks[slot] = Some(Task { stack, context: context as usize, runnable: true, waiting: None, timed: None, clock_stall_ticks: 0,
+                                      clock_error: false, preemptions: 0, process: Some(process) });
         self.count = self.count.max(slot+1);
         Ok(pid)
     }
@@ -106,6 +126,75 @@ impl Queue {
         t.waiting = Some(wait);
     }
 
+    /// Called exclusively by the owner CPU with interrupts disabled. The
+    /// original syscall is restarted on wake, and checks its own deadline.
+    pub fn block_sleep(&mut self, deadline: u64) {
+        self.block_timed(TimedWait::Sleep(deadline));
+    }
+
+    pub fn block_child(&mut self, pid: usize, deadline: u64) {
+        self.block_timed(TimedWait::Child { pid, deadline });
+    }
+
+    fn block_timed(&mut self, wait: TimedWait) {
+        let task = self.tasks[self.current.unwrap()].as_mut().unwrap();
+        task.runnable = false;
+        task.waiting = None;
+        task.timed = Some(wait);
+        task.clock_stall_ticks = 0;
+        task.clock_error = false;
+    }
+
+    /// A timed syscall that resumed due to an unresponsive clock reports -5.
+    /// Read before retrying a deadline; the failure is consumed only once.
+    pub fn take_clock_error(&mut self) -> bool {
+        let task = self.tasks[self.current.unwrap()].as_mut().unwrap();
+        let error = task.clock_error;
+        task.clock_error = false;
+        error
+    }
+
+    /// Only periodic timer IRQs consume the stall budget. IRQs that arrive
+    /// for keyboard, I/O or process exit do not fake progress of the clock.
+    pub fn wake_timed(&mut self, now: u64, timer_irq: bool) {
+        for i in 0..self.count {
+            let Some(wait) = self.tasks[i].as_ref().and_then(|t| t.timed) else { continue; };
+            let child_finished = match wait {
+                TimedWait::Child { pid, .. } =>
+                    !self.tasks.iter().flatten().any(|t|
+                        t.process.as_ref().map_or(false, |p| p.pid == pid && p.status.is_none())),
+                TimedWait::Sleep(_) => false,
+            };
+            let task = self.tasks[i].as_mut().unwrap();
+            if now >= wait.deadline() || child_finished {
+                task.timed = None;
+                task.runnable = true;
+            } else if timer_irq {
+                task.clock_stall_ticks = task.clock_stall_ticks.saturating_add(1);
+                if task.clock_stall_ticks >= CLOCK_STALL_TICKS {
+                    task.timed = None;
+                    task.clock_error = true;
+                    task.runnable = true;
+                }
+            }
+        }
+    }
+
+    pub fn has_timed_waiters(&self) -> bool {
+        self.tasks.iter().flatten().any(|task| task.timed.is_some())
+    }
+
+    /// Eagerly wake parents when a child exits, independently of the APIC
+    /// timer period. The syscall retries and performs authorized reaping.
+    fn wake_child(&mut self, pid: usize) {
+        for task in self.tasks.iter_mut().flatten() {
+            if matches!(task.timed, Some(TimedWait::Child { pid: child, .. }) if child == pid) {
+                task.timed = None;
+                task.runnable = true;
+            }
+        }
+    }
+
     pub fn wake_io(&mut self) {
         for t in self.tasks.iter_mut().flatten() {
             if t.waiting.map_or(false, |w| w.ready()) {
@@ -123,8 +212,10 @@ impl Queue {
         let task = self.tasks[self.current.unwrap()].as_mut().unwrap();
         let process = task.process.as_mut().unwrap();
         process.files.close_all(frames);
+        let pid = process.pid;
         process.status = Some(status);
         task.runnable = false;
+        self.wake_child(pid);
         self.wake_io();
     }
 
@@ -146,6 +237,7 @@ impl Queue {
                 process.status = Some(137); // forced termination, SIGKILL convention
                 task.runnable = false;
                 task.waiting = None;
+                task.timed = None;
             } else {
                 already_exited = true;
             }
@@ -153,6 +245,7 @@ impl Queue {
             break;
         }
         if !found { return Err(-3); }
+        self.wake_child(pid);
         // A closed channel or pipe can unblock other tasks on this CPU.
         self.wake_io();
         Ok(usize::from(already_exited))
@@ -194,7 +287,7 @@ impl Queue {
             return self.tasks[next].as_ref().unwrap().context;
         }
         self.current = None;
-        self.active = self.tasks.iter().flatten().any(|t| t.waiting.is_some());
+        self.active = self.tasks.iter().flatten().any(|t| t.waiting.is_some() || t.timed.is_some());
         self.caller
     }
 
