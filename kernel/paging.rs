@@ -101,7 +101,7 @@ impl UserSpace {
     }
 }
 
-extern "C" { static kernel_begin: u8; static kernel_ro: u8; static kernel_end: u8; }
+extern "C" { static kernel_begin: u8; static kernel_ro: u8; static kernel_rw: u8; static kernel_end: u8; }
 
 struct Tables<'a, 'b> {
     root: usize,
@@ -147,9 +147,18 @@ pub unsafe fn install(info: &BootInfo, map: &[u8], frames: &mut Frames<'_>, plat
     }
     let begin = ptr::addr_of!(kernel_begin) as usize;
     let ro = ptr::addr_of!(kernel_ro) as usize;
+    let rw = ptr::addr_of!(kernel_rw) as usize;
     let end = ptr::addr_of!(kernel_end) as usize;
-    tables.identity(begin, ro-begin, 0)?;
-    tables.identity(ro, end-ro, NX)?;
+    // All three boundaries come from kernel.ld and are page aligned.
+    // A writable global must never share a page with executable or read-only
+    // data. Validate defensively before allocating the kernel page tables.
+    if begin & (PAGE-1) != 0 || ro & (PAGE-1) != 0 ||
+       rw & (PAGE-1) != 0 || end & (PAGE-1) != 0 ||
+       !(begin < ro && ro <= rw && rw <= end) ||
+       end-begin > 16*1024*1024 { return None; }
+    tables.identity(begin, ro-begin, 0)?;         // executable, never writable
+    tables.identity(ro, rw-ro, NX)?;              // data, read-only, NX
+    tables.identity(rw, end-rw, WRITE | NX)?;     // .data/.bss, writable, NX
     tables.identity(info.image_base as usize, info.image_size as usize, NX)?;
     tables.identity(info.memory_map as usize, info.map_size as usize, NX)?;
     if info.rsdp != 0 { tables.identity(info.rsdp as usize, 36, NX)?; }
