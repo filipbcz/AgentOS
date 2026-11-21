@@ -389,6 +389,7 @@ mod timed_tests {
         q.active = true;
         q.current = Some(0);
         q.caller = 10; // context of the kernel HLT/schedule loop
+        q.init_pid = Some(1);
         q
     }
 
@@ -474,5 +475,89 @@ mod timed_tests {
         assert!(q.tasks[0].as_ref().unwrap().runnable);
         assert_eq!(q.kill_child(&mut frames, 1, 2), Ok(1));
         assert_eq!(q.tasks[1].as_ref().unwrap().process.as_ref().unwrap().status, Some(137));
+    }
+
+    fn nested_queue() -> Queue {
+        let mut q = queue();
+        q.tasks[2] = Some(task(3, 1));
+        q.tasks[3] = Some(task(4, 3));
+        q.count = 4;
+        q
+    }
+
+    #[test]
+    fn exitingIntermediateParentAdoptsLiveChildToCpuLocalInit() {
+        let mut q = nested_queue();
+        let mut frames = crate::frames::Frames::test_dummy();
+        q.current = Some(2);
+        q.terminate(0, &mut frames);
+        assert_eq!(q.tasks[3].as_ref().unwrap().process.as_ref().unwrap().parent, 1);
+        assert!(q.tasks[3].as_ref().unwrap().runnable);
+        assert_eq!(q.child_after(1, 2), Ok(3));
+        assert_eq!(q.child_after(1, 3), Ok(4));
+        assert_eq!(q.child_after(1, 4), Err(-10));
+        assert_eq!(q.collect(&mut frames, 3, 4), Err(-10));
+        assert_eq!(q.kill_child(&mut frames, 3, 4), Err(-1));
+        assert_eq!(q.kill_child(&mut frames, 1, 4), Ok(0));
+        assert_eq!(q.collect(&mut frames, 1, 4), Ok(137));
+        assert_eq!(q.collect(&mut frames, 1, 3), Ok(0));
+        assert_eq!(q.child_after(1, 0), Ok(2));
+    }
+
+    #[test]
+    fn exitingIntermediateParentAdoptsAlreadyZombieChild() {
+        let mut q = nested_queue();
+        let mut frames = crate::frames::Frames::test_dummy();
+        q.tasks[3].as_mut().unwrap().process.as_mut().unwrap().status = Some(19);
+        q.tasks[3].as_mut().unwrap().runnable = false;
+        q.current = Some(2);
+        q.terminate(0, &mut frames);
+        assert_eq!(q.child_after(1, 3), Ok(4));
+        assert_eq!(q.kill_child(&mut frames, 1, 4), Ok(1));
+        assert_eq!(q.collect(&mut frames, 1, 4), Ok(19));
+        assert_eq!(q.collect(&mut frames, 1, 3), Ok(0));
+    }
+
+    #[test]
+    fn killingIntermediateParentAlsoAdoptsLiveGrandchild() {
+        let mut q = nested_queue();
+        let mut frames = crate::frames::Frames::test_dummy();
+        assert_eq!(q.kill_child(&mut frames, 1, 3), Ok(0));
+        assert_eq!(q.tasks[3].as_ref().unwrap().process.as_ref().unwrap().parent, 1);
+        assert_eq!(q.kill_child(&mut frames, 1, 4), Ok(0));
+        assert_eq!(q.collect(&mut frames, 1, 3), Ok(137));
+        assert_eq!(q.collect(&mut frames, 1, 4), Ok(137));
+    }
+
+    #[test]
+    fn rootExitStopsAllLiveDescendantsWithoutLeakingRunnableServices() {
+        let mut q = nested_queue();
+        let mut frames = crate::frames::Frames::test_dummy();
+        q.current = Some(0);
+        q.terminate(7, &mut frames);
+        assert_eq!(q.init_pid, None);
+        for i in 1..4 {
+            let t=q.tasks[i].as_ref().unwrap();
+            assert_eq!(t.process.as_ref().unwrap().status, Some(137));
+            assert!(!t.runnable && t.waiting.is_none() && t.timed.is_none());
+        }
+        assert_eq!(q.tasks[0].as_ref().unwrap().process.as_ref().unwrap().status, Some(7));
+        assert_eq!(q.select(42, false), 10); // return to kernel caller
+        assert!(!q.active);
+    }
+
+    #[test]
+    fn adoptedChildEnumerationIsSortedAndOwnerScoped() {
+        let mut q=nested_queue();
+        let mut frames=crate::frames::Frames::test_dummy();
+        assert_eq!(q.child_after(1, 0), Ok(2));
+        assert_eq!(q.child_after(1, 2), Ok(3));
+        assert_eq!(q.child_after(1, 3), Err(-10)); // grandchild still hidden
+        assert_eq!(q.child_after(2, 0), Err(-10));
+        q.current=Some(2);
+        q.terminate(0, &mut frames);
+        assert_eq!(q.child_after(1, 3), Ok(4)); // adopted by root
+        assert_eq!(q.child_after(3, 0), Err(-10));
+        assert_eq!(q.child_after(1, usize::MAX), Err(-10));
     }
 }
