@@ -67,6 +67,30 @@ function Send-Keyboard([string]$Command) {
     VBox controlvm $vm keyboardputscancode 5a f0 5a
 }
 
+# The first structured BOOT.LOG event starts with '[' at (8,52) when
+# framebuffer output is enabled at severity info/debug. Verify its actual
+# 5x7 raster, not just that a screenshot file was created.
+function Verify-StructuredBootScreen([string]$Path) {
+    Add-Type -AssemblyName System.Drawing
+    $bitmap=[Drawing.Bitmap]::new((Resolve-Path $Path).Path)
+    try {
+        $scale=[Math]::Max(1,[Math]::Min(2,[Math]::Floor(($bitmap.Width-16)/240)))
+        if ($bitmap.Width -lt 40 -or $bitmap.Height -lt 52+7*$scale) {
+            throw "Framebuffer too small to inspect structured BOOT.LOG: $Path"
+        }
+        $rows=@(14,8,8,8,8,8,14)
+        for ($y=0;$y -lt 7;$y++) {
+            for ($x=0;$x -lt 5;$x++) {
+                $expected=($rows[$y] -band (16 -shr $x)) -ne 0
+                $pixel=$bitmap.GetPixel(8+$x*$scale,52+$y*$scale)
+                $actual=$pixel.R -gt 200 -and $pixel.G -gt 200 -and $pixel.B -gt 200
+                if ($actual -ne $expected) {
+                    throw "Framebuffer BOOT.LOG glyph mismatch at ($x,$y): $Path"
+                }
+            }
+        }
+    } finally { $bitmap.Dispose() }
+}
 # The interactive shell clears the boot logo; check the actual shell prompt
 # instead of demanding that the old stage-1 picture is still on screen.
 function Verify-ShellPrompt([string]$Path) {
@@ -267,7 +291,14 @@ try {
             throw "Physical frame probe missing: $dir"
         }
         # The stage-1 boot logo is overwritten when GOP is handed to TTY.
-        if (!$Shell) { & "$PSScriptRoot/verify-display.ps1" "$dir\display.png" }
+        if (!$Shell) {
+            & "$PSScriptRoot/verify-display.ps1" "$dir\display.png"
+            if ($LogLevel -in @('info','debug') -and $LogOutput -in @('screen','both')) {
+                Verify-StructuredBootScreen "$dir\display.png"
+            }
+        }
+        & python "$PSScriptRoot/verify-boot-log.py" --log "$dir\com1.log" --level $LogLevel --output $LogOutput
+        if ($LASTEXITCODE -ne 0) { throw "BOOT.LOG sink/severity verification failed: $dir" }
         & "$PSScriptRoot/verify-processes.ps1" -Log "$dir\com1.log" -ApicIds $ids
         & python "$PSScriptRoot/verify-supervisor.py" --log "$dir\com1.log" --cpus $Cpus
         if ($LASTEXITCODE -ne 0) { throw "Service supervision verification failed: $dir" }
