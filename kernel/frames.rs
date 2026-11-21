@@ -18,6 +18,9 @@ impl Frame {
 
 pub struct Frames<'a> {
     free: &'a mut [usize],
+    // One reference for every allocated page, including page tables. Forked
+    // user PTEs can retain a page without transferring its original owner.
+    refs: &'a mut [u16],
     next_word: usize,
     available: usize,
 }
@@ -96,12 +99,18 @@ impl Frames<'_> {
         let regions = || map.chunks_exact(stride).filter_map(ram);
         let highest = regions().map(|(_, end)| end).max()?;
         let words = highest.div_ceil(WORD_BITS);
-        let metadata_pages = (words * size_of::<usize>()).div_ceil(PAGE);
+        let metadata_bytes = words.checked_mul(size_of::<usize>())?
+            .checked_add(highest.checked_mul(size_of::<u16>())?)?;
+        let metadata_pages = metadata_bytes.div_ceil(PAGE);
         let (metadata, _) = regions().find(|(first, end)| end - first >= metadata_pages)?;
         let bitmap = (metadata * PAGE) as *mut usize;
+        let refs = bitmap.add(words) as *mut u16;
         for i in 0..words { ptr::write_volatile(bitmap.add(i), 0); }
+        for i in 0..highest { ptr::write(refs.add(i), 0); }
         let mut frames = Self {
-            free: slice::from_raw_parts_mut(bitmap, words), next_word: 0, available: 0,
+            free: slice::from_raw_parts_mut(bitmap, words),
+            refs: slice::from_raw_parts_mut(refs, highest),
+            next_word: 0, available: 0,
         };
         for (first, end) in regions() {
             for i in first..end {
@@ -120,7 +129,10 @@ impl Frames<'_> {
         let bit = bits.trailing_zeros() as usize;
         *bits &= *bits - 1;
         self.available -= 1;
-        Some(Frame((self.next_word * WORD_BITS + bit) * PAGE))
+        let index = self.next_word * WORD_BITS + bit;
+        assert_eq!(self.refs[index], 0, "allocated frame retained by another owner");
+        self.refs[index] = 1;
+        Some(Frame(index * PAGE))
     }
 
     pub fn alloc_zeroed(&mut self) -> Option<Frame> {
@@ -132,11 +144,37 @@ impl Frames<'_> {
         Some(frame)
     }
 
+    /// A page is free only when its final mapping/owner releases it. Caller
+    /// must hold the SharedFrames lock and own a real reference.
     pub fn release(&mut self, frame: Frame) {
         let i = frame.0 / PAGE;
-        self.free[i / WORD_BITS] |= 1 << (i % WORD_BITS);
-        self.next_word = self.next_word.min(i / WORD_BITS);
-        self.available += 1;
+        assert!(frame.0 % PAGE == 0 && i < self.refs.len() &&
+                self.refs[i] != 0, "release of unowned physical page");
+        self.refs[i] -= 1;
+        if self.refs[i] == 0 {
+            assert_eq!(self.free[i / WORD_BITS] & (1 << (i % WORD_BITS)), 0,
+                       "frame double free");
+            self.free[i / WORD_BITS] |= 1 << (i % WORD_BITS);
+            self.next_word = self.next_word.min(i / WORD_BITS);
+            self.available += 1;
+        }
+    }
+
+    /// Retain a *currently allocated* page before installing a second PTE.
+    /// The u16 count is bounded and never silently wraps on many forks.
+    pub fn retain(&mut self, address: usize) -> Option<()> {
+        if address % PAGE != 0 { return None; }
+        let i = address / PAGE;
+        let count = self.refs.get_mut(i)?;
+        if *count == 0 || *count == u16::MAX { return None; }
+        *count += 1;
+        Some(())
+    }
+
+    pub fn references(&self, address: usize) -> Option<u16> {
+        if address % PAGE != 0 { return None; }
+        let i = address / PAGE;
+        self.refs.get(i).copied().filter(|&count| count != 0)
     }
 
     pub fn probe(&mut self) -> bool {
