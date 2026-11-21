@@ -50,7 +50,7 @@ jobs:
           test -f "$vars"
           python3 scripts/qemu-smoke.py --cpus "$CPU_COUNT" \
             --ovmf-code "$code" --ovmf-vars "$vars" --timeout 720
-      - name: Verify real PS/2 service registry control and graceful shutdown
+      - name: Verify real UART COM1 service registry control and graceful shutdown
         if: matrix.cpus == 1
         run: |
           set -euo pipefail
