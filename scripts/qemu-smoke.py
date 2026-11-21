@@ -178,6 +178,9 @@ def boot(args):
             (destination / "failure.json").write_text(
                 json.dumps(failure, indent=2, sort_keys=True) + "\n",
                 encoding="utf-8")
+            # CI must expose fatal guest details without requiring privileged
+            # artifact access. Bound the output to the captured final 4KiB.
+            print("QEMU COM1 failure tail:\n" + tail, file=sys.stderr, flush=True)
             raise
         finally:
             if process.poll() is None:
