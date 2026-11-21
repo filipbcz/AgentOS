@@ -93,6 +93,14 @@ def boot(args):
                     "--output", str(vm_vars),
                     "--enroll-cert", str(cert), "--sb"], check=True)
     assert vm_vars.is_file() and vm_vars.stat().st_size > 0
+    # Record exactly what firmware was provisioned with, before OVMF alters
+    # its NVRAM. The image is known signed; Access Denied may instead mean its
+    # signer was never enrolled in db or SecureBoot/SetupMode is inconsistent.
+    variables = subprocess.run(["virt-fw-vars", "--input", str(vm_vars),
+                                "--print", "--verbose"],
+                               check=True, capture_output=True, text=True)
+    (destination / "secureboot-vars.txt").write_text(
+        variables.stdout + variables.stderr, encoding="utf-8")
     qemu = [
         "qemu-system-x86_64",
         "-machine", "q35,accel=tcg,smm=on",
