@@ -31,6 +31,12 @@ fn u16_at(data: &[u8], at: usize) -> Option<u16> { Some(u16::from_le_bytes(word(
 fn u64_at(data: &[u8], at: usize) -> Option<usize> { Some(u64::from_le_bytes(word(data, at)?) as usize) }
 
 impl Programs {
+    /// Reserve a never-reused process ID, including across fork and spawn.
+    pub fn allocate_pid(&self) -> Result<usize, isize> {
+        self.next_pid.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+            |p| (p < isize::MAX as usize).then_some(p + 1)).map_err(|_| -11isize)
+    }
+
     pub fn new(archive: &'static [u8], kernel_root: usize) -> Self {
         Self { vfs: crate::vfs::Vfs::new(archive), kernel_root, next_pid: AtomicUsize::new(1) }
     }
@@ -39,8 +45,7 @@ impl Programs {
         let elf = self.vfs.file(name)?;
         let space = UserSpace::new(frames, self.kernel_root).ok_or(ENOMEM)?;
         let result = load_elf(&space, frames, elf).and_then(|entry| {
-            let pid = self.next_pid.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
-                |p| (p < isize::MAX as usize).then_some(p+1)).map_err(|_| -11isize)?;
+            let pid = self.allocate_pid()?;
             let files = crate::files::Descriptors::new(frames).ok_or(ENOMEM)?;
             Ok((entry, pid, files))
         });
