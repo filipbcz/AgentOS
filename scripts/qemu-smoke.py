@@ -113,6 +113,8 @@ def boot(args):
     if serial.exists():
         serial.unlink()
     start = time.monotonic()
+    last_progress = start
+    last_size = -1
     run_succeeded = False
     with stdout.open("wb") as diagnostic:
         process = subprocess.Popen(qemu, cwd=root, stdin=subprocess.DEVNULL,
@@ -120,6 +122,9 @@ def boot(args):
         try:
             while time.monotonic() - start < args.timeout:
                 content = serial.read_bytes() if serial.exists() else b""
+                if len(content) != last_size:
+                    last_size = len(content)
+                    last_progress = time.monotonic()
                 if b"SMP FAILED:" in content or b"FATAL VECTOR" in content or b"SHELL FAILED" in content:
                     raise RuntimeError("Guest reported critical kernel failure; see COM1")
                 if b"AGENTOS SHELL READY\r\nagentos> " in content:
@@ -129,12 +134,28 @@ def boot(args):
                 if process.poll() is not None:
                     snapshot(destination / "qemu-monitor.sock", destination / "failed-screen.ppm")
                     raise RuntimeError(f"QEMU exited before shell became ready: {process.returncode}")
-                if not content and time.monotonic() - start > 180:
-                    snapshot(destination / "qemu-monitor.sock", destination / "failed-screen.ppm")
-                    raise TimeoutError("No guest COM1 output after 180 seconds; inspect firmware screenshot")
+                if time.monotonic() - last_progress > 180:
+                    raise TimeoutError(
+                        "Guest COM1 stopped making progress for 180 seconds "
+                        f"(last {len(content)} bytes); inspect firmware/guest screenshot")
                 time.sleep(0.25)
             if not run_succeeded:
                 raise TimeoutError(f"Guest did not reach shell in {args.timeout} host seconds")
+        except Exception as error:
+            snapshot(destination / "qemu-monitor.sock", destination / "failed-screen.ppm")
+            tail = (serial.read_bytes()[-4096:].decode("ascii", errors="replace")
+                    if serial.exists() else "")
+            failure = {
+                "schema": 1, "result": "fail", "source_commit": commit,
+                "cpu_count": args.cpus, "failure": str(error),
+                "last_com1_bytes": tail,
+                "host_elapsed_seconds": round(time.monotonic() - start, 3),
+                "signed_efi_sha256": image["artifacts"]["agentos.efi"],
+            }
+            (destination / "failure.json").write_text(
+                json.dumps(failure, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8")
+            raise
         finally:
             if process.poll() is None:
                 process.terminate()
