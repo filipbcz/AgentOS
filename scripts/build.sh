@@ -8,6 +8,8 @@ while IFS='=' read -r package expected || [[ -n "$package" ]]; do
 done < "$root/scripts/toolchain.lock"
 out="$root/build"
 mkdir -p "$out"
+# Never leave a success receipt from a previous build if the new build fails.
+rm -f "$out/build-provenance.json"
 work=$(mktemp -d)
 trap 'rm -f "$work"/{libkernel.a,ap-start.o,kernel.elf,initramfs.cpio,layout.ld,loader.o,payload.o,loader.so,stage,user.o,transfer.o,client.o,receive.o,service.o,shell.o,supervisor.o,init,fault,receiver,service,shell,svc_ok,svc_fail,svc_hang,data/transfer.bin}; rmdir "$work/data" "$work"' EXIT
 cd "$work"
@@ -52,4 +54,43 @@ sbsign --key "$keys/db.key" --cert "$keys/db.crt" --output "$out/agentos.efi" "$
 sbverify --cert "$keys/db.crt" "$out/agentos.efi"
 openssl x509 -in "$keys/db.crt" -outform der -out "$out/db.cer"
 cert-to-efi-sig-list -g d7663630-f07a-4739-bc6f-b9f6d6444865 "$keys/db.crt" "$out/db.esl"
+# A reproducible *receipt*, not a cryptographic attestation. Its hashes
+# bind the signed EFI to the current Git tree, toolchain lock and signing db.
+# Do not copy private signing keys or include wall-clock timestamps here.
+python3 - "$root" "$out" "$work/initramfs.cpio" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+root, out, initrd = (Path(value) for value in sys.argv[1:])
+def run(*cmd):
+    return subprocess.check_output(cmd, cwd=root, text=True).strip()
+def digest(path):
+    result = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            result.update(block)
+    return result.hexdigest()
+
+receipt = {
+    "schema": 1,
+    "source_commit": run("git", "rev-parse", "--verify", "HEAD"),
+    "source_clean": not bool(run("git", "status", "--porcelain", "--untracked-files=normal")),
+    "toolchain_lock_sha256": digest(root / "scripts/toolchain.lock"),
+    "rustc_version": run("rustc", "--version"),
+    "gcc_version": run("gcc-13", "-dumpfullversion"),
+    "initramfs_sha256": digest(initrd),
+    "artifacts": {
+        name: digest(out / name)
+        for name in ("agentos.unsigned.efi", "agentos.efi", "db.cer", "db.esl")
+    },
+}
+path = out / "build-provenance.json"
+temporary = out / "build-provenance.json.tmp"
+temporary.write_text(json.dumps(receipt, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+temporary.replace(path)
+print(f"Build provenance: {path} (commit {receipt['source_commit']}, clean={receipt['source_clean']})")
+PY
 sha256sum "$out/"*.efi
