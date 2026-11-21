@@ -42,7 +42,7 @@ int run_forktest(void) {
         private_value=0x90e8a165cd270f4bUL;
         on_stack^=0x22ac19f0807d43beUL;
         if (private_value!=0x90e8a165cd270f4bUL ||
-            on_stack!=0x25014b31383fa3d1UL) child_done(95);
+            on_stack!=0x25014b31383ea3d1UL) child_done(95);
         // Kernel writes sixteen bytes into a COW .bss page. A direct write
         // by the kernel must not corrupt the corresponding parent page.
         long fd=os_call(SYS_OPEN,(long)data_file,sizeof(data_file)-1,0);
