@@ -20,6 +20,9 @@ BEGIN = re.compile(rf"AGENTOS SUPERVISOR BEGIN PARENT=({HEX16})")
 END = re.compile(rf"AGENTOS SUPERVISOR ENDED PARENT=({HEX16})")
 EXIT = re.compile(rf"AGENTOS USER EXIT PID=({HEX16}) CR3=({HEX16}) STATUS=({HEX16})")
 KILL = re.compile(rf"AGENTOS USER KILL PID=({HEX16}) PARENT=({HEX16}) STATUS=({HEX16})")
+DURATION = re.compile(
+    rf"AGENTOS SERVICE DURATION PARENT=({HEX16}) CHILD=({HEX16}) MS=({HEX16})"
+)
 EVENT = re.compile(
     rf"AGENTOS SERVICE (DONE|REAP|STOP|TIME) "
     rf"PARENT=({HEX16}) CHILD=({HEX16}) STATUS=({HEX16}) ATTEMPT=({HEX8})"
@@ -27,7 +30,7 @@ EVENT = re.compile(
 CHECK = re.compile(rf"AGENTOS PROCESS OK APIC=({HEX16}) PARENT=({HEX16})")
 SHELL = re.compile(r"AGENTOS SHELL START")
 EXPECTED_ORDER = ("exit", "DONE", "exit", "REAP", "exit", "REAP",
-                  "exit", "REAP", "STOP", "kill", "TIME", "STOP")
+                  "exit", "REAP", "STOP", "kill", "duration", "TIME", "STOP")
 
 
 def require(ok, message):
@@ -44,6 +47,9 @@ def event(line):
     match = KILL.fullmatch(line)
     if match:
         return ("kill", int(match[1], 16), int(match[2], 16), int(match[3], 16), 0)
+    match = DURATION.fullmatch(line)
+    if match:
+        return ("duration", int(match[2], 16), int(match[1], 16), int(match[3], 16), 0)
     match = EVENT.fullmatch(line)
     if match:
         return (match[1], int(match[3], 16), int(match[2], 16),
@@ -113,8 +119,10 @@ def verify(text, cpus):
             failed.append(ex[1])
         require(records[8] == ("STOP", failed[-1], parent, 42, 3),
                 f"Failure restart cap not enforced for parent {parent}")
-        killed, time, stop = records[9:]
+        killed, duration, time, stop = records[9:]
         require(killed[1] > 0 and killed[2] == parent and killed[3] == 137 and
+                duration[1] == killed[1] and duration[2] == parent and
+                250 <= duration[3] < (1 << 63) and
                 time == ("TIME", killed[1], parent, 137, 1) and
                 stop == ("STOP", killed[1], parent, 137, 1),
                 f"Stalled child not killed and collected by parent {parent}")
