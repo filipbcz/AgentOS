@@ -49,6 +49,6 @@ int run_orphans(void) {
     if (os_call(SYS_KILL,adopted,0,0)!=0) return 78;
     if (os_call(SYS_TRY_WAIT,adopted,0,0)!=137) return 79;
     if (os_call(SYS_CHILD_AFTER,0,0,0)!=-10) return 80;
-    if (!report("REAP ",root,parent,adopted,137)) return 81;
+    if (!report("REAPS",root,parent,adopted,137)) return 81;
     return boundary("ENDED",root) ? 0 : 82;
 }
