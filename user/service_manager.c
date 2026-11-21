@@ -234,8 +234,12 @@ static int check_control(long now) {
     struct svc_received_request packet;
     long n=os_call(SYS_IPC_TRY_RECV,shell->fd,(long)&packet,sizeof(packet.data));
     if (n==-11) return 0;
+    if (n<0) return -1; // unexpected kernel I/O failure
+    // An inherited or leaked endpoint is not authority to manage services.
+    // Reject unauthorized sender PID or malformed payload without killing
+    // the entire local supervisor (a trivial denial-of-service otherwise).
     if (n!=sizeof(packet.data) || !valid_peer(&packet.peer,shell->pid))
-        return -1;
+        return 0;
     unsigned code=apply_command(&packet.data,now);
     return send_response(shell->fd,code)?0:-1;
 }
