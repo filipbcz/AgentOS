@@ -94,28 +94,28 @@ Rozhraní a limity jsou popsány také v aktuálním [README](README.md). Přida
 
 #### Ověření této pracovní dávky
 
-Ověřený implementační commit je [`6905d203f86e73feb86b29343acd139671c15ab6`](https://github.com/filipbcz/AgentOS/commit/6905d203f86e73feb86b29343acd139671c15ab6). [Host checks 44938454988](https://github.com/filipbcz/AgentOS/actions/runs/44938454988) a [QEMU Secure Boot 44938454967](https://github.com/filipbcz/AgentOS/actions/runs/44938454967) oba skončily **success**. CI checkout používá PR merge `3e0f338c4df027dec35ca9f6f7c68963e1b872ab`; jeho strom `1d9432b4630110d3c13bb48718cadf254ea9a726` je přesně shodný se stromem uvedeného headu.
+Finální ověřená implementační revize včetně přejímacích skriptů je [`64f87f8899e3d7e0cb3fff7bf55ff147bef2354c`](https://github.com/filipbcz/AgentOS/commit/64f87f8899e3d7e0cb3fff7bf55ff147bef2354c). [Host checks 44938920075](https://github.com/filipbcz/AgentOS/actions/runs/44938920075) a [QEMU Secure Boot 44938920070](https://github.com/filipbcz/AgentOS/actions/runs/44938920070) oba skončily **success**. CI checkout používá PR merge `e25f4323c979a6a803c9a756c6a0b8b423eaf802`; jeho strom `80894fb984d5dca7065134ea640a791349d27ee4` je přesně shodný se stromem uvedeného headu. Následný zápis těchto výsledků mění pouze dokumentaci, nikoli implementaci, build ani testovací scénáře.
 
 | Ověření | Skutečný výsledek |
 |---|---|
-| Host Python | 126 úspěšných testů |
+| Host Python | 131 úspěšných testů |
 | Rust | 159 úspěšných spuštění ve 12 sadách; sdílené moduly se mohou testovat opakovaně |
 | Rizikové nové části | 30 scheduler/timer, 6 ABI parser, 4 stack allocator a 6 paging/COW testů prošlo |
 | C | Manager, worker, supervisor a orphans harness prošly |
 | Sestavení | Rust 1.75.0, GCC 13.3.0; kernel a všech 12 user ELF slinkováno; W^X, trap návraty a note ověřeny |
 | PowerShell | Parser všech skriptů prošel |
-| QEMU 1 CPU | Podepsaný boot 33,061 s; úplná UART/PS2/GOP relace 39,944 s, výsledek pass |
-| QEMU 2 CPU | Podepsaný boot 33,570 s; úplná UART/PS2/GOP relace 40,688 s, výsledek pass |
-| Provozní klid | Obě relace: 5001 ms, celkem 6 timer IRQ, všech 6 při všech úlohách blocked |
+| QEMU 1 CPU | Podepsaný boot 33,570 s; úplná UART/PS2/GOP relace 40,450 s, výsledek pass |
+| QEMU 2 CPU | Podepsaný boot 35,584 s; úplná UART/PS2/GOP relace 41,715 s, výsledek pass |
+| Provozní klid | 1 CPU: 5000 ms, 2 CPU: 5001 ms; v obou celkem 6 timer IRQ, všech 6 při všech úlohách blocked |
 | Reálné restarty a úklid | 1 CPU ukončil nová PID 19/20/21, 2 CPU PID 31/32/33 se stavem 42; původní kořen zůstal PID 1; konec obou relací stav 0 a FRAMES=OK |
 
-Podepsané obrazy mají SHA-256 `58d8a057094dff608bb8a97056c0038c1629f8059a50f215239a266fda288290` (1 CPU) a `8ff92e4ec5fb4b1b002cdd1bdb7b53c784225255e18fd765fccc315834b30eaf` (2 CPU). Rozdíl odpovídá odděleným dočasným podpisovým klíčům jobů. **Obě nezávislá sestavení mají shodný nepodepsaný EFI hash** `aecaff94a3fae061a1a61e74a20a31b0865b1d006c7b04d1e6c8e00af03b10b1` a initramfs hash `11245c2e08a32abdaf317e09c0faac2bc9d347f8054a3fb6d708794333393fc6`.
+Podepsané obrazy mají SHA-256 `4d95f709d19e1ab15bde8d0a8b97d97ee367d9a925b7f24aaee41af2446655ce` (1 CPU) a `c2660a509ffddf533b1e43b59af5b81bc09b0f39eba940d0665203c17edbca8c` (2 CPU). Rozdíl odpovídá odděleným dočasným podpisovým klíčům jobů. **Obě nezávislá sestavení mají shodný nepodepsaný EFI hash** `aecaff94a3fae061a1a61e74a20a31b0865b1d006c7b04d1e6c8e00af03b10b1` a initramfs hash `11245c2e08a32abdaf317e09c0faac2bc9d347f8054a3fb6d708794333393fc6`.
 
-GitHub artefakty `qemu-secureboot-1cpu` (ID 14720368333) a `qemu-secureboot-2cpu` (ID 14720981753) obsahují skutečné COM1 logy, odeslané bajty, GOP snímky, signed EFI, build provenance a `smoke.json`; byly staženy a kontrolní součty porovnány s GitHub metadaty. Bootoval OVMF Secure Boot/QEMU TCG, 256 MiB, 1/2 CPU. Screenshot reálné PS/2 odpovědi byl také vizuálně zkontrolován. QEMU je samostatná platforma, ne potvrzení VirtualBoxu.
+GitHub artefakty [qemu-secureboot-1cpu](https://github.com/filipbcz/AgentOS/actions/runs/44938920070/artifacts/14720892772) (ID 14720892772) a [qemu-secureboot-2cpu](https://github.com/filipbcz/AgentOS/actions/runs/44938920070/artifacts/14721225362) (ID 14721225362) obsahují skutečné COM1 logy, odeslané bajty, GOP snímky, signed EFI, build provenance a `smoke.json`; byly staženy a kontrolní součty porovnány s GitHub metadaty. Bootoval OVMF Secure Boot/QEMU TCG, 256 MiB, 1/2 CPU. Screenshot reálné PS/2 odpovědi byl také vizuálně zkontrolován. QEMU je samostatná platforma, ne potvrzení VirtualBoxu.
 
 Lokálně dále prošly čtyři C harnessy, freestanding link všech user programů s GCC 14.2 a Python kontroly. Místní prostředí nemá rustc, QEMU, PowerShell ani VirtualBox; příslušné provedené kontroly výše skutečně běžely v GitHub CI.
 
-Po této zelené revizi následovaly pouze opravy hostitelského přejímacího postupu: čekání na kompletní poslední TCP řádek, ověření aktuálního čistého Git checkoutu při kontrole souhrnu, zákaz bytecode cache zapisované samotným ověřovačem/QEMU harness a včasné odstranění starého souhrnu i při neúspěšném sestavení. Regresní sada souhrnu má nyní 12 úspěšných lokálních testů. Tyto změny a aktualizovaná dokumentace vyžadují samostatný následný CI výsledek; nejsou připsány staršímu běhu uvedenému výše.
+Finální CI zahrnuje i čekání na kompletní poslední TCP řádek, kontrolu aktuálního čistého Git checkoutu, zákaz bytecode cache samotného ověřovače/QEMU harness a odstranění starého souhrnu před novým sestavením. Všech 12 regresních testů souhrnu včetně pěti testů se skutečnými dočasnými Git repozitáři prošlo. Předchozí implementační commit `6905d203f86e73feb86b29343acd139671c15ab6` měl také zelené host i QEMU běhy; pro aktuální předání jsou rozhodující finální výsledky výše.
 
 #### Jediný zbývající přejímací krok této etapy
 
