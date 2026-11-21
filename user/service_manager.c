@@ -12,18 +12,18 @@
  * reaper*, but it does not currently have the literal numeric PID 1.
  */
 #define MAX_MS 0x7fffffffffffffffUL
-enum { TICK_MS=20, READY_TIMEOUT_MS=750, RESTART_BASE_MS=40, MAX_ATTEMPTS=3 };
+enum { TICK_MS=20, READY_TIMEOUT_MS=750, RESTART_BASE_MS=40, RESTART_WINDOW_MS=5000, MAX_ATTEMPTS=3 };
 struct record {
     const char *name, *elf;
     unsigned name_length, elf_length, dependency;
     unsigned char desired, state, attempts, limit, ready_once;
-    long pid, fd, ready_deadline, retry_at, last_status;
+    long pid, fd, ready_deadline, retry_at, last_status, window_started;
 };
 
 static struct record registry[SVC_COUNT] = {
-    { "core", "svc_alive", 4, 9, SVC_COUNT, 1, SVC_DOWN, 0, MAX_ATTEMPTS, 0, 0, -1, 0, 0, 0 },
-    { "flaky", "svc_flaky", 5, 9, SVC_CORE, 1, SVC_DOWN, 0, MAX_ATTEMPTS, 0, 0, -1, 0, 0, 0 },
-    { "shell", "shell", 5, 5, SVC_CORE, 1, SVC_DOWN, 0, MAX_ATTEMPTS, 0, 0, -1, 0, 0, 0 }
+    { "core", "svc_alive", 4, 9, SVC_COUNT, 1, SVC_DOWN, 0, MAX_ATTEMPTS, 0, 0, -1, 0, 0, 0, -1 },
+    { "flaky", "svc_flaky", 5, 9, SVC_CORE, 1, SVC_DOWN, 0, MAX_ATTEMPTS, 0, 0, -1, 0, 0, 0, -1 },
+    { "shell", "shell", 5, 5, SVC_CORE, 1, SVC_DOWN, 0, MAX_ATTEMPTS, 0, 0, -1, 0, 0, 0, -1 }
 };
 static long owner_pid;
 static int shell_active, shutdown_requested, fatal_error, online_announced;
@@ -105,6 +105,16 @@ static int kill_and_reap(struct record *service) {
 static int start_entry(unsigned id,long now) {
     struct record *service=&registry[id];
     if (service->pid || !service->desired || !has_dependency(id)) return 0;
+    /* Attempts are scoped to a CPU-local monotonic restart window. A worker
+     * which survived that window starts a fresh budget after its next exit;
+     * a tight crash loop still gets exactly MAX_ATTEMPTS starts. Once FAILED,
+     * the operator must explicitly rearm the service; no silent retries.
+     */
+    if (service->window_started<0 ||
+        now-service->window_started>=RESTART_WINDOW_MS) {
+        service->window_started=now;
+        service->attempts=0;
+    }
     if (service->attempts >= service->limit) {
         service->state=SVC_FAILED;
         return 0;
@@ -172,15 +182,43 @@ static int finish_start(unsigned id, long now) {
     return 1;
 }
 
+/* A lost dependency must not leave any of its direct dependents running
+ * against stale state. Stop in reverse dependency order; only active processes
+ * are reset, so a previously FAILED optional service stays FAILED until an
+ * explicit operator action. The root continues its own bounded restart.
+ */
+static int suspend_dependents(unsigned dependency) {
+    for (unsigned index=SVC_COUNT;index>0;index--) {
+        unsigned id=index-1;
+        struct record *service=&registry[id];
+        if (service->dependency!=dependency || service->pid<=0) continue;
+        if (!kill_and_reap(service)) return 0;
+        service->state=service->desired?SVC_DOWN:SVC_STOPPED;
+        service->attempts=0;
+        service->window_started=-1;
+        service->retry_at=0;
+        service->ready_once=0;
+        if (id==SVC_SHELL) shell_active=0;
+    }
+    return 1;
+}
+
 /* The same finite restart budget applies to pre-readiness crashes and
  * ordinary runtime exits. An explicit admin START/RESTART resets the budget.
- * No failure loops without a timer wait between attempts.
+ * A stable worker replenishes its budget after RESTART_WINDOW_MS; a crash
+ * storm stays capped. No failure loops without a timer wait between attempts.
  */
 static int failed(unsigned id,long now,long status) {
     struct record *service=&registry[id];
     service->pid=0;
     finish_endpoint(service);
     service->last_status=status;
+    if (id==SVC_SHELL) shell_active=0;
+    if (service->window_started>=0 &&
+        now-service->window_started>=RESTART_WINDOW_MS) {
+        service->window_started=now;
+        service->attempts=0;
+    }
     if (!service->desired) {
         service->state=SVC_STOPPED;
         return 0;
@@ -191,7 +229,7 @@ static int failed(unsigned id,long now,long status) {
         if (id==SVC_CORE && !shell_active) return -1; // critical bootstrap
         if (id==SVC_SHELL) return -1;
     } else {
-        unsigned delay=RESTART_BASE_MS << (service->attempts-1);
+        unsigned delay=RESTART_BASE_MS << (service->attempts?service->attempts-1:0);
         service->retry_at=deadline(now,delay);
         if (service->retry_at<0) return -1;
         service->state=SVC_BACKOFF;
@@ -211,7 +249,7 @@ static int apply_command(const struct svc_request *req,long now) {
         if (service->desired && service->state!=SVC_FAILED &&
             service->state!=SVC_STOPPED) return SVC_ALREADY_RUNNING;
         if (!has_dependency(req->service)) return SVC_BAD_DEPENDENCY;
-        service->desired=1;service->attempts=0;service->retry_at=now;
+        service->desired=1;service->attempts=0;service->window_started=-1;service->retry_at=now;
         service->state=SVC_DOWN;
     } else {
         if (req->service==SVC_CORE &&
@@ -222,6 +260,7 @@ static int apply_command(const struct svc_request *req,long now) {
         if (!kill_and_reap(service)) return SVC_INTERNAL_ERROR;
         service->desired=req->operation==SVC_OP_RESTART;
         service->attempts=0;
+        service->window_started=-1;
         service->retry_at=now;
         service->state=service->desired?SVC_DOWN:SVC_STOPPED;
     }
@@ -251,6 +290,7 @@ static int advance_registry(long now) {
             // Reaping is always by the immediate owning manager process.
             long status=os_call(SYS_TRY_WAIT,service->pid,0,0);
             if (status>=0) {
+                if (id==SVC_CORE && !suspend_dependents(SVC_CORE)) return -1;
                 if (id==SVC_SHELL && status==0) {
                     service->pid=0;
                     finish_endpoint(service);
