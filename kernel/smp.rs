@@ -202,14 +202,22 @@ impl Cpu {
         let queue = &mut *self.queue.get();
         let scheduled = queue.active;
         let running = queue.running();
+        // Periodic APIC IRQs are the fallback for timed sleeps and also
+        // detect clock stalls; process exit may wake child waiters sooner.
+        let now = self.clock.millis(timestamp()).unwrap_or(0);
+        queue.wake_timed(now, timer);
         let next = queue.select(outgoing, timer);
         // Boot/idle probes own their one-shot timers while queue.active=false.
         // Only scheduled work uses time slices, and no tick is needed when all
         // tasks sleep on I/O. The UART can wake and select a reader directly.
         if scheduled {
             if !queue.running() {
-                self.apic.write(0x320, MASK | TIMER);
-                self.apic.write(0x380, 0);
+                // An all-blocked timed wait still requires APIC ticks to
+                // observe its deadline. Do not disable the last wake source.
+                if !queue.has_timed_waiters() {
+                    self.apic.write(0x320, MASK | TIMER);
+                    self.apic.write(0x380, 0);
+                }
             } else if !running {
                 self.apic.write(0x320, TIMER | (1 << 17));
                 self.apic.write(0x380, self.interval);
@@ -412,6 +420,45 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
         0x10001 => pid as isize,
         // Current CPU-local monotonic millisecond epoch; never compare across CPUs.
         0x10010 => cpu.clock.millis(timestamp()).map(|v| v as isize).unwrap_or(-5),
+        // SYS_WAIT_CHILD_UNTIL(child_pid, absolute_deadline_ms):
+        // nonblocking if already reaped/finished, otherwise sleep until child
+        // termination or the CPU-local monotonic deadline. Reaps on success.
+        0x10011 => {
+            if b > isize::MAX as usize { -22 }
+            else if q.take_clock_error() { -5 }
+            else {
+                match cpu.load.frames.with(|f| q.collect(f, pid, a)) {
+                    Ok(status) => status as isize,
+                    Err(-11) => match cpu.clock.millis(timestamp()) {
+                        None => -5,
+                        Some(now) if now >= b as u64 => -110,
+                        Some(_) => {
+                            q.block_child(a, b as u64);
+                            ctx.rip -= 2;
+                            return cpu.switch(ctx as *mut Context as usize, false);
+                        }
+                    },
+                    Err(error) => error,
+                }
+            }
+        }
+        // SYS_SLEEP_UNTIL(absolute_deadline_ms): timer-driven sleep. It must
+        // not treat frozen TSC ticks as actual passage of time.
+        0x10012 => {
+            if a > isize::MAX as usize { -22 }
+            else if q.take_clock_error() { -5 }
+            else {
+                match cpu.clock.millis(timestamp()) {
+                    None => -5,
+                    Some(now) if now >= a as u64 => 0,
+                    Some(_) => {
+                        q.block_sleep(a as u64);
+                        ctx.rip -= 2;
+                        return cpu.switch(ctx as *mut Context as usize, false);
+                    }
+                }
+            }
+        }
         op @ (0x10002 | 0x10008 | 0x1000d | 0x1000e) => {
             let io = match op {
                 0x10002 => p.files.write(&p.space, a, b, c),
