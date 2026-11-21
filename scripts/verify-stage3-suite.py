@@ -1,8 +1,8 @@
-"""Verify the COMPLETE stage-3 signed EFI/VirtualBox acceptance matrix.
+"""Verify all required *current* stage-3 signed EFI/VirtualBox integration profiles.
 
 A green host CI does not satisfy this suite. Each of the thirteen receipts
 must document a real VirtualBox 7.1.12 run, include integrity hashes, and
-match the exact source commit and signed image. The original VirtualBox
+match the exact source commit and signed image. Passing this matrix does NOT\nsatisfy the still-open stage-3 COW, PID1 registry or recovery requirements.\nThe original VirtualBox
 harness independently verifies COM1, screenshots and Secure Boot rejection.
 """
 import argparse
