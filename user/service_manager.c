@@ -143,7 +143,7 @@ static int failed(unsigned id,long now,long status);
 static int start_entry(unsigned id,long now) {
     struct record *service=&registry[id];
     if (service->pid || !service->desired || !has_dependency(id)) return 0;
-    /* Attempts are scoped to a CPU-local monotonic restart window. A worker
+    /* Attempts are scoped to a shared-epoch monotonic restart window. A worker
      * which survived that window starts a fresh budget after its next exit;
      * a tight crash loop still gets exactly MAX_ATTEMPTS starts. Once FAILED,
      * the operator must explicitly rearm the service; no silent retries.

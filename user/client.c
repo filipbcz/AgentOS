@@ -13,14 +13,14 @@ static int matches(const struct test_message *message, unsigned long self, unsig
 static int checkTimerStats(void) {
     unsigned long pBefore[4], pAfter[4];
     if (os_call(SYS_TIMER_STATS, (long)pBefore, sizeof(pBefore), 0) ||
-        pBefore[0] != 1 || pBefore[3] > pBefore[2] ||
+        pBefore[0] != 2 || pBefore[3] > pBefore[2] ||
         os_call(SYS_TIMER_STATS, 0, sizeof(pBefore), 0) != -14 ||
         os_call(SYS_TIMER_STATS, -8, sizeof(pBefore), 0) != -14 ||
         os_call(SYS_TIMER_STATS, (long)&checkTimerStats, sizeof(pBefore), 0) != -14 ||
         os_call(SYS_TIMER_STATS, (long)pBefore, sizeof(pBefore)-1, 0) != -22 ||
         os_call(SYS_TIMER_STATS, (long)pBefore, sizeof(pBefore), 1) != -22 ||
         os_call(SYS_TIMER_STATS, (long)pAfter, sizeof(pAfter), 0) ||
-        pAfter[0] != 1 || pAfter[1] < pBefore[1] ||
+        pAfter[0] != 2 || pAfter[1] < pBefore[1] ||
         pAfter[2] < pBefore[2] || pAfter[3] < pBefore[3] ||
         pAfter[3] > pAfter[2]) return 0;
     return 1;

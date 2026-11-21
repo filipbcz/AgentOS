@@ -162,6 +162,15 @@ def verify_run(root, run_dir, require_pass=True):
                 pVerifier.verify(log.decode("ascii", errors="replace"), cpus)
             except pVerifier.VerificationError as pError:
                 raise EvidenceError(f"Invalid demand-paging evidence: {pError}") from pError
+        if b"AGENTOS MIGRATION" in log:
+            pSpec = importlib.util.spec_from_file_location(
+                "receiptMigrationEvidence", Path(__file__).with_name("verify-migration.py"))
+            pVerifier = importlib.util.module_from_spec(pSpec)
+            pSpec.loader.exec_module(pVerifier)
+            try:
+                pVerifier.verify(log.decode("ascii", errors="replace"), cpus)
+            except pVerifier.VerificationError as pError:
+                raise EvidenceError(f"Invalid migration evidence: {pError}") from pError
         if shell:
             starts = list(SESSION_START.finditer(log))
             stops = list(SESSION_STOP.finditer(log))

@@ -1,5 +1,7 @@
-//! Per-CPU round robin for kernel threads. Queue access on its owner CPU
-//! requires IF=0. A timer interrupt owns the outgoing frame until IRETQ.
+//! Per-CPU round robin. Queue access requires IF=0 and its CPU queue lock.
+//! Cross-CPU transfer holds both queue locks in ascending CPU order. Lifecycle
+//! and shared I/O metadata additionally require the common Frames gate.
+#![allow(non_snake_case)]
 use crate::frames::Frames;
 use crate::stack::KernelStack;
 use crate::process::{Process, Programs, STACK};
@@ -29,10 +31,21 @@ struct Task {
     timed: Option<TimedWait>,
     clock_error: bool,
     preemptions: usize,
+    fHasRun: bool,
+    fMigrations: usize,
     process: Option<Process>,
 }
 
 const CAPACITY: usize = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MigrationInfo {
+    pub fPid: usize,
+    pub fContext: usize,
+    pub fRoot: usize,
+    pub fStackTop: usize,
+    pub fMigrations: usize,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TimedWait {
@@ -51,9 +64,12 @@ pub struct Queue {
     tasks: [Option<Task>; CAPACITY],
     count: usize,
     current: Option<usize>,
+    fRetiring: Option<usize>,
+    fRuntimeIdle: bool,
+    fPrograms: *const Programs,
     caller: usize,
-    /// First parent=0 userspace task of this CPU run. Never reassign while
-    /// it is alive; no parent/child relationship crosses CPU ownership.
+    /// Bootstrap root identity of this CPU acceptance run. Runtime parent and
+    /// reaper relationships live in Programs::fRegistry and may cross CPUs.
     init_pid: Option<usize>,
     /// Kernel-held BSP root across boot checks and TTY handoff.
     boot_parked: Option<usize>,
@@ -64,7 +80,7 @@ pub struct Queue {
 
 impl Queue {
     pub fn new() -> Self {
-        Self { tasks: core::array::from_fn(|_| None), count: 0, current: None, caller: 0, init_pid: None, boot_parked: None, boot_handoff_done: false, active: false }
+        Self { tasks: core::array::from_fn(|_| None), count: 0, current: None, fRetiring: None, fRuntimeIdle: false, fPrograms: ptr::null(), caller: 0, init_pid: None, boot_parked: None, boot_handoff_done: false, active: false }
     }
 
     pub fn spawn(&mut self, frames: &mut Frames<'_>, entry: extern "C" fn(usize), arg: usize) -> Option<()> {
@@ -85,13 +101,14 @@ impl Queue {
             ((top - 8) as *mut usize).write(task_return as usize);
         }
         self.tasks[self.count] = Some(Task { stack, context: context as usize, runnable: true, waiting: None, timed: None,
-                                          clock_error: false, preemptions: 0, process: None });
+                                          clock_error: false, preemptions: 0, fHasRun: false, fMigrations: 0, process: None });
         self.count += 1;
         Some(())
     }
 
     pub unsafe fn spawn_process(&mut self, frames: &mut Frames<'_>, programs: &Programs, name: &[u8],
                                 parent: usize) -> Result<usize, isize> {
+        if !self.fPrograms.is_null() && self.fPrograms != programs as *const Programs { return Err(-22); }
         let slot = self.tasks.iter().position(Option::is_none).ok_or(-11isize)?;
         let stack = KernelStack::allocate(frames).ok_or(-12isize)?;
         let credentials = self.process().map_or(crate::process::Credentials::BOOT_USER, |p| p.credentials);
@@ -99,7 +116,7 @@ impl Queue {
             Ok(process) => process,
             Err(e) => { stack.release(frames); return Err(e); }
         };
-        if let Some(caller) = self.process() { process.files.inherit(&caller.files); }
+        if let Some(caller) = self.process() { process.files.inherit(frames, &caller.files); }
         let context = (stack.top() - size_of::<Context>()) as *mut Context;
         ptr::write_unaligned((*context).fx.as_mut_ptr() as *mut u16, 0x037f);
         ptr::write_unaligned((*context).fx.as_mut_ptr().add(24) as *mut u32, 0x1f80);
@@ -109,20 +126,22 @@ impl Queue {
         (*context).rsp = STACK;
         (*context).ss = 0x2b;
         let pid = process.pid;
+        self.fPrograms = programs;
         self.tasks[slot] = Some(Task { stack, context: context as usize, runnable: true, waiting: None, timed: None,
-                                      clock_error: false, preemptions: 0, process: Some(process) });
+                                      clock_error: false, preemptions: 0, fHasRun: false, fMigrations: 0, process: Some(process) });
         self.count = self.count.max(slot+1);
         if parent == 0 && self.init_pid.is_none() { self.init_pid = Some(pid); }
         Ok(pid)
     }
 
-    /// fork(2)-style CPU-local clone. The child continues at the instruction
+    /// fork(2)-style clone with CPU-independent lifecycle identity. The child continues at the instruction
     /// after SYSCALL with RAX=0 and its own kernel interrupt stack. The parent
     /// receives the child's PID. Both user stacks start as shared RO/COW pages.
     /// All potentially failing allocations and descriptor retention happen
     /// before fork_cow commits the parent's writable PTE protection.
     pub unsafe fn fork_process(&mut self, frames: &mut Frames<'_>, programs: &Programs,
                                parent_context: &Context) -> Result<usize, isize> {
+        if self.fPrograms != programs as *const Programs { return Err(-22); }
         let slot = self.tasks.iter().position(Option::is_none).ok_or(-11isize)?;
         let parent = self.process().ok_or(-1isize)?;
         let stack = KernelStack::allocate(frames).ok_or(-12isize)?;
@@ -130,7 +149,7 @@ impl Queue {
             stack.release(frames);
             return Err(-12);
         };
-        files.inherit(&parent.files);
+        files.inherit(frames, &parent.files);
         let child_pid = match programs.allocate_pid() {
             Ok(pid) => pid,
             Err(error) => {
@@ -139,9 +158,14 @@ impl Queue {
                 return Err(error);
             }
         };
+        let pLifecycle = match programs.fRegistry.register(frames, child_pid, parent.pid) {
+            Ok(pEntry) => pEntry,
+            Err(pError) => { files.release(frames); stack.release(frames); return Err(pError); }
+        };
         let space = match parent.space.fork_cow(frames, programs.kernel_root) {
             Ok(space) => space,
             Err(error) => {
+                pLifecycle.release(frames);
                 files.release(frames);
                 stack.release(frames);
                 return Err(error);
@@ -149,14 +173,14 @@ impl Queue {
         };
         let child = Process {
             credentials: parent.credentials, space, entry: parent.entry,
-            parent: parent.pid, pid: child_pid, status: None, files,
+            parent: parent.pid, pid: child_pid, status: None, files, fLifecycle: pLifecycle,
         };
         let context = (stack.top() - size_of::<Context>()) as *mut Context;
         ptr::copy_nonoverlapping(parent_context, context, 1);
         (*context).registers[14] = 0; // child SYS_FORK return value
         self.tasks[slot] = Some(Task {
             stack, context: context as usize, runnable: true,
-            waiting: None, timed: None, clock_error: false, preemptions: 0,
+            waiting: None, timed: None, clock_error: false, preemptions: 0, fHasRun: false, fMigrations: 0,
             process: Some(child),
         });
         self.count = self.count.max(slot + 1);
@@ -178,11 +202,11 @@ impl Queue {
 
     /// Only the first root may park, and only after reaping all descendants.
     /// Its saved syscall context remains attached to the same PID/address space.
-    pub fn park_boot_root(&mut self, pid: usize) -> Result<(), isize> {
+    pub fn park_boot_root(&mut self, frames: &mut Frames<'_>, pid: usize) -> Result<(), isize> {
         if self.init_pid != Some(pid) || self.boot_parked.is_some() ||
            self.boot_handoff_done ||
            self.process().map(|p| p.pid) != Some(pid) ||
-           self.child_after(pid, 0) != Err(-10) { return Err(-16); }
+           self.child_after(frames, pid, 0) != Err(-10) { return Err(-16); }
         self.tasks[self.current.unwrap()].as_mut().unwrap().runnable = false;
         self.boot_parked = Some(pid);
         Ok(())
@@ -230,9 +254,9 @@ impl Queue {
         self.block_timed(TimedWait::Events { mask, deadline }, now);
     }
 
-    pub fn has_exited_child(&self, parent: usize) -> bool {
-        self.tasks.iter().flatten().filter_map(|task| task.process.as_ref())
-            .any(|p| p.parent == parent && p.status.is_some())
+    pub fn has_exited_child(&self, aFrames: &mut Frames<'_>, aParent: usize) -> bool {
+        unsafe { self.fPrograms.as_ref() }.map_or(false, |pPrograms|
+            pPrograms.fRegistry.hasExitedChild(aFrames, aParent))
     }
 
     fn block_timed(&mut self, wait: TimedWait, _now: u64) {
@@ -255,23 +279,25 @@ impl Queue {
     /// The LAPIC policy measures its own consumed countdown independently of
     /// TSC. A failed/stalled clock wakes waiters with EIO, never with a made-up
     /// timeout. A child exit remains valid even when time is unavailable.
-    pub fn wake_timed(&mut self, now: u64, clock_error: bool) {
-        for i in 0..self.count {
-            let Some(wait) = self.tasks[i].as_ref().and_then(|t| t.timed) else { continue; };
-            let child_finished = match wait {
-                TimedWait::Child { pid, .. } =>
-                    !self.tasks.iter().flatten().any(|t|
-                        t.process.as_ref().map_or(false, |p| p.pid == pid && p.status.is_none())),
-                TimedWait::Sleep(_) | TimedWait::Events { .. } => false,
+    pub fn wake_timed(&mut self, aFrames: &mut Frames<'_>, aNow: u64, aClockError: bool) {
+        let pPrograms = unsafe { self.fPrograms.as_ref() };
+        for pTask in self.tasks.iter_mut().flatten() {
+            let Some(pWait) = pTask.timed else { continue; };
+            let pParent = pTask.process.as_ref().map(|pProcess| pProcess.pid);
+            let pFinished = match (pWait, pPrograms, pParent) {
+                (TimedWait::Child { pid, .. }, Some(pPrograms), Some(pParent)) =>
+                    !pPrograms.fRegistry.childRunning(aFrames, pParent, pid),
+                (TimedWait::Events { .. }, Some(pPrograms), Some(pParent)) =>
+                    pPrograms.fRegistry.hasExitedChild(aFrames, pParent),
+                _ => false,
             };
-            let task = self.tasks[i].as_mut().unwrap();
-            if child_finished || (!clock_error && now >= wait.deadline()) {
-                task.timed = None;
-                task.runnable = true;
-            } else if clock_error {
-                task.timed = None;
-                task.clock_error = true;
-                task.runnable = true;
+            if pFinished || (!aClockError && aNow >= pWait.deadline()) {
+                pTask.timed = None;
+                pTask.runnable = true;
+            } else if aClockError {
+                pTask.timed = None;
+                pTask.clock_error = true;
+                pTask.runnable = true;
             }
         }
     }
@@ -286,34 +312,25 @@ impl Queue {
         self.tasks.iter().flatten().filter_map(|task| task.timed.map(TimedWait::deadline)).min()
     }
 
-    /// Eagerly wake parents when a child exits, independently of the APIC
-    /// timer period. The syscall retries and performs authorized reaping.
-    fn wake_child(&mut self, pid: usize) {
-        let parent = self.tasks.iter().flatten().filter_map(|t| t.process.as_ref())
-            .find(|p| p.pid == pid).map(|p| p.parent);
-        for task in self.tasks.iter_mut().flatten() {
-            let specified = matches!(task.timed, Some(TimedWait::Child { pid: child, .. }) if child == pid);
-            let any_child = matches!(task.timed, Some(TimedWait::Events { .. })) &&
-                task.process.as_ref().map(|p| p.pid) == parent;
-            if specified || any_child {
-                task.timed = None;
-                task.runnable = true;
+    /// The caller holds the local queue lock and Frames. Remote I/O/exit
+    /// events request an IPI; the destination performs this scan itself.
+    pub fn wake_io(&mut self, aFrames: &mut Frames<'_>) {
+        let pPrograms = unsafe { self.fPrograms.as_ref() };
+        for pTask in self.tasks.iter_mut().flatten() {
+            if pTask.waiting.map_or(false, |pWait| pWait.ready(aFrames)) {
+                pTask.waiting = None;
+                pTask.runnable = true;
             }
-        }
-    }
-
-    pub fn wake_io(&mut self) {
-        for t in self.tasks.iter_mut().flatten() {
-            if t.waiting.map_or(false, |w| w.ready()) {
-                t.waiting = None;
-                t.runnable = true;
-            }
-            if let Some(TimedWait::Events { mask, .. }) = t.timed {
-                if t.process.as_ref().and_then(|p| p.files.ipc_ready_mask(mask).ok()).unwrap_or(0) != 0 {
-                    t.timed = None;
-                    t.runnable = true;
-                }
-            }
+            let Some(pProcess) = pTask.process.as_ref() else { continue; };
+            let pReady = match pTask.timed {
+                Some(TimedWait::Child { pid, .. }) => pPrograms.map_or(false, |pPrograms|
+                    !pPrograms.fRegistry.childRunning(aFrames, pProcess.pid, pid)),
+                Some(TimedWait::Events { mask, .. }) =>
+                    pProcess.files.ipc_ready_mask(aFrames, mask).unwrap_or(0) != 0 ||
+                    pPrograms.map_or(false, |pPrograms| pPrograms.fRegistry.hasExitedChild(aFrames, pProcess.pid)),
+                _ => false,
+            };
+            if pReady { pTask.timed = None; pTask.runnable = true; }
         }
     }
 
@@ -321,112 +338,150 @@ impl Queue {
         Some(self.tasks[self.current?].as_ref()?.stack.top())
     }
 
-    /// Reassign all immediate children of an exiting process to this CPU's
-    /// root user task. An already-exited child must also be adopted: its
-    /// reaping right cannot remain attached to an uncollectable dead parent.
-    /// If the root itself exits, no replacement supervisor exists. Fail
-    /// closed by stopping all remaining userspace processes; reap() later
-    /// frees their address spaces on the kernel stack, never in an IRQ.
-    fn orphan_children(&mut self, frames: &mut Frames<'_>, exited_pid: usize) {
-        let reaper = self.init_pid.filter(|&root| root != exited_pid &&
-            self.tasks.iter().flatten().any(|t| t.process.as_ref()
-                .map_or(false, |p| p.pid == root && p.status.is_none())));
-        if let Some(root) = reaper {
-            for task in self.tasks.iter_mut().flatten() {
-                if let Some(process) = task.process.as_mut() {
-                    if process.parent == exited_pid { process.parent = root; }
-                }
-            }
-        } else if self.init_pid == Some(exited_pid) {
-            // The root supervisor died. No ordinary user task can adopt the
-            // descendants. Prevent indefinitely runnable unattended services.
-            self.init_pid = None;
-            for task in self.tasks.iter_mut().flatten() {
-                let Some(process) = task.process.as_mut() else { continue; };
-                if process.pid == exited_pid || process.status.is_some() { continue; }
-                process.files.close_all(frames);
-                process.status = Some(137);
-                process.parent = 0;
-                task.runnable = false;
-                task.waiting = None;
-                task.timed = None;
-            }
-        }
-    }
-
-    /// Enumerate only caller-owned children, in PID order. This is useful
-    /// when a child was created by another process and adopted by init.
-    /// The PID cursor avoids returning an unrelated task or private identity.
-    pub fn child_after(&self, parent: usize, cursor: usize) -> Result<usize, isize> {
-        self.tasks.iter().flatten().filter_map(|task| task.process.as_ref())
-            .filter(|process| process.parent == parent && process.pid > cursor)
-            .map(|process| process.pid).min().ok_or(-10)
-    }
-
-    pub fn terminate(&mut self, status: usize, frames: &mut Frames<'_>) {
-        let task = self.tasks[self.current.unwrap()].as_mut().unwrap();
-        let process = task.process.as_mut().unwrap();
-        process.files.close_all(frames);
-        let pid = process.pid;
-        process.status = Some(status);
-        task.runnable = false;
-        self.orphan_children(frames, pid);
-        self.wake_child(pid);
-        self.wake_io();
-    }
-
-    /// Terminate a direct child without switching to its address space.
-    /// A stopped child remains a zombie until its parent collects the status.
-    /// Only the owner CPU may call this with interrupts masked.
-    pub fn kill_child(&mut self, frames: &mut Frames<'_>, parent: usize, pid: usize)
+    pub fn child_after(&self, aFrames: &mut Frames<'_>, aParent: usize, aCursor: usize)
         -> Result<usize, isize>
     {
-        if pid == 0 || pid == parent { return Err(-22); }
-        let mut found = false;
-        let mut already_exited = false;
-        for task in self.tasks.iter_mut().flatten() {
-            let Some(process) = task.process.as_mut() else { continue; };
-            if process.pid != pid { continue; }
-            if process.parent != parent { return Err(-1); }
-            if process.status.is_none() {
-                process.files.close_all(frames);
-                process.status = Some(137); // forced termination, SIGKILL convention
-                task.runnable = false;
-                task.waiting = None;
-                task.timed = None;
-            } else {
-                already_exited = true;
+        unsafe { self.fPrograms.as_ref() }.ok_or(-10isize)?
+            .fRegistry.childAfter(aFrames, aParent, aCursor)
+    }
+
+    /// Only the owner stops a task and closes its descriptors. Registry
+    /// requests from another CPU are consumed before returning to user mode.
+    pub fn processPendingKills(&mut self, aFrames: &mut Frames<'_>) -> bool {
+        let mut pChanged = false;
+        loop {
+            let mut pPassChanged = false;
+            for pTask in self.tasks.iter_mut().flatten() {
+                let Some(pProcess) = pTask.process.as_mut() else { continue; };
+                let pState = pProcess.synchronizeMetadata(aFrames);
+                if pState.fKillPending && pState.fStatus.is_none() {
+                    pProcess.finish(aFrames, 137);
+                    pPassChanged = true;
+                }
+                if pProcess.status.is_some() {
+                    pTask.runnable = false;
+                    pTask.waiting = None;
+                    pTask.timed = None;
+                    if self.init_pid == Some(pProcess.pid) { self.init_pid = None; }
+                }
             }
-            found = true;
-            break;
+            pChanged |= pPassChanged;
+            // A root in a later migrated slot can request termination of an
+            // earlier slot. Consume that request before any user return.
+            if !pPassChanged { break; }
         }
-        if !found { return Err(-3); }
-        if !already_exited { self.orphan_children(frames, pid); }
-        self.wake_child(pid);
-        // A closed channel or pipe can unblock other tasks on this CPU.
-        self.wake_io();
-        Ok(usize::from(already_exited))
+        // An intermediate parent may have adopted an earlier local slot.
+        for pTask in self.tasks.iter_mut().flatten() {
+            if let Some(pProcess) = pTask.process.as_mut() { pProcess.synchronizeMetadata(aFrames); }
+        }
+        self.wake_io(aFrames);
+        pChanged
     }
 
-    pub fn collect(&mut self, frames: &mut Frames<'_>, parent: usize, pid: usize) -> Result<usize, isize> {
-        let (i, process) = self.tasks.iter().enumerate()
-            .filter_map(|(i, task)| Some((i, task.as_ref()?.process.as_ref()?)))
-            .find(|(_, p)| p.parent == parent && p.pid == pid).ok_or(-10isize)?;
-        let status = process.status.ok_or(-11isize)?;
-        self.release_task(i, frames);
-        Ok(status)
+    pub fn terminate(&mut self, aStatus: usize, aFrames: &mut Frames<'_>) {
+        let pTask = self.tasks[self.current.unwrap()].as_mut().unwrap();
+        pTask.process.as_mut().unwrap().finish(aFrames, aStatus);
+        pTask.runnable = false;
+        pTask.waiting = None;
+        pTask.timed = None;
+        self.processPendingKills(aFrames);
     }
 
-    fn release_task(&mut self, i: usize, frames: &mut Frames<'_>) {
-        if let Some(task) = self.tasks[i].take() {
-            if let Some(p) = task.process { p.files.release(frames); unsafe { p.space.release(frames); } }
-            task.stack.release(frames);
+    pub fn kill_child(&mut self, aFrames: &mut Frames<'_>, aParent: usize, aPid: usize)
+        -> Result<usize, isize>
+    {
+        let pResult = unsafe { self.fPrograms.as_ref() }.ok_or(-3isize)?
+            .fRegistry.requestKill(aFrames, aParent, aPid)?;
+        self.processPendingKills(aFrames);
+        Ok(pResult)
+    }
+
+    pub fn collect(&mut self, aFrames: &mut Frames<'_>, aParent: usize, aPid: usize)
+        -> Result<usize, isize>
+    {
+        let pStatus = unsafe { self.fPrograms.as_ref() }.ok_or(-10isize)?
+            .fRegistry.collect(aFrames, aParent, aPid)?;
+        self.collectRetired(aFrames);
+        Ok(pStatus)
+    }
+
+    /// Reclaim only after status consumption and after the CPU stopped using
+    /// both the address space and stack. Remote CPUs never free this Task.
+    pub fn collectRetired(&mut self, aFrames: &mut Frames<'_>) -> usize {
+        let mut pCount = 0;
+        for pIndex in 0..self.count {
+            if self.current == Some(pIndex) || self.fRetiring == Some(pIndex) { continue; }
+            let pReady = self.tasks[pIndex].as_ref().and_then(|pTask| pTask.process.as_ref())
+                .map_or(false, |pProcess| {
+                    let pState = pProcess.fLifecycle.snapshot(aFrames);
+                    pState.fStatus.is_some() && pState.fCollected
+                });
+            if pReady { self.release_task(pIndex, aFrames); pCount += 1; }
         }
+        while self.count != 0 && self.tasks[self.count - 1].is_none() { self.count -= 1; }
+        pCount
+    }
+
+    fn release_task(&mut self, aIndex: usize, aFrames: &mut Frames<'_>) {
+        assert!(self.current != Some(aIndex) && self.fRetiring != Some(aIndex), "reaping an executing stack");
+        if let Some(pTask) = self.tasks[aIndex].take() {
+            if let Some(pProcess) = pTask.process { pProcess.release(aFrames); }
+            pTask.stack.release(aFrames);
+        }
+    }
+
+    /// Called by the restore trampoline only after RSP points at the incoming
+    /// context. Before then the outgoing stack remains a CPU-owned hazard.
+    pub fn completeSwitch(&mut self) { self.fRetiring = None; }
+
+    pub fn setRuntimeIdle(&mut self, aEnabled: bool) {
+        self.fRuntimeIdle = aEnabled;
+        if aEnabled { self.active = true; }
+    }
+
+    pub fn runnableCount(&self) -> usize {
+        self.tasks.iter().flatten().filter(|pTask| pTask.runnable).count()
+    }
+    pub fn taskCount(&self) -> usize { self.tasks.iter().flatten().count() }
+    pub fn hasFreeSlot(&self) -> bool { self.tasks.iter().any(Option::is_none) }
+    pub fn currentMigrations(&self) -> usize {
+        self.current.and_then(|pIndex| self.tasks[pIndex].as_ref())
+            .map_or(0, |pTask| pTask.fMigrations)
+    }
+
+    /// The caller holds both CPU queue locks in ascending CPU order, with
+    /// local IRQs masked. No allocation, shared frame operation or remote
+    /// hardware access occurs here. A full target leaves ownership untouched.
+    pub fn moveRunnableTo(&mut self, aTarget: &mut Queue) -> Result<MigrationInfo, isize> {
+        let pTargetSlot = aTarget.tasks.iter().position(Option::is_none).ok_or(-11isize)?;
+        if !aTarget.fPrograms.is_null() && aTarget.fPrograms != self.fPrograms { return Err(-22); }
+        let pSourceSlot = (0..self.count).find(|&pIndex| {
+            if self.current == Some(pIndex) || self.fRetiring == Some(pIndex) { return false; }
+            self.tasks[pIndex].as_ref().map_or(false, |pTask| {
+                let Some(pProcess) = pTask.process.as_ref() else { return false; };
+                pTask.runnable && pTask.fHasRun && pProcess.status.is_none() &&
+                    self.boot_parked != Some(pProcess.pid) &&
+                    !(self.init_pid == Some(pProcess.pid) && !self.boot_handoff_done)
+            })
+        }).ok_or(-3isize)?;
+        let mut pTask = self.tasks[pSourceSlot].take().unwrap();
+        pTask.fMigrations = pTask.fMigrations.saturating_add(1);
+        let pProcess = pTask.process.as_ref().unwrap();
+        let pInfo = MigrationInfo { fPid: pProcess.pid, fContext: pTask.context,
+            fRoot: pProcess.space.root, fStackTop: pTask.stack.top(), fMigrations: pTask.fMigrations };
+        aTarget.tasks[pTargetSlot] = Some(pTask);
+        aTarget.fPrograms = self.fPrograms;
+        aTarget.count = aTarget.count.max(pTargetSlot + 1);
+        aTarget.active = true;
+        while self.count != 0 && self.tasks[self.count - 1].is_none() { self.count -= 1; }
+        Ok(pInfo)
     }
 
     pub fn select(&mut self, outgoing: usize, timer: bool) -> usize {
         if !self.active { return outgoing; }
-        let first = if let Some(i) = self.current {
+        assert!(self.fRetiring.is_none(), "switch completion not acknowledged");
+        let pPrevious = self.current;
+        let first = if let Some(i) = pPrevious {
             self.tasks[i].as_mut().unwrap().context = outgoing;
             i + 1
         } else {
@@ -436,15 +491,20 @@ impl Queue {
         for offset in 0..self.count {
             let next = (first + offset) % self.count;
             if !self.tasks[next].as_ref().map_or(false, |task| task.runnable) { continue; }
-            if let Some(prev) = self.current {
+            if let Some(prev) = pPrevious {
                 let previous = self.tasks[prev].as_mut().unwrap();
                 if timer && prev != next && previous.runnable { previous.preemptions += 1; }
+                if prev != next { self.fRetiring = Some(prev); }
             }
             self.current = Some(next);
-            return self.tasks[next].as_ref().unwrap().context;
+            let pTask = self.tasks[next].as_mut().unwrap();
+            pTask.fHasRun = true;
+            return pTask.context;
         }
         self.current = None;
-        self.active = self.tasks.iter().flatten().any(|t| t.waiting.is_some() || t.timed.is_some());
+        self.fRetiring = pPrevious;
+        self.active = self.fRuntimeIdle || self.tasks.iter().flatten()
+            .any(|t| t.waiting.is_some() || t.timed.is_some());
         self.caller
     }
 
@@ -457,7 +517,7 @@ impl Queue {
     }
 
     pub fn reap(&mut self, frames: &mut Frames<'_>) {
-        assert!(!self.active && self.current.is_none());
+        assert!(!self.active && self.current.is_none() && self.fRetiring.is_none());
         for i in 0..self.count { self.release_task(i, frames); }
         self.count = 0;
         self.init_pid = None;
@@ -469,296 +529,424 @@ impl Queue {
 mod timed_tests {
     use super::*;
 
-    fn task(pid: usize, parent: usize) -> Task {
-        Task {
-            stack: KernelStack::test_dummy(), context: pid * 4096,
-            runnable: true, waiting: None, timed: None,
-            clock_error: false,
-            preemptions: 0,
-            process: Some(Process {
-                pid, parent, status: None,
-                credentials: crate::process::Credentials::BOOT_USER,
-                entry: 0, space: crate::paging::UserSpace::test_dummy(),
-                files: crate::files::Descriptors::test_dummy(),
-            }),
+    struct Harness {
+        fPrograms: Box<Programs>,
+        fFrames: Frames<'static>,
+        fQueues: [Queue; 2],
+    }
+    impl Harness {
+        fn new(aChild: bool) -> Self {
+            let mut pSelf = Self {
+                fPrograms: Box::new(Programs::new(&[], 0x1000)),
+                fFrames: Frames::test_dummy(), fQueues: [Queue::new(), Queue::new()],
+            };
+            assert_eq!(pSelf.add(0, 0), 1);
+            if aChild { assert_eq!(pSelf.add(0, 1), 2); }
+            pSelf.fQueues[0].current = Some(0);
+            pSelf.fQueues[0].active = true;
+            pSelf.fQueues[0].caller = 10;
+            pSelf
+        }
+        fn add(&mut self, aCpu: usize, aParent: usize) -> usize {
+            let pPid = self.fPrograms.allocate_pid().unwrap();
+            let pEntry = unsafe { self.fPrograms.fRegistry.register(&mut self.fFrames, pPid, aParent).unwrap() };
+            let pQueue = &mut self.fQueues[aCpu];
+            pQueue.fPrograms = &*self.fPrograms;
+            let pSlot = pQueue.tasks.iter().position(Option::is_none).unwrap();
+            let mut pSpace = crate::paging::UserSpace::test_dummy();
+            pSpace.root = 0x100000 + pPid * 4096;
+            pQueue.tasks[pSlot] = Some(Task {
+                stack: KernelStack::test_dummy(), context: pPid * 4096,
+                runnable: true, waiting: None, timed: None, clock_error: false,
+                preemptions: 0, fHasRun: true, fMigrations: 0,
+                process: Some(Process { pid: pPid, parent: aParent, status: None,
+                    credentials: crate::process::Credentials::BOOT_USER, entry: 0,
+                    space: pSpace, files: crate::files::Descriptors::test_dummy(), fLifecycle: pEntry }),
+            });
+            pQueue.count = pQueue.count.max(pSlot + 1);
+            if aParent == 0 && pQueue.init_pid.is_none() { pQueue.init_pid = Some(pPid); }
+            pPid
+        }
+        fn select(&mut self, aCpu: usize, aOutgoing: usize, aTimer: bool) -> usize {
+            let pContext = self.fQueues[aCpu].select(aOutgoing, aTimer);
+            self.fQueues[aCpu].completeSwitch();
+            pContext
+        }
+        fn moveTask(&mut self, aFrom: usize) -> Result<MigrationInfo, isize> {
+            let [pLeft, pRight] = &mut self.fQueues;
+            if aFrom == 0 { pLeft.moveRunnableTo(pRight) } else { pRight.moveRunnableTo(pLeft) }
+        }
+        fn state(&mut self, aPid: usize) -> crate::lifecycle::Snapshot {
+            self.fQueues.iter().flat_map(|pQueue| pQueue.tasks.iter().flatten())
+                .filter_map(|pTask| pTask.process.as_ref()).find(|pProcess| pProcess.pid == aPid)
+                .unwrap().fLifecycle.snapshot(&mut self.fFrames)
         }
     }
-
-    fn queue() -> Queue {
-        let mut q = Queue::new();
-        q.tasks[0] = Some(task(1, 0));
-        q.tasks[1] = Some(task(2, 1));
-        q.count = 2;
-        q.active = true;
-        q.current = Some(0);
-        q.caller = 10; // context of the kernel HLT/schedule loop
-        q.init_pid = Some(1);
-        q
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            for pQueue in &mut self.fQueues {
+                pQueue.completeSwitch();
+                pQueue.current = None;
+                pQueue.active = false;
+                pQueue.reap(&mut self.fFrames);
+            }
+            assert!(!self.fPrograms.fRegistry.hasProcesses(&mut self.fFrames));
+            assert_eq!(self.fFrames.used(), 0, "registry frame leak");
+        }
     }
 
     #[test]
     fn timerKeepsAllBlockedParentRunnableAfterDeadline() {
-        let mut q = queue();
-        q.tasks[1].as_mut().unwrap().runnable = false;
-        q.block_sleep(125, 100);
-        assert_eq!(q.select(10, false), 10); // back to kernel HLT caller
-        assert!(q.active && q.has_timed_waiters() && !q.running());
-        q.wake_timed(124, false);
-        assert!(q.has_timed_waiters());
-        q.wake_timed(125, false);
-        assert!(!q.has_timed_waiters());
-        assert_eq!(q.select(11, true), 10); // parent's saved syscall context
-        assert!(!q.take_clock_error());
+        let mut p = Harness::new(true);
+        p.fQueues[0].tasks[1].as_mut().unwrap().runnable = false;
+        p.fQueues[0].block_sleep(125, 100);
+        assert_eq!(p.select(0, 77, false), 10);
+        assert!(p.fQueues[0].active && !p.fQueues[0].running());
+        p.fQueues[0].wake_timed(&mut p.fFrames, 124, false);
+        assert!(p.fQueues[0].has_timed_waiters());
+        p.fQueues[0].wake_timed(&mut p.fFrames, 125, false);
+        assert_eq!(p.select(0, 11, true), 77);
+        assert!(!p.fQueues[0].take_clock_error());
     }
 
     #[test]
-    fn childExitWakesParentBeforeDeadlineWithoutPolling() {
-        let mut q = queue();
-        q.block_child(2, 900, 100);
-        assert_eq!(q.select(99, false), 8192); // child runs
-        assert!(q.has_timed_waiters());
-        // User-mode child exits; queue notifies parent while holding IF=0.
-        let mut frames = crate::frames::Frames::test_dummy();
-        q.terminate(42, &mut frames);
-        assert!(!q.has_timed_waiters());
-        assert!(q.tasks[0].as_ref().unwrap().runnable);
-        assert_eq!(q.select(0, false), 99);
-        assert!(!q.take_clock_error());
+    fn migratedLiveChildDoesNotBecomeAFabricatedExit() {
+        let mut p = Harness::new(true);
+        assert_eq!(p.moveTask(0).unwrap().fPid, 2);
+        p.fQueues[0].block_child(2, 900, 100);
+        assert_eq!(p.select(0, 99, false), 10);
+        p.fQueues[0].wake_timed(&mut p.fFrames, 101, false);
+        p.fQueues[0].wake_io(&mut p.fFrames);
+        assert!(p.fQueues[0].has_timed_waiters() && !p.fQueues[0].running());
+        assert_eq!(p.fQueues[0].collect(&mut p.fFrames, 1, 2), Err(-11));
+        assert_eq!(p.fQueues[0].child_after(&mut p.fFrames, 1, 0), Ok(2));
     }
 
     #[test]
-    fn elapsedTimeIsNotConfusedWithStalledClock() {
-        let mut q = queue();
-        q.tasks[1].as_mut().unwrap().runnable = false;
-        q.block_sleep(20_000, 0);
-        q.select(1, false);
-        for tick in 1..=1000 {
-            q.wake_timed(tick, false);
-        }
-        assert!(q.has_timed_waiters());
-        assert!(!q.tasks[0].as_ref().unwrap().clock_error);
+    fn remoteChildExitWakesParentBeforeDeadlineWithoutPolling() {
+        let mut p = Harness::new(true);
+        p.moveTask(0).unwrap();
+        p.fQueues[0].block_child(2, 900, 100);
+        p.select(0, 99, false);
+        assert_eq!(p.select(1, 200, false), 8192);
+        p.fQueues[1].terminate(42, &mut p.fFrames);
+        p.fQueues[0].wake_io(&mut p.fFrames);
+        assert!(!p.fQueues[0].has_timed_waiters());
+        assert_eq!(p.select(0, 11, false), 99);
+        assert_eq!(p.fQueues[0].collect(&mut p.fFrames, 1, 2), Ok(42));
+        // The child still owns its outgoing kernel stack on CPU1.
+        assert_eq!(p.fQueues[1].collectRetired(&mut p.fFrames), 0);
+        p.select(1, 0, false);
+        assert_eq!(p.fQueues[1].collectRetired(&mut p.fFrames), 1);
+        assert_eq!(p.fFrames.used(), 1);
     }
 
     #[test]
-    fn permanentlyFrozenClockEventuallyReturnsErrorNotTimeout() {
-        let mut q = queue();
-        q.tasks[1].as_mut().unwrap().runnable = false;
-        q.block_sleep(10_000, 100);
-        q.select(1, false);
+    fn permanentlyFrozenClockReturnsErrorRatherThanTimeout() {
+        let mut p = Harness::new(false);
+        p.fQueues[0].block_sleep(10_000, 100);
+        p.select(0, 77, false);
         let mut pTimer = crate::timer::Timer::new(1000);
         pTimer.reset(Some(100));
         for pSecond in 1..=5 {
-            assert_eq!(pTimer.plan(false, q.next_deadline(), 100), crate::timer::Action::Arm(100_000));
-            q.wake_timed(100, pTimer.sample(0, Some(100)));
-            assert_eq!(q.has_timed_waiters(), pSecond < 5);
+            assert_eq!(pTimer.plan(false, p.fQueues[0].next_deadline(), 100), crate::timer::Action::Arm(100_000));
+            p.fQueues[0].wake_timed(&mut p.fFrames, 100, pTimer.sample(0, Some(100)));
+            assert_eq!(p.fQueues[0].has_timed_waiters(), pSecond < 5);
         }
-        assert!(!q.has_timed_waiters());
-        assert_eq!(q.select(1, true), 1);
-        assert!(q.take_clock_error());
-        assert!(!q.take_clock_error()); // consumed exactly once
+        assert_eq!(p.select(0, 11, true), 77);
+        assert!(p.fQueues[0].take_clock_error());
+        assert!(!p.fQueues[0].take_clock_error());
     }
 
     #[test]
-    fn childWaitAlsoWakesAtDeadlineWithoutCollecting() {
-        let mut q = queue();
-        q.block_child(2, 200, 100);
-        q.select(99, false);
-        q.wake_timed(200, false);
-        assert!(!q.has_timed_waiters());
-        assert!(q.tasks[1].as_ref().unwrap().process.as_ref().unwrap().status.is_none());
-        assert!(q.tasks[0].as_ref().unwrap().runnable);
+    fn advancingClockDoesNotBecomeAFalseFailure() {
+        let mut p = Harness::new(false);
+        p.fQueues[0].block_sleep(20_000, 0);
+        p.select(0, 77, false);
+        for pNow in 1..=1000 { p.fQueues[0].wake_timed(&mut p.fFrames, pNow, false); }
+        assert!(p.fQueues[0].has_timed_waiters());
+        assert!(!p.fQueues[0].tasks[0].as_ref().unwrap().clock_error);
     }
 
     #[test]
-    fn killChildRejectsUnownedTargetAndWakesParentWait() {
-        let mut q = queue();
-        let mut frames = crate::frames::Frames::test_dummy();
-        assert_eq!(q.kill_child(&mut frames, 3, 2), Err(-1));
-        assert_eq!(q.kill_child(&mut frames, 1, 1), Err(-22));
-        assert_eq!(q.kill_child(&mut frames, 1, 999), Err(-3));
-        q.block_child(2, 700, 100);
-        assert_eq!(q.select(99, false), 8192);
-        assert_eq!(q.kill_child(&mut frames, 1, 2), Ok(0));
-        assert!(q.tasks[0].as_ref().unwrap().runnable);
-        assert_eq!(q.kill_child(&mut frames, 1, 2), Ok(1));
-        assert_eq!(q.tasks[1].as_ref().unwrap().process.as_ref().unwrap().status, Some(137));
+    fn deadlineWakeDoesNotCollectAStillRunningRemoteChild() {
+        let mut p = Harness::new(true);
+        p.moveTask(0).unwrap();
+        p.fQueues[0].block_child(2, 200, 100);
+        p.select(0, 99, false);
+        p.fQueues[0].wake_timed(&mut p.fFrames, 200, false);
+        assert!(!p.fQueues[0].has_timed_waiters());
+        assert_eq!(p.state(2).fStatus, None);
+        assert_eq!(p.fQueues[0].collect(&mut p.fFrames, 1, 2), Err(-11));
+    }
+
+    #[test]
+    fn remoteKillChecksOwnershipAndWaitsForOwnerAcknowledgement() {
+        let mut p = Harness::new(true);
+        p.moveTask(0).unwrap();
+        p.select(1, 200, false);
+        assert_eq!(p.fQueues[0].kill_child(&mut p.fFrames, 3, 2), Err(-1));
+        assert_eq!(p.fQueues[0].kill_child(&mut p.fFrames, 1, 1), Err(-22));
+        assert_eq!(p.fQueues[0].kill_child(&mut p.fFrames, 1, 999), Err(-3));
+        assert_eq!(p.fQueues[0].kill_child(&mut p.fFrames, 1, 2), Ok(0));
+        assert!(p.state(2).fKillPending);
+        assert_eq!(p.state(2).fStatus, None);
+        assert_eq!(p.fQueues[0].collect(&mut p.fFrames, 1, 2), Err(-11));
+        assert!(p.fQueues[1].processPendingKills(&mut p.fFrames));
+        assert_eq!(p.state(2).fStatus, Some(137));
+        assert_eq!(p.fQueues[0].kill_child(&mut p.fFrames, 1, 2), Ok(1));
+        assert!(!p.fQueues[1].tasks[0].as_ref().unwrap().runnable);
+    }
+
+    #[test]
+    fn aConcurrentKillOfTheCallerPreventsItsNextUserSelection() {
+        let mut p = Harness::new(true);
+        p.add(0, 2); //3, child of the current syscall caller
+        p.fQueues[0].current = Some(1);
+        assert_eq!(p.fPrograms.fRegistry.requestKill(&mut p.fFrames, 1, 2), Ok(0));
+        assert_eq!(p.fQueues[0].kill_child(&mut p.fFrames, 2, 3), Ok(0));
+        assert_eq!(p.fQueues[0].process().unwrap().status, Some(137));
+        assert_eq!(p.fPrograms.fRegistry.parentOf(&mut p.fFrames, 3), Some(1));
+        assert_eq!(p.select(0, 0, false), 4096);
+        assert_eq!(p.fQueues[0].process().unwrap().pid, 1);
     }
 
     #[test]
     fn bootRootParksAndResumesWithIdenticalPidAndContext() {
-        let mut q=queue();
-        q.tasks[1]=None;
-        q.count=1;
-        assert!(q.parkedSpace().is_none());
-        assert_eq!(q.park_boot_root(1),Ok(()));
-        assert!(q.parkedSpace().is_none()); // still executing until schedule returns
-        assert_eq!(q.select(0x222, false),10); // back to the kernel caller
-        assert_eq!(q.parked_root(),Some(1));
-        assert!(core::ptr::eq(q.parkedSpace().unwrap(),
-            &q.tasks[0].as_ref().unwrap().process.as_ref().unwrap().space));
-        assert_eq!(q.resume_boot_root(999),Err(-16));
-        assert_eq!(q.resume_boot_root(1),Ok(()));
-        assert!(q.parkedSpace().is_none());
-        assert_eq!(q.resume_boot_root(1),Err(-16)); // one-shot
-        q.active=true;
-        assert_eq!(q.select(0x333,false),0x222); // original saved context
-        assert_eq!(q.process().unwrap().pid,1);
-        assert_eq!(q.park_boot_root(1),Err(-16)); // actual one-shot, after rescheduling
+        let mut p = Harness::new(false);
+        assert!(p.fQueues[0].parkedSpace().is_none());
+        assert_eq!(p.fQueues[0].park_boot_root(&mut p.fFrames, 1), Ok(()));
+        assert_eq!(p.select(0, 0x222, false), 10);
+        assert_eq!(p.fQueues[0].parked_root(), Some(1));
+        assert!(p.fQueues[0].parkedSpace().is_some());
+        assert_eq!(p.moveTask(0), Err(-3));
+        assert_eq!(p.fQueues[0].resume_boot_root(999), Err(-16));
+        assert_eq!(p.fQueues[0].resume_boot_root(1), Ok(()));
+        assert_eq!(p.fQueues[0].resume_boot_root(1), Err(-16));
+        p.fQueues[0].active = true;
+        assert_eq!(p.select(0, 0x333, false), 0x222);
+        assert_eq!(p.fQueues[0].process().unwrap().pid, 1);
+        assert_eq!(p.fQueues[0].park_boot_root(&mut p.fFrames, 1), Err(-16));
     }
 
     #[test]
-    fn eventWaitWakesOnAnyDirectChildExitWithoutTimeoutPolling() {
-        let mut q=queue();
-        q.block_events(0, 900, 100);
-        assert_eq!(q.select(77,false),8192);
-        let mut frames=crate::frames::Frames::test_dummy();
-        q.terminate(42,&mut frames);
-        assert!(!q.has_timed_waiters());
-        assert!(q.tasks[0].as_ref().unwrap().runnable);
-        assert!(q.has_exited_child(1));
-        assert!(!q.has_exited_child(2));
-        assert_eq!(q.select(0,false),77);
+    fn eventWaitWakesOnRemoteChildExitEvenWhenClockFails() {
+        let mut p = Harness::new(true);
+        p.moveTask(0).unwrap();
+        p.fQueues[0].block_events(0, 900, 100);
+        p.select(0, 77, false);
+        p.select(1, 200, false);
+        p.fQueues[1].terminate(42, &mut p.fFrames);
+        p.fQueues[0].wake_timed(&mut p.fFrames, 100, true);
+        assert_eq!(p.select(0, 11, false), 77);
+        assert!(!p.fQueues[0].take_clock_error());
+        assert!(p.fQueues[0].has_exited_child(&mut p.fFrames, 1));
+        assert!(!p.fQueues[0].has_exited_child(&mut p.fFrames, 2));
     }
 
     #[test]
-    fn eventWaitDeadlineDoesNotReapOrFabricateChildExit() {
-        let mut q=queue();
-        q.tasks[1].as_mut().unwrap().runnable=false;
-        q.block_events(0,220,100);
-        q.select(0x456,false);
-        q.wake_timed(219,false);
-        assert!(q.has_timed_waiters());
-        q.wake_timed(220,false);
-        assert!(!q.has_timed_waiters());
-        assert!(!q.has_exited_child(1));
-        assert!(q.tasks[1].as_ref().unwrap().process.as_ref().unwrap().status.is_none());
+    fn nearestDeadlineTracksSleepAndEventWaiters() {
+        let mut p = Harness::new(true);
+        p.fQueues[0].block_sleep(900, 100);
+        p.select(0, 77, false);
+        p.fQueues[0].block_events(0, 250, 100);
+        assert_eq!(p.fQueues[0].next_deadline(), Some(250));
+        p.select(0, 88, false);
+        p.fQueues[0].wake_timed(&mut p.fFrames, 249, false);
+        assert_eq!(p.fQueues[0].next_deadline(), Some(250));
+        p.fQueues[0].wake_timed(&mut p.fFrames, 250, false);
+        assert_eq!(p.fQueues[0].next_deadline(), Some(900));
+        assert_eq!(p.select(0, 99, true), 88);
+        p.fQueues[0].wake_timed(&mut p.fFrames, 900, false);
+        assert_eq!(p.fQueues[0].next_deadline(), None);
+        assert!(!p.fQueues[0].has_exited_child(&mut p.fFrames, 1));
     }
 
     #[test]
-    fn nearestDeadlineTracksIndependentSleepAndEventWaiters() {
-        let mut q=queue();
-        q.block_sleep(900,100);
-        q.select(77,false);
-        q.block_events(0,250,100);
-        assert_eq!(q.next_deadline(),Some(250));
-        q.select(88,false);
-        assert!(!q.running());
-        q.wake_timed(249,false);
-        assert_eq!(q.next_deadline(),Some(250));
-        q.wake_timed(250,false);
-        assert_eq!(q.next_deadline(),Some(900));
-        assert_eq!(q.select(99,true),88);
-        q.wake_timed(900,false);
-        assert_eq!(q.next_deadline(),None);
+    fn untrustedExpiredTimeCannotOverrideClockFailure() {
+        let mut p = Harness::new(false);
+        p.fQueues[0].block_events(0, 200, 100);
+        p.select(0, 77, false);
+        p.fQueues[0].wake_timed(&mut p.fFrames, 999, true);
+        assert_eq!(p.select(0, 88, false), 77);
+        assert!(p.fQueues[0].take_clock_error());
     }
 
     #[test]
-    fn unavailableClockReturnsErrorEvenIfAnUntrustedTimeLooksExpired() {
-        let mut q=queue();
-        q.tasks[1].as_mut().unwrap().runnable=false;
-        q.block_events(0,200,100);
-        q.select(77,false);
-        q.wake_timed(999,true);
-        assert_eq!(q.next_deadline(),None);
-        assert_eq!(q.select(88,false),77);
-        assert!(q.take_clock_error());
-        assert!(!q.has_exited_child(1));
+    fn adoptionAcrossCpusPreservesLiveAndZombieChildren() {
+        let mut p = Harness::new(true);
+        assert_eq!(p.add(1, 1), 3);
+        assert_eq!(p.add(1, 3), 4);
+        assert_eq!(p.add(0, 3), 5);
+        p.fQueues[0].current = Some(2); // grandchild5 exits before parent3
+        p.fQueues[0].terminate(19, &mut p.fFrames);
+        p.select(0, 0, false);
+        p.fQueues[1].active = true;
+        p.select(1, 200, false); // intermediate parent3
+        p.fQueues[1].terminate(0, &mut p.fFrames);
+        assert_eq!(p.fPrograms.fRegistry.parentOf(&mut p.fFrames, 4), Some(1));
+        assert_eq!(p.fPrograms.fRegistry.parentOf(&mut p.fFrames, 5), Some(1));
+        assert_eq!(p.fQueues[0].child_after(&mut p.fFrames, 1, 3), Ok(4));
+        assert_eq!(p.fQueues[0].child_after(&mut p.fFrames, 1, 4), Ok(5));
+        assert_eq!(p.fQueues[0].collect(&mut p.fFrames, 3, 4), Err(-10));
+        assert_eq!(p.fQueues[0].kill_child(&mut p.fFrames, 3, 4), Err(-1));
+        assert_eq!(p.fQueues[0].collect(&mut p.fFrames, 1, 5), Ok(19));
+        assert_eq!(p.fQueues[0].kill_child(&mut p.fFrames, 1, 4), Ok(0));
+        p.fQueues[1].processPendingKills(&mut p.fFrames);
+        assert_eq!(p.fQueues[0].collect(&mut p.fFrames, 1, 4), Ok(137));
+        assert_eq!(p.fQueues[0].collect(&mut p.fFrames, 1, 3), Ok(0));
+        assert_eq!(p.fQueues[0].child_after(&mut p.fFrames, 1, 0), Ok(2));
     }
 
     #[test]
-    fn realChildCompletionDoesNotBecomeClockFailure() {
-        let mut q=queue();
-        q.block_child(2,900,100);
-        q.select(77,false);
-        q.tasks[1].as_mut().unwrap().process.as_mut().unwrap().status=Some(42);
-        q.tasks[1].as_mut().unwrap().runnable=false;
-        q.wake_timed(100,true);
-        assert_eq!(q.select(88,false),77);
-        assert!(!q.take_clock_error());
-        assert!(q.has_exited_child(1));
-    }
-
-    fn nested_queue() -> Queue {
-        let mut q = queue();
-        q.tasks[2] = Some(task(3, 1));
-        q.tasks[3] = Some(task(4, 3));
-        q.count = 4;
-        q
+    fn killingIntermediateParentAlsoAdoptsRemoteGrandchild() {
+        let mut p = Harness::new(true);
+        p.add(1, 1); //3
+        p.add(1, 3); //4
+        assert_eq!(p.fQueues[0].kill_child(&mut p.fFrames, 1, 3), Ok(0));
+        p.fQueues[1].processPendingKills(&mut p.fFrames);
+        assert_eq!(p.fPrograms.fRegistry.parentOf(&mut p.fFrames, 4), Some(1));
+        assert_eq!(p.fQueues[0].kill_child(&mut p.fFrames, 1, 4), Ok(0));
+        p.fQueues[1].processPendingKills(&mut p.fFrames);
+        assert_eq!(p.fQueues[0].collect(&mut p.fFrames, 1, 3), Ok(137));
+        assert_eq!(p.fQueues[0].collect(&mut p.fFrames, 1, 4), Ok(137));
     }
 
     #[test]
-    fn exitingIntermediateParentAdoptsLiveChildToCpuLocalInit() {
-        let mut q = nested_queue();
-        let mut frames = crate::frames::Frames::test_dummy();
-        q.current = Some(2);
-        q.terminate(0, &mut frames);
-        assert_eq!(q.tasks[3].as_ref().unwrap().process.as_ref().unwrap().parent, 1);
-        assert!(q.tasks[3].as_ref().unwrap().runnable);
-        assert_eq!(q.child_after(1, 2), Ok(3));
-        assert_eq!(q.child_after(1, 3), Ok(4));
-        assert_eq!(q.child_after(1, 4), Err(-10));
-        assert_eq!(q.collect(&mut frames, 3, 4), Err(-10));
-        assert_eq!(q.kill_child(&mut frames, 3, 4), Err(-1));
-        assert_eq!(q.kill_child(&mut frames, 1, 4), Ok(0));
-        assert_eq!(q.collect(&mut frames, 1, 4), Ok(137));
-        assert_eq!(q.collect(&mut frames, 1, 3), Ok(0));
-        assert_eq!(q.child_after(1, 0), Ok(2));
+    fn rootExitStopsRemoteDescendantsAndWaitsForTheirStackCleanup() {
+        let mut p = Harness::new(true);
+        p.add(1, 1); //3
+        p.add(1, 3); //4
+        p.fQueues[1].active = true;
+        p.select(1, 200, false);
+        p.fQueues[0].terminate(7, &mut p.fFrames);
+        assert_eq!(p.fQueues[0].init_pid, None);
+        assert!(p.state(3).fKillPending && p.state(4).fKillPending);
+        assert!(p.fPrograms.fRegistry.sessionChildrenRemain(&mut p.fFrames, 1));
+        p.fQueues[1].processPendingKills(&mut p.fFrames);
+        assert_eq!(p.state(3).fStatus, Some(137));
+        assert_eq!(p.state(4).fStatus, Some(137));
+        p.fQueues[1].collectRetired(&mut p.fFrames);
+        assert!(!p.fPrograms.fRegistry.sessionEmpty(&mut p.fFrames, 1));
+        p.select(1, 0, false);
+        p.fQueues[1].collectRetired(&mut p.fFrames);
+        p.select(0, 0, false);
+        assert_eq!(p.fQueues[0].collect(&mut p.fFrames, 0, 1), Ok(7));
+        assert!(p.fPrograms.fRegistry.sessionEmpty(&mut p.fFrames, 1));
+        assert_eq!(p.fFrames.used(), 0);
     }
 
     #[test]
-    fn exitingIntermediateParentAdoptsAlreadyZombieChild() {
-        let mut q = nested_queue();
-        let mut frames = crate::frames::Frames::test_dummy();
-        q.tasks[3].as_mut().unwrap().process.as_mut().unwrap().status = Some(19);
-        q.tasks[3].as_mut().unwrap().runnable = false;
-        q.current = Some(2);
-        q.terminate(0, &mut frames);
-        assert_eq!(q.child_after(1, 3), Ok(4));
-        assert_eq!(q.kill_child(&mut frames, 1, 4), Ok(1));
-        assert_eq!(q.collect(&mut frames, 1, 4), Ok(19));
-        assert_eq!(q.collect(&mut frames, 1, 3), Ok(0));
+    fn pendingRootKillAlsoStopsChildrenInEarlierMigratedSlots() {
+        let mut p = Harness::new(true);
+        // Migration can place a reaper after an already-resident child.
+        p.fQueues[0].tasks.swap(0, 1);
+        p.fQueues[0].current = Some(0); // child2 is the interrupted process
+        assert_eq!(p.fPrograms.fRegistry.requestKill(&mut p.fFrames, 0, 1), Ok(0));
+        assert!(p.fQueues[0].processPendingKills(&mut p.fFrames));
+        assert_eq!(p.state(1).fStatus, Some(137));
+        assert_eq!(p.state(2).fStatus, Some(137));
+        assert_eq!(p.fQueues[0].runnableCount(), 0);
+        assert_eq!(p.select(0, 0, false), 10);
+        assert_eq!(p.fQueues[0].collect(&mut p.fFrames, 0, 1), Ok(137));
+        assert_eq!(p.fFrames.used(), 0);
     }
 
     #[test]
-    fn killingIntermediateParentAlsoAdoptsLiveGrandchild() {
-        let mut q = nested_queue();
-        let mut frames = crate::frames::Frames::test_dummy();
-        assert_eq!(q.kill_child(&mut frames, 1, 3), Ok(0));
-        assert_eq!(q.tasks[3].as_ref().unwrap().process.as_ref().unwrap().parent, 1);
-        assert_eq!(q.kill_child(&mut frames, 1, 4), Ok(0));
-        assert_eq!(q.collect(&mut frames, 1, 3), Ok(137));
-        assert_eq!(q.collect(&mut frames, 1, 4), Ok(137));
-    }
-
-    #[test]
-    fn rootExitStopsAllLiveDescendantsWithoutLeakingRunnableServices() {
-        let mut q = nested_queue();
-        let mut frames = crate::frames::Frames::test_dummy();
-        q.current = Some(0);
-        q.terminate(7, &mut frames);
-        assert_eq!(q.init_pid, None);
-        for i in 1..4 {
-            let t=q.tasks[i].as_ref().unwrap();
-            assert_eq!(t.process.as_ref().unwrap().status, Some(137));
-            assert!(!t.runnable && t.waiting.is_none() && t.timed.is_none());
+    fn migrationPreservesIdentityContextAndResourcesAcrossRepeatedTransfers() {
+        let mut p = Harness::new(true);
+        let pBefore = p.state(2);
+        let pInitial = p.moveTask(0).unwrap();
+        assert_eq!(pInitial.fPid, 2);
+        assert_eq!(pInitial.fContext, 8192);
+        assert_eq!(pInitial.fRoot, 0x102000);
+        assert_eq!(pInitial.fMigrations, 1);
+        for pIteration in 1..=100 {
+            let pInfo = p.moveTask(pIteration % 2).unwrap();
+            assert_eq!(pInfo.fPid, pInitial.fPid);
+            assert_eq!(pInfo.fContext, pInitial.fContext);
+            assert_eq!(pInfo.fRoot, pInitial.fRoot);
+            assert_eq!(pInfo.fStackTop, pInitial.fStackTop);
+            assert_eq!(pInfo.fMigrations, pIteration + 1);
+            assert_eq!(p.fQueues[0].taskCount() + p.fQueues[1].taskCount(), 2);
+            assert_eq!(p.state(2), pBefore);
+            assert_eq!(p.fFrames.used(), 2);
         }
-        assert_eq!(q.tasks[0].as_ref().unwrap().process.as_ref().unwrap().status, Some(7));
-        assert_eq!(q.select(42, false), 10); // return to kernel caller
-        assert!(!q.active);
     }
 
     #[test]
-    fn adoptedChildEnumerationIsSortedAndOwnerScoped() {
-        let mut q=nested_queue();
-        let mut frames=crate::frames::Frames::test_dummy();
-        assert_eq!(q.child_after(1, 0), Ok(2));
-        assert_eq!(q.child_after(1, 2), Ok(3));
-        assert_eq!(q.child_after(1, 3), Err(-10)); // grandchild still hidden
-        assert_eq!(q.child_after(2, 0), Err(-10));
-        q.current=Some(2);
-        q.terminate(0, &mut frames);
-        assert_eq!(q.child_after(1, 3), Ok(4)); // adopted by root
-        assert_eq!(q.child_after(3, 0), Err(-10));
-        assert_eq!(q.child_after(1, usize::MAX), Err(-10));
+    fn outgoingStackCannotMoveOrBeReapedBeforeSwitchAcknowledgement() {
+        let mut p = Harness::new(true);
+        p.fQueues[0].boot_handoff_done = true; // root becomes generally movable
+        assert_eq!(p.fQueues[0].select(77, false), 8192);
+        assert_eq!(p.moveTask(0), Err(-3)); // current child and retiring parent
+        p.fQueues[0].completeSwitch();
+        assert_eq!(p.moveTask(0).unwrap().fPid, 1);
+        p.fQueues[0].terminate(42, &mut p.fFrames);
+        assert_eq!(p.fPrograms.fRegistry.collect(&mut p.fFrames, 1, 2), Ok(42));
+        assert_eq!(p.fQueues[0].select(0, false), 10);
+        assert_eq!(p.fQueues[0].collectRetired(&mut p.fFrames), 0); // retiring child
+        p.fQueues[0].completeSwitch();
+        assert_eq!(p.fQueues[0].collectRetired(&mut p.fFrames), 1);
+    }
+
+    #[test]
+    fn fullDestinationDoesNotChangeSourceOwnership() {
+        let mut p = Harness::new(true);
+        for _ in 0..CAPACITY { p.add(1, 1); }
+        assert_eq!(p.moveTask(0), Err(-11));
+        assert_eq!(p.fQueues[0].taskCount(), 2);
+        assert_eq!(p.fQueues[0].tasks[1].as_ref().unwrap().fMigrations, 0);
+        assert_eq!(p.fQueues[1].taskCount(), CAPACITY);
+        assert_eq!(p.fFrames.used(), CAPACITY + 2);
+    }
+
+    #[test]
+    fn neverRunBlockedDeadAndKernelTasksAreNotMigrationCandidates() {
+        let mut p = Harness::new(true);
+        p.fQueues[0].tasks[1].as_mut().unwrap().fHasRun = false;
+        assert_eq!(p.moveTask(0), Err(-3));
+        p.fQueues[0].tasks[1].as_mut().unwrap().fHasRun = true;
+        p.fQueues[0].tasks[1].as_mut().unwrap().runnable = false;
+        assert_eq!(p.moveTask(0), Err(-3));
+        p.fQueues[0].tasks[1].as_mut().unwrap().runnable = true;
+        p.fQueues[0].kill_child(&mut p.fFrames, 1, 2).unwrap();
+        assert_eq!(p.moveTask(0), Err(-3));
+        p.fQueues[0].collect(&mut p.fFrames, 1, 2).unwrap();
+        p.fQueues[0].tasks[1] = Some(Task {
+            stack: KernelStack::test_dummy(), context: 99, runnable: true,
+            waiting: None, timed: None, clock_error: false, preemptions: 0,
+            fHasRun: true, fMigrations: 0, process: None,
+        });
+        p.fQueues[0].count = 2;
+        assert_eq!(p.moveTask(0), Err(-3));
+    }
+
+    #[test]
+    fn persistentEmptyRuntimeQueueKeepsItsKernelIdleCaller() {
+        let mut pQueue = Queue::new();
+        pQueue.setRuntimeIdle(true);
+        assert_eq!(pQueue.select(77, false), 77);
+        assert!(pQueue.active && pQueue.all_blocked());
+        assert_eq!(pQueue.next_deadline(), None);
+        assert_eq!(pQueue.runnableCount(), 0);
+        pQueue.completeSwitch();
+        pQueue.setRuntimeIdle(false);
+        assert_eq!(pQueue.select(88, false), 88);
+        assert!(!pQueue.active);
+    }
+
+    #[test]
+    fn exitedStatusCanOnlyBeConsumedOnceWhileZombieStillHasAStack() {
+        let mut p = Harness::new(true);
+        p.select(0, 77, false);
+        p.fQueues[0].terminate(42, &mut p.fFrames);
+        assert_eq!(p.fPrograms.fRegistry.collect(&mut p.fFrames, 1, 2), Ok(42));
+        assert_eq!(p.fPrograms.fRegistry.collect(&mut p.fFrames, 1, 2), Err(-10));
+        assert!(!p.fQueues[0].has_exited_child(&mut p.fFrames, 1));
+        assert!(p.fPrograms.fRegistry.sessionChildrenRemain(&mut p.fFrames, 1));
+        assert_eq!(p.fQueues[0].collectRetired(&mut p.fFrames), 0);
+        p.select(0, 0, false);
+        assert_eq!(p.fQueues[0].collectRetired(&mut p.fFrames), 1);
     }
 }

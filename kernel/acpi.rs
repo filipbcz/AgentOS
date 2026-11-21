@@ -49,6 +49,7 @@ pub struct IsaInterrupt { pub gsi: u32, pub low: bool, pub level: bool }
 pub struct Platform {
     pub lapic: usize,
     pub timer_port: u16,
+    pub hpet: usize,
     pub ids: [u8; 255],
     pub count: usize,
     pub legacy_pic: bool,
@@ -58,6 +59,20 @@ pub struct Platform {
     pub keyboard_irq: IsaInterrupt,
     serial_override: bool,
     keyboard_override: bool,
+}
+
+/// This profile maps one complete HPET register page, with 64-bit MMIO reads.
+/// Capability/period validation happens against the device before it is used.
+#[allow(non_snake_case)]
+fn hpetAddress(aBytes: &[u8]) -> Option<usize> {
+    if aBytes.len() < 56 || aBytes.get(..4)? != b"HPET" ||
+       u32_at(aBytes, 4)? as usize != aBytes.len() || !checksum(aBytes) ||
+       aBytes[40] != 0 || !matches!(aBytes[41], 0 | 64) ||
+       aBytes[42] != 0 || !matches!(aBytes[43], 0 | 4) { return None; }
+    let pAddress = usize::try_from(u64_at(aBytes, 44)?).ok()?;
+    // Keep hardware outside the sole user PML4 slot and canonical low half.
+    (pAddress != 0 && pAddress & 4095 == 0 && pAddress < (1usize << 39))
+        .then_some(pAddress)
 }
 
 impl Platform {
@@ -120,7 +135,7 @@ pub unsafe fn discover(info: &BootInfo, map: &[u8]) -> Option<Platform> {
     };
     if &root[..4] != (if width == 8 { b"XSDT" } else { b"RSDT" }) ||
         (root.len()-36) % width != 0 { return None; }
-    let mut p = Platform { lapic: 0, timer_port: 0, ids: [0; 255], count: 0, legacy_pic: false,
+    let mut p = Platform { lapic: 0, timer_port: 0, hpet: 0, ids: [0; 255], count: 0, legacy_pic: false,
         io_apics: [IoApic { address: 0, gsi: 0 }; 8], io_count: 0,
         serial_irq: IsaInterrupt { gsi: 4, low: false, level: false }, serial_override: false,
         keyboard_irq: IsaInterrupt { gsi: 1, low: false, level: false }, keyboard_override: false };
@@ -128,6 +143,10 @@ pub unsafe fn discover(info: &BootInfo, map: &[u8]) -> Option<Platform> {
         let address = if width == 8 { u64_at(entry, 0)? } else { u32_at(entry, 0)? as u64 };
         match fw.bytes(address, 4)? {
             b"APIC" => p.madt(fw.table(address)?)?,
+            b"HPET" => {
+                if p.hpet != 0 { return None; }
+                p.hpet = hpetAddress(fw.table(address)?)?;
+            }
             b"FACP" => {
                 let fadt = fw.table(address)?;
                 let extended = u64_at(fadt, 212).unwrap_or(0);
@@ -140,5 +159,62 @@ pub unsafe fn discover(info: &BootInfo, map: &[u8]) -> Option<Platform> {
             _ => (),
         }
     }
+    if p.hpet != 0 && (p.hpet == p.lapic ||
+       p.io_apics[..p.io_count].iter().any(|pIo| pIo.address == p.hpet)) { return None; }
     (p.lapic != 0 && p.timer_port != 0).then_some(p)
+}
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod tests {
+    use super::*;
+
+    fn fixChecksum(aBytes: &mut [u8]) {
+        aBytes[9] = 0;
+        aBytes[9] = 0u8.wrapping_sub(aBytes.iter().fold(0u8, |pSum, pByte| pSum.wrapping_add(*pByte)));
+    }
+
+    fn hpetTable() -> Vec<u8> {
+        let mut pBytes = vec![0u8; 56];
+        pBytes[..4].copy_from_slice(b"HPET");
+        pBytes[4..8].copy_from_slice(&56u32.to_le_bytes());
+        pBytes[8] = 1;
+        pBytes[36..40].copy_from_slice(&0x8086_a201u32.to_le_bytes());
+        pBytes[44..52].copy_from_slice(&0xfed0_0000u64.to_le_bytes());
+        fixChecksum(&mut pBytes);
+        pBytes
+    }
+
+    #[test]
+    fn acceptsSystemMemoryWithDeclaredOrUnspecifiedRegisterWidth() {
+        let mut pBytes = hpetTable();
+        assert_eq!(hpetAddress(&pBytes), Some(0xfed0_0000));
+        pBytes[41] = 64;
+        pBytes[43] = 4;
+        fixChecksum(&mut pBytes);
+        assert_eq!(hpetAddress(&pBytes), Some(0xfed0_0000));
+    }
+
+    #[test]
+    fn rejectsMalformedHeaderChecksumAndGasBeforeMapping() {
+        let pValid = hpetTable();
+        for pLength in 0..56 { assert_eq!(hpetAddress(&pValid[..pLength]), None); }
+        for (pOffset, pValue) in [(0, b'X'), (4, 55), (9, pValid[9].wrapping_add(1)),
+            (40, 1), (41, 32), (42, 1), (43, 3)] {
+            let mut pBytes = pValid.clone();
+            pBytes[pOffset] = pValue;
+            if pOffset != 9 { fixChecksum(&mut pBytes); }
+            assert_eq!(hpetAddress(&pBytes), None);
+        }
+    }
+
+    #[test]
+    fn rejectsZeroUnalignedAndUserRegionAddresses() {
+        for pAddress in [0u64, 0xfed0_0008, 1 << 39, 1 << 47, u64::MAX] {
+            let mut pBytes = hpetTable();
+            pBytes[44..52].copy_from_slice(&pAddress.to_le_bytes());
+            fixChecksum(&mut pBytes);
+            assert_eq!(hpetAddress(&pBytes), None);
+        }
+    }
 }

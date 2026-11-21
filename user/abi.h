@@ -27,6 +27,21 @@
 #define SYS_TIMER_STATS       0x10018
 #define SYS_IPC_TRY_SEND      0x10019
 #define SYS_VM_STATS          0x1001a
+#define SYS_SCHED_STATS       0x1001b
+
+/* Native ELF ABI v2 replaces the former CPU-local time contract. The loader
+ * rejects v1 ELF notes with -8 (ENOEXEC) before allocating a process; rebuild
+ * older native programs against this header. All process timestamps and
+ * absolute wait deadlines now use one shared boot-epoch HPET clock.
+ */
+/* SYS_SCHED_STATS(buffer, 64, 0): eight little-endian u64 fields:
+ * version=1, current APIC ID, online scheduler CPU count, this process's
+ * completed migrations, system completed migrations, cross-CPU wakeups,
+ * current PID and parent PID. Counts never reset on read. A migration moves
+ * an existing process without changing its identity, descriptors or memory.
+ * Returns 0, -14 for an invalid buffer, -12 on allocation failure, -22 for
+ * invalid size/flags. This diagnostic does not request or force a migration.
+ */
 
 /* SYS_VM_STATS(buffer, 64, 0): eight little-endian u64 fields:
  * version=1, reserved virtual pages, resident user data pages, private user
@@ -47,9 +62,11 @@
  * terminates only that process with status 270 (256 + vector 14).
  */
 
-/* SYS_TIMER_STATS(buffer, 32, 0): copy version 1, CPU-local monotonic
- * milliseconds, cumulative scheduler timer IRQs and idle scheduler IRQs,
- * as four little-endian u64 values. Counters never reset on read. Returns
+/* SYS_TIMER_STATS(buffer, 32, 0): copy version 2, shared boot-epoch monotonic
+ * milliseconds, system-wide cumulative scheduler timer IRQs and idle
+ * scheduler IRQs as four little-endian u64 values. Counts aggregate coherent
+ * pairs from all online CPUs and exclude boot/idle calibration probes; they
+ * never reset on read. Migration cannot change the meaning of a sample. Returns
  * 0, -14 for an invalid buffer, -12 on allocation failure, -22 for invalid
  * size/flags, -5 without a clock.
  * An idle IRQ interrupts an active scheduler with no runnable process.
@@ -62,46 +79,47 @@
 /* SYS_BOOT_PAUSE(): only the original BSP PID 1, after collecting all
  * boot-test descendants, may park for the trusted-terminal handoff.
  * Resumption returns to the SAME process, with no PID reuse. */
-/* SYS_WAIT_EVENTS_UNTIL(fd_mask, cpu_local_deadline_ms, 0): atomically
+/* SYS_WAIT_EVENTS_UNTIL(fd_mask, boot_epoch_deadline_ms, 0): atomically
  * validates watched IPC descriptors, sleeps without userspace polling and
  * wakes on queued messages, endpoint EOF, any direct child exit or deadline.
  * Returns bits 0..31 for readable descriptors, bit 32 for child exit, zero
  * at deadline; -9/-88 bad descriptor/type, -5 stalled clock, -22 arguments.
- * Like all IPC/wait operations, it is CPU-local; no cross-CPU callbacks.
+ * IPC and child events can originate on another CPU and wake this process
+ * wherever it is scheduled; migration preserves the original deadline.
  */
-/* SYS_MONOTONIC_MS: nonnegative milliseconds since owning CPU's epoch.
- * Per-CPU only; a process is currently pinned to its CPU. Not UTC and not
- * synchronized between CPUs. Returns -5 if the calibrated source is absent.
+/* SYS_MONOTONIC_MS: nonnegative milliseconds since the shared boot epoch.
+ * All CPUs read the same 64-bit HPET counter. Timestamps can be compared
+ * across migrated processes; they are not UTC. Returns -5 without a clock.
  */
-/* SYS_WAIT_CHILD_UNTIL(child_pid, absolute_cpu_local_deadline_ms):
+/* SYS_WAIT_CHILD_UNTIL(child_pid, absolute_boot_epoch_deadline_ms):
  * Return and reap child's nonnegative exit status (0..255 for normal exit,
  * 256+fault_vector for a trapped fault) if it has exited;
  * otherwise block until child exits or monotonic deadline is reached.
  * Returns -110 on deadline, -10 if child absent/not owned, -5 if clock stalls,
  * -22 if deadline exceeds signed syscall range. Does not reap on timeout.
- * SYS_SLEEP_UNTIL(absolute_cpu_local_deadline_ms): blocks until the deadline,
+ * SYS_SLEEP_UNTIL(absolute_boot_epoch_deadline_ms): blocks until the deadline,
  * returns 0 on success, -5 on clock stall, -22 on invalid deadline.
- * Timer-backed waits are local to the current CPU. With no runnable work,
+ * Migration preserves every absolute deadline. With no runnable work,
  * LAPIC is armed once for the earliest deadline, with at most a one-second
  * watchdog interval. Five seconds of calibrated LAPIC countdown without
- * monotonic progress reports a clock failure, never a fabricated timeout.
+ * HPET progress reports a clock failure, never a fabricated timeout.
  * Neither syscall busy-polls or sleeps while holding allocator locks.
  */
 /* SYS_CHILD_AFTER(last_pid): return the lowest direct child's PID
  * greater than last_pid, or -10 if no such child exists. Includes adopted
  * orphaned children and zombies, but never exposes another process's children.
- * In each CPU-local process session, the first root userspace process owns
+ * In each process session, the first root userspace process owns
  * the reaper role. Descendants are adopted at their parent's exit or kill.
  * If that reaper itself dies, unattended children are stopped and their
  * resources are reclaimed during kernel shutdown. -22 for invalid cursor.
  */
-/* SYS_FORK(): create a CPU-local child at the instruction following the
+/* SYS_FORK(): create a child at the instruction following the
  * syscall. Parent receives a new nonzero PID; child receives zero. Physical
  * resident user pages are shared read-only with explicit COW until the first
  * write; unmaterialized reservations remain lazy in both address spaces.
  * Kernel->user writes from read()/IPC also resolve COW; immutable text
  * stays read-only and executable, and both inherit open descriptors.
- * -11 if the CPU task table is full, -12 on frame allocation failure.
+ * -11 if no process/scheduler slot is available, -12 on frame allocation failure.
  * The parent remains unchanged on clone allocation failure.
  */
 /* SYS_IPC_TRY_RECV(fd, address, capacity): identical to SYS_IPC_RECV
@@ -119,7 +137,7 @@
 
 #ifdef __ASSEMBLER__
 /* Exactly one entry object per native ELF supplies this ABI discriminator.
- * PT_NOTE name="AgentOS\0", type=1, descriptor={u32 version=1,u32 flags=0}.
+ * PT_NOTE name="AgentOS\0", type=1, descriptor={u32 version=2,u32 flags=0}.
  * Every field and record is little-endian with four-byte ELF note alignment.
  * Unmarked ELF is reserved for the future Linux ABI and is not native code.
  */
@@ -127,7 +145,7 @@
 .balign 4
 .long 8, 8, 1
 .asciz "AgentOS"
-.long 1, 0
+.long 2, 0
 .popsection
 #endif
 

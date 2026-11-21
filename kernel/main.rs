@@ -11,6 +11,8 @@ mod smp;
 mod scheduler;
 mod stress;
 mod process;
+mod lifecycle;
+mod hpet;
 mod native_abi;
 mod files;
 mod ipc;
@@ -56,7 +58,24 @@ fn halt() -> ! {
 }
 
 #[panic_handler]
-fn panic(_: &PanicInfo) -> ! { halt() }
+#[allow(non_snake_case)]
+fn panic(aInfo: &PanicInfo) -> ! {
+    // Keep failure evidence available even before a terminal exists. Bounded
+    // formatting uses no allocator and cannot recursively overflow its buffer.
+    struct PanicText { fBytes: [u8; 256], fLength: usize }
+    impl core::fmt::Write for PanicText {
+        fn write_str(&mut self, aText: &str) -> core::fmt::Result {
+            let pLength = aText.len().min(self.fBytes.len() - self.fLength);
+            self.fBytes[self.fLength..self.fLength + pLength].copy_from_slice(&aText.as_bytes()[..pLength]);
+            self.fLength += pLength;
+            Ok(())
+        }
+    }
+    let mut pText = PanicText { fBytes: [0; 256], fLength: 0 };
+    let _ = core::fmt::write(&mut pText, format_args!("AGENTOS KERNEL PANIC: {}\r\n", aInfo));
+    unsafe { serial(&pText.fBytes[..pText.fLength]); }
+    halt()
+}
 
 unsafe fn out(port: u16, value: u8) {
     asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack));
@@ -69,6 +88,7 @@ unsafe fn input(port: u16) -> u8 {
 }
 
 const COM: u16 = 0x3f8;
+static SERIAL_LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 unsafe fn init_serial() {
     out(COM + 1, 0);
@@ -81,6 +101,12 @@ unsafe fn init_serial() {
 }
 
 unsafe fn serial(message: &[u8]) {
+    // Each call publishes one complete message. Mask local interrupts before
+    // taking the SMP gate, so the UART IRQ cannot recursively wait on it.
+    let flags: usize;
+    asm!("pushfq", "pop {}", "cli", out(reg) flags);
+    while SERIAL_LOCK.compare_exchange_weak(false, true, core::sync::atomic::Ordering::Acquire,
+        core::sync::atomic::Ordering::Relaxed).is_err() { core::hint::spin_loop(); }
     for &byte in message {
         for _ in 0..100_000 {
             let status: u8;
@@ -88,6 +114,8 @@ unsafe fn serial(message: &[u8]) {
             if status & 0x20 != 0 { out(COM, byte); break; }
         }
     }
+    SERIAL_LOCK.store(false, core::sync::atomic::Ordering::Release);
+    if flags & 0x200 != 0 { asm!("sti", options(nomem, nostack)); }
 }
 
 #[no_mangle]
@@ -115,6 +143,9 @@ pub unsafe extern "sysv64" fn kernel_main(info: &BootInfo) -> ! {
     // IST stacks use the guarded pool in the newly active kernel page tables.
     let Some(descriptors) = exceptions::Descriptors::new(&mut frames) else { log.event(0, b"IDT INIT FAILED"); halt(); };
     descriptors.load();
+    if let Err(reason) = hpet::init(platform.hpet) {
+        serial(b"GLOBAL CLOCK FAILED: "); serial(reason); serial(b"\r\n"); halt();
+    }
     serial(b"AGENTOS OWN CR3="); exceptions::hex(root as u64); serial(b"\r\n");
     if !exceptions::probe(info.stack_base) || !frames.probe() {
         log.event(0, b"EXCEPTION OR RAM PROBE FAILED"); halt();

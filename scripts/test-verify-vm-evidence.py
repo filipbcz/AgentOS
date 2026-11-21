@@ -156,6 +156,36 @@ class VmEvidenceTests(unittest.TestCase):
         self.save_manifest()
         self.assertEqual(evidence.verify_run(self.root, self.run)["result"], "pass")
 
+    def migrationLog(self):
+        pSpec = importlib.util.spec_from_file_location(
+            "receiptMigrationFixtures", Path(__file__).with_name("test-verify-migration.py"))
+        pFixtures = importlib.util.module_from_spec(pSpec)
+        pSpec.loader.exec_module(pFixtures)
+        return (b"AGENTOS KERNEL OK STAGE 1\r\n" + pFixtures.scenario(2).encode("ascii") +
+                b"AGENTOS MANAGER SESSION STOP PID=0000000000000001 "
+                b"STATUS=0000000000000000 FRAMES=OK\r\n")
+
+    def testMigrationTraceIsStrictlyVerifiedWhenPresent(self):
+        self.write(self.run / "com1.log", self.migrationLog())
+        self.manifest["artifacts"]["com1.log"] = evidence.sha256(self.run / "com1.log")
+        self.save_manifest()
+        self.assertEqual(evidence.verify_run(self.root, self.run)["result"], "pass")
+
+    def testRehashedPartialOrFabricatedMigrationIsRejected(self):
+        pOriginal = self.migrationLog()
+        pMove = next(pLine for pLine in pOriginal.splitlines(keepends=True)
+                     if pLine.startswith(b"AGENTOS MIGRATION MOVED"))
+        for pAltered in (
+            pOriginal.replace(pMove, b"", 1),
+            pOriginal.replace(b"WAKEUPS=000000000000000c", b"WAKEUPS=0000000000000000", 1),
+            pOriginal.replace(b"UID=00000000000003e8", b"UID=0000000000000000", 1),
+        ):
+            with self.subTest(log=pAltered):
+                self.write(self.run / "com1.log", pAltered)
+                self.manifest["artifacts"]["com1.log"] = evidence.sha256(self.run / "com1.log")
+                self.save_manifest()
+                self.rejected()
+
     def test_old_duplicate_foreign_or_failed_session_receipt_is_rejected(self):
         path = self.run / "com1.log"
         original = path.read_bytes()

@@ -50,9 +50,9 @@ class NativeAbiTests(unittest.TestCase):
         struct.pack_into("<Q", pElf, self.fProgramAt + 40, len(aNotes))
         return pElf
 
-    def test_actual_production_entry_and_linker_preserve_v1_note(self):
+    def test_actual_production_entry_and_linker_preserve_v2_note(self):
         gEvidence.verify(self.fElf)
-        self.assertEqual(self.fNote, struct.pack("<III8sII", 8, 8, 1, b"AgentOS\0", 1, 0))
+        self.assertEqual(self.fNote, struct.pack("<III8sII", 8, 8, 1, b"AgentOS\0", 2, 0))
 
     def test_unmarked_elf_is_not_silently_treated_as_native(self):
         pElf = bytearray(self.fElf)
@@ -61,7 +61,7 @@ class NativeAbiTests(unittest.TestCase):
             gEvidence.verify(pElf)
 
     def test_unsupported_version_flags_type_and_size(self):
-        for pAt, pValue in ((20, 2), (24, 1), (8, 9), (4, 4), (4, 12)):
+        for pAt, pValue in ((20, 0), (20, 1), (20, 3), (24, 1), (8, 9), (4, 4), (4, 12)):
             with self.subTest(offset=pAt, value=pValue):
                 pNote = bytearray(self.fNote)
                 struct.pack_into("<I", pNote, pAt, pValue)

@@ -1,3 +1,4 @@
+#![allow(non_snake_case)]
 use crate::{frames::Frames, paging::{UserSpace, USER_BASE, USER_END}};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -8,7 +9,12 @@ const PAGE: usize = 4096;
 const STACK_PAGES: usize = 4;
 pub const STACK: usize = USER_END - 16;
 
-pub struct Programs { pub vfs: crate::vfs::Vfs, pub kernel_root: usize, next_pid: AtomicUsize }
+pub struct Programs {
+    pub vfs: crate::vfs::Vfs,
+    pub kernel_root: usize,
+    next_pid: AtomicUsize,
+    pub fRegistry: crate::lifecycle::Registry,
+}
 #[derive(Clone, Copy)]
 pub struct Credentials { pub uid: u32, pub gid: u32 }
 impl Credentials {
@@ -19,9 +25,36 @@ pub struct Process {
     pub space: UserSpace,
     pub entry: usize,
     pub pid: usize,
+    /// Owner-local cache. Cross-CPU parent/status decisions use fLifecycle;
+    /// synchronizeMetadata refreshes this cache at kernel entry.
     pub parent: usize,
     pub status: Option<usize>,
     pub files: crate::files::Descriptors,
+    pub fLifecycle: crate::lifecycle::Entry,
+}
+
+impl Process {
+    pub fn synchronizeMetadata(&mut self, aFrames: &mut Frames<'_>) -> crate::lifecycle::Snapshot {
+        let pState = self.fLifecycle.snapshot(aFrames);
+        self.parent = pState.fParent;
+        self.status = pState.fStatus;
+        pState
+    }
+
+    pub fn finish(&mut self, aFrames: &mut Frames<'_>, aStatus: usize) {
+        if self.status.is_some() { return; }
+        self.files.close_all(aFrames);
+        self.fLifecycle.finish(aFrames, aStatus);
+        self.synchronizeMetadata(aFrames);
+    }
+
+    /// The owner must have switched away from this address space and its
+    /// kernel stack before reclaiming a process marked collected remotely.
+    pub fn release(self, aFrames: &mut Frames<'_>) {
+        self.files.release(aFrames);
+        unsafe { self.space.release(aFrames); }
+        self.fLifecycle.release(aFrames);
+    }
 }
 
 fn word<const N: usize>(data: &[u8], at: usize) -> Option<[u8; N]> {
@@ -38,9 +71,12 @@ impl Programs {
     }
 
     pub fn new(archive: &'static [u8], kernel_root: usize) -> Self {
-        Self { vfs: crate::vfs::Vfs::new(archive), kernel_root, next_pid: AtomicUsize::new(1) }
+        Self { vfs: crate::vfs::Vfs::new(archive), kernel_root, next_pid: AtomicUsize::new(1),
+            fRegistry: crate::lifecycle::Registry::new() }
     }
 
+    /// Programs must remain at a stable address while any returned Process
+    /// lives. Production Programs is allocated once before CPU startup.
     pub unsafe fn load(&self, frames: &mut Frames<'_>, name: &[u8], parent: usize, credentials: Credentials) -> Result<Process, isize> {
         let elf = self.vfs.file(name)?;
         // Discriminate the native ABI before even allocating a private root.
@@ -50,10 +86,16 @@ impl Programs {
         let result = load_elf(&space, elf).and_then(|entry| {
             let pid = self.allocate_pid()?;
             let files = crate::files::Descriptors::new(frames).ok_or(ENOMEM)?;
-            Ok((entry, pid, files))
+            let lifecycle = match self.fRegistry.register(frames, pid, parent) {
+                Ok(pEntry) => pEntry,
+                Err(pError) => { files.release(frames); return Err(pError); }
+            };
+            Ok((entry, pid, files, lifecycle))
         });
         match result {
-            Ok((entry, pid, files)) => Ok(Process { space, entry, pid, parent, credentials, status: None, files }),
+            Ok((entry, pid, files, lifecycle)) => Ok(Process {
+                space, entry, pid, parent, credentials, status: None, files, fLifecycle: lifecycle,
+            }),
             Err(error) => { space.release(frames); Err(error) }
         }
     }

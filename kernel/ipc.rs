@@ -1,5 +1,7 @@
 //! One bounded message in flight in each direction of a local channel.
-//! Channel access is serialized by its endpoints' CPU with interrupts masked.
+//! Endpoints may belong to processes on different CPUs. The shared frame
+//! allocator gate serializes message, readiness and endpoint-reference access.
+#![allow(non_snake_case)]
 use crate::{frames::Frames, paging::UserSpace, process::Credentials};
 
 pub const MAX_MESSAGE: usize = 1024;
@@ -13,13 +15,31 @@ struct Message {
 }
 
 pub struct Channel {
-    pub refs: [usize; 2],
+    refs: [usize; 2],
     inbox: [Message; 2],
 }
 const _: () = assert!(core::mem::size_of::<Channel>() <= 4096);
 
 impl Channel {
-    pub fn ready(&self, side: usize, op: Operation) -> bool {
+    /// Initialize a fresh zeroed channel before publishing either endpoint.
+    pub fn initialize(&mut self, _aFrames: &mut Frames<'_>) {
+        assert_eq!(self.refs, [0, 0]);
+        self.refs = [1, 1];
+    }
+
+    pub fn retain(&mut self, _aFrames: &mut Frames<'_>, aSide: usize) {
+        assert!(self.refs[aSide] != 0);
+        self.refs[aSide] += 1;
+    }
+
+    /// Return true only when the caller may release the channel's frame.
+    pub fn release(&mut self, _aFrames: &mut Frames<'_>, aSide: usize) -> bool {
+        assert!(self.refs[aSide] != 0);
+        self.refs[aSide] -= 1;
+        self.refs == [0, 0]
+    }
+
+    pub fn ready(&self, _aFrames: &mut Frames<'_>, side: usize, op: Operation) -> bool {
         self.refs[1-side] == 0 || match op {
             Operation::Send => self.inbox[1-side].length == 0,
             Operation::Receive => self.inbox[side].length != 0,

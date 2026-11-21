@@ -12,6 +12,7 @@ between boot acceptance and TTY initialization. Runtime control/cleanup is
 checked separately by the authenticated interactive shell verifier.
 """
 import argparse
+import importlib.util
 from pathlib import Path
 import re
 import sys
@@ -33,6 +34,16 @@ def require(value,message):
 
 def verify(text):
     lines=text.splitlines()
+    pMigration = None
+    if "AGENTOS MIGRATION" in text:
+        pSpec = importlib.util.spec_from_file_location(
+            "managerMigrationEvidence", Path(__file__).with_name("verify-migration.py"))
+        pModule = importlib.util.module_from_spec(pSpec)
+        pSpec.loader.exec_module(pModule)
+        try:
+            pMigration = pModule.verify(text)
+        except pModule.VerificationError as pError:
+            raise VerificationError(f"Invalid migration prelude: {pError}") from pError
     starts=[(i,SESSION.fullmatch(v)) for i,v in enumerate(lines) if v.startswith("AGENTOS MANAGER SESSION START")]
     require(len(starts)==1 and starts[0][1] is not None,"Expected one valid operational manager session")
     start,match=starts[0]
@@ -54,6 +65,11 @@ def verify(text):
     # cannot silently be skipped as background noise.
     events=[]
     for n in range(start+1,shell_index+1):
+        # Migration runs after the SAME parked root resumes, before it opens
+        # the service registry. Exclude only an independently complete and
+        # strictly validated subtrace; arbitrary process exits remain errors.
+        if pMigration is not None and pMigration["begin_line"] <= n <= pMigration["end_line"]:
+            continue
         line=lines[n]
         if line.startswith("AGENTOS MANAGER "):
             phase=PHASE.fullmatch(line)

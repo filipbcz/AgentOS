@@ -37,7 +37,7 @@ for app in init fault receiver service shell svc_ok svc_fail svc_hang orphan_par
     if [[ "$app" == svc_alive || "$app" == svc_flaky ]]; then entry=svc_worker; fi
     gcc-13 -c "$root/user/$entry.S" -o user.o
     objects=(user.o)
-    case "$app" in init) sources=(transfer client supervisor orphans forktest demand service_manager);; receiver) sources=(receive);; service) sources=(service);; shell) sources=(shell service_client);; manager) sources=(service_manager);; svc_alive|svc_flaky) sources=(svc_worker);; *) sources=();; esac
+    case "$app" in init) sources=(transfer client supervisor orphans forktest demand migration service_manager);; receiver) sources=(receive);; service) sources=(service);; shell) sources=(shell service_client);; manager) sources=(service_manager);; svc_alive|svc_flaky) sources=(svc_worker);; *) sources=();; esac
     for src in "${sources[@]}"; do
         defines=()
         if [[ "$app" == svc_flaky ]]; then defines=(-DAGENTOS_FLAKY); fi
@@ -51,6 +51,7 @@ done
 awk 'BEGIN {for (i=0;i<8193;i++) printf "%c",(i*73+int(i/251)*19)%256}' > data/transfer.bin
 touch -d @0 stage init fault receiver service shell svc_ok svc_fail svc_hang orphan_parent manager svc_alive svc_flaky data/transfer.bin data
 printf '%s\n' stage init fault receiver service shell svc_ok svc_fail svc_hang orphan_parent manager svc_alive svc_flaky data data/transfer.bin | cpio --quiet --reproducible --owner=0:0 -o -H newc > initramfs.cpio
+cp initramfs.cpio "$out/initramfs.cpio"
 gcc-13 -I/usr/include/efi -I/usr/include/efi/x86_64 -DGNU_EFI_USE_MS_ABI \
     -O2 -Wall -Wextra -Werror -fpic -ffreestanding -fno-stack-protector -fshort-wchar \
     -mno-red-zone -c "$root/boot/loader.c" -o loader.o

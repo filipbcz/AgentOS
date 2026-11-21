@@ -89,6 +89,16 @@ printf 'Testing actual lazy ELF loader, file/pipe/IPC copies and OOM rollback wi
 "$pRustc" --edition 2021 --test "$pRoot/scripts/tests/demand-process-host.rs" -o "$pOut/demand-process-tests"
 "$pOut/demand-process-tests"
 
+printf 'Testing shared cross-CPU process lifecycle and deferred reaping with %s\n' "$pRustc"
+"$pRustc" --edition 2021 --test "$pRoot/scripts/tests/lifecycle-host.rs" -o "$pOut/lifecycle-tests"
+"$pOut/lifecycle-tests"
+
+printf 'Testing shared HPET time and ACPI discovery with %s\n' "$pRustc"
+"$pRustc" --edition 2021 --test "$pRoot/kernel/hpet.rs" -o "$pOut/hpet-tests"
+"$pOut/hpet-tests"
+"$pRustc" --edition 2021 --test "$pRoot/scripts/tests/acpi-host.rs" -o "$pOut/acpi-tests"
+"$pOut/acpi-tests"
+
 printf 'Testing native ELF ABI declaration and malformed input rejection with %s\n' "$pRustc"
 "$pRustc" --edition 2021 --test "$pRoot/kernel/native_abi.rs" -o "$pOut/native-abi-tests"
 "$pOut/native-abi-tests"
@@ -97,7 +107,7 @@ printf 'Testing kernel stack guard pages, permissions and allocation rollback wi
 "$pRustc" --edition 2021 --test "$pRoot/scripts/tests/kernel-stack-host.rs" -o "$pOut/kernel-stack-tests"
 "$pOut/kernel-stack-tests"
 
-printf 'Testing real per-CPU scheduler child wakeups and APIC timed waits with %s\n' "$pRustc"
+printf 'Testing actual cross-CPU scheduler ownership, lifecycle and timed waits with %s\n' "$pRustc"
 "$pRustc" --edition 2021 --test "$pRoot/scripts/tests/scheduler-timed-host.rs" -o "$pOut/scheduler-timed-tests"
 "$pOut/scheduler-timed-tests"
 
@@ -116,7 +126,7 @@ printf 'Testing actual managed service worker timer readiness, IPC handshake and
     "$pRoot/scripts/tests/service-worker-host.c" -o "$pOut/service-worker-tests"
 "$pOut/service-worker-tests"
 
-printf 'Testing actual CPU-local orphan program and failure injection with %s\n' "$pCc"
+printf 'Testing actual orphan program and failure injection with %s\n' "$pCc"
 "$pCc" -std=c11 -O2 -Wall -Wextra -Werror -fno-stack-protector \
     "$pRoot/scripts/tests/orphans-host.c" -o "$pOut/orphans-tests"
 "$pOut/orphans-tests"
@@ -144,7 +154,7 @@ for pApp in init fault receiver service shell svc_ok svc_fail svc_hang orphan_pa
     "$pCc" -c "$pRoot/user/$pEntry.S" -o "$pOut/$pApp-entry.o"
     pObjects=("$pOut/$pApp-entry.o")
     case "$pApp" in
-        init) pSources=(transfer client supervisor orphans forktest demand service_manager);;
+        init) pSources=(transfer client supervisor orphans forktest demand migration service_manager);;
         receiver) pSources=(receive);;
         service) pSources=(service);;
         shell) pSources=(shell service_client);;

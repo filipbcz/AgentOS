@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify native ABI v1 identification in actual linked static user ELF files."""
+"""Verify native ABI v2 identification in actual linked static user ELF files."""
 import argparse
 from pathlib import Path
 import struct
@@ -48,7 +48,7 @@ def verify(aData):
                 require(pFound == 0, "Duplicate native ABI declarations")
                 require(pType == 1 and pDescSize == 8,
                         "Unsupported AgentOS ELF note type or descriptor size")
-                require(struct.unpack("<II", pDesc) == (1, 0),
+                require(struct.unpack("<II", pDesc) == (2, 0),
                         "Unsupported native ABI version or flags")
                 pFound += 1
             pAt = pEnd
@@ -64,7 +64,7 @@ def main():
             verify(pPath.read_bytes())
         except (AbiError, OSError, struct.error) as pError:
             pParser.exit(1, f"{pPath}: {pError}\n")
-        print(f"Native ABI v1 ELF note verified: {pPath}")
+        print(f"Native ABI v2 ELF note verified: {pPath}")
 
 
 if __name__ == "__main__":

@@ -14,7 +14,7 @@ pub struct BootInfo {
 mod acpi {
     pub struct Io { pub address: usize }
     pub struct Platform {
-        pub lapic: usize, pub io_apics: [Io; 1], pub io_count: usize,
+        pub lapic: usize, pub hpet: usize, pub io_apics: [Io; 1], pub io_count: usize,
     }
 }
 mod frames {

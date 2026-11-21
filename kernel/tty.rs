@@ -1,12 +1,23 @@
-//! First canonical TTY. All state lives in one owned writable frame; only its
-//! BSP and same-CPU descriptors may access it, with interrupts masked.
+//! First canonical TTY. The device IRQs stay routed to their BSP while
+//! descriptors may move between CPUs. A private IRQ-masked gate protects the
+//! complete line, UART and framebuffer state in one owned writable frame.
 #![allow(non_snake_case)]
 use crate::{acpi::Platform, fb_console::Console, input, ioapic::Route, keyboard::Keyboard,
             line::{LineInput, Read}, log_policy::Level, logger::LOGGER, out, ps2, COM};
+use core::{cell::UnsafeCell, hint::spin_loop, sync::atomic::{AtomicBool, Ordering}};
 
 pub const VECTOR: u32 = 0xe1;
 pub const KEYBOARD_VECTOR: u32 = 0xe2;
 pub struct Terminal {
+    fLocked: AtomicBool,
+    fState: UnsafeCell<TerminalState>,
+}
+
+// Every access to the state takes fLocked with local IRQs masked. The device
+// routes and framebuffer backing remain alive until all session tasks stop.
+unsafe impl Sync for Terminal {}
+
+struct TerminalState {
     fInput: LineInput,
     fRoute: Route,
     fKeyboardRoute: Option<Route>,
@@ -21,6 +32,67 @@ pub struct Terminal {
 const _: () = assert!(core::mem::size_of::<Terminal>() <= 4096);
 
 impl Terminal {
+    pub unsafe fn new(aPlatform: &Platform, aCpu: u8) -> Result<Self, &'static [u8]> {
+        Ok(Self { fLocked: AtomicBool::new(false),
+                  fState: UnsafeCell::new(TerminalState::new(aPlatform, aCpu)?) })
+    }
+
+    /// Acquire after the process/queue and optional frame gate. IRQ handlers
+    /// release this gate before taking Frames or waking scheduler queues.
+    /// No callback may acquire a new frame/queue gate while holding this one.
+    fn withState<R>(&self, aOperation: impl FnOnce(&mut TerminalState) -> R) -> R {
+        #[cfg(not(test))]
+        let pFlags: usize;
+        #[cfg(not(test))]
+        unsafe { core::arch::asm!("pushfq", "pop {}", "cli", out(reg) pFlags); }
+        #[cfg(test)]
+        let pFlags = 0;
+        while self.fLocked.swap(true, Ordering::Acquire) {
+            while self.fLocked.load(Ordering::Relaxed) { spin_loop(); }
+        }
+        let _pGuard = TerminalGuard { fLocked: &self.fLocked, fFlags: pFlags };
+        aOperation(unsafe { &mut *self.fState.get() })
+    }
+
+    pub fn attach_screen(&self, aConsole: Console) {
+        self.withState(|pState| pState.attach_screen(aConsole));
+    }
+    pub unsafe fn enable(&self) { self.withState(|pState| pState.enable()); }
+    pub unsafe fn disable(&self) { self.withState(|pState| pState.disable()); }
+    pub unsafe fn write(&self, aData: &[u8]) -> Result<usize, isize> {
+        self.withState(|pState| pState.write(aData))
+    }
+    pub unsafe fn diagnostic(&self, aData: &[u8]) {
+        self.withState(|pState| pState.diagnostic(aData));
+    }
+    pub fn ready(&self) -> bool { self.withState(|pState| pState.ready()) }
+    pub fn read<F>(&self, aLimit: usize, aCopy: F) -> Result<Option<usize>, isize>
+        where F: FnOnce(&[u8]) -> Result<(), isize>
+    {
+        self.withState(|pState| pState.read(aLimit, aCopy))
+    }
+    pub unsafe fn keyboard_interrupt(&self) {
+        self.withState(|pState| pState.keyboard_interrupt());
+    }
+    pub unsafe fn interrupt(&self) { self.withState(|pState| pState.interrupt()); }
+}
+
+struct TerminalGuard<'a> {
+    fLocked: &'a AtomicBool,
+    fFlags: usize,
+}
+
+impl Drop for TerminalGuard<'_> {
+    fn drop(&mut self) {
+        self.fLocked.store(false, Ordering::Release);
+        if self.fFlags & (1 << 9) != 0 {
+            #[cfg(not(test))]
+            unsafe { core::arch::asm!("sti", options(nostack)); }
+        }
+    }
+}
+
+impl TerminalState {
     pub unsafe fn new(aPlatform: &Platform, aCpu: u8) -> Result<Self, &'static [u8]> {
         Ok(Self { fInput: LineInput::new(), fRoute: Route::serial(aPlatform, aCpu, VECTOR)?,
                   fKeyboardRoute: Route::keyboard(aPlatform, aCpu, KEYBOARD_VECTOR).ok(),

@@ -17,7 +17,9 @@ fn sizeAt(aData: &[u8], aAt: usize) -> Option<usize> {
 }
 fn padded(aLength: usize) -> Option<usize> { Some(aLength.checked_add(3)? & !3) }
 
-/// Recognize exactly one AgentOS type-1 note with version 1 and no flags.
+/// Recognize exactly one AgentOS type-1 note with version 2 and no flags.
+/// Version 1 used CPU-local clock/deadline semantics and is deliberately
+/// rejected before process allocation; it is never silently reinterpreted.
 /// Malformed unrelated notes are rejected too, so no truncated/overlapping
 /// note stream can hide a duplicate or unsupported native declaration.
 pub fn validate(aElf: &[u8]) -> bool { validateInner(aElf) == Some(()) }
@@ -52,7 +54,7 @@ fn validateInner(aElf: &[u8]) -> Option<()> {
             let pEnd = pDescAt.checked_add(padded(pDescSize)?)?;
             if pName == b"AgentOS\0" {
                 if pFound || pType != 1 || pDescSize != 8 ||
-                    u32At(pDesc,0)? != 1 || u32At(pDesc,4)? != 0 { return None; }
+                    u32At(pDesc,0)? != 2 || u32At(pDesc,4)? != 0 { return None; }
                 pFound = true;
             }
             pNotes = pNotes.get(pEnd..)?;
@@ -78,7 +80,7 @@ mod tests {
         let mut pNote=vec![0;28];
         put32(&mut pNote,0,8);put32(&mut pNote,4,8);put32(&mut pNote,8,1);
         pNote[12..20].copy_from_slice(b"AgentOS\0");
-        put32(&mut pNote,20,1);
+        put32(&mut pNote,20,2);
         pNote
     }
     fn image(aNote: &[u8]) -> Vec<u8> {
@@ -94,7 +96,7 @@ mod tests {
     }
 
     #[test]
-    fn explicitNativeV1AcceptedAndUnmarkedProfileRejected() {
+    fn explicitNativeV2AcceptedAndUnmarkedProfileRejected() {
         assert!(validate(&image(&nativeNote())));
         let mut pElf=image(&nativeNote());
         put32(&mut pElf,64,1); // no PT_NOTE remains
@@ -104,7 +106,7 @@ mod tests {
 
     #[test]
     fn unsupportedVersionFlagsTypeAndDescriptorSizeRejected() {
-        for (pOffset,pValue) in [(20,2),(24,1),(8,2),(4,4),(4,12)] {
+        for (pOffset,pValue) in [(20,0),(20,1),(20,3),(24,1),(8,2),(4,4),(4,12)] {
             let mut pNote=nativeNote();put32(&mut pNote,pOffset,pValue);
             assert!(!validate(&image(&pNote)));
         }

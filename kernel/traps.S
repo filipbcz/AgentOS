@@ -45,7 +45,7 @@ isr_common:
     swapgs
 9:  iretq
 
-.global timer_gate, serial_gate, keyboard_gate, spurious_gate, wait_for_irq, after_hlt
+.global timer_gate, serial_gate, keyboard_gate, reschedule_gate, spurious_gate, wait_for_irq, after_hlt
 // Only the measured HLT path leaves RDI pointing at a pair of timestamps.
 // Timestamp before saving SIMD state or acknowledging the interrupt, so its
 // handler and return path are charged to active time.
@@ -103,8 +103,20 @@ keyboard_gate:
     cld
     save_context
     call keyboard_interrupt
+    jmp restore_context
+reschedule_gate:
+    test byte ptr [rsp+8], 3
+    jz 1f
+    swapgs
+1:
+    cld
+    save_context
+    call reschedule_interrupt
 restore_context:
     mov rsp, rax
+    // A queue may publish the outgoing stack only after RSP has actually
+    // left it. FXSAVE/GPR state remains intact above this callback's stack.
+    call finish_context_switch
     fxrstor64 [rsp]
     add rsp, 512
     .irp reg,r15,r14,r13,r12,rbp,rbx,r11,r10,r9,r8,rdi,rsi,rdx,rcx,rax

@@ -33,7 +33,7 @@ static long mockCall(long aOp, long aFirst, long aSecond, long aThird) {
         if (!aFirst || aSecond!=32 || aThird) abort();
         if (modeIs("idle-stats-error")) return -14;
         unsigned long *pSample=(unsigned long *)aFirst;
-        pSample[0]=modeIs("idle-version-error")?2:1;
+        pSample[0]=modeIs("idle-version-error")?1:2;
         pSample[1]=modeIs("idle-overflow")?0x7fffffffffffffffUL-4999:gClockMs;
         pSample[2]=100+gStatsCalls*5;
         pSample[3]=20+gStatsCalls*5;

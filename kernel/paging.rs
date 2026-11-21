@@ -459,6 +459,7 @@ pub unsafe fn install(info: &BootInfo, map: &[u8], frames: &mut Frames<'_>, plat
     tables.identity(info.ap_boot, PAGE, 0)?;
     tables.identity(info.ap_boot + PAGE, PAGE, WRITE | NX)?;
     tables.identity(platform.lapic, PAGE, MMIO)?;
+    if platform.hpet != 0 { tables.identity(platform.hpet, PAGE, MMIO)?; }
     for io in &platform.io_apics[..platform.io_count] { tables.identity(io.address, PAGE, MMIO)?; }
     tables.identity(info.framebuffer as usize, info.stride as usize * info.height as usize * 4, MMIO)?;
 

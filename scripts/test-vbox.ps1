@@ -125,7 +125,7 @@ $bootImageHash=(Get-FileHash (Join-Path $root $efi) -Algorithm SHA256).Hash.ToLo
 if ($LASTEXITCODE) { throw 'disk build failed' }
 VBox convertfromraw "$dir\esp.raw" "$dir\esp.vdi" --format VDI
 VBox createvm --name $vm --basefolder $dir --ostype Other_64 --register
-VBox modifyvm $vm --memory 256 --cpus $Cpus --firmware efi64 --paravirt-provider minimal --graphicscontroller vmsvga --vram 16 --ioapic on --nic1 none --audio-enabled off --boot1 disk --boot2 none --boot3 none --boot4 none --uart1 0x3f8 4
+VBox modifyvm $vm --memory 256 --cpus $Cpus --firmware efi64 --paravirt-provider minimal --x86-hpet on --graphicscontroller vmsvga --vram 16 --ioapic on --nic1 none --audio-enabled off --boot1 disk --boot2 none --boot3 none --boot4 none --uart1 0x3f8 4
 if ($Keyboard) { VBox modifyvm $vm --keyboard ps2 }
 if ($Shell) {
     $serial=@{Listener=$null; Client=$null; Stream=$null; Log=$null; Input=$null;
@@ -246,6 +246,8 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "Fork/COW page isolation failed: $dir" }
         & python "$PSScriptRoot/verify-demand-paging.py" --log "$dir\com1.log" --cpus $Cpus
         if ($LASTEXITCODE -ne 0) { throw "Demand paging and lazy syscall isolation failed: $dir" }
+        & python "$PSScriptRoot/verify-migration.py" --log "$dir\com1.log" --cpus $Cpus
+        if ($LASTEXITCODE -ne 0) { throw "Actual process migration and cross-CPU state preservation failed: $dir" }
         & python "$PSScriptRoot/verify-service-manager.py" --log "$dir\com1.log"
         if ($LASTEXITCODE -ne 0) { throw "Persistent service registry readiness/restart evidence failed: $dir" }
         & "$PSScriptRoot/verify-idle.ps1" -RunDir $dir -ApicIds $ids -HostSeconds $hostIdleSeconds

@@ -14,9 +14,9 @@ enum {
 /* Millisecond deadlines are passed to a signed 64-bit syscall ABI. */
 #define MAX_DEADLINE_MS 0x7fffffffffffffffUL
 
-/* All service children are pinned to their parent's CPU. This monotonic
- * source has a CPU-local epoch, so durations are valid, absolute cross-CPU
- * timestamps are not. A frozen or failed clock is a hard error, not a timeout.
+/* Native ABI v2 uses the same boot epoch on every CPU. Migrating a service
+ * or its supervisor preserves absolute deadlines. A frozen or failed clock
+ * is a hard error, not a timeout.
  */
 static long clock_ms(void) { return os_call(SYS_MONOTONIC_MS,0,0,0); }
 

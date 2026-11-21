@@ -1,8 +1,8 @@
 //! Host tests of the real TTY and line discipline with a controlled UART boundary.
 //! These exercise Rust state transitions, not an IOAPIC, UART, or VM implementation.
-#![allow(non_snake_case)]
+#![allow(non_snake_case, non_upper_case_globals)]
 
-use std::{cell::RefCell, collections::VecDeque};
+use std::{cell::RefCell, collections::VecDeque, sync::{Arc, Barrier, Mutex}, thread};
 
 #[path = "../../kernel/line.rs"]
 mod line;
@@ -67,9 +67,19 @@ struct Ports {
 }
 
 thread_local! { static PORTS: RefCell<Ports> = RefCell::new(Ports::default()); }
+thread_local! { static gSharedPorts: RefCell<Option<Arc<Mutex<Ports>>>> = RefCell::new(None); }
 
 fn ports<R>(aOperation: impl FnOnce(&mut Ports) -> R) -> R {
-    PORTS.with(|pPorts| aOperation(&mut pPorts.borrow_mut()))
+    let pShared = gSharedPorts.with(|pPorts| pPorts.borrow().clone());
+    if let Some(pPorts) = pShared {
+        let pResult = aOperation(&mut pPorts.lock().unwrap());
+        // Only an individual emulated port access is serialized here. Yield
+        // between bytes so complete-message atomicity must come from TTY.
+        thread::yield_now();
+        pResult
+    } else {
+        PORTS.with(|pPorts| aOperation(&mut pPorts.borrow_mut()))
+    }
 }
 
 unsafe fn input(aPort: u16) -> u8 {
@@ -297,4 +307,74 @@ fn framebufferShellStaysUsableWhenUartTransmitStalls() {
     ports(|p|assert!(p.fTransmit.is_empty()));
     receive(&mut term,b"ok\r");
     assert_eq!(read(&mut term,16),Ok((Some(3),b"ok\n".to_vec())));
+}
+
+#[test]
+fn concurrentDescriptorWritersKeepCompleteCookedMessagesTogether() {
+    let pTerminal = terminal();
+    let pPorts = Arc::new(Mutex::new(Ports::default()));
+    let pStart = Barrier::new(2);
+    let pWrite = |aByte: u8| {
+        gSharedPorts.with(|pShared| *pShared.borrow_mut() = Some(Arc::clone(&pPorts)));
+        let mut pMessage = [aByte; 13];
+        pMessage[12] = b'\n';
+        pStart.wait();
+        for _ in 0..64 {
+            assert_eq!(unsafe { pTerminal.write(&pMessage) }, Ok(pMessage.len()));
+        }
+        gSharedPorts.with(|pShared| *pShared.borrow_mut() = None);
+    };
+    thread::scope(|pScope| {
+        let pFirst = pScope.spawn(|| pWrite(b'A'));
+        let pSecond = pScope.spawn(|| pWrite(b'B'));
+        pFirst.join().unwrap();
+        pSecond.join().unwrap();
+    });
+    let pPorts = pPorts.lock().unwrap();
+    assert_eq!(pPorts.fTransmit.len(), 2 * 64 * 14);
+    let mut pCounts = [0; 2];
+    for pMessage in pPorts.fTransmit.chunks_exact(14) {
+        assert_eq!(&pMessage[12..], b"\r\n");
+        let pByte = pMessage[0];
+        assert!(pByte == b'A' || pByte == b'B');
+        assert!(pMessage[..12].iter().all(|&pOther| pOther == pByte), "TTY messages interleaved");
+        pCounts[usize::from(pByte == b'B')] += 1;
+    }
+    assert_eq!(pCounts, [64, 64]);
+}
+
+#[test]
+fn concurrentReadersConsumeEachCanonicalRecordExactlyOnce() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mut pTerminal = terminal();
+    receive(&mut pTerminal, b"first\nsecond\nthird\nfourth\n");
+    let pStart = Barrier::new(2);
+    let pCopyOwners = AtomicUsize::new(0);
+    let pRead = || {
+        let mut pRecords = Vec::new();
+        pStart.wait();
+        loop {
+            let pCount = pTerminal.read(256, |pBytes| {
+                assert_eq!(pCopyOwners.fetch_add(1, Ordering::SeqCst), 0,
+                    "two CPUs copied the same line state concurrently");
+                for _ in 0..32 { thread::yield_now(); }
+                pRecords.push(pBytes.to_vec());
+                assert_eq!(pCopyOwners.fetch_sub(1, Ordering::SeqCst), 1);
+                Ok(())
+            }).unwrap();
+            if pCount.is_none() { break; }
+            thread::yield_now();
+        }
+        pRecords
+    };
+    let (mut pFirst, pSecond) = thread::scope(|pScope| {
+        let pFirstThread = pScope.spawn(&pRead);
+        let pSecondThread = pScope.spawn(&pRead);
+        (pFirstThread.join().unwrap(), pSecondThread.join().unwrap())
+    });
+    pFirst.extend(pSecond);
+    pFirst.sort_unstable();
+    assert_eq!(pFirst, [b"first\n".to_vec(), b"fourth\n".to_vec(), b"second\n".to_vec(), b"third\n".to_vec()]);
+    assert!(!pTerminal.ready());
+    assert_eq!(pCopyOwners.load(Ordering::SeqCst), 0);
 }

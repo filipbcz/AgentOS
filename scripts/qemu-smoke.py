@@ -40,6 +40,7 @@ supervisor = load("qemu_supervisor_evidence", "verify-supervisor.py")
 orphans = load("qemu_orphan_evidence", "verify-orphans.py")
 cow = load("qemu_cow_evidence", "verify-cow.py")
 demand = load("qemu_demand_evidence", "verify-demand-paging.py")
+migration = load("qemu_migration_evidence", "verify-migration.py")
 service_manager = load("qemu_service_manager_evidence", "verify-service-manager.py")
 boot_log = load("qemu_boot_log_evidence", "verify-boot-log.py")
 session = load("qemu_stage3_session", "verify-stage3-session.py")
@@ -333,7 +334,7 @@ def boot(args):
         serial_options = ["-serial", f"file:{serial}"]
     qemu = [
         "qemu-system-x86_64",
-        "-machine", "q35,accel=tcg,smm=on",
+        "-machine", "q35,accel=tcg,smm=on,hpet=on",
         "-cpu", "max", "-smp", str(args.cpus), "-m", "256",
         "-global", "driver=cfi.pflash01,property=secure,value=on",
         "-drive", f"if=pflash,format=raw,unit=0,readonly=on,file={args.ovmf_code}",
@@ -443,6 +444,7 @@ def boot(args):
     orphans.verify(text, args.cpus)
     cow.verify(text, args.cpus)
     demand.verify(text, args.cpus)
+    migration_result = migration.verify(text, args.cpus)
     service_manager.verify(text)
     session_result = None
     if args.session:
@@ -456,6 +458,7 @@ def boot(args):
         "interactive_com1_manager_session": args.session,
         "ps2_keyboard_session": args.session,
         "runtime_session": session_result,
+        "migration": migration_result,
         "gop_sha256": evidence.sha256(destination / "shell-screen.ppm"),
         "host_elapsed_seconds": round(time.monotonic()-start, 3),
         "signed_efi_sha256": image["artifacts"]["agentos.efi"],

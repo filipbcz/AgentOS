@@ -2,14 +2,14 @@
 
 Vlastní operační systém pro x86-64 podle [technického zadání](ZADANI.md). Aktuální stav, přesné ověřené revize a otevřená přejímka jsou v [plánu implementace](PLAN_IMPLEMENTACE.md). Starší výsledky se nevztahují automaticky na nový obraz.
 
-Etapa 3 obsahuje izolované procesy, nativní ELF ABI, COW, VFS nad initramfs, roury, autentizované lokální IPC, původní PID 1 se správou služeb a interaktivní TTY přes COM1 i PS/2/GOP. Milník 3.1 A přidává demand paging procesů. Vývoj probíhá ve větvi `dev/stage3-ipc-validation`. Povinné převzetí této verze ve VirtualBoxu zůstává otevřené; QEMU poskytuje samostatný integrační důkaz konkrétní ověřené revize.
+Etapa 3 obsahuje izolované procesy, nativní ELF ABI, COW, VFS nad initramfs, roury, autentizované lokální IPC, původní PID 1 se správou služeb a interaktivní TTY přes COM1 i PS/2/GOP. Milník 3.1 přidává demand paging procesů a řízenou migraci mezi CPU. Vývoj probíhá ve větvi `dev/stage3-ipc-validation`. Povinné převzetí této verze ve VirtualBoxu zůstává otevřené; QEMU poskytuje samostatný integrační důkaz konkrétní ověřené revize.
 
 ## Sestavení
 
 Příkazy pro Windows se spouštějí z kořene čistého Git checkoutu v PowerShellu. Potřebné prostředí:
 
 - WSL distribuce `Ubuntu-24.04`, balíky s přesnými verzemi z `scripts/toolchain.lock`, dále Python 3, OpenSSL, sbsigntool, efitools, gdisk a mtools;
-- VirtualBox **7.1.12**, Windows PowerShell nebo PowerShell 7;
+- VirtualBox **7.1.12** s HPET (harness jej zapíná), Windows PowerShell nebo PowerShell 7;
 - Python 3 dostupný ve Windows příkazem `python`.
 
 ```powershell
@@ -69,7 +69,7 @@ Loader předá konečnou mapu paměti, framebuffer a initramfs a korektně opust
 
 Kernelová vlákna, zásobníky pro syscall/trap, AP a IST1 používají **16 KiB** nulované paměti s nezmapovanou stránkou na každé straně. Sdílené supervisor-only/NX mapování je v horní polovině adresního prostoru. Padesát tabulek vzniká před publikací kernelového CR3; samotné stack rámce se přidělují podle potřeby. Neúspěšná alokace vrací všechny rámce, reaping ruší mapování před uvolněním. Boot skutečně přečte oba guardy a ověří page fault; dokladem je `AGENTOS KERNEL STACK GUARD OK`.
 
-ACPI MADT řídí výběr CPU a IRQ routing. AP startují přes INIT/SIPI. Preemptivní round robin má CPU-local fronty a nejvýše 10ms kvantum. LAPIC se nastavuje **jednorázově** na nejbližší termín, který může kvantum zkrátit. Když vše čeká na čas, zbývá nejvýše sekundový watchdog; bez časového čekání se časovač vypne. UART, klávesnice, IPC a ukončení potomka přímo probouzejí příslušné čekající úlohy. Nezávislé počítání uplynulých LAPIC ticků odhaluje zastavené TSC po přibližně pěti sekundách; nevytváří smyšlený čas.
+ACPI MADT řídí výběr CPU a IRQ routing. AP startují přes INIT/SIPI. Preemptivní round robin má CPU-local fronty a nejvýše 10ms kvantum. LAPIC se nastavuje **jednorázově** na nejbližší termín, který může kvantum zkrátit. Když vše čeká na čas, zbývá nejvýše sekundový watchdog; bez časového čekání se časovač vypne. UART, klávesnice, IPC a ukončení potomka přímo probouzejí příslušné čekající úlohy. Nezávislé počítání uplynulých LAPIC ticků odhaluje zastavený společný procesový čas po přibližně pěti sekundách; nevytváří smyšlený čas.
 
 Bootové zkoušky zachovávají preempci, souběžnou alokaci, vyčerpání paměti, návrat bitmapy a samostatné přibližně 30sekundové měření klidu. Příkaz `idle` navíc měří běžící systém s PID 1, stabilní službou a zablokovaným shellem. Toto druhé měření zachytí periodická probouzení, která by pouhý bootový test neodhalil.
 
@@ -77,11 +77,19 @@ Demand paging z **milníku 3.1 A** [implementačního plánu](PLAN_IMPLEMENTACE.
 
 Stejná cesta obsluhuje CPL3 page fault i kernelové čtení/zápis uživatelského bufferu. Neplatný rozsah vrací `EFAULT` (−14), nedostatek rámců `ENOMEM` (−12). Před kopírováním se ověří a připraví celý rozsah. Při OOM mohou již připravené stránky zůstat rezidentní, ale nezmění se přenášené bajty, pozice souboru ani obsah front. Každé nedokončené jednotlivé mapování vrací nové tabulky; ukončení procesu vrátí i jeho metadata a všechny stránky. Konzolový výstup dostane vlastní kopii nejvýše 256 bajtů a UART/GOP obslouží až po uvolnění zámku alokátoru.
 
-Procesy nadále zůstávají na svém CPU. Řízená migrace a vyvažování patří do dosud neimplementované části **3.1 B**. Část A prošla [host CI](https://github.com/filipbcz/AgentOS/actions/runs/44957373668) a [QEMU na 1/2 CPU](https://github.com/filipbcz/AgentOS/actions/runs/44957373682) pro revizi `9f4dde5b7a98eb847f8e82273cab7a902e6ae7e1`, včetně interaktivních relací a závěrečného návratu rámců. Přesná měření, identita obrazu a otevřené zkoušky jsou v plánu. Testy této verze ve VirtualBoxu a na fyzickém HP zde provedené nejsou.
+Část **3.1 B** zachovává osm slotů v každé CPU frontě a při rozdílu alespoň dvou runnable úloh přesouvá již běžící uložený uživatelský kontext na méně zatížený CPU s volným slotem. Zdroj i cíl mají samostatné zámky, získávané ve vzestupném pořadí APIC ID. Přesouvá se celý vlastněný proces, takže PID, rodič, fd, CR3, COW a zásobník zůstávají stejné. Kernelové bootové úlohy a root před dokončením bootstrap handoffu se nepřesouvají; provozní PID 1 i běžné procesy migrovat mohou.
 
-## Uživatelské procesy a nativní ABI v1
+Společný registr životního cyklu drží jeden fyzický rámec na proces a odděluje rodičovství/reaper od fronty CPU. Vzdálený `kill` zapíše požadavek, který provede vlastník; `wait` převezme status a skutečné uvolnění proběhne až po opuštění adresního prostoru a zásobníku. Assembler potvrzuje přepnutí RSP před zveřejněním odchozí úlohy. Při každém výběru kontextu se znovu načte CR3 s vypnutými PCID/PGE, včetně opakovaného root, aby se nepoužily staré překlady sdílených kernelových stack slotů. Sdílená vícevláknová adresní prostora a aktivní TLB shootdown pro ně zůstávají v etapě 9.
 
-Programy jsou statické ELF64 `ET_EXEC` pro x86-64, spouštěné v CPL3 z podepsaného initramfs. Každý musí obsahovat právě jednu `PT_NOTE` s vlastníkem `AgentOS\0`, typem 1 a descriptor `{u32 version=1, u32 flags=0}`. Společná [hlavička](user/abi.h) a [linker script](user/user.ld) ji přidávají automaticky. Build i loader odmítají chybějící, duplicitní, nepodporovanou nebo poškozenou note. Neoznačený ELF je vyhrazen budoucímu Linux ABI a nyní vrací `ENOEXEC`.
+Události IPC, rour, uzavření fd a ukončení procesu vyvolají IPI; cílový CPU sám ověří své čekající procesy. Prázdný AP zůstává v `STI; HLT` a nemá periodický balancovací timer. Pořadí zámků je CPU fronta → společný frame/resource gate → vlastní TTY gate; vzdálený frontový zámek ani IPI se nezískává při držení frame gate. UART/GOP výstup má předem zkopírované bajty a probíhá mimo alokátor.
+
+Procesové lhůty používají jediný **64bit HPET** se společnou boot epochou. HPET komparátory a legacy IRQ jsou vypnuté; plánování nadále používá jednorázový LAPIC. VirtualBox harness nastavuje `--x86-hpet on`, QEMU `hpet=on`. Nepřítomný nebo neplatný 64bit HPET zastaví boot s konkrétní chybou; dostupnost na fyzickém HP musí potvrdit jeho přejímka. Původní TSC měření bootového klidu zůstává oddělené.
+
+Přesný stav ověření je v [plánu](PLAN_IMPLEMENTACE.md#31-demand-paging-a-vyvažování-smp). Část A byla samostatně ověřena na revizi `9f4dde5`; nové CPU migrace, ABI a hodiny vyžadují vlastní společný CI/QEMU běh. VirtualBox ani fyzické HP pro tuto verzi zatím otestované nejsou.
+
+## Uživatelské procesy a nativní ABI v2
+
+Programy jsou statické ELF64 `ET_EXEC` pro x86-64, spouštěné v CPL3 z podepsaného initramfs. Každý musí obsahovat právě jednu `PT_NOTE` s vlastníkem `AgentOS\0`, typem 1 a descriptor `{u32 version=2, u32 flags=0}`. Společná [hlavička](user/abi.h) a [linker script](user/user.ld) ji přidávají automaticky. Build i loader odmítají chybějící, duplicitní, nepodporovanou nebo poškozenou note. Staré nativní ABI v1 se záměrně odmítá s `ENOEXEC` před alokací: jeho CPU-local čas nelze tiše změnit na společnou epochu. Všechny programy v initramfs je nutné znovu sestavit proti ABI v2. Neoznačený ELF je vyhrazen budoucímu Linux ABI a nyní také vrací `ENOEXEC`.
 
 Segmenty `PT_LOAD` musí mít nepřekrývající se stránky v rozsahu `[0x8000000000, 0x10000000000)`. Každý proces má soukromé CR3 a uživatelský zásobník s ochrannou stránkou. `fork` sdílí data přes explicitní COW; zápis uživatele i kopírování z jádra oddělí stránku, text zůstává nezapisovatelný. Chybný ukazatel vrací chybu, pád potomka se převezme bez pádu rodiče.
 
@@ -104,21 +112,22 @@ Instrukce `syscall` přijímá číslo v RAX a tři argumenty v RDI/RSI/RDX. RAX
 | `0x1000d` | `ipc_send` | Atomická zpráva; plná schránka uspí odesílatele |
 | `0x1000e` | `ipc_recv` | Celá zpráva a kernelová identita odesílatele |
 | `0x1000f` | `kill` | Pouze přímý potomek; stav 137, následný reaping |
-| `0x10010` | `monotonic_ms` | Monotónní čas konkrétního CPU |
+| `0x10010` | `monotonic_ms` | Společné bootové milisekundy HPET |
 | `0x10011` | `wait_child_until` | Potomek nebo absolutní deadline |
 | `0x10012` | `sleep_until` | Uspání do absolutního deadline |
 | `0x10013` | `child_after` | Výčet vlastních, včetně adoptovaných potomků |
-| `0x10014` | `fork` | CPU-local COW klon; v dítěti návrat 0 |
+| `0x10014` | `fork` | Migrovatelný COW klon; v dítěti návrat 0 |
 | `0x10015` | `ipc_try_recv` | Prázdná otevřená schránka vrací −11 |
 | `0x10016` | `boot_pause` | Jednorázové předání původního BSP PID 1 |
 | `0x10017` | `wait_events_until` | IPC/EOF, child exit nebo deadline bez polling smyčky |
-| `0x10018` | `timer_stats` | Čtyři u64: verze 1, čas, timer IRQ, idle timer IRQ |
+| `0x10018` | `timer_stats` | Čtyři u64: verze 2, společný čas, součet timer IRQ a idle IRQ |
 | `0x10019` | `ipc_try_send` | Plná schránka vrací −11 bez uspání a bez odeslání |
 | `0x1001a` | `vm_stats` | Osm u64: verze 1, rezervované/rezidentní stránky, tabulky, metadata, demand/COW čítače |
+| `0x1001b` | `sched_stats` | Osm u64: verze 1, APIC ID, počet CPU, migrace procesu/celku, vzdálené IPI notifikace, PID, PPID |
 
-`timer_stats(buffer,32,0)` je pouze čtecí diagnostika; čítače se čtením nenulují. Čas je monotónní vůči epochě daného CPU, nikoli UTC ani synchronizovaný čas mezi CPU. CPU-local procesy v této etapě nemigrují.
+`timer_stats(buffer,32,0)` je pouze čtecí diagnostika verze 2; čítače se čtením nenulují. Čas i absolutní lhůty jsou srovnatelné mezi CPU a při migraci se nemění; nejde o UTC. IRQ/idle čítače jsou součtem konzistentních párů z každého CPU, čtených pomocí sekvenčního čítače. `sched_stats(buffer,64,0)` zachytí identitu a stav aktuálního procesu; špatná velikost/flags vrací −22, neplatný buffer −14 a OOM −12. Počet vzdálených probouzení znamená odeslané IPI notifikace, nikoli počet probuzených procesů nebo self-IPI.
 
-`vm_stats(buffer,64,0)` před snímkem připraví svůj výstupní buffer. Počty zahrnují vlastní PML4, uživatelské tabulky a jednu metadata stránku; společná kernelová mapování se nepočítají. Kumulativní počítadla demand alokací, COW kopií a povýšení posledního vlastníka začínají u nového procesu i po `fork` od nuly; aktuální rezervace a rezidentní mapování se dědí. Sdílená stránka se počítá v každém adresním prostoru, takže nejde o celkovou fyzickou spotřebu systému.
+`vm_stats(buffer,64,0)` před snímkem připraví svůj výstupní buffer. Počty zahrnují vlastní PML4, uživatelské tabulky a jednu metadata stránku; společná kernelová mapování ani samostatný lifecycle rámec procesu se nepočítají. Kumulativní počítadla demand alokací, COW kopií a povýšení posledního vlastníka začínají u nového procesu i po `fork` od nuly; aktuální rezervace a rezidentní mapování se dědí. Sdílená stránka se počítá v každém adresním prostoru, takže nejde o celkovou fyzickou spotřebu systému.
 
 ### VFS, roury a lokální zprávové IPC
 
@@ -138,7 +147,7 @@ Krátký nebo neplatný buffer zprávu nespotřebuje. Zařazenou zprávu lze př
 
 ## Původní PID 1 a služby
 
-BSP `init` s numerickým **PID 1** po procesových zkouškách jednorázově zaparkuje svůj kontext. Po vytvoření TTY jej jádro obnoví ve stejném adresním prostoru; tento proces pokračuje jako správce služeb. AP testy mají vlastní konečné CPU-local procesové relace. PID 1 převezme i osiřelé potomky a při shutdownu uvolní všechny prostředky své relace.
+BSP `init` s numerickým **PID 1** po procesových zkouškách jednorázově zaparkuje svůj kontext. Po vytvoření TTY jej jádro obnoví ve stejném adresním prostoru; tento proces pokračuje jako správce služeb. AP bootové testy mají vlastní konečné procesové relace. Po společných bootových zkouškách zůstávají AP dostupné pro provozní plánování; před spuštěním služeb proběhne samostatný migrační scénář. PID 1 převezme i osiřelé potomky a při shutdownu uvolní všechny prostředky své relace.
 
 Podepsaný statický registr obsahuje `core`, `flaky` a `shell`. Graf závislostí se validuje včetně cyklů. READY používá verzovaný protokol s kernelovou identitou, timeout a skutečný timer/IPC self-check workeru. Automatické restarty mají tři pokusy, backoff a 5sekundové okno; dosažený limit vyžaduje explicitní správní zásah. Pád závislosti zastaví a převezme následníky a obnoví je až po její připravenosti. STOP volitelné služby zůstává platný i během takové obnovy.
 
@@ -160,7 +169,7 @@ COM1 pracuje na 115200 baudů, 8N1; IRQ4 vede přes MADT/I/O APIC na BSP. PS/2 p
 
 Řádek má nejvýše 255 znaků a fronta čtyři dokončené záznamy. CR/LF odešle řádek, CRLF je jeden Enter, Backspace/Delete opravuje, Tab vloží mezeru, Ctrl-D na prázdném řádku vrátí jednorázové EOF. Přetečení či poškozený vstup vrátí `EOVERFLOW`; zbytek řádku se zahodí, aby se nevykonal useknutý příkaz. `EFAULT` zachová platná data pro další čtení. TTY upravuje LF na CRLF bez zdvojení existujícího CR.
 
-Současný shell nemá přihlášení, řízení úloh, uvozovky, syntaxi rour ani trvalé přesměrování. Úplný celek C se odemčením, přihlášením a trvalým zápisem podle plánu přijde v etapě 7. Profil má jedno vlákno na proces, osm slotů úloh na CPU, CPU-local IPC a bootovací UID/GID 1000. Bloková zařízení, účty, Linux ABI a A/B aktualizace mají vlastní další etapy. PS/2 používá US ASCII rozložení; USB HID patří do etapy ovladačů.
+Současný shell nemá přihlášení, řízení úloh, uvozovky, syntaxi rour ani trvalé přesměrování. Úplný celek C se odemčením, přihlášením a trvalým zápisem podle plánu přijde v etapě 7. Profil má jedno vlákno na proces, osm slotů úloh na CPU, IPC mezi CPU a bootovací UID/GID 1000. Bloková zařízení, účty, Linux ABI a A/B aktualizace mají vlastní další etapy. PS/2 používá US ASCII rozložení; USB HID patří do etapy ovladačů.
 
 ## Logování
 
@@ -181,3 +190,5 @@ Testovací skript nastavuje soubor pomocí `-LogLevel` a `-LogOutput`. Strukturo
 Nové bootové běhy na obou CPU konfiguracích povinně ověřují také `user/demand.c`: skutečnou 16MiB BSS rezervaci s malým počtem rezidentních stránek, vzdálené první přístupy, lazy syscall buffery, COW i dosud nepřítomné oblasti při `fork` a samostatné chyby guard/NX/RO. Log lze znovu prověřit příkazem `python scripts/verify-demand-paging.py --log CESTA_K_COM1_LOG --cpus 1` (nebo `2`). Stejný ověřovač používá aktuální `test-vbox.ps1`; stávající `accept-stage3.ps1` zároveň opakuje celou regresní matici základního profilu.
 
 Přesné dokončené běhy a jejich rozsah jsou evidovány v [etapě 3 plánu](PLAN_IMPLEMENTACE.md#3-izolované-procesy-vfs-ipc-a-terminál). Po jakékoli změně kódu či testovacího scénáře je nutný nový výsledek odpovídající revize. QEMU nepřepisuje stav povinné matice VirtualBoxu.
+
+Migrační zkouška `user/migration.c` vytváří čtyři skutečné potomky a řízenými probuzeními vytváří nerovnoměrnou runnable zátěž. Vyžaduje pokračování již běžícího PID na jiném CPU, zachování práce/času, COW a lazy stránek, fd offsetu, pipe/IPC identity, absolutní lhůty a převzetí potomků. Na 1 CPU provede stejné funkční operace bez přesunu. Nové sériové QEMU/VBox běhy vyžadují `python scripts/verify-migration.py --log CESTA_K_COM1_LOG --cpus 1` (nebo `2`); historické důkazy bez migračního intervalu část B nepotvrzují.

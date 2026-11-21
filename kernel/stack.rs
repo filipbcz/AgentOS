@@ -2,9 +2,12 @@
 //! installed once before CR3 publication. Allocate and release only while the
 //! frame allocator is exclusively borrowed (SharedFrames::with after SMP).
 //!
-//! Tasks never migrate between CPUs. A stack is unmapped only after its owner
-//! stopped running; the allocating CPU invalidates each reused virtual page.
-//! No other CPU may retain a live reference to the released stack.
+//! Task stacks move with their unique scheduler owner. A stack is unmapped
+//! only after neither current nor retiring refers to it: the restore path
+//! acknowledges retiring only after switching RSP to the incoming context.
+//! PCID/PGE remain disabled and every context selection reloads CR3 before
+//! touching the incoming stack, invalidating translations left by prior use
+//! on another CPU. No other CPU may retain a live reference when it is freed.
 #![allow(non_snake_case)]
 
 use crate::frames::{Frame, Frames};
@@ -106,6 +109,8 @@ impl KernelStack {
     /// Transfer ownership to a permanently retained AP or double-fault stack.
     pub fn into_top(self) -> usize { self.top() }
 
+    /// Requires scheduler quiescence on the previous owner CPU. Reused slots
+    /// are never dereferenced remotely before the mandatory context CR3 flush.
     pub fn release(self, aFrames: &mut Frames<'_>) {
         let pRoot = aFrames.kernel_root().expect("kernel stack pool not installed");
         let pFirst = (self.fBase - BASE) / PAGE;

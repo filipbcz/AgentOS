@@ -68,6 +68,9 @@ jobs:
           path: |
             build/build-provenance.json
             build/agentos.efi
+            build/agentos.unsigned.efi
+            build/kernel.elf
+            build/initramfs.cpio
             build/db.esl
             build/check/qemu-cpu${{ matrix.cpus }}/com1.log
             build/check/qemu-cpu${{ matrix.cpus }}/qemu-stderr.log

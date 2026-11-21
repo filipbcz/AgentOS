@@ -1,5 +1,7 @@
-//! Descriptor tables belong to processes. Shared descriptions are reachable
-//! only by dup2 and inheritance on the same CPU, with local IRQs masked.
+//! Descriptor tables move with their processes. Shared descriptions are
+//! reachable by dup2 and inheritance on any CPU. Every shared object access,
+//! including readiness and reference counts, requires the SharedFrames gate.
+//! The caller also owns the process so a remote stop cannot release its fds.
 #![allow(non_snake_case)]
 use crate::{frames::{Frame, Frames}, paging::UserSpace, process::EFAULT, serial};
 use core::mem;
@@ -24,7 +26,8 @@ pub enum Io { Bytes(usize), Sleep(Wait), Output(PendingOutput) }
 
 /// A bounded copy of user bytes, prepared while page allocation is locked.
 /// Complete hardware output only after releasing the shared frame lock. The
-/// descriptor/session remains owned by this CPU until the syscall returns.
+/// executing process retains its descriptors until the syscall returns; the
+/// terminal serializes device state independently of the frame allocator.
 pub struct PendingOutput {
     fTarget: Handle,
     fBytes: [u8; 256],
@@ -43,11 +46,11 @@ impl PendingOutput {
 }
 
 impl Wait {
-    pub fn ready(self) -> bool {
+    pub fn ready(self, aFrames: &mut Frames<'_>) -> bool {
         // The sleeping process still owns this endpoint until its call returns.
         let (end, need) = match self {
             Self::Terminal(p) => return unsafe { (*p).ready() },
-            Self::Socket(p, side, op) => return unsafe { (*p).ready(side, op) },
+            Self::Socket(p, side, op) => return unsafe { (*p).ready(aFrames, side, op) },
             Self::Pipe { end, need } => (end.0, need),
         };
         unsafe { match end {
@@ -59,12 +62,12 @@ impl Wait {
 }
 
 impl Handle {
-    unsafe fn retain(self) -> Self {
+    unsafe fn retain(self, aFrames: &mut Frames<'_>) -> Self {
         match self {
             Self::File(p) => (*p).refs += 1,
             Self::Reader(p) => (*p).readers += 1,
             Self::Writer(p) => (*p).writers += 1,
-            Self::Socket(p, side) => (*p).refs[side] += 1,
+            Self::Socket(p, side) => (*p).retain(aFrames, side),
             _ => (),
         }
         self
@@ -72,10 +75,7 @@ impl Handle {
 
     unsafe fn release(self, frames: &mut Frames<'_>) {
         let dead = match self {
-            Self::Socket(p, side) => {
-                (*p).refs[side] -= 1;
-                ((*p).refs == [0, 0]).then_some(p as usize)
-            }
+            Self::Socket(p, side) => (*p).release(frames, side).then_some(p as usize),
             Self::File(p) => { (*p).refs -= 1; ((*p).refs == 0).then_some(p as usize) }
             Self::Reader(p) | Self::Writer(p) => {
                 if matches!(self, Self::Reader(_)) { (*p).readers -= 1; } else { (*p).writers -= 1; }
@@ -105,8 +105,8 @@ impl Descriptors {
     }
 
     // Called once on a newly created child's table, before it becomes runnable.
-    pub fn inherit(&mut self, parent: &Self) {
-        for (slot, &h) in self.slots_mut().iter_mut().zip(parent.slots()) { *slot = unsafe { h.retain() }; }
+    pub fn inherit(&mut self, aFrames: &mut Frames<'_>, parent: &Self) {
+        for (slot, &h) in self.slots_mut().iter_mut().zip(parent.slots()) { *slot = unsafe { h.retain(aFrames) }; }
     }
 
     // Attach only to the fresh shell, preserving the acceptance programs' fd0.
@@ -135,7 +135,7 @@ impl Descriptors {
     pub fn dup2(&mut self, frames: &mut Frames<'_>, old: usize, new: usize) -> Result<usize, isize> {
         let h = self.handle(old)?;
         let target = self.slots_mut().get_mut(new).ok_or(-9isize)?;
-        if old != new { unsafe { mem::replace(target, h.retain()).release(frames); } }
+        if old != new { unsafe { mem::replace(target, h.retain(frames)).release(frames); } }
         Ok(new)
     }
     pub fn open(&mut self, frames: &mut Frames<'_>, data: &'static [u8]) -> Result<usize, isize> {
@@ -156,7 +156,7 @@ impl Descriptors {
         let address = frame.into_address();
         let (first, second) = if socket {
             let p = address as *mut Channel;
-            unsafe { (*p).refs = [1, 1]; }
+            unsafe { (*p).initialize(frames); }
             (Handle::Socket(p, 0), Handle::Socket(p, 1))
         } else {
             let p = address as *mut Pipe;
@@ -171,13 +171,13 @@ impl Descriptors {
     /// Validate the entire watch set before going to sleep. Each selected
     /// handle must be a live local IPC socket. Closure of its peer is readable
     /// (EOF), so waiting callers never get stranded on a dead service.
-    pub fn ipc_ready_mask(&self, mask: u32) -> Result<u32, isize> {
+    pub fn ipc_ready_mask(&self, aFrames: &mut Frames<'_>, mask: u32) -> Result<u32, isize> {
         let mut ready = 0u32;
         for fd in 0..SLOTS {
             let bit = 1u32 << fd;
             if mask & bit == 0 { continue; }
             let Handle::Socket(channel, side) = self.handle(fd)? else { return Err(-88); };
-            if unsafe { (*channel).ready(side, Operation::Receive) } { ready |= bit; }
+            if unsafe { (*channel).ready(aFrames, side, Operation::Receive) } { ready |= bit; }
         }
         Ok(ready)
     }

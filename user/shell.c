@@ -74,16 +74,16 @@ static int measureIdle(void) {
     struct timerSample {
         unsigned long fVersion, fMonotonicMs, fTimerIrqs, fIdleTimerIrqs;
     } pBefore, pAfter;
-    _Static_assert(sizeof(struct timerSample)==32,"native timer statistics v1");
+    _Static_assert(sizeof(struct timerSample)==32,"native timer statistics v2");
     long pResult=os_call(SYS_TIMER_STATS,(long)&pBefore,sizeof(pBefore),0);
     if (pResult<0) return writeError("idle: statistics failed",pResult);
-    if (pBefore.fVersion!=1 || pBefore.fMonotonicMs>0x7fffffffffffffffUL-5000)
+    if (pBefore.fVersion!=2 || pBefore.fMonotonicMs>0x7fffffffffffffffUL-5000)
         return writeError("idle: invalid clock",-5);
     pResult=os_call(SYS_SLEEP_UNTIL,(long)(pBefore.fMonotonicMs+5000),0,0);
     if (pResult!=0) return writeError("idle: wait failed",pResult);
     pResult=os_call(SYS_TIMER_STATS,(long)&pAfter,sizeof(pAfter),0);
     if (pResult<0) return writeError("idle: statistics failed",pResult);
-    if (pAfter.fVersion!=1 || pAfter.fMonotonicMs<pBefore.fMonotonicMs+5000 ||
+    if (pAfter.fVersion!=2 || pAfter.fMonotonicMs<pBefore.fMonotonicMs+5000 ||
         pAfter.fTimerIrqs<pBefore.fTimerIrqs ||
         pAfter.fIdleTimerIrqs<pBefore.fIdleTimerIrqs ||
         pAfter.fIdleTimerIrqs-pBefore.fIdleTimerIrqs>pAfter.fTimerIrqs-pBefore.fTimerIrqs)
