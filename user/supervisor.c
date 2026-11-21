@@ -58,6 +58,21 @@ static int record(const char event[4], unsigned long parent,
     return os_call(SYS_WRITE,1,(long)line,sizeof(line)-1)==sizeof(line)-1;
 }
 
+/* Evidence of measured time before a forced kill, not of wall-clock UTC. */
+static int record_duration(unsigned long parent, unsigned long child,
+                           unsigned long duration_ms) {
+    char line[] = "AGENTOS SERVICE DURATION PARENT=0000000000000000 CHILD=0000000000000000 MS=0000000000000000\r\n";
+    enum {
+        PARENT_AT = sizeof("AGENTOS SERVICE DURATION PARENT=")-1,
+        CHILD_AT = PARENT_AT + 16 + sizeof(" CHILD=")-1,
+        MS_AT = CHILD_AT + 16 + sizeof(" MS=")-1
+    };
+    format_hex(line+PARENT_AT,parent,16);
+    format_hex(line+CHILD_AT,child,16);
+    format_hex(line+MS_AT,duration_ms,16);
+    return os_call(SYS_WRITE,1,(long)line,sizeof(line)-1)==sizeof(line)-1;
+}
+
 /* Kill/collect on a failing wait path to avoid leaving an unowned child.
  * A permanently failed kernel operation cannot guarantee recovery; report it.
  */
@@ -70,7 +85,8 @@ static void cancel_and_collect(long pid) {
  * termination, -1 on a kernel/clock failure. A bounded poll count is only
  * a *clock-failure guard*, never treated as passage of wall-clock time.
  */
-static int collect_child(long child, unsigned long *exit_status) {
+static int collect_child(long child, unsigned long *exit_status,
+                         unsigned long *measured_ms) {
     long start=clock_ms();
     if (start<0) {
         cancel_and_collect(child);
@@ -92,6 +108,7 @@ static int collect_child(long child, unsigned long *exit_status) {
             return -1;
         }
         if ((unsigned long)(now-start)>=SERVICE_TIMEOUT_MS) {
+            *measured_ms=(unsigned long)(now-start);
             // A worker may exit between the final poll and SYS_KILL.
             // A preexisting zombie is not a forced termination.
             long killed=os_call(SYS_KILL,child,0,0);
@@ -126,11 +143,12 @@ static int supervise(const char *name, unsigned name_length,
             return -1;
         long child=os_call(SYS_SPAWN,(long)name,name_length,0);
         if (child<=0 || (unsigned long)child==parent) return -1;
-        unsigned long status=0;
-        int outcome=collect_child(child,&status);
+        unsigned long status=0, measured_ms=0;
+        int outcome=collect_child(child,&status,&measured_ms);
         if (outcome<0) return -1;
         if (outcome==1) {
-            if (!record("TIME",parent,(unsigned long)child,status,attempt) ||
+            if (!record_duration(parent,(unsigned long)child,measured_ms) ||
+                !record("TIME",parent,(unsigned long)child,status,attempt) ||
                 !record("STOP",parent,(unsigned long)child,status,attempt)) return -1;
             return 2;
         }
