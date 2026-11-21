@@ -34,16 +34,19 @@ _start:
     mov %rax, %r13
     cmp %r12, %r13
     je failed
-wait_child:
-    mov $SYS_TRY_WAIT, %eax
+    // A faulting child must be reaped through the same blocking kernel wait
+    // used by PID1 services; no userspace yield-polling or unbounded hang.
+    mov $SYS_MONOTONIC_MS, %eax
+    syscall
+    test %rax, %rax
+    js failed
+    movabs $0x7fffffffffffec77, %rbx   // signed max - 5000ms
+    cmp %rbx, %rax
+    ja failed
+    lea 5000(%rax), %rsi
+    mov $SYS_WAIT_CHILD_UNTIL, %eax
     mov %r13, %rdi
     syscall
-    cmp $-11, %rax
-    jne collected
-    mov $SYS_YIELD, %eax
-    syscall
-    jmp wait_child
-collected:
     cmp $270, %rax                 // fault status 256 + page-fault vector 14
     jne failed
     cmp %r12, -64(%rsp)
