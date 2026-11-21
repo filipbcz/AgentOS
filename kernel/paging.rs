@@ -8,6 +8,9 @@ const NX: u64 = 1 << 63;
 const MMIO: u64 = NX | WRITE | (1 << 3) | (1 << 4);
 const ADDRESS: u64 = 0x000f_ffff_ffff_f000;
 const USER: u64 = 4;
+// OS-owned software PTE bit. A COW page is present and user-readable, but
+// not hardware-writable until the last-owner promotion or a private copy.
+const COW: u64 = 1 << 9;
 pub const USER_BASE: usize = 1 << 39;
 pub const USER_END: usize = 2 << 39;
 
@@ -20,6 +23,102 @@ impl UserSpace {
         let root = frames.alloc()?.into_address();
         ptr::copy_nonoverlapping(kernel as *const u64, root as *mut u64, 512);
         Some(Self { root })
+    }
+
+    /// Clone the user subtree without copying its private data pages.
+    /// Construct the child first and roll back on any OOM; only after a
+    /// complete successful clone do we write-protect the parent's writable
+    /// PTEs. Both address spaces are pinned to the owner CPU and this method
+    /// executes with its interrupts masked by SharedFrames::with.
+    pub unsafe fn fork_cow(&self, frames: &mut Frames<'_>, kernel: usize) -> Result<Self, isize> {
+        unsafe fn copy_branch(frames: &mut Frames<'_>, from: usize, to: usize, level: u8) -> Option<()> {
+            for i in 0..512 {
+                let value = *((from as *const u64).add(i));
+                if value & PRESENT == 0 { continue; }
+                if level == 1 {
+                    // Only writable pages become COW. A read-only executable
+                    // page remains read-only in both processes.
+                    frames.retain((value & ADDRESS) as usize)?;
+                    let flags = if value & WRITE != 0 { (value & !WRITE) | COW } else { value };
+                    *((to as *mut u64).add(i)) = flags;
+                } else {
+                    let branch = frames.alloc_zeroed()?.into_address();
+                    *((to as *mut u64).add(i)) = branch as u64 | (value & !ADDRESS);
+                    copy_branch(frames, (value & ADDRESS) as usize, branch, level-1)?;
+                }
+            }
+            Some(())
+        }
+        unsafe fn protect_branch(table: usize, level: u8) {
+            for i in 0..512 {
+                let entry = (table as *mut u64).add(i);
+                let value = *entry;
+                if value & PRESENT == 0 { continue; }
+                if level == 1 {
+                    if value & WRITE != 0 { *entry = (value & !WRITE) | COW; }
+                } else {
+                    protect_branch((value & ADDRESS) as usize, level-1);
+                }
+            }
+        }
+        let child = Self::new(frames, kernel).ok_or(-12isize)?;
+        let original = *((self.root as *const u64).add(1));
+        if original & PRESENT != 0 {
+            let Some(first) = frames.alloc_zeroed() else {
+                child.release(frames);
+                return Err(-12);
+            };
+            *((child.root as *mut u64).add(1)) = first.into_address() as u64 | (original & !ADDRESS);
+            if copy_branch(frames, (original & ADDRESS) as usize,
+                           (*((child.root as *const u64).add(1)) & ADDRESS) as usize, 3).is_none() {
+                // All successfully retained leaf pages and allocated child
+                // tables are now owned by child.release, even on partial OOM.
+                child.release(frames);
+                return Err(-12);
+            }
+            protect_branch((original & ADDRESS) as usize, 3);
+            // User leaf PTE updates need a TLB shootdown. Only one CPU can
+            // execute this process (per-CPU scheduler); parent CR3 is active.
+            #[cfg(not(test))]
+            asm!("mov cr3, {}", in(reg) self.root, options(nostack));
+        }
+        Ok(child)
+    }
+
+    unsafe fn leaf(&self, va: usize) -> Option<*mut u64> {
+        if !(USER_BASE..USER_END).contains(&va) { return None; }
+        let mut node = self.root;
+        for shift in [39, 30, 21] {
+            let value = *((node as *const u64).add((va >> shift) & 511));
+            if value & (PRESENT | USER) != PRESENT | USER { return None; }
+            node = (value & ADDRESS) as usize;
+        }
+        Some((node as *mut u64).add((va >> 12) & 511))
+    }
+
+    /// Resolve a private writable user page before a user #PF or a kernel
+    /// copy_to_user. Read-only executable or unmapped addresses are rejected.
+    pub unsafe fn resolve_cow(&self, frames: &mut Frames<'_>, va: usize) -> Option<bool> {
+        let leaf = self.leaf(va)?;
+        let previous = *leaf;
+        if previous & (PRESENT | USER | COW) != PRESENT | USER | COW ||
+           previous & WRITE != 0 { return Some(false); }
+        let old = (previous & ADDRESS) as usize;
+        let count = frames.references(old)?;
+        let address = if count == 1 { old } else {
+            let fresh = frames.alloc()?.into_address();
+            ptr::copy_nonoverlapping(old as *const u8, fresh as *mut u8, PAGE);
+            fresh
+        };
+        *leaf = ((previous & !ADDRESS) & !COW) | WRITE | address as u64;
+        // If this was shared, the old mapping has lost one reference. If
+        // unique, promotion needs no allocation or reference adjustment.
+        if count > 1 {
+            frames.release(crate::frames::Frame::from_owned_address(old));
+        }
+        #[cfg(not(test))]
+        asm!("invlpg [{}]", in(reg) (va & !(PAGE-1)), options(nostack, preserves_flags));
+        Some(true)
     }
 
     pub unsafe fn map(&self, frames: &mut Frames<'_>, va: usize, write: bool, execute: bool) -> Result<usize, isize> {
@@ -63,18 +162,29 @@ impl UserSpace {
         Some(())
     }
 
-    pub fn writable(&self, va: usize, len: usize) -> Option<()> {
+    pub fn writable(&self, frames: &mut Frames<'_>, va: usize, len: usize) -> Option<()> {
         let end = va.checked_add(len)?;
         let mut pos = va;
+        // Validate the complete destination before making any COW mapping
+        // writable. It must have either WRITE or the explicit COW marker.
         while pos < end {
-            unsafe { self.translate(pos, true)?; }
-            pos += (PAGE - pos % PAGE).min(end - pos);
+            let value = unsafe { *self.leaf(pos)? };
+            if value & (PRESENT | USER) != PRESENT | USER ||
+               value & (WRITE | COW) == 0 { return None; }
+            pos += (PAGE - pos % PAGE).min(end-pos);
+        }
+        pos = va;
+        while pos < end {
+            if unsafe { self.translate(pos, true) }.is_none() {
+                if unsafe { self.resolve_cow(frames, pos) } != Some(true) { return None; }
+            }
+            pos += (PAGE - pos % PAGE).min(end-pos);
         }
         Some(())
     }
 
-    pub fn write(&self, va: usize, src: &[u8]) -> Option<()> {
-        self.writable(va, src.len())?;
+    pub fn write(&self, frames: &mut Frames<'_>, va: usize, src: &[u8]) -> Option<()> {
+        self.writable(frames, va, src.len())?;
         let mut done = 0;
         while done < src.len() {
             let addr = va + done;
