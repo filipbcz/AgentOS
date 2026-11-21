@@ -62,8 +62,25 @@ function Send-Serial($State,[string]$Command) {
     }
 }
 # Exercise the actual PS/2 path rather than writing through the COM1 socket.
-function Send-Keyboard([string]$Command) {
-    VBox controlvm $vm keyboardputstring $Command
+function Send-Keyboard([string]$Command,[string]$Correction='') {
+    if ($Command -notmatch '^[ -~]+$' -or
+        ($Correction -ne '' -and $Correction -notmatch '^[ -~]$')) {
+        throw 'PS/2 injection accepts only printable US ASCII'
+    }
+    # The emulated PS/2 output buffer is bounded. Pace make/break pairs so
+    # this tests the keyboard IRQ path, not a host-generated input flood.
+    foreach ($key in $Command.ToCharArray()) {
+        VBox controlvm $vm keyboardputstring ([string]$key)
+        Start-Sleep -Milliseconds 15
+    }
+    if ($Correction -ne '') {
+        # Set 2 backspace make/break; test canonical editing through IRQ1.
+        VBox controlvm $vm keyboardputscancode 66 f0 66
+        Start-Sleep -Milliseconds 15
+        VBox controlvm $vm keyboardputstring $Correction
+        Start-Sleep -Milliseconds 15
+    }
+    # Set 2 Enter make/break, consistent with the 8042 translation to set 1.
     VBox controlvm $vm keyboardputscancode 5a f0 5a
 }
 
@@ -312,7 +329,7 @@ try {
                 # PS/2 keyboard and COM1 have independent input sources.
                 # Keep the strict serial-only verifier unchanged.
                 $offset=$serial.Text.Length
-                Send-Keyboard 'echo ps2-ok'
+                Send-Keyboard 'echo ps2-ox' 'k'
                 Wait-Serial $serial '(?m)^ps2-ok\r\nagentos> $' $offset
                 Start-Sleep -Milliseconds 150
                 VBox controlvm $vm screenshotpng "$dir\shell-keyboard.png"
