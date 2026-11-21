@@ -56,7 +56,7 @@ def snapshot(monitor, dest):
             client.settimeout(3)
             client.connect(str(monitor))
             client.recv(4096)
-            client.sendall(f"screendump {dest}\\n".encode("ascii"))
+            client.sendall(f"screendump {dest}\n".encode("ascii"))
             client.recv(4096)
         return dest.exists() and dest.stat().st_size > 64
     except (OSError, UnicodeError):
