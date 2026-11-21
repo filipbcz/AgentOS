@@ -181,7 +181,7 @@ static void failure_injection(void) {
     reset();failure_mode=1;
     assert(runServiceManager()==81 && !count && !total_kills);
     reset();clock_failure_at=2;
-    assert(runServiceManager()==81 && total_kills<=1);
+    assert(runServiceManager()==81 && total_kills==2); // both newly live services must be stopped
     reset();spoof_ready=1;
     assert(runServiceManager()==81 && registry[SVC_CORE].attempts==3 &&
            total_kills==3 && !registry[SVC_SHELL].pid);
