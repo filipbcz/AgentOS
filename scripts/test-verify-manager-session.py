@@ -1,4 +1,4 @@
-"""Tamper tests for real interactive service registry/ordered shutdown receipts."""
+"""Tamper tests for real UART COM1 service registry/ordered shutdown receipts."""
 import importlib.util
 from pathlib import Path
 import unittest
