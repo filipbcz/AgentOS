@@ -1,6 +1,6 @@
 //! One bounded message in flight in each direction of a local channel.
 //! Channel access is serialized by its endpoints' CPU with interrupts masked.
-use crate::{paging::UserSpace, process::{Credentials, EFAULT}};
+use crate::{frames::Frames, paging::UserSpace, process::{Credentials, EFAULT}};
 
 pub const MAX_MESSAGE: usize = 1024;
 #[derive(Clone, Copy)]
@@ -40,15 +40,15 @@ impl Channel {
         Ok(Some(len))
     }
 
-    pub fn receive(&mut self, side: usize, space: &UserSpace, address: usize,
+    pub fn receive(&mut self, frames: &mut Frames<'_>, side: usize, space: &UserSpace, address: usize,
                    capacity: usize) -> Result<Option<usize>, isize> {
         let slot = &mut self.inbox[side];
         if slot.length == 0 { return Ok((self.refs[1-side] == 0).then_some(0)); }
         let len = slot.length;
         if capacity < len { return Err(-90); }
-        space.writable(address, slot.peer.len()+len).ok_or(EFAULT)?;
-        space.write(address, &slot.peer).ok_or(EFAULT)?;
-        space.write(address+slot.peer.len(), &slot.data[..len]).ok_or(EFAULT)?;
+        space.writable(frames, address, slot.peer.len()+len).ok_or(EFAULT)?;
+        space.write(frames, address, &slot.peer).ok_or(EFAULT)?;
+        space.write(frames, address+slot.peer.len(), &slot.data[..len]).ok_or(EFAULT)?;
         slot.length = 0;
         Ok(Some(len))
     }
