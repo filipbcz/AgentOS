@@ -20,6 +20,7 @@
 #define SYS_WAIT_CHILD_UNTIL 0x10011
 #define SYS_SLEEP_UNTIL      0x10012
 #define SYS_CHILD_AFTER      0x10013
+#define SYS_FORK             0x10014
 
 /* SYS_MONOTONIC_MS: nonnegative milliseconds since owning CPU's epoch.
  * Per-CPU only; a process is currently pinned to its CPU. Not UTC and not
@@ -45,6 +46,14 @@
  * the reaper role. Descendants are adopted at their parent's exit or kill.
  * If that reaper itself dies, unattended children are stopped and their
  * resources are reclaimed during kernel shutdown. -22 for invalid cursor.
+ */
+/* SYS_FORK(): create a CPU-local child at the instruction following the
+ * syscall. Parent receives a new nonzero PID; child receives zero. Physical
+ * user pages are shared read-only with explicit COW until the first write.
+ * Kernel->user writes from read()/IPC also resolve COW; immutable text
+ * stays read-only and executable, and both inherit open descriptors.
+ * -11 if the CPU task table is full, -12 on frame allocation failure.
+ * The parent remains unchanged on clone allocation failure.
  */
 /* SYS_KILL(pid): a process may terminate only its direct child.
  * The child becomes a reapable zombie with exit status 137.
