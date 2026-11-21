@@ -50,6 +50,13 @@ jobs:
           test -f "$vars"
           python3 scripts/qemu-smoke.py --cpus "$CPU_COUNT" \
             --ovmf-code "$code" --ovmf-vars "$vars" --timeout 720
+      - name: Verify real PS/2 service registry control and graceful shutdown
+        if: matrix.cpus == 1
+        run: |
+          set -euo pipefail
+          python3 scripts/qemu-smoke.py --cpus 1 --session \
+            --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd \
+            --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd --timeout 720
       - name: Preserve boot evidence even if the guest fails
         if: always()
         uses: actions/upload-artifact@v4
@@ -69,3 +76,9 @@ jobs:
             build/check/qemu-cpu${{ matrix.cpus }}/OVMF_VARS.secboot.fd
             build/check/qemu-cpu${{ matrix.cpus }}/failed-screen.ppm
             build/check/qemu-cpu${{ matrix.cpus }}/shell-screen.ppm
+            build/check/qemu-cpu1-session/com1.log
+            build/check/qemu-cpu1-session/qemu-stderr.log
+            build/check/qemu-cpu1-session/smoke.json
+            build/check/qemu-cpu1-session/failure.json
+            build/check/qemu-cpu1-session/failed-screen.ppm
+            build/check/qemu-cpu1-session/shell-screen.ppm
