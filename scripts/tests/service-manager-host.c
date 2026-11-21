@@ -339,7 +339,9 @@ static void dependency_graph_and_leaf_first_shutdown(void) {
     workers[1]=(struct worker){202,0,SVC_SHELL,0,1,1,0,0};
     workers[2]=(struct worker){203,0,SVC_FLAKY,0,1,1,0,0};
     count=3;
-    for (unsigned i=0;i<3;i++)registry[i].pid=workers[i].pid;
+    registry[SVC_CORE].pid=201;
+    registry[SVC_SHELL].pid=202;
+    registry[SVC_FLAKY].pid=203;
     assert(stop_all());
     assert(total_kills==3 && kill_order[0]==203 && kill_order[1]==202 &&
            kill_order[2]==201);
