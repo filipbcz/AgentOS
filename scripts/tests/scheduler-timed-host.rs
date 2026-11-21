@@ -35,7 +35,7 @@ mod files {
     impl Descriptors {
         pub fn test_dummy() -> Self { Self }
         pub fn inherit(&mut self, _: &Self) {}
-        pub fn terminal(&mut self, _: *mut crate::tty::Terminal) {}
+        pub fn terminal(&mut self, _: *mut crate::tty::Terminal) -> Result<(),isize> { Ok(()) }
         pub fn close_all(&mut self, _: &mut crate::frames::Frames<'_>) {}
         pub fn release(&self, _: &mut crate::frames::Frames<'_>) {}
     }
