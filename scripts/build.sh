@@ -15,7 +15,9 @@ mkdir -p "$out"
 # Never leave a success receipt from a previous build if the new build fails.
 rm -f "$out/build-provenance.json"
 work=$(mktemp -d)
-trap 'rm -f "$work"/{libkernel.a,ap-start.o,kernel.elf,initramfs.cpio,layout.ld,loader.o,payload.o,loader.so,stage,user.o,transfer.o,client.o,receive.o,service.o,shell.o,supervisor.o,init,fault,receiver,service,shell,svc_ok,svc_fail,svc_hang,data/transfer.bin}; rmdir "$work/data" "$work"' EXIT
+# Work directory was exclusively created by mktemp. New ELF programs and C
+# objects must never make a successful, signed build fail in the EXIT trap.
+trap 'rm -rf -- "$work"' EXIT
 cd "$work"
 mkdir data
 rust_version=$(/usr/bin/rustc --version)
