@@ -18,9 +18,9 @@ work=$(mktemp -d)
 trap 'rm -f "$work"/{libkernel.a,ap-start.o,kernel.elf,initramfs.cpio,layout.ld,loader.o,payload.o,loader.so,stage,user.o,transfer.o,client.o,receive.o,service.o,shell.o,supervisor.o,init,fault,receiver,service,shell,svc_ok,svc_fail,svc_hang,data/transfer.bin}; rmdir "$work/data" "$work"' EXIT
 cd "$work"
 mkdir data
-rust_version=$(rustc --version)
+rust_version=$(/usr/bin/rustc --version)
 [[ "$rust_version" == "rustc 1.75.0 "* ]] || { printf 'Pinned Rust compiler mismatch: %s\n' "$rust_version" >&2; exit 1; }
-rustc --edition 2021 --crate-type staticlib -C lto=fat -C opt-level=2 -C panic=abort \
+/usr/bin/rustc --edition 2021 --crate-type staticlib -C lto=fat -C opt-level=2 -C panic=abort \
     -C relocation-model=static -C no-redzone=yes -C overflow-checks=no \
     --remap-path-prefix="$root"=/agentos "$root/kernel/main.rs" -o libkernel.a
 gcc-13 -c -o ap-start.o "$root/kernel/ap-start.S"
@@ -84,7 +84,7 @@ receipt = {
     "source_commit": run("git", "rev-parse", "--verify", "HEAD"),
     "source_clean": not bool(run("git", "status", "--porcelain", "--untracked-files=normal")),
     "toolchain_lock_sha256": digest(root / "scripts/toolchain.lock"),
-    "rustc_version": run("rustc", "--version"),
+    "rustc_version": run("/usr/bin/rustc", "--version"),
     "gcc_version": run("gcc-13", "-dumpfullversion"),
     "initramfs_sha256": digest(initrd),
     "artifacts": {
