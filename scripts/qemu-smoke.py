@@ -32,6 +32,7 @@ evidence = load("qemu_build_evidence", "verify-vm-evidence.py")
 processes = load("qemu_process_evidence", "verify-processes.py")
 supervisor = load("qemu_supervisor_evidence", "verify-supervisor.py")
 orphans = load("qemu_orphan_evidence", "verify-orphans.py")
+cow = load("qemu_cow_evidence", "verify-cow.py")
 boot_log = load("qemu_boot_log_evidence", "verify-boot-log.py")
 
 
@@ -196,6 +197,7 @@ def boot(args):
     processes.verify(text, apics)
     supervisor.verify(text, args.cpus)
     orphans.verify(text, args.cpus)
+    cow.verify(text, args.cpus)
     receipt = {
         "schema": 1,
         "result": "pass",
