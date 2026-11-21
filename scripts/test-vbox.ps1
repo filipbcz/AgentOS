@@ -339,9 +339,11 @@ try {
                 }
             }
             $elapsed=if ($null -ne $timer) { [math]::Round($timer.Elapsed.TotalSeconds,3) } else { 0.0 }
+            $receiptStatus='fail'
+            if ($runSucceeded -and $shutdownSucceeded) { $receiptStatus='pass' }
             $receipt=[ordered]@{
                 schema=1
-                result=if ($runSucceeded -and $shutdownSucceeded) { 'pass' } else { 'fail' }
+                result=$receiptStatus
                 source_commit=$sourceCommit
                 build_provenance_sha256=$buildReceiptHash
                 harness_sha256=$harnessHash
