@@ -65,6 +65,9 @@ _start:
     test %eax, %eax
     jne finished
     call run_supervisor
+    test %eax, %eax
+    jne finished
+    call run_orphans
 finished:
     mov %eax, %edi
     jmp terminate
