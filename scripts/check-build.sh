@@ -77,6 +77,10 @@ printf 'Testing GOP text console bounds, ASCII and scrolling with %s\n' "$pRustc
 "$pRustc" --edition 2021 --test "$pRoot/scripts/tests/fb-console-host.rs" -o "$pOut/fb-console-tests"
 "$pOut/fb-console-tests"
 
+printf 'Testing actual COW paging clone, W^X and OOM rollback with %s\n' "$pRustc"
+"$pRustc" --edition 2021 --test "$pRoot/scripts/tests/paging-cow-host.rs" -o "$pOut/paging-cow-tests"
+"$pOut/paging-cow-tests"
+
 printf 'Testing real per-CPU scheduler child wakeups and APIC timed waits with %s\n' "$pRustc"
 "$pRustc" --edition 2021 --test "$pRoot/scripts/tests/scheduler-timed-host.rs" -o "$pOut/scheduler-timed-tests"
 "$pOut/scheduler-timed-tests"
