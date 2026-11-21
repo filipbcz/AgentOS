@@ -34,6 +34,14 @@ if ((${#pTests[@]} == 0)); then
     printf 'No host Python tests found in %s/scripts\n' "$pRoot" >&2
     exit 1
 fi
+printf 'Parsing all Python harnesses (including optional QEMU diagnostics)\n'
+"$pPython" - <<'PY'
+import ast
+from pathlib import Path
+for source in sorted(Path("scripts").glob("*.py")):
+    ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+PY
+
 for pTest in "${pTests[@]}"; do
     printf 'Running %s\n' "${pTest##*/}"
     "$pPython" "$pTest" -v
