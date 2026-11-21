@@ -10,6 +10,15 @@ static long mockCall(long aOp, long aFirst, long aSecond, long aThird);
 #include "../../user/shell.c"
 #undef os_call
 
+/* Shell tests isolate command parsing and TTY I/O. The authenticated
+ * manager protocol is exercised separately by service-manager integration
+ * tests and real QEMU guest boots. */
+int manager_connect(void) { return 1; }
+int manager_command(unsigned op, unsigned service) {
+    (void)op;(void)service;
+    return 1;
+}
+
 static unsigned gReadChunk, gWriteChunk;
 static const char *gMode, *gFilePath;
 static FILE *gFile;
