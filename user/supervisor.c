@@ -9,9 +9,10 @@
 enum {
     MAX_ATTEMPTS = 3,
     SERVICE_TIMEOUT_MS = 250,
-    RESTART_BACKOFF_MS = 20,
-    MAX_CLOCK_POLLS = 1000000
+    RESTART_BACKOFF_MS = 20
 };
+/* Millisecond deadlines are passed to a signed 64-bit syscall ABI. */
+#define MAX_DEADLINE_MS 0x7fffffffffffffffUL
 
 /* All service children are pinned to their parent's CPU. This monotonic
  * source has a CPU-local epoch, so durations are valid, absolute cross-CPU
@@ -21,14 +22,10 @@ static long clock_ms(void) { return os_call(SYS_MONOTONIC_MS,0,0,0); }
 
 static int wait_backoff(unsigned delay_ms) {
     long start=clock_ms();
-    if (start<0) return -1;
-    for (unsigned polls=0;polls<MAX_CLOCK_POLLS;polls++) {
-        long now=clock_ms();
-        if (now<start) return -1;
-        if ((unsigned long)(now-start)>=delay_ms) return 0;
-        if (os_call(SYS_YIELD,0,0,0)<0) return -1;
-    }
-    return -1; // Clock stalled; never spin forever.
+    if (start<0 || (unsigned long)start>MAX_DEADLINE_MS-delay_ms) return -1;
+    // A kernel-blocked timer wait, NOT a yield loop. A clock failure returns
+    // -5 after a bounded number of nonadvancing local APIC timer interrupts.
+    return os_call(SYS_SLEEP_UNTIL,start+delay_ms,0,0)==0 ? 0 : -1;
 }
 
 /* Bound the evidence of the supervised interval for independent verifiers.
@@ -82,53 +79,44 @@ static void cancel_and_collect(long pid) {
 }
 
 /* Returns 0 after collection, 1 if a real monotonic deadline required
- * termination, -1 on a kernel/clock failure. A bounded poll count is only
- * a *clock-failure guard*, never treated as passage of wall-clock time.
+ * termination, -1 on a kernel/clock failure. An exited child wakes its parent
+ * immediately in the kernel; the parent does not poll or spin in userspace.
  */
 static int collect_child(long child, unsigned long *exit_status,
                          unsigned long *measured_ms) {
     long start=clock_ms();
-    if (start<0) {
+    if (start<0 || (unsigned long)start>MAX_DEADLINE_MS-SERVICE_TIMEOUT_MS) {
         cancel_and_collect(child);
         return -1;
     }
-    for (unsigned polls=0;polls<MAX_CLOCK_POLLS;polls++) {
-        long result=os_call(SYS_TRY_WAIT,child,0,0);
-        if (result>=0) {
-            *exit_status=(unsigned long)result;
-            return 0;
-        }
-        if (result!=-11) {
-            cancel_and_collect(child);
-            return -1;
-        }
-        long now=clock_ms();
-        if (now<start) {
-            cancel_and_collect(child);
-            return -1;
-        }
-        if ((unsigned long)(now-start)>=SERVICE_TIMEOUT_MS) {
-            *measured_ms=(unsigned long)(now-start);
-            // A worker may exit between the final poll and SYS_KILL.
-            // A preexisting zombie is not a forced termination.
-            long killed=os_call(SYS_KILL,child,0,0);
-            if (killed<0) {
-                cancel_and_collect(child);
-                return -1;
-            }
-            long status=os_call(SYS_TRY_WAIT,child,0,0);
-            if (status<0) return -1;
-            *exit_status=(unsigned long)status;
-            return killed==0 ? 1 : 0;
-        }
-        if (os_call(SYS_YIELD,0,0,0)<0) {
-            cancel_and_collect(child);
-            return -1;
-        }
+    long deadline=start+SERVICE_TIMEOUT_MS;
+    long result=os_call(SYS_WAIT_CHILD_UNTIL,child,deadline,0);
+    if (result>=0) {
+        *exit_status=(unsigned long)result;
+        return 0;
     }
-    // If elapsed time never advances, do not invent a timeout record.
-    cancel_and_collect(child);
-    return -1;
+    if (result!=-110) {
+        // Includes -5 for stalled TSC/APIC failure, or lost child identity.
+        cancel_and_collect(child);
+        return -1;
+    }
+    long now=clock_ms();
+    if (now<start || (unsigned long)(now-start)<SERVICE_TIMEOUT_MS) {
+        cancel_and_collect(child);
+        return -1;
+    }
+    *measured_ms=(unsigned long)(now-start);
+    // A worker may exit between the timed wait and SYS_KILL. The kernel
+    // distinguishes an already-zombie child and preserves its exit status.
+    long killed=os_call(SYS_KILL,child,0,0);
+    if (killed<0) {
+        cancel_and_collect(child);
+        return -1;
+    }
+    long status=os_call(SYS_TRY_WAIT,child,0,0);
+    if (status<0) return -1;
+    *exit_status=(unsigned long)status;
+    return killed==0 ? 1 : 0;
 }
 
 /* 0 = clean completion; 1 = failure budget reached; 2 = stalled child killed;
