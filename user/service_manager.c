@@ -391,6 +391,33 @@ static long event_mask(void) {
     return (long)mask;
 }
 
+/* PID 1 also owns abandoned grandchildren. A service may spawn a child
+ * and then crash before collecting it; the kernel adopts that child, but
+ * does not reap it on behalf of userland. Scan only PID1-owned children,
+ * leave registered services to their policy, and fail-stop unknown orphans.
+ * An already exited adopted child is reaped without overwriting its status.
+ */
+static int reap_unmanaged(void) {
+    long cursor=0;
+    for (;;) {
+        long child=os_call(SYS_CHILD_AFTER,cursor,0,0);
+        if (child==-10) return 1;
+        if (child<=cursor) return 0;
+        cursor=child;
+        int registered=0;
+        for (unsigned id=0;id<SVC_COUNT;id++)
+            if (registry[id].pid==child) { registered=1; break; }
+        if (registered) continue;
+        long status=os_call(SYS_TRY_WAIT,child,0,0);
+        if (status==-11) {
+            long stopped=os_call(SYS_KILL,child,0,0);
+            if (stopped!=0 && stopped!=1) return 0;
+            status=os_call(SYS_TRY_WAIT,child,0,0);
+        }
+        if (status<0) return 0;
+    }
+}
+
 static int stop_subtree(unsigned id, unsigned char seen[SVC_COUNT]) {
     if (seen[id]) return 1;
     seen[id]=1;
@@ -409,7 +436,7 @@ static int stop_all(void) {
     for (unsigned id=0;id<SVC_COUNT;id++) registry[id].desired=0;
     for (unsigned id=0;id<SVC_COUNT;id++)
         if (!stop_subtree(id,seen)) return 0;
-    return 1;
+    return reap_unmanaged();
 }
 
 int runServiceManager(void) {
@@ -420,6 +447,7 @@ int runServiceManager(void) {
         if (now<0 || (unsigned long)now>MAX_MS-READY_TIMEOUT_MS-200)
             { fatal_error=1;break; }
         if (advance_registry(now)!=0) { fatal_error=1;break; }
+        if (!reap_unmanaged()) { fatal_error=1;break; }
         if (shutdown_requested) break;
         if (check_control(now)!=0) { fatal_error=1;break; }
         long next=event_deadline(now);

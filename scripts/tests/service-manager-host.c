@@ -165,6 +165,15 @@ static long mock_call(long op,long a,long b,long c) {
             }
             return -11;
         }
+        case SYS_CHILD_AFTER: {
+            assert(b==0 && c==0 && a>=0);
+            long found=0;
+            for (unsigned i=0;i<count;i++) {
+                if (workers[i].reaped || workers[i].pid<=a)continue;
+                if (!found || workers[i].pid<found) found=workers[i].pid;
+            }
+            return found ? found : -10;
+        }
         case SYS_KILL: {
             struct worker *w=from_pid(a);
             assert(w && !w->reaped && !w->killed);
@@ -298,6 +307,29 @@ static void dependency_failure_and_restart_window(void) {
     assert(flaky->state==SVC_FAILED && flaky->attempts==3);
 }
 
+static void adopted_orphan_reaping(void) {
+    reset();
+    owner_pid=100;
+    // First child is a live abandoned grandchild, second a legitimate
+    // registered service: only the adopted unknown child may be killed.
+    workers[0]=(struct worker){201,0,99,0,0,0,0,0};
+    workers[1]=(struct worker){202,0,SVC_CORE,0,0,0,0,0};
+    count=2;
+    registry[SVC_CORE].pid=202;
+    assert(reap_unmanaged());
+    assert(total_kills==1 && kill_order[0]==201 &&
+           workers[0].reaped && !workers[1].reaped);
+    assert(reap_unmanaged() && total_kills==1); // idempotent
+    reset();
+    owner_pid=100;
+    workers[0]=(struct worker){301,0,99,0,0,0,0,1};
+    // An already-zombie child must be collected without issuing a kill.
+    // The mock marks forced termination independently; use status 42 below.
+    workers[0].reaped=0;
+    workers[0].killed=1;
+    count=1;
+    assert(reap_unmanaged() && workers[0].reaped && total_kills==0);
+}
 static void dependency_graph_and_leaf_first_shutdown(void) {
     reset();
     assert(registry_valid());
@@ -394,6 +426,7 @@ int main(void){
     failure_injection();
     dependency_failure_and_restart_window();
     dependency_graph_and_leaf_first_shutdown();
+    adopted_orphan_reaping();
     command_authorization_and_dependency();
     puts("Persistent service manager registry, dependency fail-stop, restart window, IPC authentication and shutdown passed");
     return 0;
