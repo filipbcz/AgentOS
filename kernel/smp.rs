@@ -132,6 +132,7 @@ struct Cpu {
     idle: UnsafeCell<IdleSample>,
     descriptors: Option<Descriptors>,
     queue: UnsafeCell<Queue>,
+    boot_baseline: UnsafeCell<Option<crate::frames::BitmapSnapshot>>,
     terminal: UnsafeCell<*mut crate::tty::Terminal>,
     load: &'static Load,
     released: [AtomicUsize; stress::TASKS],
@@ -153,7 +154,7 @@ impl Cpu {
                          clock: crate::monotonic::Clock::new(tsc_hz),
                          interrupts: AtomicU32::new(0), hlt_wakes: AtomicU32::new(0),
                          complete: AtomicU32::new(0), phase: AtomicU32::new(0), terminal: UnsafeCell::new(ptr::null_mut()),
-                         idle: UnsafeCell::new(IdleSample::default()), descriptors, load, queue: UnsafeCell::new(Queue::new()),
+                         idle: UnsafeCell::new(IdleSample::default()), descriptors, load, queue: UnsafeCell::new(Queue::new()), boot_baseline: UnsafeCell::new(None),
                          released: core::array::from_fn(|_| AtomicUsize::new(0)) });
         for i in 0..stress::TASKS {
             (*(*cpu).queue.get()).spawn(frames, allocation_task, i).ok_or(b"task stack" as Error)?;
@@ -260,17 +261,32 @@ impl Cpu {
         msr(0xc0000082, native_syscall as usize as u64);
         msr(0xc0000084, 0xffff_ffff);
         asm!("rdmsr", "or eax, 1", "wrmsr", in("ecx") 0xc0000080u32, out("eax") _, out("edx") _);
-        let snapshot = self.load.frames.with(|f| f.snapshot()).ok_or(b"process snapshot" as Error)?;
+        // BSP's first process is the actual numeric PID 1, retained through
+        // the boot tests; AP tests still use independent finite sessions.
+        let bsp_root = self.descriptors.is_none();
+        let baseline = self.load.frames.with(|f| f.snapshot()).ok_or(b"process snapshot" as Error)?;
         let pid = self.load.frames.with(|f| (*self.queue.get()).spawn_process(f, self.programs, b"init", 0))
             .map_err(|_| b"user init ELF" as Error)?;
+        let resident = if bsp_root {
+            Some(self.load.frames.with(|f| f.snapshot()).ok_or(b"PID1 test snapshot" as Error)?)
+        } else { None };
         self.schedule();
         let ok = self.load.frames.with(|f| {
             let q = &mut *self.queue.get();
-            let result = q.collect(f, 0, pid);
-            q.reap(f);
-            let matched = snapshot.matches(f);
-            snapshot.release(f);
-            result == Ok(0) && matched && f.probe()
+            if let Some(resident) = resident {
+                let valid = pid == 1 && q.parked_root() == Some(pid) &&
+                    q.child_after(pid, 0) == Err(-10) && resident.matches(f);
+                resident.release(f);
+                if valid { (*self.boot_baseline.get()).replace(baseline); }
+                else { baseline.release(f); }
+                valid && f.probe()
+            } else {
+                let result = q.collect(f, 0, pid);
+                q.reap(f);
+                let matched = baseline.matches(f);
+                baseline.release(f);
+                result == Ok(0) && matched && f.probe()
+            }
         });
         if !ok { return Err(b"user process result or frame leak"); }
         serial(b"AGENTOS PROCESS OK APIC="); hex(self.expected_id as u64);
@@ -487,6 +503,17 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
                     return cpu.switch(ctx as *mut Context as usize, false);
                 }
                 Err(error) => { q.wake_io(); error }
+            }
+        }
+        // Bootstrap-only pause: not a general process or service control.
+        0x10016 => {
+            if pid != 1 || q.park_boot_root(pid).is_err() { -16 }
+            else {
+                cpu.output(b"AGENTOS USER PARK PID="); cpu.hex(pid as u64);
+                cpu.output(b" CR3="); cpu.hex(active_root() as u64);
+                cpu.output(b" STATUS=0000000000000000\r\n");
+                ctx.registers[14] = 0;
+                return cpu.switch(ctx as *mut Context as usize, false);
             }
         }
         0x10003 => {
@@ -713,17 +740,13 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
     Ok(())
 }
 
-/// Start the separate *operational root manager* after the boot acceptance
-/// and idle checks. It inherits the terminal, starts the shell as a child,
-/// owns the service registry, and remains alive until graceful shell exit.
-/// The earlier boot test's numeric PID 1 has already been reaped, so this
-/// process is the CPU-local reaper for this session, not literal numeric PID 1.
-/// The BSP owns this terminal until all session descriptors have been reaped.
+/// Resume the original numeric BSP PID 1 after boot and idle acceptance.
+/// It gains a trusted terminal without changing PID or reaper ownership.
 pub unsafe fn shell(platform: &Platform, info: &crate::BootInfo) -> Result<(), Error> {
     let cpu = current_cpu();
-    let snapshot = cpu.load.frames.with(|f| f.snapshot()).ok_or(b"shell snapshot" as Error)?;
+    let baseline = (*cpu.boot_baseline.get()).take().ok_or(b"PID1 baseline missing" as Error)?;
     let Some(storage) = cpu.load.frames.with(|f| f.alloc()) else {
-        cpu.load.frames.with(|f| snapshot.release(f));
+        cpu.load.frames.with(|f| baseline.release(f));
         return Err(b"TTY allocation");
     };
     let terminal = storage.address() as *mut crate::tty::Terminal;
@@ -742,9 +765,11 @@ pub unsafe fn shell(platform: &Platform, info: &crate::BootInfo) -> Result<(), E
             let _ = crate::logger::LOGGER.record(timestamp(), cpu.expected_id as u32,
                 crate::log_policy::Level::Error, b"TTY GOP unavailable");
         }
-        let pid = cpu.load.frames.with(|f| (*cpu.queue.get()).spawn_process(f, cpu.programs, b"manager", 0))
-            .map_err(|_| b"service manager ELF" as Error)?;
-        (*cpu.queue.get()).terminal(pid, terminal).map_err(|_| b"manager terminal descriptors" as Error)?;
+        let queue = &mut *cpu.queue.get();
+        let pid = queue.parked_root().ok_or(b"PID1 not parked" as Error)?;
+        if pid != 1 { return Err(b"invalid PID1 identity"); }
+        queue.terminal(pid, terminal).map_err(|_| b"PID1 terminal descriptors" as Error)?;
+        queue.resume_boot_root(pid).map_err(|_| b"PID1 resume" as Error)?;
         let _ = crate::logger::LOGGER.record(timestamp(), cpu.expected_id as u32,
             crate::log_policy::Level::Info, b"service manager session started");
         serial(b"AGENTOS MANAGER SESSION START PID="); hex(pid as u64); serial(b"\r\n");
@@ -762,8 +787,8 @@ pub unsafe fn shell(platform: &Platform, info: &crate::BootInfo) -> Result<(), E
         });
         q.reap(f);
         f.release(storage);
-        let matched = snapshot.matches(f);
-        snapshot.release(f);
+        let matched = baseline.matches(f);
+        baseline.release(f);
         if matched && f.probe() { status } else { Err(b"manager session frame leak" as Error) }
     });
     let pid = result?;

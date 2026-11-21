@@ -25,7 +25,7 @@ PATTERNS = {
              f"CR3={hex_field('cr3')} VECTOR={hex_field('vector')} "
              f"ERROR={hex_field('error')} ADDRESS={hex_field('address')}",
     "survived": "AGENTOS USER SURVIVED",
-    "exit": f"AGENTOS USER EXIT PID={PID} CR3={hex_field('cr3')} "
+    "exit": f"AGENTOS USER (?:EXIT|PARK) PID={PID} CR3={hex_field('cr3')} "
             f"STATUS={hex_field('status')}",
     "check": f"AGENTOS PROCESS OK APIC={hex_field('apic')} PARENT={hex_field('parent')}",
     "received": f"AGENTOS PIPE RECEIVED PID={PID} BYTES={hex_field('bytes', 8)} "

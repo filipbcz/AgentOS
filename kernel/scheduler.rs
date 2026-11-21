@@ -58,12 +58,14 @@ pub struct Queue {
     /// First parent=0 userspace task of this CPU run. Never reassign while
     /// it is alive; no parent/child relationship crosses CPU ownership.
     init_pid: Option<usize>,
+    /// Kernel-held BSP root across boot checks and TTY handoff.
+    boot_parked: Option<usize>,
     pub active: bool,
 }
 
 impl Queue {
     pub fn new() -> Self {
-        Self { tasks: core::array::from_fn(|_| None), count: 0, current: None, caller: 0, init_pid: None, active: false }
+        Self { tasks: core::array::from_fn(|_| None), count: 0, current: None, caller: 0, init_pid: None, boot_parked: None, active: false }
     }
 
     pub fn spawn(&mut self, frames: &mut Frames<'_>, entry: extern "C" fn(usize), arg: usize) -> Option<()> {
@@ -171,6 +173,30 @@ impl Queue {
         if self.active || self.current.is_some() { return Err(-16); }
         self.tasks.iter_mut().flatten().filter_map(|task| task.process.as_mut())
             .find(|p| p.pid == pid).ok_or(-3isize)?.files.terminal(terminal)
+    }
+
+    /// Only the first root may park, and only after reaping all descendants.
+    /// Its saved syscall context remains attached to the same PID/address space.
+    pub fn park_boot_root(&mut self, pid: usize) -> Result<(), isize> {
+        if self.init_pid != Some(pid) || self.boot_parked.is_some() ||
+           self.process().map(|p| p.pid) != Some(pid) ||
+           self.child_after(pid, 0) != Err(-10) { return Err(-16); }
+        self.tasks[self.current.unwrap()].as_mut().unwrap().runnable = false;
+        self.boot_parked = Some(pid);
+        Ok(())
+    }
+
+    pub fn parked_root(&self) -> Option<usize> {
+        if !self.active && self.current.is_none() { self.boot_parked } else { None }
+    }
+
+    pub fn resume_boot_root(&mut self, pid: usize) -> Result<(), isize> {
+        if self.parked_root() != Some(pid) { return Err(-16); }
+        let task = self.tasks.iter_mut().flatten().find(|t| t.process.as_ref()
+            .map_or(false, |p| p.pid == pid && p.status.is_none())).ok_or(-3isize)?;
+        task.runnable = true;
+        self.boot_parked = None;
+        Ok(())
     }
 
     pub fn block(&mut self, wait: crate::files::Wait) {
@@ -407,6 +433,7 @@ impl Queue {
         for i in 0..self.count { self.release_task(i, frames); }
         self.count = 0;
         self.init_pid = None;
+        self.boot_parked = None;
     }
 }
 

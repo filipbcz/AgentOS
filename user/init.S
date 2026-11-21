@@ -71,6 +71,21 @@ _start:
     test %eax, %eax
     jne finished
     call run_forktest
+    test %eax, %eax
+    jne finished
+    // BSP PID 1 stays resident for service supervision; AP roots exit.
+    mov $SYS_GETPID, %eax
+    syscall
+    cmp $1, %rax
+    jne ap_finished
+    mov $SYS_BOOT_PAUSE, %eax
+    syscall
+    test %eax, %eax
+    jne failed
+    call runServiceManager
+    jmp finished
+ap_finished:
+    xor %eax, %eax
 finished:
     mov %eax, %edi
     jmp terminate

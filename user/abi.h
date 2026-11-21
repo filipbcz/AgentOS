@@ -22,7 +22,11 @@
 #define SYS_CHILD_AFTER      0x10013
 #define SYS_FORK             0x10014
 #define SYS_IPC_TRY_RECV     0x10015
+#define SYS_BOOT_PAUSE       0x10016
 
+/* SYS_BOOT_PAUSE(): only the original BSP PID 1, after collecting all
+ * boot-test descendants, may park for the trusted-terminal handoff.
+ * Resumption returns to the SAME process, with no PID reuse. */
 /* SYS_MONOTONIC_MS: nonnegative milliseconds since owning CPU's epoch.
  * Per-CPU only; a process is currently pinned to its CPU. Not UTC and not
  * synchronized between CPUs. Returns -5 if the calibrated source is absent.

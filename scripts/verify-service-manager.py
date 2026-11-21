@@ -7,9 +7,9 @@ bounded restarts the manager records a FAILED service without preventing local
 shell login. The shell child does not print SHELL READY until its handshake
 was accepted. It remains a separate process, owned by an active manager root.
 
-This is not proof of numeric PID=1 (boot acceptance currently consumes that
-PID before the operational root session). Runtime control/cleanup is checked
-by its own host integration harness and the strict interactive shell verifier.
+The operational manager must be the first BSP PID 1, parked by the kernel
+between boot acceptance and TTY initialization. Runtime control/cleanup is
+checked separately by the authenticated interactive shell verifier.
 """
 import argparse
 from pathlib import Path
@@ -36,7 +36,7 @@ def verify(text):
     require(len(starts)==1 and starts[0][1] is not None,"Expected one valid operational manager session")
     start,match=starts[0]
     root=int(match[1],16)
-    require(root>0,"Invalid root PID")
+    require(root==1,"Operational manager must retain original BSP PID 1")
     shell=[i for i,v in enumerate(lines) if v.startswith("AGENTOS SHELL START")]
     require(len(shell)==1 and shell[0]>start,"Expected one shell child after root manager startup")
     shell_index=shell[0]
