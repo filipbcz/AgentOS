@@ -25,6 +25,8 @@ static unsigned openfds[32], fdchannel[32], chars;
 static char log_text[LOG_SIZE];
 static int failure_mode, clock_failure_at, spoof_ready, never_ready;
 static int spoof_control, spoof_control_sent;
+static long core_crash_at;
+static unsigned core_crashes;
 
 static void reset(void) {
     memset(workers,0,sizeof(workers));
@@ -34,16 +36,17 @@ static void reset(void) {
     ticks=0;next_pid=101;
     failure_mode=clock_failure_at=spoof_ready=never_ready=0;
     spoof_control=spoof_control_sent=0;
+    core_crash_at=0;core_crashes=0;
     owner_pid=0;shell_active=shutdown_requested=fatal_error=online_announced=0;
     registry[SVC_CORE]=(struct record){
         "core","svc_alive",4,9,SVC_COUNT,1,SVC_DOWN,0,MAX_ATTEMPTS,0,
-        0,-1,0,0,0};
+        0,-1,0,0,0,-1};
     registry[SVC_FLAKY]=(struct record){
         "flaky","svc_flaky",5,9,SVC_CORE,1,SVC_DOWN,0,MAX_ATTEMPTS,0,
-        0,-1,0,0,0};
+        0,-1,0,0,0,-1};
     registry[SVC_SHELL]=(struct record){
         "shell","shell",5,5,SVC_CORE,1,SVC_DOWN,0,MAX_ATTEMPTS,0,
-        0,-1,0,0,0};
+        0,-1,0,0,0,-1};
 }
 static struct worker *from_pid(long pid) {
     for(unsigned i=0;i<count;i++) if(workers[i].pid==pid) return &workers[i];
@@ -145,6 +148,13 @@ static long mock_call(long op,long a,long b,long c) {
             if(w->killed) {
                 w->reaped=1;total_exits++;return 137;
             }
+            if(w->kind==SVC_CORE && w->ack && core_crash_at>0 &&
+               ticks>=core_crash_at) {
+                core_crash_at=0;
+                core_crashes++;
+                w->reaped=1;total_exits++;
+                return 73;
+            }
             if(w->kind==SVC_FLAKY && w->ack && ticks>=w->start+100) {
                 w->reaped=1;total_exits++;return 42;
             }
@@ -204,6 +214,54 @@ static void failure_injection(void) {
     assert(runServiceManager()==81 && registry[SVC_CORE].attempts==3 &&
            total_kills==3 && !registry[SVC_SHELL].pid);
 }
+static void dependency_failure_and_restart_window(void) {
+    /* The operational shell must be stopped when its core dependency dies.
+     * Its replacement must be a new child, with the same stable kernel-owned
+     * registry; the failed optional worker must not be silently rearmed.
+     */
+    reset();
+    core_crash_at=700;
+    assert(runServiceManager()==0);
+    unsigned core_starts=0,shell_starts=0,flaky_starts=0;
+    for (unsigned i=0;i<count;i++) {
+        if (workers[i].kind==SVC_CORE) core_starts++;
+        if (workers[i].kind==SVC_SHELL) shell_starts++;
+        if (workers[i].kind==SVC_FLAKY) flaky_starts++;
+    }
+    assert(core_crashes==1 && core_starts==2 && shell_starts==2);
+    assert(flaky_starts==3 && total_exits==count && total_kills==2);
+    assert(registry[SVC_CORE].state==SVC_STOPPED &&
+           registry[SVC_FLAKY].attempts==3 &&
+           registry[SVC_SHELL].state==SVC_STOPPED);
+
+    /* Long healthy uptime replenishes the bounded restart budget, whereas
+     * three quick crashes in the same window remain terminal until START.
+     */
+    reset();
+    owner_pid=100;
+    registry[SVC_CORE].state=SVC_RUNNING;
+    struct record *flaky=&registry[SVC_FLAKY];
+    flaky->state=SVC_RUNNING;
+    flaky->attempts=3;
+    flaky->window_started=10;
+    assert(failed(SVC_FLAKY,RESTART_WINDOW_MS+10,42)==0);
+    assert(flaky->attempts==0 && flaky->state==SVC_BACKOFF &&
+           flaky->retry_at==RESTART_WINDOW_MS+10+RESTART_BASE_MS);
+    assert(start_entry(SVC_FLAKY,flaky->retry_at)==1);
+    assert(flaky->attempts==1 && flaky->window_started==RESTART_WINDOW_MS+10);
+    assert(flaky->pid>0);
+    assert(kill_and_reap(flaky));
+    reset();
+    owner_pid=100;
+    registry[SVC_CORE].state=SVC_RUNNING;
+    flaky=&registry[SVC_FLAKY];
+    flaky->state=SVC_RUNNING;
+    flaky->attempts=3;
+    flaky->window_started=10;
+    assert(failed(SVC_FLAKY,RESTART_WINDOW_MS+9,42)==0);
+    assert(flaky->state==SVC_FAILED && flaky->attempts==3);
+}
+
 static void command_authorization_and_dependency(void) {
     reset();
     struct svc_request request={SVC_MAGIC,SVC_VERSION,SVC_OP_STOP,SVC_CORE,0};
@@ -250,7 +308,8 @@ static void command_authorization_and_dependency(void) {
 int main(void){
     normal_session();
     failure_injection();
+    dependency_failure_and_restart_window();
     command_authorization_and_dependency();
-    puts("Persistent service manager registry, restart/backoff, readiness/auth, shutdown and failures passed");
+    puts("Persistent service manager registry, dependency fail-stop, restart window, IPC authentication and shutdown passed");
     return 0;
 }
