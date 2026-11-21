@@ -3,8 +3,12 @@ set -euo pipefail
 export LC_ALL=C SOURCE_DATE_EPOCH=0
 root=$(cd "$(dirname "$0")/.." && pwd)
 while IFS='=' read -r package expected || [[ -n "$package" ]]; do
-    actual=$(dpkg-query -W -f='${Version}' "$package")
+    if ! actual=$(dpkg-query -W -f='${Version}' "$package" 2>/dev/null); then
+        printf 'Missing pinned build package: %s (required version %s)\n' "$package" "$expected" >&2
+        exit 1
+    fi
     [[ "$actual" == "$expected" ]] || { echo "$package: expected $expected, found $actual" >&2; exit 1; }
+    printf 'Pinned build dependency: %s=%s\n' "$package" "$actual"
 done < "$root/scripts/toolchain.lock"
 out="$root/build"
 mkdir -p "$out"
@@ -14,7 +18,8 @@ work=$(mktemp -d)
 trap 'rm -f "$work"/{libkernel.a,ap-start.o,kernel.elf,initramfs.cpio,layout.ld,loader.o,payload.o,loader.so,stage,user.o,transfer.o,client.o,receive.o,service.o,shell.o,supervisor.o,init,fault,receiver,service,shell,svc_ok,svc_fail,svc_hang,data/transfer.bin}; rmdir "$work/data" "$work"' EXIT
 cd "$work"
 mkdir data
-[[ $(rustc --version) == "rustc 1.75.0 "* ]]
+rust_version=$(rustc --version)
+[[ "$rust_version" == "rustc 1.75.0 "* ]] || { printf 'Pinned Rust compiler mismatch: %s\n' "$rust_version" >&2; exit 1; }
 rustc --edition 2021 --crate-type staticlib -C lto=fat -C opt-level=2 -C panic=abort \
     -C relocation-model=static -C no-redzone=yes -C overflow-checks=no \
     --remap-path-prefix="$root"=/agentos "$root/kernel/main.rs" -o libkernel.a
