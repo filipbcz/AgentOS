@@ -35,7 +35,8 @@ def transcript(aPid=9):
             f"AGENTOS USER KILL PID={aPid+20:016x} PARENT={pRoot:016x} STATUS=0000000000000089\r\n"
             f"AGENTOS MANAGER ENDED ROOT={pRoot:016x} COUNT=00000003\r\n"
             f"AGENTOS USER EXIT PID={pRoot:016x} CR3=0000000000710000 STATUS=0000000000000000\r\n"
-            f"AGENTOS MANAGER SESSION STOP PID={pRoot:016x} STATUS=0000000000000000 FRAMES=OK\r\n".encode("ascii"))
+            f"AGENTOS MANAGER SESSION STOP PID={pRoot:016x} STATUS=0000000000000000 FRAMES=OK\r\n"
+            f"[INFO] INTERACTIVE SHELL STOPPED\r\n".encode("ascii"))
 
 class ShellEvidenceTests(unittest.TestCase):
     def setUp(self):
