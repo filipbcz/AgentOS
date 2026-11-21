@@ -6,6 +6,7 @@ The scenario proves immediate SPAWN acknowledgement, STOP persistence, three
 real restarted worker exits, timer-backed idle, TTY editing and clean shutdown.
 """
 import argparse
+import importlib.util
 import json
 from pathlib import Path
 import re
@@ -98,21 +99,44 @@ def without_kernel_events(aBytes):
     return KERNEL_EVENT.sub(b"",aBytes)
 
 
-def verify_idle(aBytes):
+def timerCpuCount(aLog, aCpus):
+    require(aCpus is None or type(aCpus) is int and aCpus in (1,2),
+            "Invalid configured CPU count for runtime timing")
+    # Historical native-v1 captures measured one CPU. A command-line override
+    # must not silently enlarge their budget. Native-v2 evidence includes the
+    # complete migration prelude and must match the actual VM configuration.
+    if b"AGENTOS MIGRATION" not in aLog:
+        return 1
+    require(aCpus is not None,"Native-v2 timing requires the configured CPU count")
+    pSpec = importlib.util.spec_from_file_location(
+        "sessionMigrationEvidence", Path(__file__).with_name("verify-migration.py"))
+    pVerifier = importlib.util.module_from_spec(pSpec)
+    pSpec.loader.exec_module(pVerifier)
+    try:
+        pMigration = pVerifier.verify(aLog.decode("ascii",errors="replace"),aCpus)
+    except pVerifier.VerificationError as pError:
+        raise VerificationError(f"Invalid migration evidence for runtime timing: {pError}") from pError
+    return pMigration["cpus"]
+
+
+def verify_idle(aBytes, aCpus=1):
     pMatches = list(IDLE.finditer(aBytes))
     require(len(pMatches)==1,"Expected exactly one runtime idle measurement")
     pMs,pTimers,pIdle = (int(pValue,16) for pValue in pMatches[0].groups())
     require(5000 <= pMs <= 15000,"Runtime idle did not cover the requested five-second sleep")
     require(1 <= pIdle <= pTimers and pTimers-pIdle <= 2,
             "Runtime idle counters do not describe blocked-queue timer interrupts")
-    # The independent clock watchdog is at most once per second; allow a few
-    # boundary/preemption IRQs. The former 10ms periodic timer fails by >50x.
-    require(pTimers <= (pMs+999)//1000+4,
+    # Native-v2 counts aggregate all configured CPUs. Each blocked queue may
+    # have its own one-second clock watchdog; retain the same per-CPU rate and
+    # four global boundary IRQs. The former 10ms periodic policy still fails.
+    require(pTimers <= ((pMs+999)//1000)*aCpus+4,
             "Runtime idle still has excessive periodic scheduler interrupts")
-    return {"milliseconds":pMs,"timer_irqs":pTimers,"idle_timer_irqs":pIdle}
+    return {"milliseconds":pMs,"timer_irqs":pTimers,"idle_timer_irqs":pIdle,
+            "timer_cpu_count":aCpus}
 
 
-def verify(aLog, aInput=None, aKeyboard=False):
+def verify(aLog, aInput=None, aKeyboard=False, aCpus=None):
+    pTimerCpus = timerCpuCount(aLog,aCpus)
     pRoots,pChildren,pEnds = (list(pPattern.finditer(aLog)) for pPattern in
                               (ROOT_START,SHELL_START,SESSION_STOP))
     require(len(pRoots)==len(pChildren)==len(pEnds)==1,
@@ -136,7 +160,7 @@ def verify(aLog, aInput=None, aKeyboard=False):
         pStep["pattern"].encode("ascii") for pStep in steps(pShell,aKeyboard))
     require(re.fullmatch(pExpected,pClean) is not None,
             "Incorrect extended command echo/response/state sequence")
-    pIdle = verify_idle(pClean)
+    pIdle = verify_idle(pClean,pTimerCpus)
     if aInput is not None:
         require(aInput==transmitted_input(pShell,aKeyboard),"Captured transmitted UART bytes differ from scenario")
     pRestart = pInteractive.find(b"service restart flaky\r\n")
@@ -176,6 +200,7 @@ def main():
     pParser.add_argument("--log",type=Path)
     pParser.add_argument("--input",type=Path)
     pParser.add_argument("--keyboard",action="store_true")
+    pParser.add_argument("--cpus",type=int,choices=(1,2))
     pParser.add_argument("--plan-pid",type=int)
     pArgs = pParser.parse_args()
     if pArgs.plan_pid is not None:
@@ -188,7 +213,8 @@ def main():
     if pArgs.log is None:
         pParser.error("--log or --plan-pid is required")
     try:
-        pResult = verify(pArgs.log.read_bytes(),pArgs.input.read_bytes() if pArgs.input else None,pArgs.keyboard)
+        pResult = verify(pArgs.log.read_bytes(),pArgs.input.read_bytes() if pArgs.input else None,
+                         pArgs.keyboard,pArgs.cpus)
     except (OSError,VerificationError) as pError:
         print(f"Stage-3 interactive verification failed: {pError}",file=sys.stderr)
         return 1

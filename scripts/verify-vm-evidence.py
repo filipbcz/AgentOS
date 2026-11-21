@@ -178,6 +178,15 @@ def verify_run(root, run_dir, require_pass=True):
                     starts[0][1] == stops[0][1] == b"0000000000000001" and
                     starts[0].end() <= stops[0].start(),
                     "Signed shell receipt lacks successful clean exit")
+            if b"AGENTOS MIGRATION" in log:
+                pSpec = importlib.util.spec_from_file_location(
+                    "receiptSessionEvidence", Path(__file__).with_name("verify-stage3-session.py"))
+                pVerifier = importlib.util.module_from_spec(pSpec)
+                pSpec.loader.exec_module(pVerifier)
+                try:
+                    pVerifier.verify(log,(run_dir / "com1-input.bin").read_bytes(),keyboard,cpus)
+                except pVerifier.VerificationError as pError:
+                    raise EvidenceError(f"Invalid native-v2 session evidence: {pError}") from pError
     else:
         require(data.get("boot_image_sha256") == sha256(run_dir / "changed.efi"),
                 "Negative VM test boot hash mismatch")

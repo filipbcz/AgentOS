@@ -281,7 +281,7 @@ try {
                 # read can otherwise end halfway through the final line.
                 Wait-Serial $serial '\[INFO\] INTERACTIVE SHELL STOPPED\r\n$' 0 15
             }
-            $verifyArgs=@('--log',"$dir\com1.log",'--input',"$dir\com1-input.bin")
+            $verifyArgs=@('--log',"$dir\com1.log",'--input',"$dir\com1-input.bin",'--cpus',[string]$Cpus)
             if ($Keyboard) { $verifyArgs+='--keyboard' }
             & python "$PSScriptRoot/verify-stage3-session.py" @verifyArgs
             if ($LASTEXITCODE -ne 0) { throw "Stage-3 interactive verification failed: $dir" }

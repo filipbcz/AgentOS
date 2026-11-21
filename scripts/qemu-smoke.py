@@ -448,7 +448,8 @@ def boot(args):
     service_manager.verify(text)
     session_result = None
     if args.session:
-        session_result = session.verify(serial.read_bytes(), (destination / "com1-input.bin").read_bytes(), True)
+        session_result = session.verify(serial.read_bytes(), (destination / "com1-input.bin").read_bytes(),
+                                        True, args.cpus)
     receipt = {
         "schema": 1,
         "result": "pass",

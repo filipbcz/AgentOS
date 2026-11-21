@@ -96,7 +96,7 @@ static int collect_child(long child, unsigned long *exit_status,
         return 0;
     }
     if (result!=-110) {
-        // Includes -5 for stalled TSC/APIC failure, or lost child identity.
+        // Includes -5 for stalled HPET/APIC failure, or lost child identity.
         cancel_and_collect(child);
         return -1;
     }

@@ -1,7 +1,7 @@
 //! Owner-CPU one-shot LAPIC policy. No MMIO, allocation or IRQ operations.
 //! `sample` must precede `plan` after reading the hardware current counter.
 //! Count actual consumed LAPIC ticks, including intervals cut short by I/O,
-//! so the independent stalled-TSC guard has the same duration in busy and
+//! so the independent stalled-clock guard has the same duration in busy and
 //! tickless operation. Never reset an earlier pending timer merely because
 //! another unrelated interrupt arrived.
 #![allow(non_snake_case)]
@@ -33,7 +33,7 @@ impl Timer {
         self.fStalledCounts = 0;
     }
 
-    /// Returns true when the calibrated TSC did not progress for about five
+    /// Returns true when the shared process clock did not progress for about five
     /// seconds measured by the independent LAPIC countdown, or is missing.
     /// Timer expiry counts once even if another IRQ observes zero first.
     pub fn sample(&mut self, aRemaining: u32, aNow: Option<u64>) -> bool {
@@ -54,7 +54,7 @@ impl Timer {
     /// waiter deadline can shorten it. With all tasks blocked, arm only the
     /// nearest timeout or the sparse watchdog.
     /// The countdown is capped to hardware width; this can wake early but
-    /// never extends a deadline or claims that TSC time actually elapsed.
+    /// never extends a deadline or claims that process-clock time actually elapsed.
     pub fn plan(&mut self, aRunnable: bool, aDeadline: Option<u64>, aNow: u64) -> Action {
         let pLimit = if aRunnable { QUANTUM_MS } else { WATCHDOG_MS };
         let pMs = if let Some(pDeadline) = aDeadline {
@@ -164,7 +164,7 @@ mod tests {
             assert_eq!(pTimer.plan(false, Some(60_010), 10), Action::Arm(100_000));
             assert_eq!(pTimer.sample(0, Some(10)), pSecond==5);
         }
-        assert!(!pTimer.sample(0, Some(11))); // recovery requires actual TSC progress
+        assert!(!pTimer.sample(0, Some(11))); // recovery requires actual clock progress
     }
 
     #[test]

@@ -69,10 +69,27 @@ def transcript(aKeyboard=False):
     return pText.encode("ascii")
 
 
+def migrationTranscript(aCpus=2, aKeyboard=False, aTimers=11):
+    pSpec = importlib.util.spec_from_file_location(
+        "sessionMigrationFixture", ROOT / "scripts/test-verify-migration.py")
+    pFixture = importlib.util.module_from_spec(pSpec)
+    pSpec.loader.exec_module(pFixture)
+    pBoot = pFixture.scenario(aCpus).encode("ascii")
+    pBoot = pBoot[:pBoot.index(b"AGENTOS SHELL START")]
+    pSession = transcript(aKeyboard)
+    pSession = pSession[pSession.index(b"AGENTOS SHELL START"):]
+    for pOld,pNew in ((2,101),(9,105),(10,106),(11,107),(12,108),(13,109)):
+        pSession = pSession.replace(f"PID={pOld:016x}".encode(),f"PID={pNew:016x}".encode())
+    pSession = pSession.replace(b"pid\r\n9\r\n",b"pid\r\n105\r\n")
+    for pField in (b"TIMERS",b"IDLE"):
+        pSession = re.sub(pField+rb"=[0-9a-f]{16}",pField+f"={aTimers:016x}".encode(),pSession)
+    return pBoot+pSession
+
+
 class SessionTests(unittest.TestCase):
-    def rejected(self, aLog, aInput=None, aKeyboard=False):
+    def rejected(self, aLog, aInput=None, aKeyboard=False, aCpus=None):
         with self.assertRaises(v.VerificationError):
-            v.verify(aLog, aInput, aKeyboard)
+            v.verify(aLog, aInput, aKeyboard, aCpus)
 
     def test_full_serial_and_ps2_sessions(self):
         for pKeyboard in (False, True):
@@ -113,6 +130,36 @@ class SessionTests(unittest.TestCase):
                                (b"TIMERS", 0), (b"IDLE", 0), (b"IDLE", 6), (b"IDLE", 1)):
             pChanged = re.sub(pField + rb"=[0-9a-f]{16}", pField + f"={pValue:016x}".encode(), pText)
             self.rejected(pChanged)
+
+    def testNativeV2IdleKeepsOneWatchdogPerConfiguredCpu(self):
+        for pKeyboard in (False,True):
+            pResult = v.verify(migrationTranscript(2,pKeyboard),v.transmitted_input(105,pKeyboard),
+                               pKeyboard,2)
+            self.assertEqual(pResult["idle"]["timer_irqs"],11)
+            self.assertEqual(pResult["idle"]["timer_cpu_count"],2)
+        self.rejected(migrationTranscript(1,aTimers=11),aCpus=1)
+        self.rejected(migrationTranscript(2,aTimers=500),aCpus=2)
+        pTooBusy = migrationTranscript().replace(b"IDLE=000000000000000b",b"IDLE=0000000000000008")
+        self.rejected(pTooBusy,aCpus=2)
+
+    def testNativeV2CpuBudgetRequiresMatchingCompleteMigrationEvidence(self):
+        pLog = migrationTranscript()
+        self.rejected(pLog)
+        self.rejected(pLog,aCpus=1)
+        for pCpus in (0,3,True,"2"):
+            self.rejected(pLog,aCpus=pCpus)
+        pMove = next(pLine for pLine in pLog.splitlines(keepends=True)
+                     if pLine.startswith(b"AGENTOS MIGRATION MOVED"))
+        self.rejected(pLog.replace(pMove,b"",1),aCpus=2)
+        self.rejected(pLog.replace(b"CPUS=0000000000000002",b"CPUS=0000000000000001",1),aCpus=2)
+        pForged = migrationTranscript(1).replace(b"CPUS=0000000000000001",b"CPUS=0000000000000002")
+        self.rejected(pForged,aCpus=2)
+
+    def testHistoricalCpuLocalTimingNeverInheritsAggregateBudget(self):
+        pLog = transcript().replace(b"TIMERS=0000000000000005 IDLE=0000000000000005",
+                                    b"TIMERS=000000000000000b IDLE=000000000000000b")
+        self.rejected(pLog,aCpus=2)
+        self.assertEqual(v.verify(transcript(),aCpus=2)["idle"]["timer_cpu_count"],1)
 
     def test_complete_kernel_events_can_interrupt_echo_but_not_invent_output(self):
         pText = transcript()

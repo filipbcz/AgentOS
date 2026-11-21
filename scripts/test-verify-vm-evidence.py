@@ -158,12 +158,12 @@ class VmEvidenceTests(unittest.TestCase):
 
     def migrationLog(self):
         pSpec = importlib.util.spec_from_file_location(
-            "receiptMigrationFixtures", Path(__file__).with_name("test-verify-migration.py"))
+            "receiptSessionFixtures", Path(__file__).with_name("test-verify-stage3-session.py"))
         pFixtures = importlib.util.module_from_spec(pSpec)
         pSpec.loader.exec_module(pFixtures)
-        return (b"AGENTOS KERNEL OK STAGE 1\r\n" + pFixtures.scenario(2).encode("ascii") +
-                b"AGENTOS MANAGER SESSION STOP PID=0000000000000001 "
-                b"STATUS=0000000000000000 FRAMES=OK\r\n")
+        self.write(self.run / "com1-input.bin",pFixtures.v.transmitted_input(105,True))
+        self.manifest["artifacts"]["com1-input.bin"] = evidence.sha256(self.run / "com1-input.bin")
+        return b"AGENTOS KERNEL OK STAGE 1\r\n"+pFixtures.migrationTranscript(2,True)
 
     def testMigrationTraceIsStrictlyVerifiedWhenPresent(self):
         self.write(self.run / "com1.log", self.migrationLog())
@@ -182,6 +182,21 @@ class VmEvidenceTests(unittest.TestCase):
         ):
             with self.subTest(log=pAltered):
                 self.write(self.run / "com1.log", pAltered)
+                self.manifest["artifacts"]["com1.log"] = evidence.sha256(self.run / "com1.log")
+                self.save_manifest()
+                self.rejected()
+
+    def testRehashedNativeV2IdleCannotUseUnverifiedCpuBudget(self):
+        pOriginal = self.migrationLog()
+        for pCpus,pAltered in (
+            (1,pOriginal),
+            (2,pOriginal.replace(b"TIMERS=000000000000000b IDLE=000000000000000b",
+                                 b"TIMERS=00000000000001f4 IDLE=00000000000001f4")),
+            (2,pOriginal.replace(b"CPUS=0000000000000002",b"CPUS=0000000000000001",1)),
+        ):
+            with self.subTest(cpus=pCpus,log=pAltered):
+                self.manifest["cpus"] = pCpus
+                self.write(self.run / "com1.log",pAltered)
                 self.manifest["artifacts"]["com1.log"] = evidence.sha256(self.run / "com1.log")
                 self.save_manifest()
                 self.rejected()
