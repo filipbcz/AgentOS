@@ -713,7 +713,11 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
     Ok(())
 }
 
-/// Start only after the boot tests, idle measurements and framebuffer marker.
+/// Start the separate *operational root manager* after the boot acceptance
+/// and idle checks. It inherits the terminal, starts the shell as a child,
+/// owns the service registry, and remains alive until graceful shell exit.
+/// The earlier boot test's numeric PID 1 has already been reaped, so this
+/// process is the CPU-local reaper for this session, not literal numeric PID 1.
 /// The BSP owns this terminal until all session descriptors have been reaped.
 pub unsafe fn shell(platform: &Platform, info: &crate::BootInfo) -> Result<(), Error> {
     let cpu = current_cpu();
@@ -738,12 +742,12 @@ pub unsafe fn shell(platform: &Platform, info: &crate::BootInfo) -> Result<(), E
             let _ = crate::logger::LOGGER.record(timestamp(), cpu.expected_id as u32,
                 crate::log_policy::Level::Error, b"TTY GOP unavailable");
         }
-        let pid = cpu.load.frames.with(|f| (*cpu.queue.get()).spawn_process(f, cpu.programs, b"shell", 0))
-            .map_err(|_| b"shell ELF" as Error)?;
-        (*cpu.queue.get()).terminal(pid, terminal).map_err(|_| b"shell descriptors" as Error)?;
+        let pid = cpu.load.frames.with(|f| (*cpu.queue.get()).spawn_process(f, cpu.programs, b"manager", 0))
+            .map_err(|_| b"service manager ELF" as Error)?;
+        (*cpu.queue.get()).terminal(pid, terminal).map_err(|_| b"manager terminal descriptors" as Error)?;
         let _ = crate::logger::LOGGER.record(timestamp(), cpu.expected_id as u32,
-            crate::log_policy::Level::Info, b"shell started");
-        serial(b"AGENTOS SHELL START PID="); hex(pid as u64); serial(b"\r\n");
+            crate::log_policy::Level::Info, b"service manager session started");
+        serial(b"AGENTOS MANAGER SESSION START PID="); hex(pid as u64); serial(b"\r\n");
         cpu.terminal.get().write(terminal);
         (*terminal).enable();
         cpu.schedule();
@@ -754,18 +758,18 @@ pub unsafe fn shell(platform: &Platform, info: &crate::BootInfo) -> Result<(), E
     let result = cpu.load.frames.with(|f| {
         let q = &mut *cpu.queue.get();
         let status = started.and_then(|pid| {
-            if q.collect(f, 0, pid) == Ok(0) { Ok(pid) } else { Err(b"shell exit status" as Error) }
+            if q.collect(f, 0, pid) == Ok(0) { Ok(pid) } else { Err(b"service manager exit status" as Error) }
         });
         q.reap(f);
         f.release(storage);
         let matched = snapshot.matches(f);
         snapshot.release(f);
-        if matched && f.probe() { status } else { Err(b"shell frame leak" as Error) }
+        if matched && f.probe() { status } else { Err(b"manager session frame leak" as Error) }
     });
     let pid = result?;
     let _ = crate::logger::LOGGER.record(timestamp(), cpu.expected_id as u32,
-        crate::log_policy::Level::Info, b"shell stopped");
-    serial(b"AGENTOS SHELL STOP PID="); hex(pid as u64);
+        crate::log_policy::Level::Info, b"service manager session stopped");
+    serial(b"AGENTOS MANAGER SESSION STOP PID="); hex(pid as u64);
     serial(b" STATUS=0000000000000000 FRAMES=OK\r\n");
     Ok(())
 }
