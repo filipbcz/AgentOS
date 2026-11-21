@@ -144,12 +144,30 @@ $tag=[Guid]::NewGuid().ToString('N').Substring(0,10)
 $vm="AgentOS-$Case-$tag"
 $relative="build/runs/$vm"
 $dir=(New-Item -Type Directory -Path $relative).FullName
+# Refuse stale signed images and uncommitted/modified source. The WSL build
+# emits build-provenance.json only after signing and signature verification.
+$sourceCommit=(& git -C $root rev-parse --verify HEAD)
+if ($LASTEXITCODE -ne 0 -or !$sourceCommit) { throw 'Git source revision cannot be established' }
+$sourceCommit=$sourceCommit.Trim()
+$dirty=@(& git -C $root status --porcelain --untracked-files=normal)
+if ($LASTEXITCODE -ne 0 -or $dirty.Count -ne 0) {
+    throw 'VM acceptance requires a clean committed source tree'
+}
+& python "$PSScriptRoot/verify-vm-evidence.py" --root $root --commit $sourceCommit
+if ($LASTEXITCODE -ne 0) { throw 'Signed EFI build provenance check failed; rebuild from this exact commit' }
+$vboxVersion=(& $vbox --version).Trim()
+if ($LASTEXITCODE -ne 0 -or $vboxVersion -notmatch '^7\.1\.12(?:r[0-9]+)?$') {
+    throw "VirtualBox 7.1.12 required for comparable acceptance: $vboxVersion"
+}
+$buildReceiptHash=(Get-FileHash (Join-Path $root 'build/build-provenance.json') -Algorithm SHA256).Hash.ToLowerInvariant()
+$harnessHash=(Get-FileHash (Join-Path $PSScriptRoot 'test-vbox.ps1') -Algorithm SHA256).Hash.ToLowerInvariant()
 $efi='build/agentos.efi'
 if ($Case -ne 'signed') {
     & python scripts/tamper.py $efi "$relative/changed.efi" $Case
     if ($LASTEXITCODE) { throw 'mutation failed' }
     $efi="$relative/changed.efi"
 }
+$bootImageHash=(Get-FileHash (Join-Path $root $efi) -Algorithm SHA256).Hash.ToLowerInvariant()
 & wsl -d Ubuntu-24.04 -- bash scripts/disk.sh $relative $efi "$LogLevel $LogOutput"
 if ($LASTEXITCODE) { throw 'disk build failed' }
 VBox convertfromraw "$dir\esp.raw" "$dir\esp.vdi" --format VDI
@@ -178,6 +196,7 @@ VBox modifynvram $vm changevar --name=db "--filename=$root\build\db.esl"
 VBox modifynvram $vm enrollorclpk
 VBox modifynvram $vm secureboot --enable
 $runSucceeded=$false
+$shutdownSucceeded=$false
 try {
     VBox startvm $vm --type headless
     $timer=[Diagnostics.Stopwatch]::StartNew()
@@ -287,10 +306,9 @@ try {
     } elseif (!(Select-String -LiteralPath "$dir\com1.log" -Pattern 'BdsDxe: failed to load .*HARDDISK.*(Access Denied|Security Violation)' -Quiet)) {
         throw "Missing firmware rejection; timeout is inconclusive: $dir"
     }
-    Write-Output "Captured $Case ($Cpus vCPUs): $dir"
     $runSucceeded=$true
 } finally {
-    try { VBox controlvm $vm poweroff } catch {
+    try { VBox controlvm $vm poweroff; $shutdownSucceeded=$true } catch {
         if ($runSucceeded) { throw }
         Write-Warning "VM power-off after a failed run also failed: $_"
     }
