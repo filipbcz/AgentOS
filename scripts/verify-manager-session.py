@@ -1,4 +1,4 @@
-"""Verify interactive QEMU PS/2 manager control and frame-clean shutdown.
+"""Verify interactive QEMU UART COM1 manager control and frame-clean shutdown.
 
 Not a VirtualBox assertion. This verifier requires the real shell child to
 query the persistent registry through authenticated IPC, return exact stable
