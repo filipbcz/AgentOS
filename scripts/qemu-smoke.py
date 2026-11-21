@@ -181,6 +181,17 @@ def boot(args):
             # CI must expose fatal guest details without requiring privileged
             # artifact access. Bound the output to the captured final 4KiB.
             print("QEMU COM1 failure tail:\n" + tail, file=sys.stderr, flush=True)
+            fatal = re.search(r"FATAL VECTOR=[0-9a-f]{16} ERROR=[0-9a-f]{16} "
+                              r"RIP=([0-9a-f]{16})", tail)
+            kernel_elf = root / "build/kernel.elf"
+            if fatal and kernel_elf.is_file():
+                rip = int(fatal[1], 16)
+                disasm = subprocess.run(
+                    ["objdump", "-drwC", f"--start-address={max(0,rip-128)}",
+                     f"--stop-address={rip+192}", str(kernel_elf)],
+                    capture_output=True, text=True, check=False)
+                print("Kernel ELF instructions near fatal RIP:\n" + disasm.stdout,
+                      file=sys.stderr, flush=True)
             raise
         finally:
             if process.poll() is None:
