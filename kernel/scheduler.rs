@@ -574,6 +574,50 @@ mod timed_tests {
         assert_eq!(q.tasks[1].as_ref().unwrap().process.as_ref().unwrap().status, Some(137));
     }
 
+    #[test]
+    fn bootRootParksAndResumesWithIdenticalPidAndContext() {
+        let mut q=queue();
+        q.tasks[1]=None;
+        q.count=1;
+        assert_eq!(q.park_boot_root(1),Ok(()));
+        assert_eq!(q.select(0x222, false),0x222); // back to the kernel
+        assert_eq!(q.parked_root(),Some(1));
+        assert_eq!(q.resume_boot_root(999),Err(-16));
+        assert_eq!(q.resume_boot_root(1),Ok(()));
+        assert_eq!(q.resume_boot_root(1),Err(-16)); // one-shot
+        q.active=true;
+        assert_eq!(q.select(0x333,false),0x222); // original saved context
+        assert_eq!(q.process().unwrap().pid,1);
+    }
+
+    #[test]
+    fn eventWaitWakesOnAnyDirectChildExitWithoutTimeoutPolling() {
+        let mut q=queue();
+        q.block_events(0, 900, 100);
+        assert_eq!(q.select(77,false),8192);
+        let mut frames=crate::frames::Frames::test_dummy();
+        q.terminate(42,&mut frames);
+        assert!(!q.has_timed_waiters());
+        assert!(q.tasks[0].as_ref().unwrap().runnable);
+        assert!(q.has_exited_child(1));
+        assert!(!q.has_exited_child(2));
+        assert_eq!(q.select(0,false),77);
+    }
+
+    #[test]
+    fn eventWaitDeadlineDoesNotReapOrFabricateChildExit() {
+        let mut q=queue();
+        q.tasks[1].as_mut().unwrap().runnable=false;
+        q.block_events(0,220,100);
+        q.select(0x456,false);
+        q.wake_timed(219,true);
+        assert!(q.has_timed_waiters());
+        q.wake_timed(220,true);
+        assert!(!q.has_timed_waiters());
+        assert!(!q.has_exited_child(1));
+        assert!(q.tasks[1].as_ref().unwrap().process.as_ref().unwrap().status.is_none());
+    }
+
     fn nested_queue() -> Queue {
         let mut q = queue();
         q.tasks[2] = Some(task(3, 1));

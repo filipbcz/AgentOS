@@ -40,6 +40,7 @@ mod files {
         pub fn new(_: &mut crate::frames::Frames<'_>) -> Option<Self> { Some(Self) }
         pub fn inherit(&mut self, _: &Self) {}
         pub fn terminal(&mut self, _: *mut crate::tty::Terminal) -> Result<(),isize> { Ok(()) }
+        pub fn ipc_ready_mask(&self, _: u32) -> Result<u32, isize> { Ok(0) }
         pub fn close_all(&mut self, _: &mut crate::frames::Frames<'_>) {}
         pub fn release(&self, _: &mut crate::frames::Frames<'_>) {}
     }
