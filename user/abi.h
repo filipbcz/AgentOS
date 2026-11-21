@@ -16,7 +16,12 @@
 #define SYS_IPC_SEND 0x1000d
 #define SYS_IPC_RECV 0x1000e
 #define SYS_KILL     0x1000f
+#define SYS_MONOTONIC_MS 0x10010
 
+/* SYS_MONOTONIC_MS: nonnegative milliseconds since owning CPU's epoch.
+ * Per-CPU only; a process is currently pinned to its CPU. Not UTC and not
+ * synchronized between CPUs. Returns -5 if the calibrated source is absent.
+ */
 /* SYS_KILL(pid): a process may terminate only its direct child.
  * The child becomes a reapable zombie with exit status 137.
  * Returns 0 when newly terminated and 1 if already a zombie; unknown PID -3,
