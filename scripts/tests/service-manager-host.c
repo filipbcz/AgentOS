@@ -24,6 +24,7 @@ static long ticks, next_pid, times[3];
 static unsigned openfds[32], fdchannel[32], chars;
 static char log_text[LOG_SIZE];
 static int failure_mode, clock_failure_at, spoof_ready, never_ready;
+static int spoof_control, spoof_control_sent;
 
 static void reset(void) {
     memset(workers,0,sizeof(workers));
@@ -32,6 +33,7 @@ static void reset(void) {
     count=channel_count=sleeps=total_exits=total_kills=chars=0;
     ticks=0;next_pid=101;
     failure_mode=clock_failure_at=spoof_ready=never_ready=0;
+    spoof_control=spoof_control_sent=0;
     owner_pid=0;shell_active=shutdown_requested=fatal_error=online_announced=0;
     registry[SVC_CORE]=(struct record){
         "core","svc_alive",4,9,SVC_COUNT,1,SVC_DOWN,0,MAX_ATTEMPTS,0,
@@ -106,8 +108,18 @@ static long mock_call(long op,long a,long b,long c) {
         case SYS_IPC_TRY_RECV: {
             assert(a>=3 && a<32 && openfds[a] && b && c==sizeof(struct svc_request));
             struct worker *w=from_channel(fdchannel[a]);
-            if(!w || w->ready_sent || never_ready || ticks<w->start+20)return -11;
+            if(!w)return -11;
             struct svc_received_request *packet=(struct svc_received_request *)b;
+            if(w->ready_sent && w->kind==SVC_SHELL &&
+               spoof_control && !spoof_control_sent && ticks>=w->start+80) {
+                spoof_control_sent=1;
+                memset(packet,0,sizeof(*packet));
+                packet->peer=(struct ipc_peer){(unsigned long)w->pid+1,1000,1000};
+                packet->data=(struct svc_request){SVC_MAGIC,SVC_VERSION,
+                    SVC_OP_STOP,SVC_CORE,0};
+                return sizeof(packet->data);
+            }
+            if(w->ready_sent || never_ready || ticks<w->start+20)return -11;
             memset(packet,0,sizeof(*packet));
             packet->peer=(struct ipc_peer){(unsigned long)w->pid,1000,1000};
             if(spoof_ready && w->kind==SVC_CORE)packet->peer.pid++;
@@ -176,6 +188,9 @@ static void normal_session(void) {
     const char *scan=log_text;
     while((scan=strstr(scan,"AGENTOS MANAGER READY"))){ready_count++;scan++;}
     assert(ready_count==4); // core once, flaky three times; shell handshake separate
+    reset();spoof_control=1;
+    assert(runServiceManager()==0 && spoof_control_sent &&
+           total_kills==1 && registry[SVC_CORE].state==SVC_STOPPED);
 }
 static void failure_injection(void) {
     reset();failure_mode=1;
@@ -211,6 +226,26 @@ static void command_authorization_and_dependency(void) {
     assert(apply_command(&request,20)==SVC_BAD_REQUEST);
     request.magic=0;
     assert(apply_command(&request,20)==SVC_BAD_REQUEST);
+
+    // A stopped optional service can be explicitly re-armed. A successful
+    // START or RESTART resets its entire bounded failure budget.
+    reset();
+    registry[SVC_CORE].state=SVC_RUNNING;
+    registry[SVC_FLAKY].state=SVC_FAILED;
+    registry[SVC_FLAKY].attempts=3;
+    request=(struct svc_request){SVC_MAGIC,SVC_VERSION,SVC_OP_STOP,SVC_FLAKY,0};
+    assert(apply_command(&request,500)==SVC_OK &&
+           registry[SVC_FLAKY].state==SVC_STOPPED &&
+           registry[SVC_FLAKY].desired==0);
+    request.operation=SVC_OP_START;
+    assert(apply_command(&request,520)==SVC_OK &&
+           registry[SVC_FLAKY].state==SVC_DOWN &&
+           registry[SVC_FLAKY].desired==1 &&
+           registry[SVC_FLAKY].attempts==0);
+    request.operation=SVC_OP_RESTART;
+    assert(apply_command(&request,540)==SVC_OK &&
+           registry[SVC_FLAKY].state==SVC_DOWN &&
+           registry[SVC_FLAKY].attempts==0);
 }
 int main(void){
     normal_session();
