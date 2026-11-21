@@ -75,6 +75,15 @@ def boot(args):
         raw.unlink()
     subprocess.run(["bash", "scripts/disk.sh", str(destination),
                     "build/agentos.efi", "info both"], cwd=root, check=True)
+    # Independently re-read the exact signed EFI from the ESP. A GPT image
+    # that merely exists is not evidence its fallback boot file was copied.
+    copied = destination / "esp-bootx64.efi"
+    if copied.exists():
+        copied.unlink()
+    subprocess.run(["mcopy", "-i", f"{raw}@@1048576",
+                    "::EFI/BOOT/BOOTX64.EFI", str(copied)], check=True)
+    if evidence.sha256(copied) != image["artifacts"]["agentos.efi"]:
+        raise RuntimeError("EFI on QEMU ESP differs from the signed build output")
     vm_vars = destination / "OVMF_VARS.secboot.fd"
     if vm_vars.exists():
         vm_vars.unlink()
@@ -97,7 +106,7 @@ def boot(args):
         "-monitor", f"unix:{destination / 'qemu-monitor.sock'},server=on,wait=off",
         "-vga", "std", "-display", "none", "-serial",
         f"file:{destination / 'com1.log'}",
-        "-nic", "none", "-no-reboot", "-no-shutdown",
+        "-nic", "none", "-boot", "order=c", "-no-reboot", "-no-shutdown",
     ]
     stdout = destination / "qemu-stderr.log"
     serial = destination / "com1.log"
@@ -153,6 +162,7 @@ def boot(args):
         "signed_efi_sha256": image["artifacts"]["agentos.efi"],
         "ovmf_code_sha256": evidence.sha256(args.ovmf_code),
         "esp_sha256": evidence.sha256(raw),
+        "esp_boot_efi_sha256": evidence.sha256(copied),
         "com1_sha256": evidence.sha256(serial),
         "firmware_vars_sha256_after_boot": evidence.sha256(vm_vars),
     }
