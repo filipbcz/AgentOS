@@ -16,24 +16,24 @@ static long mock_call(long op,long a,long b,long c);
 
 enum { MAX_CHILDREN=16, LOG_BYTES=4096 };
 static char log_text[LOG_BYTES];
-static unsigned log_used, spawns, collected, kills, kill_attempts, yields, writes;
-static unsigned spawn_error_at, write_error_at, yield_error_at, wait_error_at, clock_error_at, clock_calls;
+static unsigned log_used, spawns, collected, kills, kill_attempts, sleeps, waits, writes;
+static unsigned spawn_error_at, write_error_at, sleep_error_at, wait_error_at, clock_error_at, clock_calls;
 static long clock_time_ms, kill_time_ms;
 static int clock_frozen;
 static unsigned freeze_on_spawn, clock_failure_after_spawn;
 static long spawn_times[MAX_CHILDREN];
 static long live_child;
 static char live_kind; // 'o': success, 'f': failure, 'h': hung
-static int killed, completed_before_kill, complete_on_last_yield;
+static int killed, completed_before_kill, complete_at_deadline;
 
 static void reset(void) {
     memset(log_text,0,sizeof(log_text));
-    log_used=spawns=collected=kills=kill_attempts=yields=writes=0;
-    spawn_error_at=write_error_at=yield_error_at=wait_error_at=clock_error_at=clock_calls=0;
+    log_used=spawns=collected=kills=kill_attempts=sleeps=waits=writes=0;
+    spawn_error_at=write_error_at=sleep_error_at=wait_error_at=clock_error_at=clock_calls=0;
     clock_time_ms=kill_time_ms=0;clock_frozen=0;
     freeze_on_spawn=clock_failure_after_spawn=0;
     memset(spawn_times,0,sizeof(spawn_times));
-    live_child=0; live_kind=0; killed=0; completed_before_kill=0; complete_on_last_yield=0;
+    live_child=0; live_kind=0; killed=0; completed_before_kill=0; complete_at_deadline=0;
 }
 
 static long mock_call(long op,long a,long b,long c) {
@@ -60,28 +60,42 @@ static long mock_call(long op,long a,long b,long c) {
         killed=0;
         return live_child;
     }
-    if (op==SYS_TRY_WAIT) {
+    if (op==SYS_WAIT_CHILD_UNTIL) {
+        waits++;
         if (!live_child || a!=live_child) abort();
-        if (wait_error_at && collected+1==wait_error_at && !killed) {
-            wait_error_at=0;
-            return -10;
+        if (wait_error_at && waits==wait_error_at) return -5;
+        if (live_kind=='h' && !killed) {
+            if (clock_frozen) return -5; // LAPIC stall guard
+            if (b<clock_time_ms) abort();
+            clock_time_ms=b;
+            // The clock has reached the deadline: syscall must not reap.
+            if (complete_at_deadline) completed_before_kill=1;
+            return -110;
         }
-        if (live_kind=='h' && !killed && !completed_before_kill) return -11;
         long status=killed?137:(live_kind=='o' || completed_before_kill)?0:42;
         collected++;live_child=0;
         return status;
     }
-    if (op==SYS_YIELD) {
-        yields++;
-        if (!clock_frozen) clock_time_ms += 10;
-        return yields==yield_error_at?-5:0;
+    if (op==SYS_SLEEP_UNTIL) {
+        sleeps++;
+        if (sleeps==sleep_error_at || clock_frozen) return -5;
+        if (b!=0 || a<clock_time_ms) abort();
+        clock_time_ms=a;
+        return 0;
+    }
+    if (op==SYS_TRY_WAIT) {
+        if (!live_child || a!=live_child) abort();
+        if (live_kind=='h' && !killed && !completed_before_kill) return -11;
+        long status=killed?137:(live_kind=='o' || completed_before_kill)?0:42;
+        collected++;live_child=0;
+        return status;
     }
     if (op==SYS_KILL) {
         if (a==0 || a==1) return -22;
         if (a==0x7fffffff) return -3;
         if (a!=live_child || !live_child) abort();
         kill_attempts++;
-        if (complete_on_last_yield && live_kind=='h') {
+        if (complete_at_deadline && live_kind=='h') {
             completed_before_kill=1;
             return 1;
         }
@@ -131,7 +145,8 @@ static void append_expected(char *out,size_t capacity,const char *kind,
 static void success_case(void) {
     reset();
     assert(run_supervisor()==0);
-    assert(spawns==5 && collected==5 && kills==1 && yields==31 && !live_child);
+    assert(spawns==5 && collected==5 && kills==1 && sleeps==2 &&
+           waits==5 && !live_child);
     assert(spawn_times[3]-spawn_times[2]>=RESTART_BACKOFF_MS);
     assert(spawn_times[4]-spawn_times[3]>=2*RESTART_BACKOFF_MS);
     assert(kill_time_ms-spawn_times[5]>=SERVICE_TIMEOUT_MS);
@@ -158,16 +173,18 @@ int main(void) {
     assert(run_supervisor()==63 && spawns==3 && collected==2 && !live_child);
     reset();write_error_at=2;
     assert(run_supervisor()==62 && spawns==1 && collected==1 && !live_child);
-    reset();yield_error_at=7;
+    reset();wait_error_at=5;
     assert(run_supervisor()==64 && spawns==5 && collected==5 && kills==1 && !live_child);
+    reset();sleep_error_at=1;
+    assert(run_supervisor()==63 && spawns==2 && collected==2 && kills==0 && !live_child);
     reset();wait_error_at=1;
     assert(run_supervisor()==62 && spawns==1 && collected==1 && kills==1 && !live_child);
-    // Simulate the race where the final yield completes the worker and the
-    // kernel finds an already-zombie child at kill time. Do not log TIME.
-    reset();complete_on_last_yield=1;
+    // Simulate the race where the child exits exactly at its timed deadline.
+    // SYS_KILL must report already-zombie and must not manufacture TIME.
+    reset();complete_at_deadline=1;
     assert(supervise("svc_hang",8,1,1)==0);
     assert(spawns==1 && collected==1 && kills==0 && kill_attempts==1 &&
-           yields==25 && !live_child);
+           waits==1 && !live_child);
     assert(strstr(log_text,"SERVICE DONE")!=NULL);
     assert(strstr(log_text,"SERVICE TIME")==NULL);
     assert(strstr(log_text,"SERVICE DURATION")==NULL);
@@ -175,12 +192,12 @@ int main(void) {
     assert(run_supervisor()==62 && spawns==1 && collected==1 && kills==1 && !live_child);
     reset();clock_frozen=1;
     assert(run_supervisor()==63 && spawns==2 && collected==2 && kills==0 &&
-           yields==MAX_CLOCK_POLLS && !live_child);
+           sleeps==1 && !live_child);
     // Frozen or failed clock DURING a live hanging service must fail closed,
     // forcibly clean up the child, and never claim a measured TIME event.
     reset();freeze_on_spawn=5;
     assert(run_supervisor()==64 && spawns==5 && collected==5 && kills==1 &&
-           yields==6+MAX_CLOCK_POLLS && !live_child);
+           waits==5 && !live_child);
     assert(strstr(log_text,"SERVICE TIME")==NULL);
     assert(strstr(log_text,"SERVICE DURATION")==NULL);
     reset();clock_failure_after_spawn=5;
@@ -188,6 +205,6 @@ int main(void) {
     assert(strstr(log_text,"SERVICE TIME")==NULL);
     assert(strstr(log_text,"SERVICE DURATION")==NULL);
     puts("Supervisor host acceptance: success, restart cap, stalled child kill, "
-         "spawn/write/yield/wait failures passed");
+         "spawn/write/sleep/wait failures passed");
     return 0;
 }
