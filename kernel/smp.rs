@@ -469,7 +469,7 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
                 }
             }
         }
-        op @ (0x10002 | 0x10008 | 0x1000d | 0x1000e) => {
+        op @ (0x10002 | 0x10008 | 0x1000d | 0x1000e | 0x10015) => {
             let io = match op {
                 0x10002 => p.files.write(&p.space, a, b, c),
                 0x10008 => cpu.load.frames.with(|f| p.files.read(f, &p.space, a, b, c)),
@@ -478,6 +478,7 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
             };
             match io {
                 Ok(crate::files::Io::Bytes(n)) => { q.wake_io(); n as isize }
+                Ok(crate::files::Io::Sleep(_)) if op == 0x10015 => -11,
                 Ok(crate::files::Io::Sleep(wait)) => {
                     // No bytes committed. Retry SYSCALL with its original
                     // registers when data, space, or the last close wakes it.
