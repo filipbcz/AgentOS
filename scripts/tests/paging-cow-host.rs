@@ -172,3 +172,39 @@ fn syscallCopyToUserResolvesCOWAcrossMultiplePages() {
     unsafe {child.release(&mut frames);parent.release(&mut frames);}
     assert_eq!(frames.used(),1);
 }
+
+#[test]
+fn repeatedAndNestedForksPreserveReferenceCountsAndLastOwnerWrite() {
+    let (mut frames,root,parent)=setup();
+    let va=USER_BASE+0x5000;
+    unsafe {parent.map(&mut frames,va,true,false).unwrap();}
+    parent.write(&mut frames,va,b"shared").unwrap();
+    let physical=unsafe {get_page(&parent,va)};
+    let sibling1=unsafe {parent.fork_cow(&mut frames,root).unwrap()};
+    let sibling2=unsafe {parent.fork_cow(&mut frames,root).unwrap()};
+    assert_eq!(frames.references(physical),Some(3));
+    // A third generation forks from a page that is *already* COW.
+    let grandchild=unsafe {sibling2.fork_cow(&mut frames,root).unwrap()};
+    assert_eq!(frames.references(physical),Some(4));
+    sibling1.write(&mut frames,va,b"FIRST!").unwrap();
+    assert_eq!(frames.references(physical),Some(3));
+    grandchild.write(&mut frames,va,b"THIRD!").unwrap();
+    assert_eq!(frames.references(physical),Some(2));
+    let mut buf=[0u8;6];
+    sibling2.read(va,&mut buf).unwrap();
+    assert_eq!(&buf,b"shared");
+    parent.read(va,&mut buf).unwrap();
+    assert_eq!(&buf,b"shared");
+    unsafe {sibling1.release(&mut frames);grandchild.release(&mut frames);}
+    assert_eq!(frames.references(physical),Some(2));
+    unsafe {sibling2.release(&mut frames);}
+    assert_eq!(frames.references(physical),Some(1));
+    // A last-owner COW promotion changes the PTE without a new allocation.
+    frames.no_allocations();
+    parent.write(&mut frames,va,b"latest").unwrap();
+    parent.read(va,&mut buf).unwrap();
+    assert_eq!(&buf,b"latest");
+    frames.allow(96);
+    unsafe {parent.release(&mut frames);}
+    assert_eq!(frames.used(),1);
+}
