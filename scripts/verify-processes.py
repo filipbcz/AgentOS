@@ -39,6 +39,7 @@ PREFIXES = ("AGENTOS USER ", "AGENTOS PIPE ", "AGENTOS IPC ", "AGENTOS PROCESS "
 ORDER = ("fault", "survived", "received", "exit", "sent", "service", "exit",
          "reply", "exit", "check")
 SHELL_START = re.compile(r"AGENTOS SHELL START PID=([0-9a-f]{16})")
+MANAGER_SESSION = re.compile(r"AGENTOS MANAGER SESSION START PID=([0-9a-f]{16})")
 SUPERVISOR_BEGIN = re.compile(r"AGENTOS SUPERVISOR BEGIN PARENT=([0-9a-f]{16})")
 SUPERVISOR_END = re.compile(r"AGENTOS SUPERVISOR ENDED PARENT=([0-9a-f]{16})")
 ORPHAN_BEGIN = re.compile(r"AGENTOS ORPHAN BEGIN ROOT=([0-9a-f]{16})")
@@ -64,7 +65,26 @@ def verify(text, apic_ids):
     orphan_roots = []
     cow_open = None
     cow_roots = []
+    manager_open = False
     for number, line in enumerate(text.splitlines(), 1):
+        if line.startswith("AGENTOS MANAGER SESSION START"):
+            match = MANAGER_SESSION.fullmatch(line)
+            require(match is not None and int(match[1],16)>0 and not manager_open and
+                    supervisor_open is None and orphan_open is None and cow_open is None and
+                    sum(kind=="check" for kind,_,_ in events)==len(expected_cpus),
+                    f"Operational root manager began before CPU process tests completed at {number}")
+            manager_open=True
+            continue
+        if manager_open:
+            if line.startswith("AGENTOS SHELL START"):
+                match=SHELL_START.fullmatch(line)
+                require(match is not None and int(match[1],16)>0,
+                        f"Invalid managed shell boundary at {number}")
+                break
+            # verify-service-manager.py strictly authenticates the entire
+            # ongoing registry/worker/ready/restart subtrace. Do not mistake
+            # its worker process EXIT records for IPC transfer children.
+            continue
         if line.startswith("AGENTOS COW "):
             begin = COW_BEGIN.fullmatch(line)
             end = COW_END.fullmatch(line)
