@@ -113,18 +113,24 @@ printf 'Compiling and linking the kernel with %s and %s\n' "$pRustc" "$pCc"
 
 for pApp in init fault receiver service shell svc_ok svc_fail svc_hang orphan_parent manager svc_alive svc_flaky; do
     printf 'Compiling and linking user program %s\n' "$pApp"
-    "$pCc" -c "$pRoot/user/$pApp.S" -o "$pOut/$pApp-entry.o"
+    pEntry="$pApp"
+    if [[ "$pApp" == svc_alive || "$pApp" == svc_flaky ]]; then pEntry=svc_worker; fi
+    "$pCc" -c "$pRoot/user/$pEntry.S" -o "$pOut/$pApp-entry.o"
     pObjects=("$pOut/$pApp-entry.o")
     case "$pApp" in
         init) pSources=(transfer client supervisor orphans forktest);;
         receiver) pSources=(receive);;
         service) pSources=(service);;
-        shell) pSources=(shell);;
+        shell) pSources=(shell service_client);;
+        manager) pSources=(service_manager);;
+        svc_alive|svc_flaky) pSources=(svc_worker);;
         *) pSources=();;
     esac
     for pSource in "${pSources[@]}"; do
+        pDefines=()
+        if [[ "$pApp" == svc_flaky ]]; then pDefines=(-DAGENTOS_FLAKY); fi
         "$pCc" -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
-            -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large \
+            -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large "${pDefines[@]}" \
             -c "$pRoot/user/$pSource.c" -o "$pOut/$pSource.o"
         pObjects+=("$pOut/$pSource.o")
     done
