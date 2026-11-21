@@ -65,5 +65,7 @@ jobs:
             build/check/qemu-cpu${{ matrix.cpus }}/qemu-stderr.log
             build/check/qemu-cpu${{ matrix.cpus }}/smoke.json
             build/check/qemu-cpu${{ matrix.cpus }}/failure.json
+            build/check/qemu-cpu${{ matrix.cpus }}/secureboot-vars.txt
+            build/check/qemu-cpu${{ matrix.cpus }}/OVMF_VARS.secboot.fd
             build/check/qemu-cpu${{ matrix.cpus }}/failed-screen.ppm
             build/check/qemu-cpu${{ matrix.cpus }}/shell-screen.ppm
