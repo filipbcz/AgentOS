@@ -35,6 +35,8 @@ def service_interval(parent):
     event("STOP", children[3], 42, 3)
     out.append(f"AGENTOS USER KILL PID={children[4]:016x} "
                f"PARENT={parent:016x} STATUS=0000000000000089")
+    out.append(f"AGENTOS SERVICE DURATION PARENT={parent:016x} "
+               f"CHILD={children[4]:016x} MS=00000000000000fa")
     event("TIME", children[4], 137, 1)
     event("STOP", children[4], 137, 1)
     out.append(f"AGENTOS SUPERVISOR ENDED PARENT={parent:016x}")
@@ -83,6 +85,8 @@ class SupervisorEvidenceTests(unittest.TestCase):
             ("AGENTOS SERVICE DONE PARENT=0000000000000001", "AGENTOS SERVICE DONE PARENT=0000000000000002"),
             ("CHILD=0000000000000009", "CHILD=0000000000000003"),
             ("AGENTOS SERVICE TIME", "AGENTOS SERVICE REAP"),
+            ("MS=00000000000000fa", "MS=00000000000000f9"),
+            ("MS=00000000000000fa", "MS=ffffffffffffffff"),
             ("AGENTOS USER KILL", "AGENTOS USER EXIT"),
         ):
             with self.subTest(old=old):
