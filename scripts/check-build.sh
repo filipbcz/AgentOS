@@ -74,6 +74,10 @@ printf 'Testing PID1 supervision and forced-child cleanup with %s\n' "$pCc"
     "$pRoot/scripts/tests/supervisor-host.c" -o "$pOut/supervisor-tests"
 "$pOut/supervisor-tests"
 
+printf 'Testing per-CPU monotonic TSC time conversion with %s\n' "$pRustc"
+"$pRustc" --edition 2021 --test "$pRoot/kernel/monotonic.rs" -o "$pOut/monotonic-tests"
+"$pOut/monotonic-tests"
+
 printf 'Compiling and linking the kernel with %s and %s\n' "$pRustc" "$pCc"
 "$pRustc" --version
 "$pCc" --version
