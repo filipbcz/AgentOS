@@ -25,7 +25,7 @@
  * synchronized between CPUs. Returns -5 if the calibrated source is absent.
  */
 /* SYS_WAIT_CHILD_UNTIL(child_pid, absolute_cpu_local_deadline_ms):
- * Return and reap child's exit status if it has exited (0..255);
+ * Return and reap child's nonnegative exit status (0..255 for normal exit,\n * 256+fault_vector for a trapped fault) if it has exited;
  * otherwise block until child exits or monotonic deadline is reached.
  * Returns -110 on deadline, -10 if child absent/not owned, -5 if clock stalls,
  * -22 if deadline exceeds signed syscall range. Does not reap on timeout.
