@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import socket
 import time
 
 
@@ -47,6 +48,21 @@ def main():
         return 1
 
 
+def snapshot(monitor, dest):
+    # Capture the guest's real GOP screen, even if UEFI refuses the EFI.
+    # A screenshot is evidence, not proof of successful boot on its own.
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(3)
+            client.connect(str(monitor))
+            client.recv(4096)
+            client.sendall(f"screendump {dest}\\n".encode("ascii"))
+            client.recv(4096)
+        return dest.exists() and dest.stat().st_size > 64
+    except (OSError, UnicodeError):
+        return False
+
+
 def boot(args):
     root = ROOT
     commit = subprocess.check_output(["git", "rev-parse", "--verify", "HEAD"],
@@ -78,6 +94,7 @@ def boot(args):
         "-drive", f"if=none,format=raw,id=esp,file={raw}",
         "-device", "ich9-ahci,id=sata",
         "-device", "ide-hd,drive=esp,bus=sata.0",
+        "-monitor", f"unix:{destination / 'qemu-monitor.sock'},server=on,wait=off",
         "-vga", "std", "-display", "none", "-serial",
         f"file:{destination / 'com1.log'}",
         "-nic", "none", "-no-reboot", "-no-shutdown",
@@ -98,9 +115,14 @@ def boot(args):
                     raise RuntimeError("Guest reported critical kernel failure; see COM1")
                 if b"AGENTOS SHELL READY\r\nagentos> " in content:
                     run_succeeded = True
+                    snapshot(destination / "qemu-monitor.sock", destination / "shell-screen.ppm")
                     break
                 if process.poll() is not None:
+                    snapshot(destination / "qemu-monitor.sock", destination / "failed-screen.ppm")
                     raise RuntimeError(f"QEMU exited before shell became ready: {process.returncode}")
+                if not content and time.monotonic() - start > 180:
+                    snapshot(destination / "qemu-monitor.sock", destination / "failed-screen.ppm")
+                    raise TimeoutError("No guest COM1 output after 180 seconds; inspect firmware screenshot")
                 time.sleep(0.25)
             if not run_succeeded:
                 raise TimeoutError(f"Guest did not reach shell in {args.timeout} host seconds")
