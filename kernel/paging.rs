@@ -90,7 +90,7 @@ impl UserSpace {
         let mut node = self.root;
         for shift in [39, 30, 21] {
             let value = *((node as *const u64).add((va >> shift) & 511));
-            if value & (PRESENT | USER) != PRESENT | USER { return None; }
+            if value & (PRESENT | USER) != (PRESENT | USER) { return None; }
             node = (value & ADDRESS) as usize;
         }
         Some((node as *mut u64).add((va >> 12) & 511))
@@ -101,7 +101,7 @@ impl UserSpace {
     pub unsafe fn resolve_cow(&self, frames: &mut Frames<'_>, va: usize) -> Option<bool> {
         let leaf = self.leaf(va)?;
         let previous = *leaf;
-        if previous & (PRESENT | USER | COW) != PRESENT | USER | COW ||
+        if previous & (PRESENT | USER | COW) != (PRESENT | USER | COW) ||
            previous & WRITE != 0 { return Some(false); }
         let old = (previous & ADDRESS) as usize;
         let count = frames.references(old)?;
@@ -169,7 +169,7 @@ impl UserSpace {
         // writable. It must have either WRITE or the explicit COW marker.
         while pos < end {
             let value = unsafe { *self.leaf(pos)? };
-            if value & (PRESENT | USER) != PRESENT | USER ||
+            if value & (PRESENT | USER) != (PRESENT | USER) ||
                value & (WRITE | COW) == 0 { return None; }
             pos += (PAGE - pos % PAGE).min(end-pos);
         }
