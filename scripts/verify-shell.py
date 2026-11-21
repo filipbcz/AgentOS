@@ -44,7 +44,8 @@ def verify(aLog, aInput=None):
             "Manager/shell identity or root exit status mismatch")
     require(pRootStart.end() <= pStart.start() < pStop.start(),
             "Manager/shell session boundaries are out of order")
-    require(not aLog[pStop.end():].strip(b"\r\n"), "Unexpected records after shell STOP")
+    require(aLog[pStop.end():] == b"[INFO] INTERACTIVE SHELL STOPPED\r\n",
+            "Missing or unexpected kernel completion message after manager shutdown")
 
     # Separate command echo from output. In particular, the edited echo command
     # contains the erased 'x', while the actual response must contain 'shell-ok'.
