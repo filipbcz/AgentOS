@@ -68,8 +68,8 @@ def verify(log):
     require(match is not None and int(match[1],16)==root and
             int(match[2],16)>0 and int(match[2],16)%4096==0,
             "Manager did not exit cleanly from its own CR3")
-    require(not log[ends[0].end():].strip(b"\r\n"),
-            "Unexpected guest records after final snapshot/bitmap verification")
+    require(log[ends[0].end():] == b"[INFO] INTERACTIVE SHELL STOPPED\r\n",
+            "Missing or unexpected final kernel service-session completion log")
     return root,shell,worker
 
 def main():
