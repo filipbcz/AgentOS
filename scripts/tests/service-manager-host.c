@@ -24,7 +24,7 @@ static long ticks, next_pid, times[3];
 static unsigned openfds[32], fdchannel[32], chars;
 static char log_text[LOG_SIZE];
 static int failure_mode, clock_failure_at, spoof_ready, never_ready;
-static int spoof_control, spoof_control_sent;
+static int spoof_control, spoof_control_sent, shell_disconnect;
 static long core_crash_at;
 static unsigned core_crashes;
 static long kill_order[MAX_CHILDREN];
@@ -37,7 +37,7 @@ static void reset(void) {
     count=channel_count=sleeps=total_exits=total_kills=chars=0;
     ticks=0;next_pid=101;
     failure_mode=clock_failure_at=spoof_ready=never_ready=0;
-    spoof_control=spoof_control_sent=0;
+    spoof_control=spoof_control_sent=shell_disconnect=0;
     core_crash_at=0;core_crashes=0;
     owner_pid=0;shell_active=shutdown_requested=fatal_error=online_announced=0;
     registry[SVC_CORE]=(struct record){
@@ -114,6 +114,8 @@ static long mock_call(long op,long a,long b,long c) {
             assert(a>=3 && a<32 && openfds[a] && b && c==sizeof(struct svc_request));
             struct worker *w=from_channel(fdchannel[a]);
             if(!w)return -11;
+            if(w->ack && w->kind==SVC_SHELL && shell_disconnect &&
+               ticks>=w->start+80) return 0; // peer EOF without process exit
             struct svc_received_request *packet=(struct svc_received_request *)b;
             if(w->ready_sent && w->kind==SVC_SHELL &&
                spoof_control && !spoof_control_sent && ticks>=w->start+80) {
@@ -149,6 +151,9 @@ static long mock_call(long op,long a,long b,long c) {
             assert(w && !w->reaped);
             if(w->killed) {
                 w->reaped=1;total_exits++;return 137;
+            }
+            if(w->kind==99 && w->ack) {
+                w->reaped=1;total_exits++;return 42; // exited adopted grandchild
             }
             if(w->kind==SVC_CORE && w->ack && core_crash_at>0 &&
                ticks>=core_crash_at) {
@@ -194,9 +199,10 @@ static long mock_call(long op,long a,long b,long c) {
                 if(candidate>ticks && candidate<next)next=candidate;
                 if(w->ack && w->kind==SVC_CORE && core_crash_at>ticks &&
                    core_crash_at<next)next=core_crash_at;
-                if(w->ack && w->kind==SVC_SHELL && spoof_control &&
-                   !spoof_control_sent && w->start+80>ticks &&
-                   w->start+80<next)next=w->start+80;
+                if(w->ack && w->kind==SVC_SHELL &&
+                   (shell_disconnect || (spoof_control && !spoof_control_sent)) &&
+                   w->start+80>ticks && w->start+80<next)
+                    next=w->start+80;
             }
             ticks=next;
             unsigned long events=0;
@@ -205,8 +211,9 @@ static long mock_call(long op,long a,long b,long c) {
                 struct worker *w=from_channel(fdchannel[fd]);
                 if(w && !w->reaped &&
                    ((!w->ready_sent && !never_ready && ticks>=w->start+20) ||
-                    (w->ack && w->kind==SVC_SHELL && spoof_control &&
-                     !spoof_control_sent && ticks>=w->start+80)))
+                    (w->ack && w->kind==SVC_SHELL &&
+                     (shell_disconnect || (spoof_control && !spoof_control_sent)) &&
+                     ticks>=w->start+80)))
                     events|=1UL<<fd;
             }
             for(unsigned i=0;i<count;i++) {
@@ -258,6 +265,9 @@ static void failure_injection(void) {
     reset();never_ready=1;
     assert(runServiceManager()==81 && registry[SVC_CORE].attempts==3 &&
            total_kills==3 && !registry[SVC_SHELL].pid);
+    reset();shell_disconnect=1;
+    assert(runServiceManager()==81 && registry[SVC_SHELL].attempts==3 &&
+           total_kills>=4 && !registry[SVC_SHELL].pid);
 }
 static void dependency_failure_and_restart_window(void) {
     /* The operational shell must be stopped when its core dependency dies.
@@ -322,11 +332,9 @@ static void adopted_orphan_reaping(void) {
     assert(reap_unmanaged() && total_kills==1); // idempotent
     reset();
     owner_pid=100;
-    workers[0]=(struct worker){301,0,99,0,0,0,0,1};
-    // An already-zombie child must be collected without issuing a kill.
-    // The mock marks forced termination independently; use status 42 below.
-    workers[0].reaped=0;
-    workers[0].killed=1;
+    // A zombie adopted by PID 1 is reaped with its original exit status.
+    // No extra kill syscall is issued to an already-exited process.
+    workers[0]=(struct worker){301,0,99,0,0,1,0,0};
     count=1;
     assert(reap_unmanaged() && workers[0].reaped && total_kills==0);
 }

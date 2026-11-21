@@ -307,6 +307,13 @@ static int check_control(long now) {
     long n=os_call(SYS_IPC_TRY_RECV,shell->fd,(long)&packet,sizeof(packet.data));
     if (n==-11) return 0;
     if (n<0) return -1; // unexpected kernel I/O failure
+    if (n==0) {
+        // A running shell closed its control endpoint without exiting:
+        // an EOF socket stays forever readable. Stop/reap it and apply the
+        // bounded restart policy; never spin endlessly on the same EOF.
+        if (!kill_and_reap(shell)) return -1;
+        return failed(SVC_SHELL,now,137);
+    }
     // An inherited or leaked endpoint is not authority to manage services.
     // Reject unauthorized sender PID or malformed payload without killing
     // the entire local supervisor (a trivial denial-of-service otherwise).

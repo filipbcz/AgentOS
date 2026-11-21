@@ -62,12 +62,14 @@ pub struct Queue {
     init_pid: Option<usize>,
     /// Kernel-held BSP root across boot checks and TTY handoff.
     boot_parked: Option<usize>,
+    /// Never allow PID 1 to initiate a second bootstrap handoff after TTY.
+    boot_handoff_done: bool,
     pub active: bool,
 }
 
 impl Queue {
     pub fn new() -> Self {
-        Self { tasks: core::array::from_fn(|_| None), count: 0, current: None, caller: 0, init_pid: None, boot_parked: None, active: false }
+        Self { tasks: core::array::from_fn(|_| None), count: 0, current: None, caller: 0, init_pid: None, boot_parked: None, boot_handoff_done: false, active: false }
     }
 
     pub fn spawn(&mut self, frames: &mut Frames<'_>, entry: extern "C" fn(usize), arg: usize) -> Option<()> {
@@ -181,6 +183,7 @@ impl Queue {
     /// Its saved syscall context remains attached to the same PID/address space.
     pub fn park_boot_root(&mut self, pid: usize) -> Result<(), isize> {
         if self.init_pid != Some(pid) || self.boot_parked.is_some() ||
+           self.boot_handoff_done ||
            self.process().map(|p| p.pid) != Some(pid) ||
            self.child_after(pid, 0) != Err(-10) { return Err(-16); }
         self.tasks[self.current.unwrap()].as_mut().unwrap().runnable = false;
@@ -198,6 +201,7 @@ impl Queue {
             .map_or(false, |p| p.pid == pid && p.status.is_none())).ok_or(-3isize)?;
         task.runnable = true;
         self.boot_parked = None;
+        self.boot_handoff_done = true;
         Ok(())
     }
 
@@ -588,6 +592,7 @@ mod timed_tests {
         q.active=true;
         assert_eq!(q.select(0x333,false),0x222); // original saved context
         assert_eq!(q.process().unwrap().pid,1);
+        assert_eq!(q.park_boot_root(1),Err(-16)); // actual one-shot, after rescheduling
     }
 
     #[test]
