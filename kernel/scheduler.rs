@@ -339,6 +339,7 @@ mod timed_tests {
         q.count = 2;
         q.active = true;
         q.current = Some(0);
+        q.caller = 10; // context of the kernel HLT/schedule loop
         q
     }
 
@@ -353,7 +354,7 @@ mod timed_tests {
         assert!(q.has_timed_waiters());
         q.wake_timed(125, true);
         assert!(!q.has_timed_waiters());
-        assert_eq!(q.select(11, true), 4096); // restarted parent's syscall
+        assert_eq!(q.select(11, true), 10); // parent's saved syscall context
         assert!(!q.take_clock_error());
     }
 
@@ -368,7 +369,7 @@ mod timed_tests {
         q.terminate(42, &mut frames);
         assert!(!q.has_timed_waiters());
         assert!(q.tasks[0].as_ref().unwrap().runnable);
-        assert_eq!(q.select(0, false), 4096);
+        assert_eq!(q.select(0, false), 99);
         assert!(!q.take_clock_error());
     }
 
@@ -395,7 +396,7 @@ mod timed_tests {
         assert!(q.has_timed_waiters());
         q.wake_timed(100, true);
         assert!(!q.has_timed_waiters());
-        assert_eq!(q.select(1, true), 4096);
+        assert_eq!(q.select(1, true), 1);
         assert!(q.take_clock_error());
         assert!(!q.take_clock_error()); // consumed exactly once
     }
