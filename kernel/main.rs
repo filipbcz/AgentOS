@@ -21,6 +21,7 @@ mod ps2;
 mod log_policy;
 mod log_ring;
 mod logger;
+mod monotonic;
 mod fb_console;
 use fb_console::glyph;
 
