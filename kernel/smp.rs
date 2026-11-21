@@ -396,6 +396,16 @@ unsafe extern "C" fn serial_interrupt(context: *mut Context) -> usize {
     cpu.switch(context as usize, false)
 }
 
+/// A genuine CPL3 write protection fault may be a COW fault. Resolve it
+/// in the current address space without killing the process, or reject it
+/// as an ordinary isolation violation. The CPU returns to the *same* RIP.
+pub unsafe fn user_cow_fault(addr: usize) -> bool {
+    let cpu = current_cpu();
+    let queue = &mut *cpu.queue.get();
+    let Some(process) = queue.process() else { return false; };
+    cpu.load.frames.with(|frames| process.space.resolve_cow(frames, addr)) == Some(true)
+}
+
 pub unsafe fn user_fault(vector: u64, error: u64, addr: u64) -> usize {
     let cpu = current_cpu();
     let q = &mut *cpu.queue.get();
@@ -462,9 +472,9 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
         op @ (0x10002 | 0x10008 | 0x1000d | 0x1000e) => {
             let io = match op {
                 0x10002 => p.files.write(&p.space, a, b, c),
-                0x10008 => p.files.read(&p.space, a, b, c),
-                0x1000d => p.files.message(crate::ipc::Operation::Send, p, a, b, c),
-                _ => p.files.message(crate::ipc::Operation::Receive, p, a, b, c),
+                0x10008 => cpu.load.frames.with(|f| p.files.read(f, &p.space, a, b, c)),
+                0x1000d => cpu.load.frames.with(|f| p.files.message(f, crate::ipc::Operation::Send, p, a, b, c)),
+                _ => cpu.load.frames.with(|f| p.files.message(f, crate::ipc::Operation::Receive, p, a, b, c)),
             };
             match io {
                 Ok(crate::files::Io::Bytes(n)) => { q.wake_io(); n as isize }
@@ -492,6 +502,10 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
                        .map(|v| v as isize).unwrap_or_else(|e| e) }
         }
         0x10005 => cpu.load.frames.with(|f| q.collect(f, pid, a)).map(|v| v as isize).unwrap_or_else(|e| e),
+        // Parent gets the new PID. The child resumes at the same return RIP
+        // with RAX=0, a private kernel stack and COW userspace pages.
+        0x10014 => cpu.load.frames.with(|f| q.fork_process(f, cpu.programs, ctx))
+            .map(|v| v as isize).unwrap_or_else(|e| e),
         // Child enumeration is owner-scoped, never global. The zero cursor
         // returns the oldest living or zombie direct child (including
         // grandchildren adopted when their intermediate parent exited).
