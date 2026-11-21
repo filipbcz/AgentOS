@@ -1,4 +1,7 @@
 #include "abi.h"
+#include "service_protocol.h"
+int manager_connect(void);
+int manager_command(unsigned op,unsigned service);
 
 enum { commandCapacity = 256, inputChunk = 64, outputChunk = 256 };
 
@@ -84,9 +87,30 @@ static int executeLine(char *aLine) {
         char *pRest = pEnd;
         if (*pEnd) { *pEnd = 0; pRest = skipSpaces(pEnd + 1); }
         pOk = !*pArgs || *pRest ? writeText("usage: cat PATH\r\n") : catFile(pArgs);
+    } else if (equals(pCommand, "services") && !*pArgs) {
+        pOk = manager_command(SVC_OP_STATUS,0xffff);
+    } else if (equals(pCommand, "service")) {
+        char *pVerb = pArgs;
+        while (*pArgs && !isSpace(*pArgs)) pArgs++;
+        if (*pArgs) *pArgs++ = 0;
+        pArgs = skipSpaces(pArgs);
+        char *pName = pArgs;
+        while (*pArgs && !isSpace(*pArgs)) pArgs++;
+        if (*pArgs) *pArgs++ = 0;
+        pArgs = skipSpaces(pArgs);
+        unsigned pService=equals(pName,"core")?SVC_CORE:
+            equals(pName,"flaky")?SVC_FLAKY:SVC_COUNT;
+        unsigned pOperation=equals(pVerb,"start")?SVC_OP_START:
+            equals(pVerb,"stop")?SVC_OP_STOP:
+            equals(pVerb,"restart")?SVC_OP_RESTART:0;
+        pOk = pService>=SVC_SHELL || !pOperation || *pArgs ?
+            writeText("usage: service start|stop|restart core|flaky\r\n") :
+            manager_command(pOperation,pService);
     } else if (equals(pCommand, "help") && !*pArgs) {
         pOk = writeText("help       List commands\r\npid        Show process ID\r\n"
                        "echo TEXT  Print text\r\ncat PATH   Read an initramfs file\r\n"
+                       "services   Show service registry\r\n"
+                       "service start|stop|restart core|flaky\r\n"
                        "exit       Close the shell\r\n");
     } else if (equals(pCommand, "pid") && !*pArgs) {
         long pPid = os_call(SYS_GETPID, 0, 0, 0);
@@ -116,6 +140,7 @@ int runShell(void) {
     char pInput[inputChunk];
     unsigned pUsed = 0;
     int pRejected = 0;
+    if (!manager_connect()) return 2;
     if (!writeText("AGENTOS SHELL READY\r\nagentos> ")) return 2;
     for (;;) {
         long pRead = os_call(SYS_READ, 0, (long)pInput, sizeof(pInput));
