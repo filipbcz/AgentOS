@@ -23,6 +23,9 @@ mod paging {
     impl UserSpace {
         pub fn test_dummy() -> Self { Self {root:0} }
         pub unsafe fn release(&self, _: &mut crate::frames::Frames<'_>) {}
+        pub unsafe fn fork_cow(&self, _: &mut crate::frames::Frames<'_>, _: usize) -> Result<Self,isize> {
+            Err(-12)
+        }
     }
 }
 
@@ -34,6 +37,7 @@ mod files {
     pub struct Descriptors;
     impl Descriptors {
         pub fn test_dummy() -> Self { Self }
+        pub fn new(_: &mut crate::frames::Frames<'_>) -> Option<Self> { Some(Self) }
         pub fn inherit(&mut self, _: &Self) {}
         pub fn terminal(&mut self, _: *mut crate::tty::Terminal) -> Result<(),isize> { Ok(()) }
         pub fn close_all(&mut self, _: &mut crate::frames::Frames<'_>) {}
@@ -57,8 +61,9 @@ mod process {
         pub status: Option<usize>,
         pub files: crate::files::Descriptors,
     }
-    pub struct Programs;
+    pub struct Programs { pub kernel_root: usize }
     impl Programs {
+        pub fn allocate_pid(&self) -> Result<usize,isize> { Ok(8) }
         pub unsafe fn load(&self, _: &mut crate::frames::Frames<'_>, _: &[u8],
                           _: usize, _: Credentials) -> Result<Process,isize> {
             Err(-8)
