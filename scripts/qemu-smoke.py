@@ -76,15 +76,15 @@ def monitor_keys(monitor, text):
     missing keyboard, unavailable monitor or rejected sendkey command.
     """
     for character in text:
-        assert character == "\\n" or ("a" <= character <= "z")
-        key = "ret" if character == "\\n" else character
+        assert character == "\n" or ("a" <= character <= "z")
+        key = "ret" if character == "\n" else character
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(5)
             client.connect(str(monitor))
             banner = client.recv(4096)
             if b"QEMU" not in banner and b"(qemu)" not in banner:
                 raise RuntimeError("Missing QEMU interactive monitor banner")
-            client.sendall(f"sendkey {key} 60\\n".encode("ascii"))
+            client.sendall(f"sendkey {key} 60\n".encode("ascii"))
             response = client.recv(4096)
             if b"unknown command" in response or b"Error:" in response:
                 raise RuntimeError(f"QEMU PS/2 key {key} rejected: {response!r}")
@@ -188,14 +188,14 @@ def boot(args):
                         break
                     interactive_start = time.monotonic()
                     time.sleep(0.25)
-                    monitor_keys(monitor_socket, "services\\n")
+                    monitor_keys(monitor_socket, "services\n")
                     interactive_stage = 1
                 if interactive_stage == 1 and (
                     b"core: running (attempts=1)\r\n" in content and
                     b"flaky: failed (attempts=3)\r\n" in content and
                     b"shell: running (attempts=1)\r\nagentos> " in content
                 ):
-                    monitor_keys(monitor_socket, "exit\\n")
+                    monitor_keys(monitor_socket, "exit\n")
                     interactive_stage = 2
                 if interactive_stage == 2 and re.search(
                     rb"AGENTOS MANAGER SESSION STOP PID=[0-9a-f]{16} "
