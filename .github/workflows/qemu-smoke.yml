@@ -13,6 +13,11 @@ on:
 permissions:
   contents: read
 
+# Cancel obsolete emulator jobs when a newer PR revision arrives.
+concurrency:
+  group: agentos-qemu-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   secureboot:
     runs-on: ubuntu-24.04
