@@ -75,9 +75,39 @@ static long deadline(long now, unsigned delay) {
 static void close_fd(long fd) {
     if (fd>=0) (void)os_call(SYS_CLOSE,fd,0,0);
 }
+/* A cycle or out-of-range dependency fails closed. The registry comes from
+ * the signed image, but it must still be structurally sound before PID 1
+ * starts any services. Future compiled manifests use the same contract.
+ */
+static int reaches(unsigned id, unsigned ancestor) {
+    unsigned dep=registry[id].dependency;
+    for (unsigned hops=0;hops<SVC_COUNT;hops++) {
+        if (dep==SVC_COUNT) return 0;
+        if (dep>=SVC_COUNT) return -1;
+        if (dep==ancestor) return 1;
+        dep=registry[dep].dependency;
+    }
+    return -1;
+}
+static int registry_valid(void) {
+    for (unsigned id=0;id<SVC_COUNT;id++) {
+        const struct record *s=&registry[id];
+        if (s->dependency>SVC_COUNT || reaches(id,id)!=0 || s->limit==0 ||
+            s->name_length!=text_length(s->name) ||
+            s->elf_length!=text_length(s->elf)) return 0;
+        for (unsigned prev=0;prev<id;prev++)
+            if (s->name_length==registry[prev].name_length) {
+                unsigned i=0;
+                for (;i<s->name_length && s->name[i]==registry[prev].name[i];i++) {}
+                if (i==s->name_length) return 0;
+            }
+    }
+    return 1;
+}
 static int has_dependency(unsigned id) {
     const unsigned dep=registry[id].dependency;
-    return dep==SVC_COUNT || registry[dep].state==SVC_RUNNING;
+    return dep==SVC_COUNT || (dep<SVC_COUNT &&
+        registry[dep].state==SVC_RUNNING);
 }
 static int valid_peer(const struct ipc_peer *peer, long pid) {
     return peer->pid==(unsigned long)pid && peer->uid==1000 && peer->gid==1000;
@@ -182,16 +212,16 @@ static int finish_start(unsigned id, long now) {
     return 1;
 }
 
-/* A lost dependency must not leave any of its direct dependents running
- * against stale state. Stop in reverse dependency order; only active processes
- * are reset, so a previously FAILED optional service stays FAILED until an
- * explicit operator action. The root continues its own bounded restart.
+/* Traverse the validated DAG in postorder, not array order. Descendants
+ * must stop before their own prerequisites, even if service IDs were later
+ * reordered. A failed optional service stays failed until operator rearm.
  */
 static int suspend_dependents(unsigned dependency) {
-    for (unsigned index=SVC_COUNT;index>0;index--) {
-        unsigned id=index-1;
+    for (unsigned id=0;id<SVC_COUNT;id++) {
         struct record *service=&registry[id];
-        if (service->dependency!=dependency || service->pid<=0) continue;
+        if (service->dependency!=dependency) continue;
+        if (!suspend_dependents(id)) return 0;
+        if (service->pid<=0) continue;
         if (!kill_and_reap(service)) return 0;
         service->state=service->desired?SVC_DOWN:SVC_STOPPED;
         service->attempts=0;
@@ -252,9 +282,12 @@ static int apply_command(const struct svc_request *req,long now) {
         service->desired=1;service->attempts=0;service->window_started=-1;service->retry_at=now;
         service->state=SVC_DOWN;
     } else {
-        if (req->service==SVC_CORE &&
-            (registry[SVC_FLAKY].desired || registry[SVC_SHELL].pid>0))
-            return SVC_BAD_DEPENDENCY;
+        // Never kill the authenticated caller's prerequisite before it
+        // receives a reply; enforce this rule transitively for any DAG.
+        for (unsigned id=0;id<SVC_COUNT;id++)
+            if (id!=req->service && reaches(id,req->service)>0 &&
+                (registry[id].desired || registry[id].pid>0))
+                return SVC_BAD_DEPENDENCY;
         if (req->operation==SVC_OP_RESTART && !has_dependency(req->service))
             return SVC_BAD_DEPENDENCY;
         if (!kill_and_reap(service)) return SVC_INTERNAL_ERROR;
@@ -358,21 +391,30 @@ static long event_mask(void) {
     return (long)mask;
 }
 
+static int stop_subtree(unsigned id, unsigned char seen[SVC_COUNT]) {
+    if (seen[id]) return 1;
+    seen[id]=1;
+    for (unsigned child=0;child<SVC_COUNT;child++)
+        if (registry[child].dependency==id &&
+            !stop_subtree(child,seen)) return 0;
+    struct record *service=&registry[id];
+    if (!kill_and_reap(service)) return 0;
+    finish_endpoint(service);
+    service->state=SVC_STOPPED;
+    return 1;
+}
 static int stop_all(void) {
-    // Stop admissions before descending in reverse dependency order.
+    // Reject all new work, then use a deterministic reverse topological order.
+    unsigned char seen[SVC_COUNT]={0};
     for (unsigned id=0;id<SVC_COUNT;id++) registry[id].desired=0;
-    for (unsigned i=SVC_COUNT;i>0;i--) {
-        struct record *service=&registry[i-1];
-        if (!kill_and_reap(service)) return 0;
-        finish_endpoint(service);
-        service->state=SVC_STOPPED;
-    }
+    for (unsigned id=0;id<SVC_COUNT;id++)
+        if (!stop_subtree(id,seen)) return 0;
     return 1;
 }
 
 int runServiceManager(void) {
     owner_pid=os_call(SYS_GETPID,0,0,0);
-    if (owner_pid<=0 || !manager_phase("BEGIN")) return 80;
+    if (owner_pid<=0 || !registry_valid() || !manager_phase("BEGIN")) return 80;
     for (;;) {
         long now=clock_ms();
         if (now<0 || (unsigned long)now>MAX_MS-READY_TIMEOUT_MS-200)

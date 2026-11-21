@@ -27,11 +27,13 @@ static int failure_mode, clock_failure_at, spoof_ready, never_ready;
 static int spoof_control, spoof_control_sent;
 static long core_crash_at;
 static unsigned core_crashes;
+static long kill_order[MAX_CHILDREN];
 
 static void reset(void) {
     memset(workers,0,sizeof(workers));
     memset(openfds,0,sizeof(openfds));memset(fdchannel,0,sizeof(fdchannel));
     memset(log_text,0,sizeof(log_text));memset(times,0,sizeof(times));
+    memset(kill_order,0,sizeof(kill_order));
     count=channel_count=sleeps=total_exits=total_kills=chars=0;
     ticks=0;next_pid=101;
     failure_mode=clock_failure_at=spoof_ready=never_ready=0;
@@ -166,7 +168,7 @@ static long mock_call(long op,long a,long b,long c) {
         case SYS_KILL: {
             struct worker *w=from_pid(a);
             assert(w && !w->reaped && !w->killed);
-            w->killed=1;total_kills++;return 0;
+            w->killed=1;kill_order[total_kills++]=a;return 0;
         }
         case SYS_WAIT_EVENTS_UNTIL: {
             assert(a>=0 && (unsigned long)a<=0xffffffffUL && b>ticks && c==0);
@@ -296,6 +298,52 @@ static void dependency_failure_and_restart_window(void) {
     assert(flaky->state==SVC_FAILED && flaky->attempts==3);
 }
 
+static void dependency_graph_and_leaf_first_shutdown(void) {
+    reset();
+    assert(registry_valid());
+    registry[SVC_CORE].dependency=SVC_FLAKY;
+    assert(!registry_valid()); // cycle core -> flaky -> core
+    registry[SVC_CORE].dependency=SVC_COUNT;
+    registry[SVC_FLAKY].dependency=SVC_COUNT+1;
+    assert(!registry_valid()); // invalid index, not an arbitrary pointer
+    registry[SVC_FLAKY].dependency=SVC_SHELL;
+    assert(registry_valid()); // nested core -> shell -> flaky
+    assert(reaches(SVC_FLAKY,SVC_CORE)==1);
+    assert(reaches(SVC_CORE,SVC_FLAKY)==0);
+    owner_pid=100;
+    workers[0]=(struct worker){101,0,SVC_SHELL,0,1,1,0,0};
+    workers[1]=(struct worker){102,0,SVC_FLAKY,0,1,1,0,0};
+    count=2;
+    registry[SVC_CORE].state=SVC_RUNNING;
+    registry[SVC_SHELL].state=SVC_RUNNING;
+    registry[SVC_SHELL].pid=101;
+    registry[SVC_FLAKY].state=SVC_RUNNING;
+    registry[SVC_FLAKY].pid=102;
+    shell_active=1;
+    assert(suspend_dependents(SVC_CORE));
+    assert(total_kills==2 && kill_order[0]==102 && kill_order[1]==101);
+    assert(shell_active==0 && registry[SVC_SHELL].state==SVC_DOWN &&
+           registry[SVC_FLAKY].state==SVC_DOWN);
+    assert(workers[0].reaped && workers[1].reaped);
+    reset();
+    registry[SVC_FLAKY].dependency=SVC_SHELL;
+    registry[SVC_CORE].state=SVC_RUNNING;
+    registry[SVC_SHELL].desired=0;
+    registry[SVC_FLAKY].desired=1;
+    struct svc_request req={SVC_MAGIC,SVC_VERSION,SVC_OP_STOP,SVC_CORE,0};
+    assert(apply_command(&req,100)==SVC_BAD_DEPENDENCY);
+    reset();
+    registry[SVC_FLAKY].dependency=SVC_SHELL;
+    owner_pid=100;
+    workers[0]=(struct worker){201,0,SVC_CORE,0,1,1,0,0};
+    workers[1]=(struct worker){202,0,SVC_SHELL,0,1,1,0,0};
+    workers[2]=(struct worker){203,0,SVC_FLAKY,0,1,1,0,0};
+    count=3;
+    for (unsigned i=0;i<3;i++)registry[i].pid=workers[i].pid;
+    assert(stop_all());
+    assert(total_kills==3 && kill_order[0]==203 && kill_order[1]==202 &&
+           kill_order[2]==201);
+}
 static void command_authorization_and_dependency(void) {
     reset();
     struct svc_request request={SVC_MAGIC,SVC_VERSION,SVC_OP_STOP,SVC_CORE,0};
@@ -343,6 +391,7 @@ int main(void){
     normal_session();
     failure_injection();
     dependency_failure_and_restart_window();
+    dependency_graph_and_leaf_first_shutdown();
     command_authorization_and_dependency();
     puts("Persistent service manager registry, dependency fail-stop, restart window, IPC authentication and shutdown passed");
     return 0;
