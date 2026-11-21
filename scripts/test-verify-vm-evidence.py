@@ -25,6 +25,7 @@ class VmEvidenceTests(unittest.TestCase):
         self.run.mkdir(parents=True)
         (self.root / "scripts").mkdir()
         self.write(self.root / "scripts/toolchain.lock", b"locked compiler versions\n")
+        self.write(self.root / "scripts/test-vbox.ps1", b"# exact acceptance harness\n")
         contents = {
             "agentos.unsigned.efi": b"unsigned EFI",
             "agentos.efi": b"signed EFI",
@@ -54,6 +55,7 @@ class VmEvidenceTests(unittest.TestCase):
             "schema": 1, "result": "pass", "vm": self.run.name,
             "source_commit": SHA,
             "build_provenance_sha256": evidence.sha256(self.build / "build-provenance.json"),
+            "harness_sha256": evidence.sha256(self.root / "scripts/test-vbox.ps1"),
             "virtualbox_version": "7.1.12r169651",
             "case": "signed", "cpus": 2, "shell": True,
             "keyboard": True, "boot_log_level": "info",
@@ -96,7 +98,7 @@ class VmEvidenceTests(unittest.TestCase):
     def test_valid_mutation_rejected_by_firmware(self):
         self.manifest.update({"case": "loader", "shell": False, "keyboard": False})
         self.write(self.run / "changed.efi", b"altered signed EFI")
-        self.write(self.run / "com1.log", b"BdsDxe: failed to load Access Denied\r\n")
+        self.write(self.run / "com1.log", b"BdsDxe: failed to load EFI\\BOOT\\BOOTX64.EFI HARDDISK Access Denied\r\n")
         self.manifest["boot_image_sha256"] = evidence.sha256(self.run / "changed.efi")
         for name in ("shell-before.png", "shell-keyboard.png"):
             self.manifest["artifacts"].pop(name)
@@ -140,6 +142,11 @@ class VmEvidenceTests(unittest.TestCase):
         self.manifest["build_provenance_sha256"] = evidence.sha256(
             self.build / "build-provenance.json")
         self.save_manifest()
+        self.rejected()
+
+    def test_reject_modified_test_harness(self):
+        script = self.root / "scripts/test-vbox.ps1"
+        self.write(script, b"altered checks")
         self.rejected()
 
     def test_reject_changed_toolchain_or_missing_kernel_completion(self):
