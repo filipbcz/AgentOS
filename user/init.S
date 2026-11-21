@@ -68,6 +68,9 @@ _start:
     test %eax, %eax
     jne finished
     call run_orphans
+    test %eax, %eax
+    jne finished
+    call run_forktest
 finished:
     mov %eax, %edi
     jmp terminate
