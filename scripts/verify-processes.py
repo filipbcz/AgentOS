@@ -41,6 +41,8 @@ ORDER = ("fault", "survived", "received", "exit", "sent", "service", "exit",
 SHELL_START = re.compile(r"AGENTOS SHELL START PID=([0-9a-f]{16})")
 SUPERVISOR_BEGIN = re.compile(r"AGENTOS SUPERVISOR BEGIN PARENT=([0-9a-f]{16})")
 SUPERVISOR_END = re.compile(r"AGENTOS SUPERVISOR ENDED PARENT=([0-9a-f]{16})")
+ORPHAN_BEGIN = re.compile(r"AGENTOS ORPHAN BEGIN ROOT=([0-9a-f]{16})")
+ORPHAN_END = re.compile(r"AGENTOS ORPHAN ENDED ROOT=([0-9a-f]{16})")
 
 
 def require(condition, message):
@@ -56,7 +58,30 @@ def verify(text, apic_ids):
     events = []
     supervisor_open = None
     supervised_parents = []
+    orphan_open = None
+    orphan_roots = []
     for number, line in enumerate(text.splitlines(), 1):
+        if line.startswith("AGENTOS ORPHAN "):
+            begin = ORPHAN_BEGIN.fullmatch(line)
+            end = ORPHAN_END.fullmatch(line)
+            require(supervisor_open is None, f"Orphan phase overlaps supervisor at {number}")
+            if begin:
+                require(orphan_open is None and len(supervised_parents) > len(orphan_roots),
+                        f"Orphan phase is nested or precedes supervisor at line {number}")
+                orphan_open = int(begin[1], 16)
+                require(orphan_open != 0, f"Zero orphan root at line {number}")
+            elif end:
+                require(orphan_open is not None and orphan_open == int(end[1], 16),
+                        f"Unmatched orphan interval at line {number}")
+                orphan_roots.append(orphan_open)
+                orphan_open = None
+            else:
+                require(orphan_open is not None, f"Orphan event outside interval at {number}")
+            continue
+        if orphan_open is not None:
+            # verify-orphans.py independently validates the exact USER EXIT,
+            # KILL, adoption and reaping subtrace inside these boundaries.
+            continue
         if line.startswith("AGENTOS SUPERVISOR "):
             begin = SUPERVISOR_BEGIN.fullmatch(line)
             end = SUPERVISOR_END.fullmatch(line)
@@ -82,6 +107,7 @@ def verify(text, apic_ids):
             # We must not interpret its service-child exits as IPC child exits.
             continue
         if line.startswith("AGENTOS SHELL START"):
+            require(orphan_open is None, "Unterminated orphan interval before shell")
             match = SHELL_START.fullmatch(line)
             require(match is not None and int(match[1], 16) != 0,
                     f"Malformed shell phase boundary at line {number}")
@@ -100,8 +126,11 @@ def verify(text, apic_ids):
             raise VerificationError(f"Malformed process evidence at line {number}: {line}")
 
     require(supervisor_open is None, "Unterminated supervisor interval")
+    require(orphan_open is None, "Unterminated orphan interval")
     require(not supervised_parents or len(supervised_parents) == len(expected_cpus),
             "Missing supervisor interval on one or more CPUs")
+    require(not orphan_roots or len(orphan_roots) == len(expected_cpus),
+            "Missing orphan interval on one or more CPUs")
     require(len(events) == len(ORDER) * len(expected_cpus),
             f"Incomplete or extra process evidence: expected {len(ORDER) * len(expected_cpus)} "
             f"records, found {len(events)}")
@@ -119,6 +148,9 @@ def verify(text, apic_ids):
         if supervised_parents:
             require(supervised_parents[len(seen_cpus)] == parent,
                     f"Supervisor interval does not belong to this parent: {context}")
+        if orphan_roots:
+            require(orphan_roots[len(seen_cpus)] == parent,
+                    f"Orphan interval does not belong to this parent: {context}")
         require(cpu in expected_cpus and cpu not in seen_cpus,
                 f"Unexpected or repeated CPU: {context}")
         require(len(pids) == 4 and 0 not in pids and not (pids & seen_pids),
