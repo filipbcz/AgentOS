@@ -138,7 +138,7 @@ Základní profil před 3.1 B měl jedno vlákno, CPU-local fd/IPC a monotónní
 
 ### 3.1. Demand paging a vyvažování SMP
 
-**Stav k 2026-11-21: část A má samostatné úspěšné host/QEMU důkazy; část B je implementovaná a čeká na společné CI a QEMU ověření nové revize.** Tento milník přiřazuje dva požadavky zadání, které původní plán nepojmenoval v žádné etapě. Přejímka ve VirtualBoxu zůstává otevřená. Nové důkazy části A jsou uvedeny níže pro konkrétní revizi; historické výsledky etapy 3 je nenahrazují. Aktuální bootové scénáře ověřují demand paging a opakují původní regrese.
+**Stav k 2026-11-22: části A i B jsou implementované a společně ověřené host CI a QEMU na revizi `2023723`; převzetí ve VirtualBoxu zůstává otevřené.** Tento milník přiřazuje dva požadavky zadání, které původní plán nepojmenoval v žádné etapě. Níže jsou samostatné historické důkazy části A i nové společné výsledky A+B. Aktuální scénáře ověřují demand paging, skutečné migrace, vzdálené ukončení a původní regrese. Host OOM/rollback kontroly jsou provedené; samostatná guest zkouška vyčerpání paměti demand procesem ještě chybí.
 
 | Požadavek zadání | Odpovědná část milníku | Návaznost |
 |---|---|---|
@@ -195,7 +195,7 @@ Rust testy obsahují 17 kontrol pageru, 5 kontrol přesného započítání živ
 
 Artefakty [1 CPU](https://github.com/filipbcz/AgentOS/actions/runs/44957373682/artifacts/14728262311) a [2 CPU](https://github.com/filipbcz/AgentOS/actions/runs/44957373682/artifacts/14728002770) obsahují COM1 logy, vstup relace, GOP/PS/2 snímky, podepsané i nepodepsané EFI, build provenance a výsledné `smoke.json`. Byly staženy, porovnány jejich SHA-256 a opakovány striktní kontroly skutečných logů a obrazových dat. Obě nezávislá sestavení mají shodný nepodepsaný EFI hash `1f09b2b8c9f2e8e556c54ce487b5f9d28c24422aad4ca78e977423309e9c8365` a initramfs hash `98a4a604ffb2057483cda40b1ea44f2bdbe415aefa891c09e027b5cfba82a143`. Podepsané EFI mají SHA-256 `47e3c766040a37889bf877abc4d27c9aeee207d4e2a7b1962af2cac4946abd34` (1 CPU) a `1054b906974170711cbc16f1798b7e3d2e5462757037b975844a9ad397ac5317` (2 CPU); každý job používá vlastní dočasný podpisový klíč. Délka těchto běhů zahrnuje úmyslné třicetisekundové bootové měření klidu a není měřením limitu studeného startu vydání.
 
-Přejímka ve VirtualBoxu zůstává neprovedená. Aktuální `scripts/accept-stage3.ps1` sestaví nový obraz a provede 13 profilů s rozšířeným bootovým scénářem. Výsledné COM1 logy pro 1/2 CPU lze samostatně ověřit přes `python scripts/verify-demand-paging.py --log CESTA_K_COM1_LOG --cpus 1` nebo `2`; celý souhrn dál vyžaduje čistý odpovídající Git checkout. Část B níže rozšiřuje implementaci; úspěch samostatných testů části A nepotvrzuje nové CPU migrace.
+Přejímka ve VirtualBoxu zůstává neprovedená. Aktuální `scripts/accept-stage3.ps1` sestaví nový obraz a provede 13 profilů s rozšířeným bootovým scénářem. Výsledné COM1 logy pro 1/2 CPU lze samostatně ověřit přes `python scripts/verify-demand-paging.py --log CESTA_K_COM1_LOG --cpus 1` nebo `2`; celý souhrn dál vyžaduje čistý odpovídající Git checkout. Společné výsledky A+B jsou v následující části; výše uvedená historická čísla platí pro revizi `9f4dde5`.
 
 #### B. Řízená migrace a vyvažování SMP
 
@@ -216,11 +216,11 @@ Monotónní čas a platné lhůty nesmějí při migraci změnit význam. Nahrad
 
 ##### Ověření a předání části B
 
-Pracovní revize [`8ca96f8613071cebea706edf7f3db364661f5294`](https://github.com/filipbcz/AgentOS/commit/8ca96f8613071cebea706edf7f3db364661f5294) prošla [host CI](https://github.com/filipbcz/AgentOS/actions/runs/44959769108). Její [QEMU běh](https://github.com/filipbcz/AgentOS/actions/runs/44959769276) prošel na 1 CPU a v bootovém scénáři na 2 CPU; dvouprocesorová interaktivní relace odhalila závod při shutdownu popsaný níže. **Aktuální opravy asynchronního ukončení a rozšířená guest regrese čekají na nový společný CI/QEMU běh.** Uvedené host počty patří revizi `8ca96f8`, nikoli automaticky pozdějším změnám. Její CI testovalo čistý merge checkout `4c404a2928cd9b061cfa94ebd3d8a57d7c711002` se shodným stromem `808aac1c27b1bc45915911d706e5537277a38130`. Toolchain: Rust 1.75.0, GCC 13.3.0 a připnutý `scripts/toolchain.lock`.
+Ověřená funkční revize je [`2023723cc59bc0b7fd496d45f2acece21cb8e021`](https://github.com/filipbcz/AgentOS/commit/2023723cc59bc0b7fd496d45f2acece21cb8e021). [Host CI](https://github.com/filipbcz/AgentOS/actions/runs/44960642362) a oba joby [QEMU CI](https://github.com/filipbcz/AgentOS/actions/runs/44960642316) skončily `success`. CI testovalo čistý merge checkout `1248c90f6094e052b7fd367768db46fc9d7e3f3a`; jeho strom `c0798a8d628cd4e2a5fc616edc9f4700949d7c7b` je shodný se stromem funkční revize. Následný zápis výsledků mění pouze README a tento plán. Toolchain: Rust 1.75.0, GCC 13.3.0 a připnutý `scripts/toolchain.lock`.
 
-| Host kontrola revize `8ca96f8` | Výsledek |
+| Kontrola finální revize `2023723` | Výsledek |
 |---|---|
-| Python ověřovače a harness entrypointy | 165 testů v 19 sadách prošlo |
+| Python ověřovače a harness entrypointy | 167 testů v 19 sadách prošlo |
 | Rust host sady nad skutečným kódem | 218 spuštění v 17 sadách prošlo; sdílené moduly se v některých sadách opakují |
 | Scheduler a časovací politika | 22 scheduler testů a 13 timer testů prošlo |
 | Společný registr životního cyklu | 7 testů prošlo |
@@ -229,18 +229,44 @@ Pracovní revize [`8ca96f8613071cebea706edf7f3db364661f5294`](https://github.com
 | Nativní uživatelské programy | Všech 12 ELF se sestavilo a prošlo kontrolou ABI v2 |
 | Kernel a návraty z přerušení | Link prošel; W^X 27 RX / 3 RO+NX / 2 RW+NX stránek; GS návrat 41 instrukcí a přepnutí stacku s retirement callbackem 23 instrukcí |
 | PowerShell harnessy | Parsování prošlo |
+| OVMF Secure Boot / QEMU TCG, 256 MiB, 1 a 2 CPU | Běžný boot i interaktivní UART+PS/2/GOP relace prošly na obou konfiguracích |
+| Ukončení živého potomka a wait | Na 1 CPU ověřena místní větev; na 2 CPU prokázán jiný vlastník CPU, skutečný status 137 a nezměněný čítač migrací během ukončení |
+| Závěrečný úklid | V obou interaktivních relacích původní PID 1 skončil se stavem 0 a přesným návratem bitmapy `FRAMES=OK` |
 
 Host sady prověřují skutečný scheduler/lifecycle, zákaz přesunu právě používaného stacku, plný cíl, přesuny tam a zpět, vzdálený kill/collect/adopci a návrat rámců. Skutečné fd/pipe/IPC a TTY se testují také v souběžných host vláknech. Samostatné sady ověřují HPET a ACPI. Kontrola linkovaného assembleru požaduje potvrzení přepnutí až po změně RSP a před obnovením registrů; mutace nesprávného pořadí, cíle volání a návratových instrukcí musí selhat. Kompilátor stále vydává varování. Lokálně byly provedeny Python kontroly a sestavení uživatelských ELF s GCC 14.2; výsledky Rust/kernel/QEMU pocházejí z uvedených skutečných běhů GitHub CI.
 
 `user/migration.c` běží po obnovení původního PID 1 a před službami, vytváří čtyři potomky a nerovnoměrnou runnable zátěž. Na 2 CPU vyžaduje skutečné opakovaně pozorované změny CPU již běžících PID s růstem provedené práce; na 1 CPU stejné funkční operace proběhnou bez migrace. Dále ověřuje lazy/COW obsah, sdílený file offset, data roury, autentizované IPC, lhůty vytvořené před přesunem a skutečný exit/reaping. `verify-migration.py` vyžaduje úplný interval, konkrétní procesní identity a odpovídající exit události. Nové sériové QEMU/VBox běhy jej vyžadují; původní procesové, demand a service testy zůstávají povinné.
 
+Ze stažených COM1 logů a skutečného vstupu byly nezávisle zopakovány boot/process/supervisor/orphan/COW/demand/migration/service verifiery a u obou relací i úplný interaktivní scénář. Všechny čtyři `smoke.json` obsahují `pass`; oba PS/2 důkazy kontrolují skutečné nové glyphy odpovědi a zachovaný boot header na GOP 1280 × 800.
+
+| Konfigurace a režim | Pozorované změny CPU dětí (z toho původní zátěž) | Migrace celkem v intervalu | Vzdálené IPI notifikace | Kill: CPU rodiče → vlastníka |
+|---|---:|---:|---:|---|
+| 1 CPU, Běžný boot | 0 (0) | 0 | 0 | 0 → 0 |
+| 1 CPU, UART + PS/2 relace | 0 (0) | 0 | 0 | 0 → 0 |
+| 2 CPU, Běžný boot | 12 (11) | 23 | 209 | 0 → 1 |
+| 2 CPU, UART + PS/2 relace | 9 (9) | 21 | 197 | 0 → 1 |
+
+Globální počet zahrnuje také přesuny rodiče a přesuny mezi dvěma pozorováními; není totožný s počtem uživatelských `MOVED` záznamů. V každém běhu se ukončoval právě jeden živý potomek a skutečný `wait` vrátil 137 za 1 ms. Na 2 CPU šlo o PID 33, rodiče na CPU 0 a vlastníka na CPU 1; globální čítač zůstal během kill/collect přesně 22 → 22 v běžném bootu a 20 → 20 v interaktivní relaci. Všechny ostatní děti skončily stavem 0 a byly převzaty. Na 1 CPU byl stejný scénář místní, bez jakékoli migrace nebo vzdálené IPI.
+
+Provozní klid v interaktivní relaci naměřil **5 000 ms / 6 timer IRQ / všech 6 idle IRQ** na 1 CPU a **5 001 ms / 11 timer IRQ / všech 11 idle IRQ** na 2 CPU. V obou případech následoval skutečný PID 1 exit 0 a `FRAMES=OK`. Rozšířený init má v demand scénáři 4 124 rezervovaných stránek, rezidentní data 8 → 12, soukromé tabulky 6 → 9 a jednu metadata stránku. Tyto počty byly stejné na každém testovaném CPU ve všech čtyřech bootech; historická tabulka části A popisuje menší dřívější obraz. Bootové běhy obsahují úmyslné třicetisekundové měření klidu a neměří limit studeného startu vydání.
+
+Artefakty [1 CPU](https://github.com/filipbcz/AgentOS/actions/runs/44960642316/artifacts/14729062318) a [2 CPU](https://github.com/filipbcz/AgentOS/actions/runs/44960642316/artifacts/14729247026) obsahují COM1 logy, vstup relace, GOP/PS/2 snímky, receipts, build provenance, podepsané i nepodepsané EFI, kernel ELF a initramfs. U obou je ověřeno `source_clean: true` a výše uvedený merge checkout. Stažené soubory i odkazy v receipts prošly porovnáním SHA-256; nezávislé joby vytvořily shodné nepodepsané EFI, kernel a initramfs. Podepsané EFI se liší, protože každý job používá vlastní testovací klíč.
+
+| Obraz / součást | SHA-256 |
+|---|---|
+| `agentos.unsigned.efi`, oba joby | `c95530c8e2a15cba6476f0610021ed5886f8320f619d1683985ebda3a583c8ae` |
+| `kernel.elf`, oba joby | `9078e1d99795d4486b9cac62e0290cc5d7d0281a22f4164a18f46dfb13e9eeac` |
+| `initramfs.cpio`, oba joby | `4994ff3442e41ff98b9c054c93cb3a2eb1cf98c6e8ed50117e19ee79d99af733` |
+| Podepsané `agentos.efi`, 1 CPU | `d8e3f5696ab3fc2984f4b08a237f4f3781f1ebe79e5ba2bd83513805576451ef` |
+| Podepsané `agentos.efi`, 2 CPU | `7372d8066854253e95e58c6c72dc9afc8525c5c62c713d1663f6b35790daadc7` |
+
 První kandidát `a71689b` prošel [host kontrolami](https://github.com/filipbcz/AgentOS/actions/runs/44959340602). Jeho [QEMU běh](https://github.com/filipbcz/AgentOS/actions/runs/44959340593) dokončil migrace a čisté ukončení na obou konfiguracích, ale dvouprocesorovou interaktivní relaci odmítl ověřovač klidu: za 5 001 ms naměřil 11 timer IRQ, všech 11 při čekání, proti původnímu limitu pro jediný CPU. Příčinou byl neaktualizovaný test po přechodu na globální čítače ABI v2. Oprava `8ca96f8` zachovává původní rozpočet jednoho watchdogu za sekundu na CPU a čtyři hraniční IRQ celkem: `ceil(ms / 1000) × počet_CPU + 4`; zároveň stále požaduje `TIMERS − IDLE ≤ 2`. Počet CPU musí odpovídat konfiguraci i úplnému ověřenému migračnímu scénáři. Historické logy bez tohoto scénáře nadále mají limit pro jeden CPU. Regrese odmítají chybný či podvržený počet CPU, neúplný důkaz a návrat rychlého periodického ticku. Původní neúspěšný CI výsledek ani jeho artefakty se nepřepisují.
 
-Druhý běh `8ca96f8` odkryl skutečný závod: původní správce služeb po vzdáleném `kill` okamžitě volal `try_wait`, výsledek −11 považoval za chybu a skončil se stavem 81. Nativní ABI v2 nyní výslovně rozlišuje přijetí stop požadavku od publikace konečného statusu. `service_manager.c`, `supervisor.c` i `orphans.c` potvrzují dokončení blokujícím `wait_child_until` s novou kontrolovanou lhůtou (správce 5 s, bootové konzumenty 1 s); při selhání se úklid neoznačí za úspěšný. Správce zachovává PID/fd do reapu, rozlišuje normální exit shellu od EOF živého procesu a navazující readiness/backoff počítá od čerstvého času. Deterministické C regrese nejprve reprodukovaly odložené potvrzení vlastníka i závod `try_wait` → exit 0 → EOF a po opravě prošly; pokrývají také timeout, selhání hodin, přetečení a přirozený exit během kill.
+Druhý běh `8ca96f8` odkryl skutečný závod: původní správce služeb po vzdáleném `kill` okamžitě volal `try_wait`, výsledek −11 považoval za chybu a skončil se stavem 81. Nativní ABI v2 nyní výslovně rozlišuje přijetí stop požadavku od publikace konečného statusu. `service_manager.c`, `supervisor.c` i `orphans.c` potvrzují dokončení blokujícím `wait_child_until` s novou kontrolovanou lhůtou (správce 5 s, bootové testy 1 s); při selhání se úklid neoznačí za úspěšný. Správce zachovává PID/fd do reapu, rozlišuje normální exit shellu od EOF živého procesu a navazující readiness/backoff počítá od čerstvého času. Deterministické C regrese nejprve reprodukovaly odložené potvrzení vlastníka i závod `try_wait` → exit 0 → EOF a po opravě prošly; pokrývají také timeout, selhání hodin, přetečení a přirozený exit během kill.
 
 Rozšířený migrační scénář po původní zátěži vybere živého potomka pro `kill` a vyžaduje skutečný `wait` se stavem 137. Na 2 CPU prokazuje vzdáleného vlastníka čerstvým autentizovaným ARM reportem CPU a globálního čítače migrací; čítač musí zůstat stejný až po dokončení `wait`. Kernel započte přesun ještě pod oběma frontovými zámky, takže nový vlastník nemůže vykonat úlohu před zveřejněním čítače. Ostatní tři potomci končí běžným exit 0. Nová regrese nevyužívá testovací syscalls ani afinitu a nenahrazuje původní důkaz migrace již běžících úloh.
 
-VirtualBox a fyzické HP zůstávají neprovedené. Přejímka celého milníku 3.1 vyžaduje následující společná kritéria; testy vyčerpání paměti demand procesem v guestu se stále nesmějí zaměnit za již provedené host OOM kontroly.
+VirtualBox a fyzické HP zůstávají neprovedené. Přejímka celého milníku 3.1 vyžaduje následující společná kritéria; testy vyčerpání paměti demand procesem v guestu se stále nesmějí zaměnit za již provedené host OOM kontroly. Další implementační oblastí je etapa 4: PCI/PCIe, DMA a blokové rozhraní. Její vývoj může pokračovat během odložené hardwarové přejímky, ale otevřené testy 3.1 zůstávají podmínkou převzetí celého milníku.
 
 #### Převzetí milníku 3.1
 

@@ -37,7 +37,7 @@ Skript nejprve provede hostitelské kontroly a sestaví podepsaný obraz. Potom 
 
 | Profil | CPU | Obsah |
 |---|---|---|
-| Podepsaný obraz, `info both` | 1 a 2 | Boot, izolace, COW, IPC, PID 1, guardy, základní klid a GOP |
+| Podepsaný obraz, `info both` | 1 a 2 | Boot, demand/COW, migrace, IPC, PID 1, guardy, základní klid a GOP |
 | Sériová relace, `debug serial` | 1 a 2 | Příkazy, správní IPC, restarty, provozní klid, čisté ukončení |
 | Smíšená COM1/PS/2 relace, `info serial` | 1 a 2 | Totéž, navíc skutečná virtuální klávesnice a nově vykreslená odpověď |
 | Podepsaný obraz, `quiet none` | 1 a 2 | Potlačení strukturovaných výpisů při funkčním systému |
@@ -85,7 +85,7 @@ Události IPC, rour, uzavření fd a ukončení procesu vyvolají IPI; cílový 
 
 Procesové lhůty používají jediný **64bit HPET** se společnou boot epochou. HPET komparátory a legacy IRQ jsou vypnuté; plánování nadále používá jednorázový LAPIC. VirtualBox harness nastavuje `--x86-hpet on`, QEMU `hpet=on`. Nepřítomný nebo neplatný 64bit HPET zastaví boot s konkrétní chybou; dostupnost na fyzickém HP musí potvrdit jeho přejímka. Původní TSC měření bootového klidu zůstává oddělené.
 
-Přesný stav ověření je v [plánu](PLAN_IMPLEMENTACE.md#31-demand-paging-a-vyvažování-smp). Část A byla samostatně ověřena na revizi `9f4dde5`; nové CPU migrace, ABI a hodiny vyžadují vlastní společný CI/QEMU běh. VirtualBox ani fyzické HP pro tuto verzi zatím otestované nejsou.
+Části **3.1 A i B** mají společné úspěšné host a QEMU důkazy pro funkční revizi [`2023723`](https://github.com/filipbcz/AgentOS/commit/2023723cc59bc0b7fd496d45f2acece21cb8e021): 167 Python testů, 218 spuštění Rust testů, čtyři C harnessy a skutečný boot i interaktivní relace na 1/2 CPU. Zahrnut je prokázaný vzdálený `kill`/`wait` a čistý shutdown s přesným návratem rámců. Revize a měřené hodnoty jsou v [plánu](PLAN_IMPLEMENTACE.md#31-demand-paging-a-vyvažování-smp). VirtualBox, fyzické HP a samostatná guest zkouška OOM při demand pagingu zůstávají otevřené; host testy již ověřují řízené OOM a rollback.
 
 ## Uživatelské procesy a nativní ABI v2
 
