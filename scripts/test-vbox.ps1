@@ -353,6 +353,8 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "Orphan reparenting verification failed: $dir" }
         & python "$PSScriptRoot/verify-cow.py" --log "$dir\com1.log" --cpus $Cpus
         if ($LASTEXITCODE -ne 0) { throw "Fork/COW page isolation failed: $dir" }
+        & python "$PSScriptRoot/verify-service-manager.py" --log "$dir\com1.log"
+        if ($LASTEXITCODE -ne 0) { throw "Persistent service registry readiness/restart evidence failed: $dir" }
         & "$PSScriptRoot/verify-idle.ps1" -RunDir $dir -ApicIds $ids -HostSeconds $hostIdleSeconds
         if ($Shell) {
             Wait-Serial $serial 'AGENTOS SHELL READY\r\nagentos> $'
@@ -370,7 +372,7 @@ try {
                 Verify-ShellScreen "$dir\shell-before.png" "$dir\shell-keyboard.png"
                 $offset=$serial.Text.Length
                 Send-Keyboard 'exit'
-                Wait-Serial $serial '(?m)^AGENTOS SHELL STOP PID=[0-9a-f]{16} STATUS=0000000000000000 FRAMES=OK\r\n' $offset
+                Wait-Serial $serial '(?m)^AGENTOS MANAGER SESSION STOP PID=[0-9a-f]{16} STATUS=0000000000000000 FRAMES=OK\r\n' $offset
             } else {
                 $commands=@('help','pid',("echo shell-ox"+[char]8+'k'),'cat /stage','cat /missing','no-such-command')
                 foreach ($command in $commands) {
@@ -380,7 +382,7 @@ try {
                 }
                 $offset=$serial.Text.Length
                 Send-Serial $serial 'exit'
-                Wait-Serial $serial '(?m)^AGENTOS SHELL STOP PID=[0-9a-f]{16} STATUS=[0-9a-f]{16} FRAMES=OK\r\n' $offset
+                Wait-Serial $serial '(?m)^AGENTOS MANAGER SESSION STOP PID=[0-9a-f]{16} STATUS=[0-9a-f]{16} FRAMES=OK\r\n' $offset
                 & python "$PSScriptRoot/verify-shell.py" --log "$dir\com1.log" --input "$dir\com1-input.bin"
                 if ($LASTEXITCODE -ne 0) { throw "Shell verification failed: $dir" }
             }
