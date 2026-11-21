@@ -44,7 +44,9 @@ function Wait-Serial($State,[string]$Pattern,[int]$Offset=0,[int]$Seconds=10) {
     do {
         Receive-Serial $State
         $text=$State.Text.ToString($Offset,$State.Text.Length-$Offset)
-        if ([regex]::IsMatch($text,$Pattern)) { return }
+        $clean=$text
+        if ($null -ne $sessionPlan) { $clean=[regex]::Replace($text,$sessionPlan.kernel_event_pattern,'') }
+        if ([regex]::IsMatch($clean,$Pattern)) { return }
         if ($text -match 'SMP FAILED|FATAL VECTOR|SHELL FAILED') { throw 'Guest failed during shell test' }
         Start-Sleep -Milliseconds 25
     } while ($wait.Elapsed.TotalSeconds -lt $Seconds)
@@ -58,155 +60,39 @@ function Send-Serial($State,[string]$Command) {
         $State.Input.WriteByte($byte)
         $State.Input.Flush()
         Receive-Serial $State
-        Start-Sleep -Milliseconds 10
+        Start-Sleep -Milliseconds 2
     }
 }
-# Exercise the actual PS/2 path rather than writing through the COM1 socket.
-function Send-Keyboard([string]$Command,[string]$Correction='') {
-    if ($Command -notmatch '^[ -~]+$' -or
-        ($Correction -ne '' -and $Correction -notmatch '^[ -~]$')) {
-        throw 'PS/2 injection accepts only printable US ASCII'
-    }
-    # The emulated PS/2 output buffer is bounded. Pace make/break pairs so
-    # this tests the keyboard IRQ path, not a host-generated input flood.
+# Exercise the real PS/2 controller; VBox's API accepts PC/XT Set 1, then
+# the device translates it to the scan set configured by the guest.
+function Send-Keyboard([string]$Command) {
+    if ($Command -notmatch '^[\x08 -~]+$') { throw 'PS/2 injection requires US ASCII or Backspace' }
     foreach ($key in $Command.ToCharArray()) {
-        VBox controlvm $vm keyboardputstring ([string]$key)
+        if ([int]$key -eq 8) { VBox controlvm $vm keyboardputscancode 0e 8e }
+        else { VBox controlvm $vm keyboardputstring ([string]$key) }
         Start-Sleep -Milliseconds 15
     }
-    if ($Correction -ne '') {
-        # Set 2 backspace make/break; test canonical editing through IRQ1.
-        VBox controlvm $vm keyboardputscancode 66 f0 66
-        Start-Sleep -Milliseconds 15
-        VBox controlvm $vm keyboardputstring $Correction
-        Start-Sleep -Milliseconds 15
-    }
-    # Set 2 Enter make/break, consistent with the 8042 translation to set 1.
-    VBox controlvm $vm keyboardputscancode 5a f0 5a
+    VBox controlvm $vm keyboardputscancode 1c 9c
 }
-
-# Boot marker drawing is mandatory even when BOOT.LOG disables the screen
-# sink. In that case the firmware background is intentionally preserved, so
-# test white glyph pixels without assuming a black surrounding framebuffer.
-function Verify-RawBootMarker([string]$Path) {
-    Add-Type -AssemblyName System.Drawing
-    $bitmap=[Drawing.Bitmap]::new((Resolve-Path $Path).Path)
-    try {
-        $scale=[Math]::Max(1,[Math]::Min(4,[Math]::Floor(($bitmap.Width-16)/150)))
-        if ($bitmap.Width -lt 16+12*$scale -or $bitmap.Height -lt 16+7*$scale) {
-            throw "Framebuffer too small for the raw boot glyphs: $Path"
-        }
-        $letters=@('14,17,17,31,17,17,17','14,17,16,23,17,17,14')
-        for ($letter=0;$letter -lt 2;$letter++) {
-            $rows=$letters[$letter].Split(',')
-            for ($y=0;$y -lt 7;$y++) {
-                for ($x=0;$x -lt 5;$x++) {
-                    if (([int]$rows[$y] -band (16 -shr $x)) -eq 0) { continue }
-                    $pixel=$bitmap.GetPixel(8+($letter*6+$x)*$scale,16+$y*$scale)
-                    if ($pixel.R -lt 200 -or $pixel.G -lt 200 -or $pixel.B -lt 200) {
-                        throw "Raw boot glyph pixel missing at ($letter,$x,$y): $Path"
-                    }
-                }
-            }
-        }
-    } finally { $bitmap.Dispose() }
+function Verify-Console([string]$Path,[string]$Before='') {
+    $imageArgs=@('--after',$Path,'--level',$LogLevel,'--output',$LogOutput)
+    if ($Before) { $imageArgs+=@('--before',$Before,'--response','ps2-ok') }
+    & python "$PSScriptRoot/verify-console-image.py" @imageArgs
+    if ($LASTEXITCODE -ne 0) { throw "Actual GOP glyph verification failed: $Path" }
 }
-# The first structured BOOT.LOG event starts with '[' at (8,52) when
-# framebuffer output is enabled at severity info/debug. Verify its actual
-# 5x7 raster, not just that a screenshot file was created.
-function Verify-StructuredBootScreen([string]$Path) {
-    Add-Type -AssemblyName System.Drawing
-    $bitmap=[Drawing.Bitmap]::new((Resolve-Path $Path).Path)
-    try {
-        $scale=[Math]::Max(1,[Math]::Min(2,[Math]::Floor(($bitmap.Width-16)/240)))
-        if ($bitmap.Width -lt 40 -or $bitmap.Height -lt 52+7*$scale) {
-            throw "Framebuffer too small to inspect structured BOOT.LOG: $Path"
-        }
-        $rows=@(14,8,8,8,8,8,14)
-        for ($y=0;$y -lt 7;$y++) {
-            for ($x=0;$x -lt 5;$x++) {
-                $expected=($rows[$y] -band (16 -shr $x)) -ne 0
-                $pixel=$bitmap.GetPixel(8+$x*$scale,52+$y*$scale)
-                $actual=$pixel.R -gt 200 -and $pixel.G -gt 200 -and $pixel.B -gt 200
-                if ($actual -ne $expected) {
-                    throw "Framebuffer BOOT.LOG glyph mismatch at ($x,$y): $Path"
-                }
-            }
-        }
-    } finally { $bitmap.Dispose() }
+function Wait-WorkerExits($State,[int]$Offset,[int]$Count) {
+    $wait=[Diagnostics.Stopwatch]::StartNew()
+    do {
+        Receive-Serial $State
+        $text=$State.Text.ToString($Offset,$State.Text.Length-$Offset)
+        $exits=[regex]::Matches($text,$sessionPlan.worker_exit_pattern)
+        if ($exits.Count -ge $Count) { return }
+        if ($text -match 'SMP FAILED|FATAL VECTOR|SHELL FAILED') { throw 'Guest failed during restart' }
+        Start-Sleep -Milliseconds 25
+    } while ($wait.Elapsed.TotalSeconds -lt 15)
+    throw 'Service RESTART did not autonomously complete its three bounded attempts'
 }
-# The interactive shell clears the boot logo; check the actual shell prompt
-# instead of demanding that the old stage-1 picture is still on screen.
-function Verify-ShellPrompt([string]$Path) {
-    Add-Type -AssemblyName System.Drawing
-    $bitmap=[Drawing.Bitmap]::new((Resolve-Path $Path).Path)
-    try {
-        if ($bitmap.Width -lt 6 -or $bitmap.Height -lt 9) {
-            throw "Framebuffer too small for shell prompt: $Path"
-        }
-        $rows=@(14,17,17,31,17,17,17)
-        for ($y=0;$y -lt 7;$y++) {
-            for ($x=0;$x -lt 5;$x++) {
-                $expectedWhite=($rows[$y] -band (16 -shr $x)) -ne 0
-                $pixel=$bitmap.GetPixel($x,$y)
-                $actualWhite=$pixel.R -gt 200 -and $pixel.G -gt 200 -and $pixel.B -gt 200
-                if ($expectedWhite -ne $actualWhite) {
-                    throw "Shell prompt framebuffer glyph mismatch at ($x,$y): $Path"
-                }
-            }
-        }
-    } finally { $bitmap.Dispose() }
-}
-# Compare visible pixels and the exact PS/2 shell command response raster.
-function Verify-ShellScreen([string]$Before,[string]$After) {
-    Add-Type -AssemblyName System.Drawing
-    $a=[Drawing.Bitmap]::new((Resolve-Path $Before).Path)
-    $b=[Drawing.Bitmap]::new((Resolve-Path $After).Path)
-    try {
-        if ($a.Width -ne $b.Width -or $a.Height -ne $b.Height) {
-            throw 'Shell screenshots have inconsistent geometry'
-        }
-        $changes=0
-        $limitX=[Math]::Min($a.Width,600)
-        $limitY=[Math]::Min($a.Height,180)
-        for ($y=0;$y -lt $limitY;$y+=2) {
-            for ($x=0;$x -lt $limitX;$x+=2) {
-                if ($a.GetPixel($x,$y).ToArgb() -ne $b.GetPixel($x,$y).ToArgb()) {
-                    $changes++
-                }
-            }
-        }
-        if ($changes -lt 20) { throw "PS/2 command did not change visible GOP text: $After" }
-
-        # Five-bit font rows for 'ps2-ok' at third 6x9 text row.
-        $glyphs=@(
-            '0,30,17,17,30,16,16'
-            '0,0,15,16,14,1,30'
-            '14,17,1,2,4,8,31'
-            '0,0,0,31,0,0,0'
-            '0,0,14,17,17,17,14'
-            '16,16,18,20,24,20,18'
-        )
-        if ($b.Width -lt 36 -or $b.Height -lt 27) {
-            throw "GOP too small to verify response text: $After"
-        }
-        for ($index=0;$index -lt $glyphs.Length;$index++) {
-            $raster=$glyphs[$index].Split(',')
-            for ($row=0;$row -lt 7;$row++) {
-                for ($col=0;$col -lt 5;$col++) {
-                    $expectedWhite=([int]$raster[$row] -band (16 -shr $col)) -ne 0
-                    $pixel=$b.GetPixel($index*6+$col,18+$row)
-                    $actualWhite=$pixel.R -gt 200 -and $pixel.G -gt 200 -and $pixel.B -gt 200
-                    if ($expectedWhite -ne $actualWhite) {
-                        throw "Framebuffer shell glyph mismatch at ($($index*6+$col),$($row+18)): $After"
-                    }
-                }
-            }
-        }
-    } finally {
-        $a.Dispose()
-        $b.Dispose()
-    }
-}
+$sessionPlan=$null
 $tag=[Guid]::NewGuid().ToString('N').Substring(0,10)
 $vm="AgentOS-$Case-$tag"
 $relative="build/runs/$vm"
@@ -292,8 +178,6 @@ try {
         }
         if ($found -and $Case -eq 'signed') {
             $hostIdleSeconds=$timer.Elapsed.TotalSeconds-$idleStart
-            Start-Sleep -Seconds 1
-            Receive-Serial $serial
             break
         }
         if ($found -and $Case -ne 'signed') { throw 'Firmware accepted a modified boot image' }
@@ -302,6 +186,20 @@ try {
     } while (($null -eq $idleStart -and $timer.Elapsed.TotalSeconds -lt 120) -or
              ($null -ne $idleStart -and ($timer.Elapsed.TotalSeconds - $idleStart) -lt 60))
     if ($Case -eq 'signed' -and !$found) { throw "Kernel marker missing: $dir" }
+    if ($Case -eq 'signed') {
+        # The guest always enters its operational TTY. Capture its explicit
+        # readiness state, with a preserved boot header, rather than racing
+        # the old framebuffer clear one second after the raw boot marker.
+        $readyTimer=[Diagnostics.Stopwatch]::StartNew()
+        do {
+            Receive-Serial $serial
+            $readyText=[IO.File]::ReadAllText("$dir\com1.log")
+            if ($readyText -match 'AGENTOS SHELL READY\r\nagentos> ') { break }
+            if ($readyText -match 'SMP FAILED|FATAL VECTOR|SHELL FAILED') { throw 'Guest failed before shell readiness' }
+            Start-Sleep -Milliseconds 25
+        } while ($readyTimer.Elapsed.TotalSeconds -lt 30)
+        if ($readyText -notmatch 'AGENTOS SHELL READY\r\nagentos> ') { throw 'Operational shell did not become ready' }
+    }
     VBox controlvm $vm screenshotpng "$dir\display.png"
     if ($Case -eq 'signed') {
         $tasks = @(Select-String -LiteralPath "$dir\com1.log" -Pattern '^AGENTOS TASK (BSP|AP) APIC=([0-9a-f]{16}) TIMER-WAKES=0000000000000003$')
@@ -333,16 +231,9 @@ try {
         if (!(Select-String -LiteralPath "$dir\com1.log" -SimpleMatch 'AGENTOS PHYSICAL FRAMES OK' -Quiet)) {
             throw "Physical frame probe missing: $dir"
         }
-        # The stage-1 boot logo is overwritten when GOP is handed to TTY.
-        if (!$Shell) {
-            if ($LogOutput -in @('screen','both')) {
-                & "$PSScriptRoot/verify-display.ps1" "$dir\display.png"
-            } else {
-                Verify-RawBootMarker "$dir\display.png"
-            }
-            if ($LogLevel -in @('info','debug') -and $LogOutput -in @('screen','both')) {
-                Verify-StructuredBootScreen "$dir\display.png"
-            }
+        Verify-Console "$dir\display.png"
+        if (!(Select-String -LiteralPath "$dir\com1.log" -SimpleMatch 'AGENTOS KERNEL STACK GUARD OK' -Quiet)) {
+            throw "Kernel stack guard fault probes missing: $dir"
         }
         & python "$PSScriptRoot/verify-boot-log.py" --log "$dir\com1.log" --level $LogLevel --output $LogOutput
         if ($LASTEXITCODE -ne 0) { throw "BOOT.LOG sink/severity verification failed: $dir" }
@@ -357,35 +248,35 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "Persistent service registry readiness/restart evidence failed: $dir" }
         & "$PSScriptRoot/verify-idle.ps1" -RunDir $dir -ApicIds $ids -HostSeconds $hostIdleSeconds
         if ($Shell) {
-            Wait-Serial $serial 'AGENTOS SHELL READY\r\nagentos> $'
-            Start-Sleep -Milliseconds 150
+            $match=[regex]::Match($serial.Text.ToString(),'(?m)^AGENTOS SHELL START PID=([0-9a-f]{16})\r\n')
+            if (!$match.Success) { throw 'Managed shell identity missing' }
+            $shellPid=[Convert]::ToUInt64($match.Groups[1].Value,16)
+            $planArgs=@('--plan-pid',[string]$shellPid)
+            if ($Keyboard) { $planArgs+='--keyboard' }
+            $planJson=& python "$PSScriptRoot/verify-stage3-session.py" @planArgs
+            if ($LASTEXITCODE -ne 0) { throw 'Could not load the shared stage-3 input plan' }
+            $sessionPlan=$planJson | ConvertFrom-Json
             VBox controlvm $vm screenshotpng "$dir\shell-before.png"
-            Verify-ShellPrompt "$dir\shell-before.png"
-            if ($Keyboard) {
-                # PS/2 keyboard and COM1 have independent input sources.
-                # Keep the strict serial-only verifier unchanged.
+            Verify-Console "$dir\shell-before.png"
+            foreach ($step in $sessionPlan.steps) {
+                if ($step.screenshot) { VBox controlvm $vm screenshotpng "$dir\shell-before.png" }
                 $offset=$serial.Text.Length
-                Send-Keyboard 'echo ps2-ox' 'k'
-                Wait-Serial $serial '(?m)^ps2-ok\r\nagentos> $' $offset
-                Start-Sleep -Milliseconds 150
-                VBox controlvm $vm screenshotpng "$dir\shell-keyboard.png"
-                Verify-ShellScreen "$dir\shell-before.png" "$dir\shell-keyboard.png"
-                $offset=$serial.Text.Length
-                Send-Keyboard 'exit'
-                Wait-Serial $serial '(?m)^AGENTOS MANAGER SESSION STOP PID=[0-9a-f]{16} STATUS=0000000000000000 FRAMES=OK\r\n' $offset
-            } else {
-                $commands=@('help','pid',("echo shell-ox"+[char]8+'k'),'cat /stage','cat /missing','no-such-command')
-                foreach ($command in $commands) {
-                    $offset=$serial.Text.Length
-                    Send-Serial $serial $command
-                    Wait-Serial $serial 'agentos> $' $offset
+                if ($step.transport -eq 'keyboard') { Send-Keyboard $step.command }
+                else { Send-Serial $serial $step.command }
+                Wait-Serial $serial $step.pattern $offset 20
+                if ($step.wait_exits -gt 0) { Wait-WorkerExits $serial $offset $step.wait_exits }
+                if ($step.screenshot) {
+                    VBox controlvm $vm screenshotpng "$dir\shell-keyboard.png"
+                    Verify-Console "$dir\shell-keyboard.png" "$dir\shell-before.png"
                 }
-                $offset=$serial.Text.Length
-                Send-Serial $serial 'exit'
-                Wait-Serial $serial '(?m)^AGENTOS MANAGER SESSION STOP PID=[0-9a-f]{16} STATUS=[0-9a-f]{16} FRAMES=OK\r\n' $offset
-                & python "$PSScriptRoot/verify-shell.py" --log "$dir\com1.log" --input "$dir\com1-input.bin"
-                if ($LASTEXITCODE -ne 0) { throw "Shell verification failed: $dir" }
             }
+            Wait-Serial $serial $sessionPlan.stop_pattern 0 15
+            $verifyArgs=@('--log',"$dir\com1.log",'--input',"$dir\com1-input.bin")
+            if ($Keyboard) { $verifyArgs+='--keyboard' }
+            & python "$PSScriptRoot/verify-stage3-session.py" @verifyArgs
+            if ($LASTEXITCODE -ne 0) { throw "Stage-3 interactive verification failed: $dir" }
+            & python "$PSScriptRoot/verify-boot-log.py" --log "$dir\com1.log" --level $LogLevel --output $LogOutput
+            if ($LASTEXITCODE -ne 0) { throw 'BOOT.LOG policy violated during interactive session' }
         }
     } elseif (!(Select-String -LiteralPath "$dir\com1.log" -Pattern 'BdsDxe: failed to load .*HARDDISK.*(Access Denied|Security Violation)' -Quiet)) {
         throw "Missing firmware rejection; timeout is inconclusive: $dir"

@@ -23,10 +23,30 @@ static unsigned gReadChunk, gWriteChunk;
 static const char *gMode, *gFilePath;
 static FILE *gFile;
 static unsigned gOpens, gCloses, gInputCalls, gWriteCalls;
+static unsigned gStatsCalls;
+static unsigned long gClockMs=1000;
 
 static int modeIs(const char *aMode) { return strcmp(gMode, aMode) == 0; }
 static long mockCall(long aOp, long aFirst, long aSecond, long aThird) {
     if (aOp == SYS_GETPID) return modeIs("pid-error") ? -5 : 4242;
+    if (aOp == SYS_TIMER_STATS) {
+        if (!aFirst || aSecond!=32 || aThird) abort();
+        if (modeIs("idle-stats-error")) return -14;
+        unsigned long *pSample=(unsigned long *)aFirst;
+        pSample[0]=modeIs("idle-version-error")?2:1;
+        pSample[1]=modeIs("idle-overflow")?0x7fffffffffffffffUL-4999:gClockMs;
+        pSample[2]=100+gStatsCalls*5;
+        pSample[3]=20+gStatsCalls*5;
+        if (modeIs("idle-counter-error") && gStatsCalls) pSample[2]=99;
+        gStatsCalls++;
+        return 0;
+    }
+    if (aOp == SYS_SLEEP_UNTIL) {
+        if (aFirst!=(long)gClockMs+5000 || aSecond || aThird) abort();
+        if (modeIs("idle-wait-error")) return -5;
+        gClockMs=modeIs("idle-early-wake")?gClockMs+4999:(unsigned long)aFirst;
+        return 0;
+    }
     if (aOp == SYS_WRITE && aFirst == 1) {
         gWriteCalls++;
         if (modeIs("write-zero") || (modeIs("cat-write-zero") && gFile)) return 0;

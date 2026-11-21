@@ -28,17 +28,30 @@ static int spoof_control, spoof_control_sent, shell_disconnect;
 static long core_crash_at;
 static unsigned core_crashes;
 static long kill_order[MAX_CHILDREN];
+struct control {
+    unsigned operation, service;
+    long at;
+    int sent, answered;
+    unsigned result, state, attempts;
+    long answered_at;
+};
+static struct control controls[8];
+static unsigned control_count;
+static long shell_exit_at, response_failure;
+static int oversized_control;
 
 static void reset(void) {
     memset(workers,0,sizeof(workers));
     memset(openfds,0,sizeof(openfds));memset(fdchannel,0,sizeof(fdchannel));
     memset(log_text,0,sizeof(log_text));memset(times,0,sizeof(times));
     memset(kill_order,0,sizeof(kill_order));
+    memset(controls,0,sizeof(controls));
     count=channel_count=sleeps=total_exits=total_kills=chars=0;
     ticks=0;next_pid=101;
     failure_mode=clock_failure_at=spoof_ready=never_ready=0;
     spoof_control=spoof_control_sent=shell_disconnect=0;
     core_crash_at=0;core_crashes=0;
+    control_count=0;response_failure=0;oversized_control=0;shell_exit_at=1000;
     owner_pid=0;shell_active=shutdown_requested=fatal_error=online_announced=0;
     registry[SVC_CORE]=(struct record){
         "core","svc_alive",4,9,SVC_COUNT,1,SVC_DOWN,0,MAX_ATTEMPTS,0,
@@ -58,6 +71,15 @@ static struct worker *from_channel(unsigned channel) {
     for(unsigned i=0;i<count;i++) if((unsigned)workers[i].channel==channel && !workers[i].reaped)
         return &workers[i];
     return NULL;
+}
+static struct control *next_control(void) {
+    for (unsigned i=0;i<control_count;i++)
+        if (!controls[i].answered) return &controls[i];
+    return NULL;
+}
+static void add_control(unsigned operation,unsigned service,long at) {
+    assert(control_count<8);
+    controls[control_count++]=(struct control){operation,service,at,0,0,0,0,0,0};
 }
 static long mock_call(long op,long a,long b,long c) {
     switch(op) {
@@ -87,36 +109,47 @@ static long mock_call(long op,long a,long b,long c) {
             if(a>=3 && a<32) {openfds[a]=0;fdchannel[a]=0;}
             return 0;
         case SYS_SPAWN: {
-            if(failure_mode) return -12;
             assert(count<MAX_CHILDREN && openfds[SVC_CHANNEL_FD]);
             int kind=-1;
             if(b==9 && !memcmp((const void *)a,"svc_alive",9))kind=SVC_CORE;
             if(b==9 && !memcmp((const void *)a,"svc_flaky",9))kind=SVC_FLAKY;
             if(b==5 && !memcmp((const void *)a,"shell",5))kind=SVC_SHELL;
             assert(kind>=0);
+            if(failure_mode==1 || (failure_mode==2 && kind==SVC_FLAKY)) return -12;
             if(kind==SVC_FLAKY) {
                 assert(registry[SVC_CORE].state==SVC_RUNNING);
-                if(registry[SVC_FLAKY].attempts>0) {
-                    long previous=times[registry[SVC_FLAKY].attempts-1];
-                    long required=RESTART_BASE_MS<<(registry[SVC_FLAKY].attempts-1);
+                unsigned attempt=registry[SVC_FLAKY].attempts-1;
+                assert(attempt<3);
+                if(attempt>0) {
+                    long previous=times[attempt-1];
+                    long required=RESTART_BASE_MS<<(attempt-1);
                     assert(ticks-previous>=required);
                 }
-                times[registry[SVC_FLAKY].attempts]=ticks;
+                times[attempt]=ticks;
             }
             if(kind==SVC_SHELL)
-                assert(registry[SVC_FLAKY].state==SVC_FAILED &&
-                       registry[SVC_CORE].state==SVC_RUNNING);
+                assert(registry[SVC_CORE].state==SVC_RUNNING);
             struct worker *w=&workers[count++];
             *w=(struct worker){next_pid++,ticks,kind,(int)fdchannel[SVC_CHANNEL_FD],0,0,0,0};
             return w->pid;
         }
         case SYS_IPC_TRY_RECV: {
-            assert(a>=3 && a<32 && openfds[a] && b && c==sizeof(struct svc_request));
+            assert(a>=3 && a<32 && openfds[a] && b && c==IPC_MAX_MESSAGE);
             struct worker *w=from_channel(fdchannel[a]);
             if(!w)return -11;
             if(w->ack && w->kind==SVC_SHELL && shell_disconnect &&
                ticks>=w->start+80) return 0; // peer EOF without process exit
             struct svc_received_request *packet=(struct svc_received_request *)b;
+            struct control *command=next_control();
+            if(w->ack && w->kind==SVC_SHELL && command &&
+               !command->sent && ticks>=command->at) {
+                command->sent=1;
+                memset(packet,0,sizeof(*packet));
+                packet->peer=(struct ipc_peer){(unsigned long)w->pid,1000,1000};
+                packet->data=(struct svc_request){SVC_MAGIC,SVC_VERSION,
+                    (unsigned short)command->operation,(unsigned short)command->service,0};
+                return oversized_control?IPC_MAX_MESSAGE:sizeof(packet->data);
+            }
             if(w->ready_sent && w->kind==SVC_SHELL &&
                spoof_control && !spoof_control_sent && ticks>=w->start+80) {
                 spoof_control_sent=1;
@@ -135,11 +168,22 @@ static long mock_call(long op,long a,long b,long c) {
             w->ready_sent=1;
             return sizeof(packet->data);
         }
-        case SYS_IPC_SEND: {
+        case SYS_IPC_TRY_SEND: {
             assert(a>=3 && a<32 && openfds[a] && c==sizeof(struct svc_response));
             struct worker *w=from_channel(fdchannel[a]);
-            assert(w && w->ready_sent && !w->ack);
+            assert(w && w->ready_sent);
             const struct svc_response *response=(const struct svc_response *)b;
+            if (w->ack) {
+                struct control *command=next_control();
+                assert(w->kind==SVC_SHELL && command && command->sent);
+                command->answered=1;
+                command->answered_at=ticks;
+                command->result=response->result;
+                command->state=response->states[command->service];
+                command->attempts=response->attempts[command->service];
+                if (response_failure) { long failure=response_failure;response_failure=0;return failure; }
+                return c;
+            }
             assert(response->magic==SVC_MAGIC && response->version==SVC_VERSION &&
                    response->result==SVC_OK &&
                    response->states[w->kind]==SVC_RUNNING);
@@ -165,7 +209,7 @@ static long mock_call(long op,long a,long b,long c) {
             if(w->kind==SVC_FLAKY && w->ack && ticks>=w->start+100) {
                 w->reaped=1;total_exits++;return 42;
             }
-            if(w->kind==SVC_SHELL && w->ack && ticks>=1000) {
+            if(w->kind==SVC_SHELL && w->ack && ticks>=shell_exit_at) {
                 w->reaped=1;total_exits++;return 0;
             }
             return -11;
@@ -185,7 +229,7 @@ static long mock_call(long op,long a,long b,long c) {
             w->killed=1;kill_order[total_kills++]=a;return 0;
         }
         case SYS_WAIT_EVENTS_UNTIL: {
-            assert(a>=0 && (unsigned long)a<=0xffffffffUL && b>ticks && c==0);
+            assert(a>=0 && (unsigned long)a<=0xffffffffUL && b>=ticks && c==0);
             sleeps++;
             if(clock_failure_at && sleeps==(unsigned)clock_failure_at)return -5;
             long next=b;
@@ -195,7 +239,7 @@ static long mock_call(long op,long a,long b,long c) {
                 long candidate=0;
                 if(!w->ready_sent && !never_ready)candidate=w->start+20;
                 else if(w->ack && w->kind==SVC_FLAKY)candidate=w->start+100;
-                else if(w->ack && w->kind==SVC_SHELL)candidate=1000;
+                else if(w->ack && w->kind==SVC_SHELL)candidate=shell_exit_at;
                 if(candidate>ticks && candidate<next)next=candidate;
                 if(w->ack && w->kind==SVC_CORE && core_crash_at>ticks &&
                    core_crash_at<next)next=core_crash_at;
@@ -203,6 +247,9 @@ static long mock_call(long op,long a,long b,long c) {
                    (shell_disconnect || (spoof_control && !spoof_control_sent)) &&
                    w->start+80>ticks && w->start+80<next)
                     next=w->start+80;
+                struct control *command=next_control();
+                if(w->ack && w->kind==SVC_SHELL && command && !command->sent &&
+                   command->at>ticks && command->at<next) next=command->at;
             }
             ticks=next;
             unsigned long events=0;
@@ -215,12 +262,15 @@ static long mock_call(long op,long a,long b,long c) {
                      (shell_disconnect || (spoof_control && !spoof_control_sent)) &&
                      ticks>=w->start+80)))
                     events|=1UL<<fd;
+                struct control *command=next_control();
+                if(w && w->ack && w->kind==SVC_SHELL && command && !command->sent &&
+                   ticks>=command->at) events|=1UL<<fd;
             }
             for(unsigned i=0;i<count;i++) {
                 const struct worker *w=&workers[i];
                 if(w->reaped || w->killed || !w->ack)continue;
                 if((w->kind==SVC_FLAKY && ticks>=w->start+100) ||
-                   (w->kind==SVC_SHELL && ticks>=1000) ||
+                   (w->kind==SVC_SHELL && ticks>=shell_exit_at) ||
                    (w->kind==SVC_CORE && core_crash_at>0 && ticks>=core_crash_at))
                     events|=1UL<<32;
             }
@@ -421,13 +471,89 @@ static void command_authorization_and_dependency(void) {
            registry[SVC_FLAKY].desired==0);
     request.operation=SVC_OP_START;
     assert(apply_command(&request,520)==SVC_OK &&
-           registry[SVC_FLAKY].state==SVC_DOWN &&
+           registry[SVC_FLAKY].state==SVC_STARTING &&
            registry[SVC_FLAKY].desired==1 &&
-           registry[SVC_FLAKY].attempts==0);
+           registry[SVC_FLAKY].attempts==1 && registry[SVC_FLAKY].pid>0);
+    long first_pid=registry[SVC_FLAKY].pid;
     request.operation=SVC_OP_RESTART;
     assert(apply_command(&request,540)==SVC_OK &&
-           registry[SVC_FLAKY].state==SVC_DOWN &&
-           registry[SVC_FLAKY].attempts==0);
+           registry[SVC_FLAKY].state==SVC_STARTING &&
+           registry[SVC_FLAKY].attempts==1 && registry[SVC_FLAKY].pid!=first_pid);
+    assert(from_pid(first_pid)->reaped);
+    assert(kill_and_reap(&registry[SVC_FLAKY]));
+}
+
+static unsigned starts_of(unsigned kind) {
+    unsigned result=0;
+    for (unsigned i=0;i<count;i++) if ((unsigned)workers[i].kind==kind) result++;
+    return result;
+}
+static void no_leaked_children_or_channels(void) {
+    assert(total_exits==count);
+    for (unsigned i=0;i<count;i++) assert(workers[i].reaped);
+    for (unsigned fd=3;fd<32;fd++) assert(!openfds[fd]);
+}
+static void full_loop_command_lifecycle(void) {
+    /* No STATUS request follows START/RESTART. Only the real worker READY
+     * event may wake the manager; this catches the old sixty-second delay
+     * which an extra status query would accidentally conceal. */
+    for (unsigned operation=SVC_OP_START;operation<=SVC_OP_RESTART;operation+=2) {
+        reset();shell_exit_at=1800;
+        add_control(operation,SVC_FLAKY,600);
+        assert(runServiceManager()==0);
+        const struct control *command=&controls[0];
+        assert(command->answered && command->answered_at==600 &&
+               command->result==SVC_OK && command->state==SVC_STARTING &&
+               command->attempts==1);
+        assert(starts_of(SVC_FLAKY)==6);
+        unsigned starts_at_command=0;
+        for (unsigned i=0;i<count;i++)
+            if (workers[i].kind==SVC_FLAKY && workers[i].start==600) starts_at_command++;
+        assert(starts_at_command==1);
+        no_leaked_children_or_channels();
+    }
+    /* Ordinary STOP is persistent intent. Later core recovery must restore
+     * the terminal without reviving the deliberately stopped optional child. */
+    reset();shell_exit_at=1200;core_crash_at=700;
+    add_control(SVC_OP_STOP,SVC_FLAKY,600);
+    assert(runServiceManager()==0 && core_crashes==1);
+    assert(controls[0].answered && controls[0].state==SVC_STOPPED &&
+           controls[0].attempts==0 && controls[0].result==SVC_OK);
+    assert(starts_of(SVC_CORE)==2 && starts_of(SVC_SHELL)==2 &&
+           starts_of(SVC_FLAKY)==3);
+    no_leaked_children_or_channels();
+
+    // A dependent whose backoff elapsed while core is still starting cannot
+    // make progress yet. Do not return an expired deadline and spin PID 1.
+    reset();
+    registry[SVC_CORE].state=SVC_STARTING;
+    registry[SVC_CORE].pid=101;
+    registry[SVC_CORE].ready_deadline=750;
+    registry[SVC_FLAKY].state=SVC_BACKOFF;
+    registry[SVC_FLAKY].retry_at=100;
+    assert(event_deadline(200)==750);
+}
+static void bounded_control_failures(void) {
+    reset();oversized_control=1;
+    add_control(SVC_OP_STATUS,SVC_FLAKY,600);
+    assert(runServiceManager()==0 && controls[0].answered &&
+           controls[0].result==SVC_BAD_REQUEST && starts_of(SVC_SHELL)==1);
+    no_leaked_children_or_channels();
+    const long failures[]={-11,-32};
+    for (unsigned i=0;i<sizeof(failures)/sizeof(failures[0]);i++) {
+        reset();response_failure=failures[i];
+        add_control(SVC_OP_STATUS,SVC_FLAKY,600);
+        assert(runServiceManager()==0 && starts_of(SVC_CORE)==1 &&
+               starts_of(SVC_SHELL)==2 && registry[SVC_SHELL].attempts==2);
+        no_leaked_children_or_channels();
+    }
+    // An optional allocation failure consumes a finite startup budget,
+    // closes both channel ends, and leaves the diagnostic shell usable.
+    reset();failure_mode=2;
+    assert(runServiceManager()==0 && starts_of(SVC_CORE)==1 &&
+           starts_of(SVC_FLAKY)==0 && registry[SVC_FLAKY].attempts==3 &&
+           starts_of(SVC_SHELL)==1);
+    no_leaked_children_or_channels();
 }
 int main(void){
     normal_session();
@@ -436,6 +562,8 @@ int main(void){
     dependency_graph_and_leaf_first_shutdown();
     adopted_orphan_reaping();
     command_authorization_and_dependency();
-    puts("Persistent service manager registry, dependency fail-stop, restart window, IPC authentication and shutdown passed");
+    full_loop_command_lifecycle();
+    bounded_control_failures();
+    puts("Persistent manager lifecycle, immediate commands, recovery, bounded IPC, restart budget and shutdown passed");
     return 0;
 }

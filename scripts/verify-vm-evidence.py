@@ -27,6 +27,9 @@ ARTIFACTS = frozenset({
 BUILD_ARTIFACTS = frozenset({
     "agentos.unsigned.efi", "agentos.efi", "db.cer", "db.esl"
 })
+SESSION_START = re.compile(rb"(?m)^AGENTOS MANAGER SESSION START PID=([0-9a-f]{16})\r\n")
+SESSION_STOP = re.compile(rb"(?m)^AGENTOS MANAGER SESSION STOP PID=([0-9a-f]{16}) "
+                          rb"STATUS=0000000000000000 FRAMES=OK\r\n")
 
 
 def require(condition, reason):
@@ -123,10 +126,11 @@ def verify_run(root, run_dir, require_pass=True):
         expected.add("changed.efi")
     elif shell:
         expected.add("shell-before.png")
+        # Keyboard profiles also run the full UART service/idle sequence,
+        # then inject editing and exit through the independent PS/2 path.
+        expected.add("com1-input.bin")
         if keyboard:
             expected.add("shell-keyboard.png")
-        else:
-            expected.add("com1-input.bin")
     require(expected <= set(artifacts), f"Missing required VM artifacts: {sorted(expected-set(artifacts))}")
     for name, digest in artifacts.items():
         require(isinstance(digest, str) and HEX_SHA.fullmatch(digest),
@@ -143,8 +147,11 @@ def verify_run(root, run_dir, require_pass=True):
         require(b"AGENTOS KERNEL OK STAGE 1\r\n" in log,
                 "Signed VM receipt lacks final kernel boot marker")
         if shell:
-            require(b"AGENTOS SHELL STOP PID=" in log and
-                    b"STATUS=0000000000000000 FRAMES=OK\r\n" in log,
+            starts = list(SESSION_START.finditer(log))
+            stops = list(SESSION_STOP.finditer(log))
+            require(len(starts) == len(stops) == 1 and
+                    starts[0][1] == stops[0][1] == b"0000000000000001" and
+                    starts[0].end() <= stops[0].start(),
                     "Signed shell receipt lacks successful clean exit")
     else:
         require(data.get("boot_image_sha256") == sha256(run_dir / "changed.efi"),

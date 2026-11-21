@@ -3,7 +3,9 @@ $ErrorActionPreference='Stop'
 $root=Split-Path $PSScriptRoot
 Set-Location $root
 
-# This is the mandatory current VM integration matrix for stage 3, NOT\n# proof of complete stage-3 acceptance (COW, orphan reparenting and long-lived\n# service registry still require implementation and separate verification).
+# Mandatory stage-3 integration matrix. Each signed run verifies real process
+# isolation, COW, IPC, orphan adoption and the PID1 service registry; interactive
+# profiles additionally verify control, timer-backed idle and clean shutdown.
 # It MUST NOT manufacture acceptance from source compilation or synthetic
 # logs. test-vbox.ps1 independently verifies firmware, kernel, COM1, timer,
 # IPC, PID1, shell and framebuffer, then writes one immutable-by-hash receipt.

@@ -70,6 +70,34 @@ static int catFile(const char *aPath) {
     return pOutputOk;
 }
 
+static int measureIdle(void) {
+    struct timerSample {
+        unsigned long fVersion, fMonotonicMs, fTimerIrqs, fIdleTimerIrqs;
+    } pBefore, pAfter;
+    _Static_assert(sizeof(struct timerSample)==32,"native timer statistics v1");
+    long pResult=os_call(SYS_TIMER_STATS,(long)&pBefore,sizeof(pBefore),0);
+    if (pResult<0) return writeError("idle: statistics failed",pResult);
+    if (pBefore.fVersion!=1 || pBefore.fMonotonicMs>0x7fffffffffffffffUL-5000)
+        return writeError("idle: invalid clock",-5);
+    pResult=os_call(SYS_SLEEP_UNTIL,(long)(pBefore.fMonotonicMs+5000),0,0);
+    if (pResult!=0) return writeError("idle: wait failed",pResult);
+    pResult=os_call(SYS_TIMER_STATS,(long)&pAfter,sizeof(pAfter),0);
+    if (pResult<0) return writeError("idle: statistics failed",pResult);
+    if (pAfter.fVersion!=1 || pAfter.fMonotonicMs<pBefore.fMonotonicMs+5000 ||
+        pAfter.fTimerIrqs<pBefore.fTimerIrqs ||
+        pAfter.fIdleTimerIrqs<pBefore.fIdleTimerIrqs ||
+        pAfter.fIdleTimerIrqs-pBefore.fIdleTimerIrqs>pAfter.fTimerIrqs-pBefore.fTimerIrqs)
+        return writeError("idle: invalid measurement",-5);
+    char pLine[]="AGENTOS RUNTIME IDLE MS=0000000000000000 TIMERS=0000000000000000 IDLE=0000000000000000\r\n";
+    format_hex(pLine+sizeof("AGENTOS RUNTIME IDLE MS=")-1,
+               pAfter.fMonotonicMs-pBefore.fMonotonicMs,16);
+    format_hex(pLine+sizeof("AGENTOS RUNTIME IDLE MS=0000000000000000 TIMERS=")-1,
+               pAfter.fTimerIrqs-pBefore.fTimerIrqs,16);
+    format_hex(pLine+sizeof("AGENTOS RUNTIME IDLE MS=0000000000000000 TIMERS=0000000000000000 IDLE=")-1,
+               pAfter.fIdleTimerIrqs-pBefore.fIdleTimerIrqs,16);
+    return writeAll(pLine,sizeof(pLine)-1);
+}
+
 // Returns 1 to continue, 0 for an explicit exit and -1 after an output failure.
 static int executeLine(char *aLine) {
     char *pCommand = skipSpaces(aLine);
@@ -89,6 +117,8 @@ static int executeLine(char *aLine) {
         pOk = !*pArgs || *pRest ? writeText("usage: cat PATH\r\n") : catFile(pArgs);
     } else if (equals(pCommand, "services") && !*pArgs) {
         pOk = manager_command(SVC_OP_STATUS,0xffff);
+    } else if (equals(pCommand, "idle") && !*pArgs) {
+        pOk = measureIdle();
     } else if (equals(pCommand, "service")) {
         char *pVerb = pArgs;
         while (*pArgs && !isSpace(*pArgs)) pArgs++;
@@ -111,6 +141,7 @@ static int executeLine(char *aLine) {
                        "echo TEXT  Print text\r\ncat PATH   Read an initramfs file\r\n"
                        "services   Show service registry\r\n"
                        "service start|stop|restart core|flaky\r\n"
+                       "idle       Measure timer wakeups over 5 seconds\r\n"
                        "exit       Close the shell\r\n");
     } else if (equals(pCommand, "pid") && !*pArgs) {
         long pPid = os_call(SYS_GETPID, 0, 0, 0);

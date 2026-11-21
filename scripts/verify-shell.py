@@ -55,6 +55,7 @@ def verify(aLog, aInput=None):
         b"echo TEXT  Print text\r\ncat PATH   Read an initramfs file\r\n"
         b"services   Show service registry\r\n"
         b"service start|stop|restart core|flaky\r\n"
+        b"idle       Measure timer wakeups over 5 seconds\r\n"
         b"exit       Close the shell\r\nagentos> pid\r\n" + str(pPid).encode("ascii") +
         b"\r\nagentos> echo shell-ox\b \bk\r\nshell-ok\r\n"
         b"agentos> cat /stage\r\nAgentOS stage 1\r\n"

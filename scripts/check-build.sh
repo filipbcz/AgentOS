@@ -81,6 +81,14 @@ printf 'Testing actual COW paging clone, W^X and OOM rollback with %s\n' "$pRust
 "$pRustc" --edition 2021 --test "$pRoot/scripts/tests/paging-cow-host.rs" -o "$pOut/paging-cow-tests"
 "$pOut/paging-cow-tests"
 
+printf 'Testing native ELF ABI declaration and malformed input rejection with %s\n' "$pRustc"
+"$pRustc" --edition 2021 --test "$pRoot/kernel/native_abi.rs" -o "$pOut/native-abi-tests"
+"$pOut/native-abi-tests"
+
+printf 'Testing kernel stack guard pages, permissions and allocation rollback with %s\n' "$pRustc"
+"$pRustc" --edition 2021 --test "$pRoot/scripts/tests/kernel-stack-host.rs" -o "$pOut/kernel-stack-tests"
+"$pOut/kernel-stack-tests"
+
 printf 'Testing real per-CPU scheduler child wakeups and APIC timed waits with %s\n' "$pRustc"
 "$pRustc" --edition 2021 --test "$pRoot/scripts/tests/scheduler-timed-host.rs" -o "$pOut/scheduler-timed-tests"
 "$pOut/scheduler-timed-tests"
@@ -146,6 +154,7 @@ for pApp in init fault receiver service shell svc_ok svc_fail svc_hang orphan_pa
     done
     "$pLd" --no-undefined --build-id=none -z noexecstack -s -T "$pRoot/user/user.ld" \
         -o "$pOut/$pApp" "${pObjects[@]}"
+    "$pPython" "$pRoot/scripts/verify-user-abi.py" "$pOut/$pApp"
 done
 printf 'Host tests and kernel/user ELF links passed: %s\n' "$pOut"
 printf 'EFI assembly/signing, pinned-toolchain reproducibility and VM execution remain separate checks.\n'

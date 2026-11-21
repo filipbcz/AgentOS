@@ -125,6 +125,9 @@ struct Cpu {
     interval: u32,
     tsc_hz: u64,
     clock: crate::monotonic::Clock,
+    timer_policy: UnsafeCell<crate::timer::Timer>,
+    runtime_timer_irqs: AtomicUsize,
+    runtime_idle_irqs: AtomicUsize,
     interrupts: AtomicU32,
     hlt_wakes: AtomicU32,
     complete: AtomicU32,
@@ -152,6 +155,8 @@ impl Cpu {
         cpu.write(Self { self_address: addr, syscall_user_rsp: UnsafeCell::new(0), syscall_stack: UnsafeCell::new(0),
                          rsp0, programs, apic, expected_id: id, interval, tsc_hz,
                          clock: crate::monotonic::Clock::new(tsc_hz),
+                         timer_policy: UnsafeCell::new(crate::timer::Timer::new(interval)),
+                         runtime_timer_irqs: AtomicUsize::new(0), runtime_idle_irqs: AtomicUsize::new(0),
                          interrupts: AtomicU32::new(0), hlt_wakes: AtomicU32::new(0),
                          complete: AtomicU32::new(0), phase: AtomicU32::new(0), terminal: UnsafeCell::new(ptr::null_mut()),
                          idle: UnsafeCell::new(IdleSample::default()), descriptors, load, queue: UnsafeCell::new(Queue::new()), boot_baseline: UnsafeCell::new(None),
@@ -192,37 +197,48 @@ impl Cpu {
 
     unsafe fn schedule(&self) {
         (*self.queue.get()).active = true;
-        self.apic.write(0x320, TIMER | (1 << 17)); // periodic time slices
-        self.apic.write(0x380, self.interval);
+        // The first quantum enters the run queue from the kernel caller.
+        // Subsequent arms are one-shot: runnable quantum, earliest deadline,
+        // or a sparse independent-clock watchdog when every task is asleep.
+        self.apic.write(0x320, MASK | TIMER);
+        self.apic.write(0x380, 0);
+        let now = self.clock.millis(timestamp());
+        (*self.timer_policy.get()).reset(now);
+        self.arm_timer(true, None, now.unwrap_or(0));
         while ptr::addr_of!((*self.queue.get()).active).read_volatile() { wait_for_irq(); }
         self.apic.write(0x320, MASK | TIMER);
         self.apic.write(0x380, 0);
     }
 
+    unsafe fn arm_timer(&self, runnable: bool, deadline: Option<u64>, now: u64) {
+        match (*self.timer_policy.get()).plan(runnable, deadline, now) {
+            crate::timer::Action::Keep => (),
+            crate::timer::Action::Disable => {
+                self.apic.write(0x320, MASK | TIMER);
+                self.apic.write(0x380, 0);
+            }
+            crate::timer::Action::Arm(counts) => {
+                self.apic.write(0x320, TIMER); // one-shot, never periodic
+                self.apic.write(0x380, counts);
+            }
+        }
+    }
+
     unsafe fn switch(&self, outgoing: usize, timer: bool) -> usize {
         let queue = &mut *self.queue.get();
         let scheduled = queue.active;
-        let running = queue.running();
-        // Periodic APIC IRQs are the fallback for timed sleeps and also
-        // detect clock stalls; process exit may wake child waiters sooner.
-        let now = self.clock.millis(timestamp()).unwrap_or(0);
-        queue.wake_timed(now, timer);
+        let measured = self.clock.millis(timestamp());
+        let now = measured.unwrap_or(0);
+        if scheduled {
+            let clock_error = (*self.timer_policy.get()).sample(self.apic.read(0x390), measured);
+            queue.wake_timed(now, clock_error);
+        }
         let next = queue.select(outgoing, timer);
         // Boot/idle probes own their one-shot timers while queue.active=false.
-        // Only scheduled work uses time slices, and no tick is needed when all
-        // tasks sleep on I/O. The UART can wake and select a reader directly.
+        // An unrelated device IRQ must not postpone an already armed deadline.
+        // Deadline and I/O wakes select their reader directly before rearming.
         if scheduled {
-            if !queue.running() {
-                // An all-blocked timed wait still requires APIC ticks to
-                // observe its deadline. Do not disable the last wake source.
-                if !queue.has_timed_waiters() {
-                    self.apic.write(0x320, MASK | TIMER);
-                    self.apic.write(0x380, 0);
-                }
-            } else if !running {
-                self.apic.write(0x320, TIMER | (1 << 17));
-                self.apic.write(0x380, self.interval);
-            }
+            self.arm_timer(queue.running(), queue.next_deadline(), now);
         }
         let root = if let Some(p) = queue.process() {
             let top = queue.user_stack_top().unwrap();
@@ -378,6 +394,11 @@ unsafe extern "C" fn timer_interrupt(context: *mut Context) -> usize {
     cpu.apic.write(0xb0, 0);              // EOI before returning to the task
     if (*context).rip == ptr::addr_of!(after_hlt) as usize { cpu.hlt_wakes.fetch_add(1, Ordering::Release); }
     cpu.interrupts.fetch_add(1, Ordering::Release);
+    let queue = &*cpu.queue.get();
+    if queue.active {
+        cpu.runtime_timer_irqs.fetch_add(1, Ordering::Relaxed);
+        if queue.all_blocked() { cpu.runtime_idle_irqs.fetch_add(1, Ordering::Relaxed); }
+    }
     if (*context).user() && (*context).rsp >= (1usize << 47) {
         return user_fault(13, 0, 0);
     }
@@ -446,6 +467,22 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
         0x10001 => pid as isize,
         // Current CPU-local monotonic millisecond epoch; never compare across CPUs.
         0x10010 => cpu.clock.millis(timestamp()).map(|v| v as isize).unwrap_or(-5),
+        // Read-only, versioned CPU-local timer diagnostics. All fields are
+        // captured with IF=0, and the destination is validated before writing.
+        // Counts cover scheduled operation, excluding boot/idle timer probes.
+        0x10018 => {
+            if b != 32 || c != 0 { -22 }
+            else if let Some(now) = cpu.clock.millis(timestamp()) {
+                let fields = [1u64, now,
+                    cpu.runtime_timer_irqs.load(Ordering::Relaxed) as u64,
+                    cpu.runtime_idle_irqs.load(Ordering::Relaxed) as u64];
+                let mut bytes = [0u8; 32];
+                for (i, field) in fields.iter().enumerate() {
+                    bytes[i*8..(i+1)*8].copy_from_slice(&field.to_le_bytes());
+                }
+                cpu.load.frames.with(|f| p.space.write(f, a, &bytes)).map_or(EFAULT, |_| 0)
+            } else { -5 }
+        }
         // SYS_WAIT_CHILD_UNTIL(child_pid, absolute_deadline_ms):
         // nonblocking if already reaped/finished, otherwise sleep until child
         // termination or the CPU-local monotonic deadline. Reaps on success.
@@ -485,16 +522,16 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
                 }
             }
         }
-        op @ (0x10002 | 0x10008 | 0x1000d | 0x1000e | 0x10015) => {
+        op @ (0x10002 | 0x10008 | 0x1000d | 0x1000e | 0x10015 | 0x10019) => {
             let io = match op {
                 0x10002 => p.files.write(&p.space, a, b, c),
                 0x10008 => cpu.load.frames.with(|f| p.files.read(f, &p.space, a, b, c)),
-                0x1000d => cpu.load.frames.with(|f| p.files.message(f, crate::ipc::Operation::Send, p, a, b, c)),
+                0x1000d | 0x10019 => cpu.load.frames.with(|f| p.files.message(f, crate::ipc::Operation::Send, p, a, b, c)),
                 _ => cpu.load.frames.with(|f| p.files.message(f, crate::ipc::Operation::Receive, p, a, b, c)),
             };
             match io {
                 Ok(crate::files::Io::Bytes(n)) => { q.wake_io(); n as isize }
-                Ok(crate::files::Io::Sleep(_)) if op == 0x10015 => -11,
+                Ok(crate::files::Io::Sleep(_)) if op == 0x10015 || op == 0x10019 => -11,
                 Ok(crate::files::Io::Sleep(wait)) => {
                     // No bytes committed. Retry SYSCALL with its original
                     // registers when data, space, or the last close wakes it.
@@ -673,6 +710,12 @@ unsafe fn start_ap(cpu: &Cpu, root: usize, base: usize, stack: usize, clock: &Pm
 
 pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Frames<'static>,
                   bsp_rsp0: usize, archive: &'static [u8], log: &mut crate::BootLog<'_>) -> Result<(), Error> {
+    let guard_probe = crate::stack::KernelStack::allocate(&mut frames).ok_or(b"kernel guard stack" as Error)?;
+    let guarded = crate::exceptions::probe_guard(guard_probe.guard()) &&
+        crate::exceptions::probe_guard(guard_probe.top());
+    guard_probe.release(&mut frames);
+    if !guarded { return Err(b"kernel stack guard probe"); }
+    serial(b"AGENTOS KERNEL STACK GUARD OK\r\n");
     if platform.legacy_pic { out(0x21, 0xff); out(0xa1, 0xff); }
     let apic = Lapic(platform.lapic);
     apic.enable()?;
@@ -699,7 +742,8 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
             let rsp0 = descriptors.rsp0_slot();
             Cpu::create(f, apic, id, interval, tsc_hz, Some(descriptors), load, programs, rsp0)
         })?;
-        let stack = load.frames.with(|f| f.alloc()).ok_or(b"AP stack" as Error)?.into_address() + PAGE;
+        let stack = load.frames.with(crate::stack::KernelStack::allocate)
+            .ok_or(b"AP stack" as Error)?.into_top();
         start_ap(cpu, root, base, stack, &clock)?;
         cpus[id as usize] = Some(cpu);
     }
@@ -785,7 +829,7 @@ pub unsafe fn shell(platform: &Platform, info: &crate::BootInfo) -> Result<(), E
         initialized = true;
         // The BSP TTY owns the mapped GOP framebuffer for the entire shell
         // session; the serial path remains available if GOP validation fails.
-        if let Some(screen) = crate::fb_console::Console::new(
+        if let Some(screen) = crate::fb_console::Console::below_boot_status(
             info.framebuffer, info.width as usize, info.height as usize,
             info.stride as usize, info.pixel_format
         ) {

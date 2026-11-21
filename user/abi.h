@@ -24,6 +24,19 @@
 #define SYS_IPC_TRY_RECV     0x10015
 #define SYS_BOOT_PAUSE       0x10016
 #define SYS_WAIT_EVENTS_UNTIL 0x10017
+#define SYS_TIMER_STATS       0x10018
+#define SYS_IPC_TRY_SEND      0x10019
+
+/* SYS_TIMER_STATS(buffer, 32, 0): copy version 1, CPU-local monotonic
+ * milliseconds, cumulative scheduler timer IRQs and idle scheduler IRQs,
+ * as four little-endian u64 values. Counters never reset on read. Returns
+ * 0, -14 for an invalid buffer, -22 for invalid size/flags, -5 without a clock.
+ * An idle IRQ interrupts an active scheduler with no runnable process.
+ */
+/* SYS_IPC_TRY_SEND(fd, address, length): same authenticated, atomic message
+ * operation as IPC_SEND; a full peer inbox returns -11 instead of sleeping.
+ * Peer closure returns -32. No message is consumed/committed on failure.
+ */
 
 /* SYS_BOOT_PAUSE(): only the original BSP PID 1, after collecting all
  * boot-test descendants, may park for the trusted-terminal handoff.
@@ -47,10 +60,11 @@
  * -22 if deadline exceeds signed syscall range. Does not reap on timeout.
  * SYS_SLEEP_UNTIL(absolute_cpu_local_deadline_ms): blocks until the deadline,
  * returns 0 on success, -5 on clock stall, -22 on invalid deadline.
- * Timer-backed waits are local to the current CPU; duration is quantized by
- * the scheduler's 10ms LAPIC quantum. Neither syscall busy-polls or sleeps
- * while holding allocator locks. Clock-fault guard uses APIC interrupts and
- * reports failure, never a fabricated time expiration.
+ * Timer-backed waits are local to the current CPU. With no runnable work,
+ * LAPIC is armed once for the earliest deadline, with at most a one-second
+ * watchdog interval. Five seconds of calibrated LAPIC countdown without
+ * monotonic progress reports a clock failure, never a fabricated timeout.
+ * Neither syscall busy-polls or sleeps while holding allocator locks.
  */
 /* SYS_CHILD_AFTER(last_pid): return the lowest direct child's PID
  * greater than last_pid, or -10 if no such child exists. Includes adopted
@@ -80,6 +94,20 @@
  * Returns 0 when newly terminated and 1 if already a zombie; unknown PID -3,
  * unrelated PID -1, zero/self -22. This is not a general signal ABI. */
 #define IPC_MAX_MESSAGE 1024
+
+#ifdef __ASSEMBLER__
+/* Exactly one entry object per native ELF supplies this ABI discriminator.
+ * PT_NOTE name="AgentOS\0", type=1, descriptor={u32 version=1,u32 flags=0}.
+ * Every field and record is little-endian with four-byte ELF note alignment.
+ * Unmarked ELF is reserved for the future Linux ABI and is not native code.
+ */
+.pushsection .note.agentos,"a",@note
+.balign 4
+.long 8, 8, 1
+.asciz "AgentOS"
+.long 1, 0
+.popsection
+#endif
 
 #ifndef __ASSEMBLER__
 /* IPC_PAIR stores two 32-bit descriptors. Each endpoint can send and receive.

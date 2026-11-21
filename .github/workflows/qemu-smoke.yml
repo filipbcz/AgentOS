@@ -50,11 +50,12 @@ jobs:
           test -f "$vars"
           python3 scripts/qemu-smoke.py --cpus "$CPU_COUNT" \
             --ovmf-code "$code" --ovmf-vars "$vars" --timeout 720
-      - name: Verify real UART COM1 service registry control and graceful shutdown
-        if: matrix.cpus == 1
+      - name: Verify real UART, PS2/GOP, service control, runtime idle and graceful shutdown
+        env:
+          CPU_COUNT: ${{ matrix.cpus }}
         run: |
           set -euo pipefail
-          python3 scripts/qemu-smoke.py --cpus 1 --session \
+          python3 scripts/qemu-smoke.py --cpus "$CPU_COUNT" --session \
             --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd \
             --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd --timeout 720
       - name: Preserve boot evidence even if the guest fails
@@ -76,9 +77,14 @@ jobs:
             build/check/qemu-cpu${{ matrix.cpus }}/OVMF_VARS.secboot.fd
             build/check/qemu-cpu${{ matrix.cpus }}/failed-screen.ppm
             build/check/qemu-cpu${{ matrix.cpus }}/shell-screen.ppm
-            build/check/qemu-cpu1-session/com1.log
-            build/check/qemu-cpu1-session/qemu-stderr.log
-            build/check/qemu-cpu1-session/smoke.json
-            build/check/qemu-cpu1-session/failure.json
-            build/check/qemu-cpu1-session/failed-screen.ppm
-            build/check/qemu-cpu1-session/shell-screen.ppm
+            build/check/qemu-cpu${{ matrix.cpus }}-session/com1.log
+            build/check/qemu-cpu${{ matrix.cpus }}-session/qemu-stderr.log
+            build/check/qemu-cpu${{ matrix.cpus }}-session/smoke.json
+            build/check/qemu-cpu${{ matrix.cpus }}-session/failure.json
+            build/check/qemu-cpu${{ matrix.cpus }}-session/failed-screen.ppm
+            build/check/qemu-cpu${{ matrix.cpus }}-session/shell-screen.ppm
+            build/check/qemu-cpu${{ matrix.cpus }}-session/com1-input.bin
+            build/check/qemu-cpu${{ matrix.cpus }}-session/keyboard-before.ppm
+            build/check/qemu-cpu${{ matrix.cpus }}-session/keyboard-after.ppm
+            build/check/qemu-cpu${{ matrix.cpus }}-session/secureboot-vars.txt
+            build/check/qemu-cpu${{ matrix.cpus }}-session/OVMF_VARS.secboot.fd

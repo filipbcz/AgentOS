@@ -6,6 +6,10 @@ const W: usize = 6;
 const H: usize = 9;
 const BG: u32 = 0x181818;
 const FG: u32 = 0xffffff;
+// Keep the boot identity and the first diagnostic rows visible above the
+// scrolling terminal. The console owns only the region below this boundary.
+// 88 = 52 + 2 * 18 also ends on a BOOT.LOG row boundary at both font scales.
+pub const BOOT_STATUS_HEIGHT: usize = 88;
 
 /// Five-bit rows with the high bit on the left, covering printable ASCII.
 /// All unsupported control characters are handled by Console::write.
@@ -122,6 +126,19 @@ pub struct Console {
 }
 
 impl Console {
+    /// Retain the actual boot status pixels while the interactive region
+    /// scrolls. Small displays use the whole framebuffer to retain usable
+    /// terminal space. No framebuffer snapshot or test-only pause is needed.
+    pub unsafe fn below_boot_status(base: *mut u32, width: usize, height: usize,
+                                    stride: usize, format: u32) -> Option<Self> {
+        if base.is_null() || stride < width { return None; }
+        let pBytes = stride.checked_mul(height)?.checked_mul(4)?;
+        if pBytes > isize::MAX as usize { return None; }
+        (base as usize).checked_add(pBytes)?;
+        let pTop = if height >= BOOT_STATUS_HEIGHT + 2*H { BOOT_STATUS_HEIGHT } else { 0 };
+        Self::new(base.add(pTop.checked_mul(stride)?), width, height-pTop, stride, format)
+    }
+
     /// Valid GOP format 0 (RGB) or 1 (BGR), both use identical black/white.
     /// Caller owns a mapped, writable framebuffer for the entire lifetime.
     pub unsafe fn new(base: *mut u32, width: usize, height: usize, stride: usize, format: u32) -> Option<Self> {
@@ -265,5 +282,35 @@ mod tests {
         scrolling.write(b"A\nB\nC");
         expected.write(b"B\nC");
         assert_eq!(a,b);
+    }
+
+    #[test]
+    fn interactiveScrollingAndClearPreserveBootStatusPixels() {
+        let pWidth=42; let pStride=47; let pHeight=BOOT_STATUS_HEIGHT+4*H;
+        let mut pPixels=vec![0x12345678; pStride*pHeight+8];
+        let pHeader=pPixels[..BOOT_STATUS_HEIGHT*pStride].to_vec();
+        let mut pConsole=unsafe {Console::below_boot_status(
+            pPixels.as_mut_ptr(),pWidth,pHeight,pStride,0)}.unwrap();
+        for _ in 0..12 { pConsole.write(b"ready\r\n"); }
+        pConsole.clear();
+        assert_eq!(&pPixels[..BOOT_STATUS_HEIGHT*pStride], &pHeader);
+        for pRow in BOOT_STATUS_HEIGHT..pHeight {
+            assert!(pPixels[pRow*pStride+pWidth..(pRow+1)*pStride]
+                .iter().all(|&pValue|pValue==0x12345678));
+        }
+        assert!(pPixels[pStride*pHeight..].iter().all(|&pValue|pValue==0x12345678));
+        pConsole.write(b"A");
+        assert_eq!(pPixels[BOOT_STATUS_HEIGHT*pStride+1],FG);
+    }
+
+    #[test]
+    fn smallDisplaysRemainUsableAndHeaderOffsetCannotOverflow() {
+        let mut pPixels=vec![0x12345678;12*18];
+        let mut pConsole=unsafe {Console::below_boot_status(
+            pPixels.as_mut_ptr(),12,18,12,1)}.unwrap();
+        pConsole.write(b"A");
+        assert_eq!(pPixels[1],FG);
+        assert!(unsafe {Console::below_boot_status(
+            pPixels.as_mut_ptr(),12,usize::MAX,12,0)}.is_none());
     }
 }

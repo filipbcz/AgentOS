@@ -27,9 +27,16 @@ pub struct Descriptors { gdt: usize, idt: usize }
 
 impl Descriptors {
     pub unsafe fn new(frames: &mut Frames<'_>) -> Option<Self> {
-        let idt = frames.alloc_zeroed()?.into_address();
-        let gdt = frames.alloc_zeroed()?.into_address();
-        let emergency_top = frames.alloc()?.into_address() + 4096;
+        let idt = frames.alloc_zeroed()?;
+        let Some(gdt) = frames.alloc_zeroed() else {
+            frames.release(idt); return None;
+        };
+        let Some(emergency) = crate::stack::KernelStack::allocate(frames) else {
+            frames.release(gdt); frames.release(idt); return None;
+        };
+        let idt = idt.into_address();
+        let gdt = gdt.into_address();
+        let emergency_top = emergency.into_top();
         // GDT and the 104-byte long-mode TSS share a permanently owned frame.
         let tss = gdt + 64;
         ptr::write_unaligned((tss + 36) as *mut u64, emergency_top as u64); // IST1
@@ -112,3 +119,7 @@ pub unsafe fn probe(guard: u64) -> bool {
     probe_break() == 1 && probe_read(0) == 1 && probe_read(guard) == 1 &&
         probe_ro(ro) == 1 && probe_nx(ro) == 1
 }
+
+/// Exercise a real supervisor page fault on either unmapped kernel-stack
+/// guard. The narrowly matched probe instruction is the only recovery path.
+pub unsafe fn probe_guard(guard: usize) -> bool { probe_read(guard as u64) == 1 }

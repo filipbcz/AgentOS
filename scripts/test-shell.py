@@ -140,6 +140,20 @@ class ShellTests(unittest.TestCase):
         self.assertIn(b"pid: failed (-5)", pOutput)
         self.assertIn(b"recovered\r\n", pOutput)
 
+    def test_idle_reports_measured_deltas(self):
+        pOutput, _ = self.runShell(b"idle\nexit\n", aRead=3, aWrite=5)
+        self.assertIn(b"AGENTOS RUNTIME IDLE MS=0000000000001388 "
+                      b"TIMERS=0000000000000005 IDLE=0000000000000005\r\n", pOutput)
+
+    def test_idle_never_reports_success_on_invalid_measurements(self):
+        for pMode in ("idle-stats-error", "idle-version-error", "idle-overflow",
+                      "idle-counter-error", "idle-wait-error", "idle-early-wake"):
+            with self.subTest(mode=pMode):
+                pOutput, _ = self.runShell(b"idle\necho recovered\nexit\n", aMode=pMode)
+                self.assertNotIn(b"AGENTOS RUNTIME IDLE", pOutput)
+                self.assertIn(b"idle: ", pOutput)
+                self.assertIn(b"recovered\r\n", pOutput)
+
 
 if __name__ == "__main__":
     unittest.main()

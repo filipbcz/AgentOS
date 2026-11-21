@@ -1,15 +1,14 @@
 #include "abi.h"
 #include "service_protocol.h"
 
-/* Long-running CPU-root process, not a finite bootstrap demonstration.
+/* The original BSP PID 1 continues here after its one-time boot handoff.
  * It owns the three-entry service registry for its entire terminal session:
  * dependency-aware readiness, authenticated IPC control, monitored exits,
  * capped exponential restart with timer-backed waits and ordered shutdown.
  * The kernel remains the ultimate authority on PID ownership and memory.
  *
- * The current boot acceptance creates a separate short-lived init session
- * before this operational session. This process is the *operational root
- * reaper*, but it does not currently have the literal numeric PID 1.
+ * Initial optional-worker probation precedes the first terminal prompt.
+ * That boot policy never prevents recovery of an established shell session.
  */
 #define MAX_MS 0x7fffffffffffffffUL
 enum { QUIET_WAKE_MS=60000, READY_TIMEOUT_MS=750, RESTART_BASE_MS=40, RESTART_WINDOW_MS=5000, MAX_ATTEMPTS=3 };
@@ -27,6 +26,13 @@ static struct record registry[SVC_COUNT] = {
 };
 static long owner_pid;
 static int shell_active, shutdown_requested, fatal_error, online_announced;
+/* Read the complete bounded kernel message before checking its protocol.
+ * A malformed oversized request must not stay queued behind EMSGSIZE and
+ * repeatedly wake PID 1 without making progress. */
+struct request_packet {
+    struct ipc_peer peer;
+    union { struct svc_request request; unsigned char bytes[IPC_MAX_MESSAGE]; } data;
+};
 
 static unsigned text_length(const char *text) {
     unsigned n=0;
@@ -132,6 +138,8 @@ static int kill_and_reap(struct record *service) {
     return 1;
 }
 
+static int failed(unsigned id,long now,long status);
+
 static int start_entry(unsigned id,long now) {
     struct record *service=&registry[id];
     if (service->pid || !service->desired || !has_dependency(id)) return 0;
@@ -149,26 +157,26 @@ static int start_entry(unsigned id,long now) {
         service->state=SVC_FAILED;
         return 0;
     }
+    service->attempts++;
     unsigned long pair=0;
     long result=os_call(SYS_IPC_PAIR,(long)&pair,0,0);
-    if (result!=0) return -1;
+    if (result!=0) return failed(id,now,result);
     long manager_fd=(long)(unsigned)(pair & 0xffffffffUL);
     long child_fd=(long)(unsigned)(pair >> 32);
     // Exactly one designated handle is inherited by the worker/shell. It
     // immediately closes all other inherited service-manager descriptors.
     if (os_call(SYS_DUP2,child_fd,SVC_CHANNEL_FD,0)!=SVC_CHANNEL_FD) {
-        close_fd(manager_fd);close_fd(child_fd);return -1;
+        close_fd(manager_fd);close_fd(child_fd);return failed(id,now,-9);
     }
     long child=os_call(SYS_SPAWN,(long)service->elf,service->elf_length,0);
     close_fd(SVC_CHANNEL_FD);
     close_fd(child_fd);
     if (child<=0 || child==owner_pid) {
         close_fd(manager_fd);
-        return -1;
+        return failed(id,now,child<0?child:-5);
     }
     service->pid=child;
     service->fd=manager_fd;
-    service->attempts++;
     service->state=SVC_STARTING;
     service->ready_deadline=deadline(now,READY_TIMEOUT_MS);
     if (service->ready_deadline<0 || !manager_event("START",id)) return -1;
@@ -183,18 +191,21 @@ static int send_response(long fd,unsigned result) {
         answer.states[i]=registry[i].state;
         answer.attempts[i]=registry[i].attempts;
     }
-    return os_call(SYS_IPC_SEND,fd,(long)&answer,sizeof(answer))==(long)sizeof(answer);
+    // A stalled peer must not block the entire supervisor inside SEND.
+    // One unanswered reply violates this synchronous control protocol; the
+    // caller isolates that session using the normal bounded restart policy.
+    return os_call(SYS_IPC_TRY_SEND,fd,(long)&answer,sizeof(answer))==(long)sizeof(answer);
 }
 
 static int finish_start(unsigned id, long now) {
     struct record *service=&registry[id];
-    struct svc_received_request received;
-    long n=os_call(SYS_IPC_TRY_RECV,service->fd,(long)&received,sizeof(received.data));
+    struct request_packet received;
+    long n=os_call(SYS_IPC_TRY_RECV,service->fd,(long)&received,sizeof(received.data.bytes));
     if (n==-11) return 0;
-    if (n!=sizeof(received.data) || !valid_peer(&received.peer,service->pid) ||
-        received.data.magic!=SVC_MAGIC || received.data.version!=SVC_VERSION ||
-        received.data.operation!=SVC_OP_READY || received.data.service!=id ||
-        received.data.reserved!=0) return -1;
+    if (n!=sizeof(received.data.request) || !valid_peer(&received.peer,service->pid) ||
+        received.data.request.magic!=SVC_MAGIC || received.data.request.version!=SVC_VERSION ||
+        received.data.request.operation!=SVC_OP_READY || received.data.request.service!=id ||
+        received.data.request.reserved!=0) return -1;
     service->state=SVC_RUNNING;
     service->ready_once=1;
     service->retry_at=0;
@@ -207,7 +218,9 @@ static int finish_start(unsigned id, long now) {
         shell_active=1;
     } else if (!manager_event("READY",id)) return -1;
     if (!send_response(service->fd,SVC_OK)) return -1;
-    if (id!=SVC_SHELL) finish_endpoint(service);
+    // The stable worker waits on this lifetime channel after READY. Keeping
+    // both endpoints open lets it block on IPC instead of waking periodically.
+    if (id==SVC_FLAKY) finish_endpoint(service);
     (void)now;
     return 1;
 }
@@ -297,30 +310,45 @@ static int apply_command(const struct svc_request *req,long now) {
         service->retry_at=now;
         service->state=service->desired?SVC_DOWN:SVC_STOPPED;
     }
+    // An acknowledged START/RESTART means a real child has been created.
+    // READY is deliberately separate and is reported by subsequent STATUS.
+    if (service->desired && start_entry(req->service,now)!=1)
+        return SVC_INTERNAL_ERROR;
     return SVC_OK;
+}
+
+static int recover_shell(long now) {
+    if (!kill_and_reap(&registry[SVC_SHELL])) return -1;
+    return failed(SVC_SHELL,now,137);
 }
 
 static int check_control(long now) {
     struct record *shell=&registry[SVC_SHELL];
     if (shell->state!=SVC_RUNNING || shell->fd<0) return 0;
-    struct svc_received_request packet;
-    long n=os_call(SYS_IPC_TRY_RECV,shell->fd,(long)&packet,sizeof(packet.data));
+    struct request_packet packet;
+    long n=os_call(SYS_IPC_TRY_RECV,shell->fd,(long)&packet,sizeof(packet.data.bytes));
     if (n==-11) return 0;
     if (n<0) return -1; // unexpected kernel I/O failure
     if (n==0) {
         // A running shell closed its control endpoint without exiting:
         // an EOF socket stays forever readable. Stop/reap it and apply the
         // bounded restart policy; never spin endlessly on the same EOF.
-        if (!kill_and_reap(shell)) return -1;
-        return failed(SVC_SHELL,now,137);
+        return recover_shell(now);
     }
     // An inherited or leaked endpoint is not authority to manage services.
     // Reject unauthorized sender PID or malformed payload without killing
     // the entire local supervisor (a trivial denial-of-service otherwise).
-    if (n!=sizeof(packet.data) || !valid_peer(&packet.peer,shell->pid))
-        return 0;
-    unsigned code=apply_command(&packet.data,now);
-    return send_response(shell->fd,code)?0:-1;
+    if (!valid_peer(&packet.peer,shell->pid)) return 0;
+    unsigned code=n==sizeof(packet.data.request)?
+        apply_command(&packet.data.request,now):SVC_BAD_REQUEST;
+    return send_response(shell->fd,code)?0:recover_shell(now);
+}
+
+static int can_start(unsigned id) {
+    if (!has_dependency(id)) return 0;
+    return id!=SVC_SHELL || online_announced ||
+        !registry[SVC_FLAKY].desired || registry[SVC_FLAKY].state==SVC_FAILED ||
+        reaches(SVC_FLAKY,SVC_SHELL)>0;
 }
 
 static int advance_registry(long now) {
@@ -353,8 +381,7 @@ static int advance_registry(long now) {
         } else if (service->desired &&
                    (service->state==SVC_DOWN ||
                     (service->state==SVC_BACKOFF && now>=service->retry_at)) &&
-                   has_dependency(id) &&
-                   (id!=SVC_SHELL || registry[SVC_FLAKY].state==SVC_FAILED)) {
+                   can_start(id)) {
             // The optional unstable service gets three real attempts during
             // boot probation. Once exhausted, the shell remains available
             // for diagnosis and manual restart; no background crash can
@@ -379,10 +406,14 @@ static long event_deadline(long now) {
     if (next<0) return -1;
     for (unsigned id=0;id<SVC_COUNT;id++) {
         const struct record *service=&registry[id];
+        // State changes earlier in this iteration can make a dependency
+        // runnable after its array position has already been visited.
+        if (!service->pid && service->desired && service->state==SVC_DOWN &&
+            can_start(id)) return now;
         if (service->pid>0 && service->state==SVC_STARTING &&
             service->ready_deadline<next) next=service->ready_deadline;
         if (!service->pid && service->desired && service->state==SVC_BACKOFF &&
-            service->retry_at<next) next=service->retry_at;
+            can_start(id) && service->retry_at<next) next=service->retry_at;
     }
     return next;
 }

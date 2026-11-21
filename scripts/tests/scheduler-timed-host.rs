@@ -18,6 +18,16 @@ mod frames {
     }
 }
 
+mod stack {
+    pub struct KernelStack;
+    impl KernelStack {
+        pub fn test_dummy() -> Self { Self }
+        pub fn allocate(_: &mut crate::frames::Frames<'_>) -> Option<Self> { None }
+        pub fn top(&self) -> usize { 0 }
+        pub fn release(self, _: &mut crate::frames::Frames<'_>) {}
+    }
+}
+
 mod paging {
     pub struct UserSpace { pub root: usize }
     impl UserSpace {
@@ -77,3 +87,6 @@ pub extern "C" fn task_return() {}
 
 #[path = "../../kernel/scheduler.rs"]
 mod scheduler;
+
+#[path = "../../kernel/timer.rs"]
+mod timer;

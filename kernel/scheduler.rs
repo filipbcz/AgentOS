@@ -1,6 +1,7 @@
 //! Per-CPU round robin for kernel threads. Queue access on its owner CPU
 //! requires IF=0. A timer interrupt owns the outgoing frame until IRETQ.
-use crate::frames::{Frame, Frames};
+use crate::frames::Frames;
+use crate::stack::KernelStack;
 use crate::process::{Process, Programs, STACK};
 use core::{mem::size_of, ptr};
 
@@ -21,23 +22,17 @@ const _: () = assert!(size_of::<Context>() == 512 + 20 * 8);
 impl Context { pub fn user(&self) -> bool { self.cs & 3 == 3 } }
 
 struct Task {
-    stack: Frame,
+    stack: KernelStack,
     context: usize,
     runnable: bool,
     waiting: Option<crate::files::Wait>,
     timed: Option<TimedWait>,
-    clock_stall_ticks: u16,
-    last_clock_ms: u64,
     clock_error: bool,
     preemptions: usize,
     process: Option<Process>,
 }
 
 const CAPACITY: usize = 8;
-/// 512 periodic APIC ticks (~5 seconds at the measured 10ms quantum):
-/// detect a stalled TSC without pretending monotonic time has elapsed.
-/// The timeout is in APIC ticks, not guaranteed wall clock time.
-const CLOCK_STALL_TICKS: u16 = 512;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TimedWait {
@@ -74,8 +69,8 @@ impl Queue {
 
     pub fn spawn(&mut self, frames: &mut Frames<'_>, entry: extern "C" fn(usize), arg: usize) -> Option<()> {
         if self.active || self.count == CAPACITY { return None; }
-        let stack = frames.alloc_zeroed()?;
-        let top = stack.address() + 4096;
+        let stack = KernelStack::allocate(frames)?;
+        let top = stack.top();
         let context = (top - 16 - size_of::<Context>()) as *mut Context;
         unsafe {
             // Fresh x87/SSE state and SysV function-entry stack alignment.
@@ -89,7 +84,7 @@ impl Queue {
             (*context).ss = 16;
             ((top - 8) as *mut usize).write(task_return as usize);
         }
-        self.tasks[self.count] = Some(Task { stack, context: context as usize, runnable: true, waiting: None, timed: None, clock_stall_ticks: 0, last_clock_ms: 0,
+        self.tasks[self.count] = Some(Task { stack, context: context as usize, runnable: true, waiting: None, timed: None,
                                           clock_error: false, preemptions: 0, process: None });
         self.count += 1;
         Some(())
@@ -98,14 +93,14 @@ impl Queue {
     pub unsafe fn spawn_process(&mut self, frames: &mut Frames<'_>, programs: &Programs, name: &[u8],
                                 parent: usize) -> Result<usize, isize> {
         let slot = self.tasks.iter().position(Option::is_none).ok_or(-11isize)?;
-        let stack = frames.alloc_zeroed().ok_or(-12isize)?;
+        let stack = KernelStack::allocate(frames).ok_or(-12isize)?;
         let credentials = self.process().map_or(crate::process::Credentials::BOOT_USER, |p| p.credentials);
         let mut process = match programs.load(frames, name, parent, credentials) {
             Ok(process) => process,
-            Err(e) => { frames.release(stack); return Err(e); }
+            Err(e) => { stack.release(frames); return Err(e); }
         };
         if let Some(caller) = self.process() { process.files.inherit(&caller.files); }
-        let context = (stack.address() + 4096 - size_of::<Context>()) as *mut Context;
+        let context = (stack.top() - size_of::<Context>()) as *mut Context;
         ptr::write_unaligned((*context).fx.as_mut_ptr() as *mut u16, 0x037f);
         ptr::write_unaligned((*context).fx.as_mut_ptr().add(24) as *mut u32, 0x1f80);
         (*context).rip = process.entry;
@@ -114,7 +109,7 @@ impl Queue {
         (*context).rsp = STACK;
         (*context).ss = 0x2b;
         let pid = process.pid;
-        self.tasks[slot] = Some(Task { stack, context: context as usize, runnable: true, waiting: None, timed: None, clock_stall_ticks: 0, last_clock_ms: 0,
+        self.tasks[slot] = Some(Task { stack, context: context as usize, runnable: true, waiting: None, timed: None,
                                       clock_error: false, preemptions: 0, process: Some(process) });
         self.count = self.count.max(slot+1);
         if parent == 0 && self.init_pid.is_none() { self.init_pid = Some(pid); }
@@ -130,9 +125,9 @@ impl Queue {
                                parent_context: &Context) -> Result<usize, isize> {
         let slot = self.tasks.iter().position(Option::is_none).ok_or(-11isize)?;
         let parent = self.process().ok_or(-1isize)?;
-        let stack = frames.alloc_zeroed().ok_or(-12isize)?;
+        let stack = KernelStack::allocate(frames).ok_or(-12isize)?;
         let Some(mut files) = crate::files::Descriptors::new(frames) else {
-            frames.release(stack);
+            stack.release(frames);
             return Err(-12);
         };
         files.inherit(&parent.files);
@@ -140,7 +135,7 @@ impl Queue {
             Ok(pid) => pid,
             Err(error) => {
                 files.release(frames);
-                frames.release(stack);
+                stack.release(frames);
                 return Err(error);
             }
         };
@@ -148,7 +143,7 @@ impl Queue {
             Ok(space) => space,
             Err(error) => {
                 files.release(frames);
-                frames.release(stack);
+                stack.release(frames);
                 return Err(error);
             }
         };
@@ -156,13 +151,12 @@ impl Queue {
             credentials: parent.credentials, space, entry: parent.entry,
             parent: parent.pid, pid: child_pid, status: None, files,
         };
-        let context = (stack.address() + 4096 - size_of::<Context>()) as *mut Context;
+        let context = (stack.top() - size_of::<Context>()) as *mut Context;
         ptr::copy_nonoverlapping(parent_context, context, 1);
         (*context).registers[14] = 0; // child SYS_FORK return value
         self.tasks[slot] = Some(Task {
             stack, context: context as usize, runnable: true,
-            waiting: None, timed: None, clock_stall_ticks: 0,
-            last_clock_ms: 0, clock_error: false, preemptions: 0,
+            waiting: None, timed: None, clock_error: false, preemptions: 0,
             process: Some(child),
         });
         self.count = self.count.max(slot + 1);
@@ -172,6 +166,9 @@ impl Queue {
     pub fn process(&self) -> Option<&Process> { self.tasks[self.current?].as_ref()?.process.as_ref() }
     pub fn process_mut(&mut self) -> Option<&mut Process> { self.tasks[self.current?].as_mut()?.process.as_mut() }
     pub fn running(&self) -> bool { self.current.is_some() }
+    pub fn all_blocked(&self) -> bool {
+        self.active && !self.tasks.iter().flatten().any(|task| task.runnable)
+    }
 
     pub fn terminal(&mut self, pid: usize, terminal: *mut crate::tty::Terminal) -> Result<(), isize> {
         if self.active || self.current.is_some() { return Err(-16); }
@@ -230,13 +227,11 @@ impl Queue {
             .any(|p| p.parent == parent && p.status.is_some())
     }
 
-    fn block_timed(&mut self, wait: TimedWait, now: u64) {
+    fn block_timed(&mut self, wait: TimedWait, _now: u64) {
         let task = self.tasks[self.current.unwrap()].as_mut().unwrap();
         task.runnable = false;
         task.waiting = None;
         task.timed = Some(wait);
-        task.clock_stall_ticks = 0;
-        task.last_clock_ms = now;
         task.clock_error = false;
     }
 
@@ -249,9 +244,10 @@ impl Queue {
         error
     }
 
-    /// Only periodic timer IRQs consume the stall budget. IRQs that arrive
-    /// for keyboard, I/O or process exit do not fake progress of the clock.
-    pub fn wake_timed(&mut self, now: u64, timer_irq: bool) {
+    /// The LAPIC policy measures its own consumed countdown independently of
+    /// TSC. A failed/stalled clock wakes waiters with EIO, never with a made-up
+    /// timeout. A child exit remains valid even when time is unavailable.
+    pub fn wake_timed(&mut self, now: u64, clock_error: bool) {
         for i in 0..self.count {
             let Some(wait) = self.tasks[i].as_ref().and_then(|t| t.timed) else { continue; };
             let child_finished = match wait {
@@ -261,27 +257,25 @@ impl Queue {
                 TimedWait::Sleep(_) | TimedWait::Events { .. } => false,
             };
             let task = self.tasks[i].as_mut().unwrap();
-            if now >= wait.deadline() || child_finished {
+            if child_finished || (!clock_error && now >= wait.deadline()) {
                 task.timed = None;
                 task.runnable = true;
-            } else if timer_irq {
-                if now > task.last_clock_ms {
-                    task.last_clock_ms = now;
-                    task.clock_stall_ticks = 0;
-                } else {
-                    task.clock_stall_ticks = task.clock_stall_ticks.saturating_add(1);
-                }
-                if task.clock_stall_ticks >= CLOCK_STALL_TICKS {
-                    task.timed = None;
-                    task.clock_error = true;
-                    task.runnable = true;
-                }
+            } else if clock_error {
+                task.timed = None;
+                task.clock_error = true;
+                task.runnable = true;
             }
         }
     }
 
     pub fn has_timed_waiters(&self) -> bool {
         self.tasks.iter().flatten().any(|task| task.timed.is_some())
+    }
+
+    /// Earliest scheduler-owned timeout, independent of task slot order.
+    /// The CPU uses this only after selecting work, with local IRQs masked.
+    pub fn next_deadline(&self) -> Option<u64> {
+        self.tasks.iter().flatten().filter_map(|task| task.timed.map(TimedWait::deadline)).min()
     }
 
     /// Eagerly wake parents when a child exits, independently of the APIC
@@ -316,7 +310,7 @@ impl Queue {
     }
 
     pub fn user_stack_top(&self) -> Option<usize> {
-        Some(self.tasks[self.current?].as_ref()?.stack.address() + 4096)
+        Some(self.tasks[self.current?].as_ref()?.stack.top())
     }
 
     /// Reassign all immediate children of an exiting process to this CPU's
@@ -418,7 +412,7 @@ impl Queue {
     fn release_task(&mut self, i: usize, frames: &mut Frames<'_>) {
         if let Some(task) = self.tasks[i].take() {
             if let Some(p) = task.process { p.files.release(frames); unsafe { p.space.release(frames); } }
-            frames.release(task.stack);
+            task.stack.release(frames);
         }
     }
 
@@ -469,9 +463,9 @@ mod timed_tests {
 
     fn task(pid: usize, parent: usize) -> Task {
         Task {
-            stack: unsafe { Frame::from_owned_address(0) }, context: pid * 4096,
+            stack: KernelStack::test_dummy(), context: pid * 4096,
             runnable: true, waiting: None, timed: None,
-            clock_stall_ticks: 0, last_clock_ms: 0, clock_error: false,
+            clock_error: false,
             preemptions: 0,
             process: Some(Process {
                 pid, parent, status: None,
@@ -501,9 +495,9 @@ mod timed_tests {
         q.block_sleep(125, 100);
         assert_eq!(q.select(10, false), 10); // back to kernel HLT caller
         assert!(q.active && q.has_timed_waiters() && !q.running());
-        q.wake_timed(124, true);
+        q.wake_timed(124, false);
         assert!(q.has_timed_waiters());
-        q.wake_timed(125, true);
+        q.wake_timed(125, false);
         assert!(!q.has_timed_waiters());
         assert_eq!(q.select(11, true), 10); // parent's saved syscall context
         assert!(!q.take_clock_error());
@@ -530,8 +524,8 @@ mod timed_tests {
         q.tasks[1].as_mut().unwrap().runnable = false;
         q.block_sleep(20_000, 0);
         q.select(1, false);
-        for tick in 1..=CLOCK_STALL_TICKS as u64 * 2 {
-            q.wake_timed(tick, true);
+        for tick in 1..=1000 {
+            q.wake_timed(tick, false);
         }
         assert!(q.has_timed_waiters());
         assert!(!q.tasks[0].as_ref().unwrap().clock_error);
@@ -543,9 +537,13 @@ mod timed_tests {
         q.tasks[1].as_mut().unwrap().runnable = false;
         q.block_sleep(10_000, 100);
         q.select(1, false);
-        for _ in 0..CLOCK_STALL_TICKS-1 { q.wake_timed(100, true); }
-        assert!(q.has_timed_waiters());
-        q.wake_timed(100, true);
+        let mut pTimer = crate::timer::Timer::new(1000);
+        pTimer.reset(Some(100));
+        for pSecond in 1..=5 {
+            assert_eq!(pTimer.plan(false, q.next_deadline(), 100), crate::timer::Action::Arm(100_000));
+            q.wake_timed(100, pTimer.sample(0, Some(100)));
+            assert_eq!(q.has_timed_waiters(), pSecond < 5);
+        }
         assert!(!q.has_timed_waiters());
         assert_eq!(q.select(1, true), 1);
         assert!(q.take_clock_error());
@@ -557,7 +555,7 @@ mod timed_tests {
         let mut q = queue();
         q.block_child(2, 200, 100);
         q.select(99, false);
-        q.wake_timed(200, true);
+        q.wake_timed(200, false);
         assert!(!q.has_timed_waiters());
         assert!(q.tasks[1].as_ref().unwrap().process.as_ref().unwrap().status.is_none());
         assert!(q.tasks[0].as_ref().unwrap().runnable);
@@ -615,12 +613,56 @@ mod timed_tests {
         q.tasks[1].as_mut().unwrap().runnable=false;
         q.block_events(0,220,100);
         q.select(0x456,false);
-        q.wake_timed(219,true);
+        q.wake_timed(219,false);
         assert!(q.has_timed_waiters());
-        q.wake_timed(220,true);
+        q.wake_timed(220,false);
         assert!(!q.has_timed_waiters());
         assert!(!q.has_exited_child(1));
         assert!(q.tasks[1].as_ref().unwrap().process.as_ref().unwrap().status.is_none());
+    }
+
+    #[test]
+    fn nearestDeadlineTracksIndependentSleepAndEventWaiters() {
+        let mut q=queue();
+        q.block_sleep(900,100);
+        q.select(77,false);
+        q.block_events(0,250,100);
+        assert_eq!(q.next_deadline(),Some(250));
+        q.select(88,false);
+        assert!(!q.running());
+        q.wake_timed(249,false);
+        assert_eq!(q.next_deadline(),Some(250));
+        q.wake_timed(250,false);
+        assert_eq!(q.next_deadline(),Some(900));
+        assert_eq!(q.select(99,true),88);
+        q.wake_timed(900,false);
+        assert_eq!(q.next_deadline(),None);
+    }
+
+    #[test]
+    fn unavailableClockReturnsErrorEvenIfAnUntrustedTimeLooksExpired() {
+        let mut q=queue();
+        q.tasks[1].as_mut().unwrap().runnable=false;
+        q.block_events(0,200,100);
+        q.select(77,false);
+        q.wake_timed(999,true);
+        assert_eq!(q.next_deadline(),None);
+        assert_eq!(q.select(88,false),77);
+        assert!(q.take_clock_error());
+        assert!(!q.has_exited_child(1));
+    }
+
+    #[test]
+    fn realChildCompletionDoesNotBecomeClockFailure() {
+        let mut q=queue();
+        q.block_child(2,900,100);
+        q.select(77,false);
+        q.tasks[1].as_mut().unwrap().process.as_mut().unwrap().status=Some(42);
+        q.tasks[1].as_mut().unwrap().runnable=false;
+        q.wake_timed(100,true);
+        assert_eq!(q.select(88,false),77);
+        assert!(!q.take_clock_error());
+        assert!(q.has_exited_child(1));
     }
 
     fn nested_queue() -> Queue {

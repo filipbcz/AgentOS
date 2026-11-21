@@ -43,6 +43,9 @@ impl Programs {
 
     pub unsafe fn load(&self, frames: &mut Frames<'_>, name: &[u8], parent: usize, credentials: Credentials) -> Result<Process, isize> {
         let elf = self.vfs.file(name)?;
+        // Discriminate the native ABI before even allocating a private root.
+        // Rejecting an invalid/unmarked note needs no page-table/data frames.
+        if !crate::native_abi::validate(elf) { return Err(ENOEXEC); }
         let space = UserSpace::new(frames, self.kernel_root).ok_or(ENOMEM)?;
         let result = load_elf(&space, frames, elf).and_then(|entry| {
             let pid = self.allocate_pid()?;
@@ -57,6 +60,7 @@ impl Programs {
 }
 
 unsafe fn load_elf(space: &UserSpace, frames: &mut Frames<'_>, elf: &[u8]) -> Result<usize, isize> {
+    // Programs::load validated the native ABI before creating this space.
     if elf.get(..7) != Some(b"\x7fELF\x02\x01\x01") || u16_at(elf, 16) != Some(2) ||
         u16_at(elf, 18) != Some(62) || word(elf, 20) != Some(1u32.to_le_bytes()) ||
         u16_at(elf, 52) != Some(64) || u16_at(elf, 54) != Some(56) { return Err(ENOEXEC); }

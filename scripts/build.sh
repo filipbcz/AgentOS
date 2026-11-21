@@ -46,6 +46,7 @@ for app in init fault receiver service shell svc_ok svc_fail svc_hang orphan_par
         objects+=("$src.o")
     done
     ld --build-id=none -z noexecstack -s -T "$root/user/user.ld" -o "$app" "${objects[@]}"
+    python3 "$root/scripts/verify-user-abi.py" "$app"
 done
 awk 'BEGIN {for (i=0;i<8193;i++) printf "%c",(i*73+int(i/251)*19)%256}' > data/transfer.bin
 touch -d @0 stage init fault receiver service shell svc_ok svc_fail svc_hang orphan_parent manager svc_alive svc_flaky data/transfer.bin data

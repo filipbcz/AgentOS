@@ -3,6 +3,7 @@
 
 use core::{arch::asm, panic::PanicInfo, ptr::write_volatile};
 mod frames;
+mod stack;
 mod paging;
 mod exceptions;
 mod acpi;
@@ -10,6 +11,7 @@ mod smp;
 mod scheduler;
 mod stress;
 mod process;
+mod native_abi;
 mod files;
 mod ipc;
 mod vfs;
@@ -22,6 +24,7 @@ mod log_policy;
 mod log_ring;
 mod logger;
 mod monotonic;
+mod timer;
 mod fb_console;
 use fb_console::glyph;
 
@@ -105,12 +108,13 @@ pub unsafe extern "sysv64" fn kernel_main(info: &BootInfo) -> ! {
     serial(b"AGENTOS PHYSICAL FRAMES OK\r\n");
     let Some(platform) = acpi::discover(info, map) else { log.event(0, b"ACPI DISCOVERY FAILED"); halt(); };
     log.event(2, b"ACPI TABLES READY");
-    let Some(descriptors) = exceptions::Descriptors::new(&mut frames) else { log.event(0, b"IDT INIT FAILED"); halt(); };
-    descriptors.load();
     smp::copy_startup(info.ap_boot);
     let Some(root) = paging::install(info, map, &mut frames, &platform) else {
         log.event(0, b"PAGING INIT FAILED"); halt();
     };
+    // IST stacks use the guarded pool in the newly active kernel page tables.
+    let Some(descriptors) = exceptions::Descriptors::new(&mut frames) else { log.event(0, b"IDT INIT FAILED"); halt(); };
+    descriptors.load();
     serial(b"AGENTOS OWN CR3="); exceptions::hex(root as u64); serial(b"\r\n");
     if !exceptions::probe(info.stack_base) || !frames.probe() {
         log.event(0, b"EXCEPTION OR RAM PROBE FAILED"); halt();

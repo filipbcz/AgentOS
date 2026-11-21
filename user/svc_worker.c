@@ -34,19 +34,27 @@ int runServiceWorker(void) {
                 sizeof(reply.data))!=sizeof(reply.data) ||
         reply.peer.pid==0 || reply.peer.uid!=1000 || reply.peer.gid!=1000 ||
         reply.data.magic!=SVC_MAGIC || reply.data.version!=SVC_VERSION ||
-        reply.data.result!=SVC_OK) return 122;
+        reply.data.result!=SVC_OK || reply.data.reserved ||
+        reply.data.states[id]!=SVC_RUNNING) return 122;
+#ifdef AGENTOS_FLAKY
     if (os_call(SYS_CLOSE,SVC_CHANNEL_FD,0,0)!=0) return 123;
+#endif
     (void)os_call(SYS_CLOSE,0,0,0);
     (void)os_call(SYS_CLOSE,1,0,0);
     (void)os_call(SYS_CLOSE,2,0,0);
-    for (;;) {
+#ifdef AGENTOS_FLAKY
         long now=os_call(SYS_MONOTONIC_MS,0,0,0);
         if (now<0 || (unsigned long)now>MAX_MS-100) return 124;
         if (os_call(SYS_SLEEP_UNTIL,now+100,0,0)!=0) return 125;
-#ifdef AGENTOS_FLAKY
         // Deliberately crash after a successful IPC READY handshake.
         // The persistent supervisor must reap, back off and enforce limits.
         return 42;
+#else
+    // A ready stable service has no periodic work. Its manager keeps this
+    // lifetime endpoint open; closure is an orderly end of ownership. A
+    // protocol violation is a service failure, never a busy receive loop.
+    unsigned char pPacket[sizeof(struct ipc_peer)+IPC_MAX_MESSAGE];
+    long pReceived=os_call(SYS_IPC_RECV,SVC_CHANNEL_FD,(long)pPacket,IPC_MAX_MESSAGE);
+    return pReceived==0 ? 0 : 129;
 #endif
-    }
 }

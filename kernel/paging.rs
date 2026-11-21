@@ -280,6 +280,10 @@ pub unsafe fn install(info: &BootInfo, map: &[u8], frames: &mut Frames<'_>, plat
     for io in &platform.io_apics[..platform.io_count] { tables.identity(io.address, PAGE, MMIO)?; }
     tables.identity(info.framebuffer as usize, info.stride as usize * info.height as usize * 4, MMIO)?;
 
+    // User roots copy this shared upper-half subtree; runtime stack allocation
+    // changes only its preallocated leaf tables, never an individual root.
+    crate::stack::prepare(tables.frames, root)?;
+
     // Firmware may leave global translations in the TLB. Flush those as well.
     asm!("rdmsr", "bts eax, 11", "wrmsr", in("ecx") 0xc0000080u32,
          out("eax") _, out("edx") _);

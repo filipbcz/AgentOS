@@ -2,9 +2,9 @@
 
 This is NOT the mandatory VirtualBox 7.1.12 acceptance. It boots the same
 signed EFI on an independent emulator, checks process, IPC and PID1 evidence
-on real COM1. --session additionally sends real bytes through QEMU's emulated
-16550 UART, validates authenticated interactive shell service control and
-clean root-manager shutdown, but does not claim PS/2/GOP acceptance.
+on real COM1. --session additionally drives the emulated 16550 UART and PS/2
+keyboard, verifies actual GOP glyphs, START/STOP/RESTART, runtime idle timer
+counts and clean manager shutdown. It does not claim VirtualBox acceptance.
 Every failure is recorded, never converted into a success by a timeout.
 """
 import argparse
@@ -38,13 +38,15 @@ orphans = load("qemu_orphan_evidence", "verify-orphans.py")
 cow = load("qemu_cow_evidence", "verify-cow.py")
 service_manager = load("qemu_service_manager_evidence", "verify-service-manager.py")
 boot_log = load("qemu_boot_log_evidence", "verify-boot-log.py")
+session = load("qemu_stage3_session", "verify-stage3-session.py")
+console = load("qemu_console_image", "verify-console-image.py")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cpus", type=int, choices=(1, 2), required=True)
     parser.add_argument("--session", action="store_true",
-                        help="Drive real COM1 services/exit commands and prove clean shutdown")
+                        help="Drive UART/PS2 editing, service control, runtime idle and shutdown")
     parser.add_argument("--timeout", type=int, default=720)
     parser.add_argument("--ovmf-code", type=Path, required=True)
     parser.add_argument("--ovmf-vars", type=Path, required=True)
@@ -121,11 +123,16 @@ class UartCapture:
                 self.error = error
 
     def send(self, command):
-        if command not in (b"services\r", b"exit\r"):
-            raise ValueError("Only fixed acceptance commands may be sent")
         if self.error is not None:
             raise RuntimeError(f"UART reader stopped: {self.error}")
-        self.link.sendall(command)
+        # A paced, real UART stream exercises the canonical input path and
+        # cannot overflow the emulated 16550 before its IRQ drains the FIFO.
+        with self.destination.with_name("com1-input.bin").open("ab", buffering=0) as sent:
+            for byte in command:
+                packet = bytes([byte])
+                self.link.sendall(packet)
+                sent.write(packet)
+                time.sleep(0.002)
 
     def close(self):
         self.stop.set()
@@ -137,6 +144,118 @@ class UartCapture:
         self.link.close()
         if self.worker.is_alive():
             raise RuntimeError("UART capture thread did not stop")
+
+
+class Qmp:
+    """Small QMP client; input is delivered to QEMU's emulated keyboard."""
+    def __init__(self, path):
+        self.link = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.link.settimeout(5)
+        self.link.connect(str(path))
+        self.file = self.link.makefile("rwb", buffering=0)
+        self.sequence = 0
+        greeting = self._receive()
+        if "QMP" not in greeting:
+            raise RuntimeError("QEMU did not send its QMP greeting")
+        self.execute("qmp_capabilities")
+
+    def _receive(self):
+        line = self.file.readline(1024 * 1024)
+        if not line or not line.endswith(b"\n"):
+            raise RuntimeError("Truncated or disconnected QMP response")
+        return json.loads(line)
+
+    def execute(self, name, arguments=None):
+        self.sequence += 1
+        command = {"execute": name, "id": self.sequence}
+        if arguments is not None:
+            command["arguments"] = arguments
+        self.file.write(json.dumps(command).encode("ascii") + b"\r\n")
+        until = time.monotonic() + 10
+        while time.monotonic() < until:
+            response = self._receive()
+            if "event" in response:
+                continue
+            if response.get("id") != self.sequence:
+                raise RuntimeError("QMP reply ID does not match the request")
+            if "error" in response:
+                raise RuntimeError(f"QMP {name}: {response['error']}")
+            if "return" not in response:
+                raise RuntimeError(f"Invalid QMP {name} response")
+            return response["return"]
+        raise TimeoutError(f"QMP {name} did not complete")
+
+    def screenshot(self, path):
+        path.unlink(missing_ok=True)
+        self.execute("screendump", {"filename": str(path)})
+        if not path.is_file():
+            raise RuntimeError("QEMU did not capture its actual guest framebuffer")
+
+    def keyboard(self, command):
+        # QMP send-key accepts QKeyCode, including explicit Backspace/Return.
+        # https://www.qemu.org/docs/master/interop/qemu-qmp-ref.html#command-send-key
+        special = {" ": "spc", "-": "minus", "\b": "backspace", "\r": "ret"}
+        for char in command + "\r":
+            if char not in special and not re.fullmatch("[a-z0-9]", char):
+                raise ValueError(f"Unsupported acceptance keyboard character: {char!r}")
+            self.execute("send-key", {"keys": [{"type": "qcode", "data": special.get(char, char)}],
+                                      "hold-time": 20})
+            time.sleep(0.06)
+
+    def close(self):
+        self.file.close()
+        self.link.close()
+
+
+def wait_session(process, capture, serial, predicate, description, seconds=30):
+    until = time.monotonic() + seconds
+    while time.monotonic() < until:
+        if capture.error is not None:
+            raise RuntimeError(f"UART capture stopped: {capture.error}")
+        content = serial.read_bytes()
+        if re.search(rb"SMP FAILED|FATAL VECTOR|SHELL FAILED", content):
+            raise RuntimeError("Guest failed during the interactive session")
+        if predicate(content):
+            return content
+        if process.poll() is not None:
+            raise RuntimeError("QEMU exited during the interactive session")
+        time.sleep(0.025)
+    raise TimeoutError(f"Interactive guest did not complete {description}")
+
+
+def run_session(process, capture, qmp, destination):
+    serial = destination / "com1.log"
+    children = list(session.SHELL_START.finditer(serial.read_bytes()))
+    if len(children) != 1:
+        raise RuntimeError("Cannot identify the real managed shell")
+    shell = int(children[0][1], 16)
+    for step in session.steps(shell, True):
+        if step["screenshot"]:
+            qmp.screenshot(destination / "keyboard-before.ppm")
+        offset = serial.stat().st_size
+        print(f"QEMU session: {step['transport']} {step['command']!r}", flush=True)
+        if step["transport"] == "keyboard":
+            qmp.keyboard(step["command"])
+        else:
+            capture.send((step["command"] + "\r").encode("ascii"))
+        pattern = re.compile(step["pattern"].encode("ascii"))
+        wait_session(process, capture, serial,
+                     lambda data: pattern.search(session.without_kernel_events(data[offset:])),
+                     step["command"], 45 if step["command"] == "idle" else 30)
+        if step["wait_exits"]:
+            wait_session(process, capture, serial,
+                         lambda data: len(list(session.EXIT.finditer(data[offset:]))) >= step["wait_exits"],
+                         "autonomous bounded service restart")
+        if step["screenshot"]:
+            qmp.screenshot(destination / "keyboard-after.ppm")
+            console.verify(destination / "keyboard-after.ppm", destination / "keyboard-before.ppm",
+                           "ps2-ok", "info", "both")
+    wait_session(process, capture, serial, lambda data: session.SESSION_STOP.search(data),
+                 "frame-clean manager shutdown")
+    # BOOT.LOG is enabled for QEMU. Wait for the final real write rather than
+    # closing the UART immediately after the preceding native stop record.
+    wait_session(process, capture, serial, lambda data: data.endswith(b"[INFO] INTERACTIVE SHELL STOPPED\r\n"),
+                 "final structured completion log")
 
 
 def boot(args):
@@ -193,6 +312,9 @@ def boot(args):
         variables.stdout + variables.stderr, encoding="utf-8")
     monitor_socket = destination / "qemu-monitor.sock"
     monitor_socket.unlink(missing_ok=True)
+    qmp_socket = destination / "qemu-qmp.sock"
+    qmp_socket.unlink(missing_ok=True)
+    (destination / "com1-input.bin").unlink(missing_ok=True)
     serial = destination / "com1.log"
     serial_socket = destination / "real-com1.sock"
     if args.session:
@@ -216,6 +338,7 @@ def boot(args):
         "-device", "ich9-ahci,id=sata",
         "-device", "ide-hd,drive=esp,bus=sata.0",
         "-monitor", f"unix:{monitor_socket},server=on,wait=off",
+        "-qmp", f"unix:{qmp_socket},server=on,wait=off",
         "-vga", "std", "-display", "none", *serial_options,
         "-nic", "none", "-boot", "order=c", "-no-reboot", "-no-shutdown",
     ]
@@ -226,8 +349,7 @@ def boot(args):
     last_progress = start
     last_size = -1
     run_succeeded = False
-    interactive_stage = 0
-    interactive_start = None
+    qmp = None
     serial_capture = None
     with stdout.open("wb") as diagnostic:
         process = subprocess.Popen(qemu, cwd=root, stdin=subprocess.DEVNULL,
@@ -244,32 +366,14 @@ def boot(args):
                     last_progress = time.monotonic()
                 if b"SMP FAILED:" in content or b"FATAL VECTOR" in content or b"SHELL FAILED" in content:
                     raise RuntimeError("Guest reported critical kernel failure; see COM1")
-                if b"AGENTOS SHELL READY\r\nagentos> " in content and interactive_stage == 0:
-                    snapshot(monitor_socket, destination / "shell-screen.ppm")
-                    if not args.session:
-                        run_succeeded = True
-                        break
-                    interactive_start = time.monotonic()
-                    time.sleep(0.25)
-                    serial_capture.send(b"services\r")
-                    interactive_stage = 1
-                if interactive_stage == 1 and (
-                    b"core: running (attempts=1)\r\n" in content and
-                    b"flaky: failed (attempts=3)\r\n" in content and
-                    b"shell: running (attempts=1)\r\nagentos> " in content
-                ):
-                    serial_capture.send(b"exit\r")
-                    interactive_stage = 2
-                if interactive_stage == 2 and re.search(
-                    rb"AGENTOS MANAGER SESSION STOP PID=[0-9a-f]{16} "
-                    rb"STATUS=0000000000000000 FRAMES=OK\r\n"
-                    rb"\[INFO\] INTERACTIVE SHELL STOPPED\r\n", content):
+                if b"AGENTOS SHELL READY\r\nagentos> " in content:
+                    qmp = Qmp(qmp_socket)
+                    qmp.screenshot(destination / "shell-screen.ppm")
+                    console.verify(destination / "shell-screen.ppm", aLevel="info", aOutput="both")
+                    if args.session:
+                        run_session(process, serial_capture, qmp, destination)
                     run_succeeded = True
                     break
-                if interactive_start is not None and time.monotonic()-interactive_start > 45:
-                    raise TimeoutError(
-                        f"COM1 interactive session stalled at stage {interactive_stage} "
-                        "for more than 45 host seconds")
                 if process.poll() is not None:
                     snapshot(destination / "qemu-monitor.sock", destination / "failed-screen.ppm")
                     raise RuntimeError(f"QEMU exited before shell became ready: {process.returncode}")
@@ -310,6 +414,8 @@ def boot(args):
                       file=sys.stderr, flush=True)
             raise
         finally:
+            if qmp is not None:
+                qmp.close()
             if serial_capture is not None:
                 serial_capture.close()
             if process.poll() is None:
@@ -321,6 +427,8 @@ def boot(args):
                     process.wait(timeout=10)
     text = serial.read_text(encoding="ascii", errors="replace")
     boot_log.verify(text.encode("ascii", errors="replace"), "info", "both")
+    if text.splitlines().count("AGENTOS KERNEL STACK GUARD OK") != 1:
+        raise RuntimeError("Missing actual guarded kernel stack fault-probe evidence")
     marker = re.compile(r"(?m)^AGENTOS TASK (?:BSP|AP) APIC=([0-9a-f]{16}) "
                         r"TIMER-WAKES=0000000000000003$")
     apics = [int(x, 16) for x in marker.findall(text)]
@@ -331,9 +439,9 @@ def boot(args):
     orphans.verify(text, args.cpus)
     cow.verify(text, args.cpus)
     service_manager.verify(text)
+    session_result = None
     if args.session:
-        session = load("qemu_manager_session_evidence", "verify-manager-session.py")
-        session.verify(serial.read_bytes())
+        session_result = session.verify(serial.read_bytes(), (destination / "com1-input.bin").read_bytes(), True)
     receipt = {
         "schema": 1,
         "result": "pass",
@@ -341,6 +449,9 @@ def boot(args):
         "source_commit": commit,
         "cpus": args.cpus,
         "interactive_com1_manager_session": args.session,
+        "ps2_keyboard_session": args.session,
+        "runtime_session": session_result,
+        "gop_sha256": evidence.sha256(destination / "shell-screen.ppm"),
         "host_elapsed_seconds": round(time.monotonic()-start, 3),
         "signed_efi_sha256": image["artifacts"]["agentos.efi"],
         "ovmf_code_sha256": evidence.sha256(args.ovmf_code),
@@ -349,6 +460,10 @@ def boot(args):
         "com1_sha256": evidence.sha256(serial),
         "firmware_vars_sha256_after_boot": evidence.sha256(vm_vars),
     }
+    if args.session:
+        receipt["com1_input_sha256"] = evidence.sha256(destination / "com1-input.bin")
+        receipt["ps2_before_sha256"] = evidence.sha256(destination / "keyboard-before.ppm")
+        receipt["ps2_after_sha256"] = evidence.sha256(destination / "keyboard-after.ppm")
     (destination / "smoke.json").write_text(
         json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(f"QEMU Secure Boot smoke OK: {args.cpus} CPUs, "

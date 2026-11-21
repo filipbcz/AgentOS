@@ -3,6 +3,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import re
 import tempfile
 import unittest
 
@@ -47,9 +48,11 @@ class VmEvidenceTests(unittest.TestCase):
         self.write(self.run / "display.png", b"mock GOP screenshot")
         self.write(self.run / "shell-before.png", b"mock prompt")
         self.write(self.run / "shell-keyboard.png", b"mock typed response")
+        self.write(self.run / "com1-input.bin", b"mock transmitted UART bytes")
         self.write(self.run / "com1.log",
                    b"AGENTOS KERNEL OK STAGE 1\r\n"
-                   b"AGENTOS SHELL STOP PID=0000000000000008 "
+                   b"AGENTOS MANAGER SESSION START PID=0000000000000001\r\n"
+                   b"AGENTOS MANAGER SESSION STOP PID=0000000000000001 "
                    b"STATUS=0000000000000000 FRAMES=OK\r\n")
         self.manifest = {
             "schema": 1, "result": "pass", "vm": self.run.name,
@@ -64,7 +67,7 @@ class VmEvidenceTests(unittest.TestCase):
             "artifacts": {
                 name: evidence.sha256(self.run / name)
                 for name in ("esp.raw", "esp.vdi", "display.png",
-                             "shell-before.png", "shell-keyboard.png", "com1.log")
+                             "shell-before.png", "shell-keyboard.png", "com1.log", "com1-input.bin")
             },
         }
         self.save_manifest()
@@ -107,6 +110,36 @@ class VmEvidenceTests(unittest.TestCase):
         self.save_manifest()
         self.assertEqual(evidence.verify_run(self.root, self.run)["case"], "loader")
 
+    def test_session_receipt_matches_actual_kernel_producer(self):
+        # This contract test reads the real emitter, not another hand-maintained
+        # fixture. Renaming a kernel session boundary must update its consumer.
+        source = (Path(__file__).resolve().parents[1] / "kernel/smp.rs").read_text()
+        prefixes = re.findall(r'serial\(b"(AGENTOS MANAGER SESSION (?:START|STOP) PID=)"\)', source)
+        self.assertEqual(len(prefixes), 2)
+        log = (b"AGENTOS KERNEL OK STAGE 1\r\n" +
+               prefixes[0].encode() + b"0000000000000001\r\n" +
+               prefixes[1].encode() + b"0000000000000001 STATUS=0000000000000000 FRAMES=OK\r\n")
+        self.write(self.run / "com1.log", log)
+        self.manifest["artifacts"]["com1.log"] = evidence.sha256(self.run / "com1.log")
+        self.save_manifest()
+        self.assertEqual(evidence.verify_run(self.root, self.run)["result"], "pass")
+
+    def test_old_duplicate_foreign_or_failed_session_receipt_is_rejected(self):
+        path = self.run / "com1.log"
+        original = path.read_bytes()
+        for altered in (
+            original.replace(b"MANAGER SESSION STOP", b"SHELL STOP"),
+            original.replace(b"STOP PID=0000000000000001", b"STOP PID=0000000000000002"),
+            original.replace(b"STATUS=0000000000000000", b"STATUS=0000000000000001"),
+            original + original.splitlines(keepends=True)[-1],
+            original.replace(b"AGENTOS MANAGER SESSION START PID=0000000000000001\r\n", b""),
+        ):
+            with self.subTest(log=altered):
+                self.write(path, altered)
+                self.manifest["artifacts"]["com1.log"] = evidence.sha256(path)
+                self.save_manifest()
+                self.rejected()
+
     def test_reject_failed_incomplete_or_wrong_vm(self):
         for key, wrong in (("result", "fail"), ("cpus", 4),
                            ("virtualbox_version", "7.2.0r123"),
@@ -129,6 +162,11 @@ class VmEvidenceTests(unittest.TestCase):
                 self.rejected()
                 self.write(path, original)
         self.manifest["artifacts"].pop("shell-keyboard.png")
+        self.save_manifest()
+        self.rejected()
+
+    def test_keyboard_profile_still_requires_transmitted_uart_evidence(self):
+        self.manifest["artifacts"].pop("com1-input.bin")
         self.save_manifest()
         self.rejected()
 

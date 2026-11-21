@@ -23,6 +23,8 @@ pub struct Frames<'a> {
     refs: &'a mut [u16],
     next_word: usize,
     available: usize,
+    // Shared kernel PML4 with a permanently prepared guarded-stack subtree.
+    kernel_root: usize,
 }
 
 pub struct SharedFrames {
@@ -71,6 +73,13 @@ pub(super) fn ram(desc: &[u8]) -> Option<(usize, usize)> {
 
 impl Frames<'_> {
     pub fn available(&self) -> usize { self.available }
+    pub fn kernel_root(&self) -> Option<usize> {
+        (self.kernel_root != 0).then_some(self.kernel_root)
+    }
+    pub(super) fn install_kernel_root(&mut self, root: usize) {
+        assert!(self.kernel_root == 0 && root != 0 && root % PAGE == 0);
+        self.kernel_root = root;
+    }
 
     // Allocate all snapshot pages before copying so their own bits are included.
     pub fn snapshot(&mut self) -> Option<BitmapSnapshot> {
@@ -110,7 +119,7 @@ impl Frames<'_> {
         let mut frames = Self {
             free: slice::from_raw_parts_mut(bitmap, words),
             refs: slice::from_raw_parts_mut(refs, highest),
-            next_word: 0, available: 0,
+            next_word: 0, available: 0, kernel_root: 0,
         };
         for (first, end) in regions() {
             for i in first..end {

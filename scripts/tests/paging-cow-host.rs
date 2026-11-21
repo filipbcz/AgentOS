@@ -27,15 +27,20 @@ mod frames {
         pub fn into_address(self)->usize {self.0}
     }
     pub struct Frames<'a> {
-        pool: Vec<Box<Page>>, counts: Vec<u16>, budget: usize, _l:PhantomData<&'a ()>,
+        pool: Vec<Box<Page>>, counts: Vec<u16>, budget: usize, root: usize, _l:PhantomData<&'a ()>,
     }
     pub fn ram(_desc:&[u8])->Option<(usize,usize)> {None}
     impl Frames<'_> {
         pub fn new(n:usize)->Self {
             let pool=(0..n).map(|_|Box::new(Page([0;4096]))).collect();
-            Self{pool,counts:vec![0;n],budget:usize::MAX,_l:PhantomData}
+            Self{pool,counts:vec![0;n],budget:usize::MAX,root:0,_l:PhantomData}
         }
         pub fn used(&self)->usize {self.counts.iter().filter(|&&r|r!=0).count()}
+        pub fn kernel_root(&self)->Option<usize> {(self.root!=0).then_some(self.root)}
+        pub fn install_kernel_root(&mut self,root:usize) {
+            assert!(self.root==0 && root!=0 && root%4096==0);
+            self.root=root;
+        }
         pub fn alloc(&mut self)->Option<Frame> {
             if self.budget==0 {return None}
             let i=self.counts.iter().position(|&n| n==0)?;
@@ -66,6 +71,8 @@ mod frames {
         pub fn allow(&mut self,n:usize){self.budget=n}
     }
 }
+#[path="../../kernel/stack.rs"]
+mod stack;
 #[path="../../kernel/paging.rs"]
 mod paging;
 use paging::{UserSpace, USER_BASE};
@@ -75,6 +82,40 @@ fn setup()->(frames::Frames<'static>,usize,UserSpace) {
     let root=frames.alloc_zeroed().unwrap().into_address();
     let user=unsafe {UserSpace::new(&mut frames,root).unwrap()};
     (frames,root,user)
+}
+
+#[test]
+fn guardedKernelStacksRemainSharedAcrossPrivateUserRoots() {
+    let mut frames=frames::Frames::new(64);
+    let root=frames.alloc_zeroed().unwrap().into_address();
+    unsafe {stack::prepare(&mut frames,root).unwrap();}
+    let user=unsafe {UserSpace::new(&mut frames,root).unwrap()};
+    let before=frames.used();
+    let stack=stack::KernelStack::allocate(&mut frames).unwrap();
+    let guard=stack.guard();
+    unsafe {
+        assert_eq!((root as *const u64).add(256).read(),(user.root as *const u64).add(256).read());
+        let walk=|mut table:usize,va:usize| {
+            for shift in [39,30,21] {
+                let value=(table as *const u64).add((va>>shift)&511).read();
+                assert_eq!(value&7,3,"kernel subtree may not become user accessible");
+                table=(value&0x000f_ffff_ffff_f000) as usize;
+            }
+            (table as *const u64).add((va>>12)&511).read()
+        };
+        assert_eq!(walk(user.root,guard),0);
+        assert_eq!(walk(user.root,stack.top()),0);
+        for offset in 1..=4 {
+            let va=guard+offset*4096;
+            assert_eq!(walk(user.root,va),walk(root,va));
+            assert_eq!(walk(user.root,va)&((1<<63)|7),(1<<63)|3);
+        }
+        stack.release(&mut frames);
+        assert_eq!(frames.used(),before);
+        assert_eq!(walk(user.root,guard+4096),0);
+        user.release(&mut frames);
+    }
+    assert_eq!(frames.used(),51,"user destruction must preserve shared pool tables");
 }
 
 #[test]
