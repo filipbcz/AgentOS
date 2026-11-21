@@ -115,6 +115,54 @@ impl Queue {
         Ok(pid)
     }
 
+    /// fork(2)-style CPU-local clone. The child continues at the instruction
+    /// after SYSCALL with RAX=0 and its own kernel interrupt stack. The parent
+    /// receives the child's PID. Both user stacks start as shared RO/COW pages.
+    /// All potentially failing allocations and descriptor retention happen
+    /// before fork_cow commits the parent's writable PTE protection.
+    pub unsafe fn fork_process(&mut self, frames: &mut Frames<'_>, programs: &Programs,
+                               parent_context: &Context) -> Result<usize, isize> {
+        let slot = self.tasks.iter().position(Option::is_none).ok_or(-11isize)?;
+        let parent = self.process().ok_or(-1isize)?;
+        let stack = frames.alloc_zeroed().ok_or(-12isize)?;
+        let Some(mut files) = crate::files::Descriptors::new(frames) else {
+            frames.release(stack);
+            return Err(-12);
+        };
+        files.inherit(&parent.files);
+        let child_pid = match programs.allocate_pid() {
+            Ok(pid) => pid,
+            Err(error) => {
+                files.release(frames);
+                frames.release(stack);
+                return Err(error);
+            }
+        };
+        let space = match parent.space.fork_cow(frames, programs.kernel_root) {
+            Ok(space) => space,
+            Err(error) => {
+                files.release(frames);
+                frames.release(stack);
+                return Err(error);
+            }
+        };
+        let child = Process {
+            credentials: parent.credentials, space, entry: parent.entry,
+            parent: parent.pid, pid: child_pid, status: None, files,
+        };
+        let context = (stack.address() + 4096 - size_of::<Context>()) as *mut Context;
+        ptr::copy_nonoverlapping(parent_context, context, 1);
+        (*context).registers[14] = 0; // child SYS_FORK return value
+        self.tasks[slot] = Some(Task {
+            stack, context: context as usize, runnable: true,
+            waiting: None, timed: None, clock_stall_ticks: 0,
+            last_clock_ms: 0, clock_error: false, preemptions: 0,
+            process: Some(child),
+        });
+        self.count = self.count.max(slot + 1);
+        Ok(child_pid)
+    }
+
     pub fn process(&self) -> Option<&Process> { self.tasks[self.current?].as_ref()?.process.as_ref() }
     pub fn process_mut(&mut self) -> Option<&mut Process> { self.tasks[self.current?].as_mut()?.process.as_mut() }
     pub fn running(&self) -> bool { self.current.is_some() }
