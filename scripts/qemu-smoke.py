@@ -262,7 +262,8 @@ def boot(args):
                     interactive_stage = 2
                 if interactive_stage == 2 and re.search(
                     rb"AGENTOS MANAGER SESSION STOP PID=[0-9a-f]{16} "
-                    rb"STATUS=0000000000000000 FRAMES=OK\r\n", content):
+                    rb"STATUS=0000000000000000 FRAMES=OK\r\n"
+                    rb"\[INFO\] INTERACTIVE SHELL STOPPED\r\n", content):
                     run_succeeded = True
                     break
                 if interactive_start is not None and time.monotonic()-interactive_start > 45:
