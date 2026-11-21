@@ -18,6 +18,7 @@ import subprocess
 import sys
 import socket
 import time
+import threading
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -83,32 +84,59 @@ def connect_uart(path, process):
             client.close()
             time.sleep(0.05)
             continue
-        client.setblocking(False)
+        client.settimeout(0.2)
         return client
     raise TimeoutError("QEMU 16550 UART was not ready for a real COM1 session")
 
 
-def capture_uart(client, destination):
-    """Drain actual transmitted UART bytes into the same integrity-checked log."""
-    with destination.open("ab") as log:
-        for _ in range(128):
-            try:
-                packet = client.recv(65536)
-            except BlockingIOError:
-                break
-            if not packet:
-                raise RuntimeError("QEMU real COM1 channel closed during guest boot")
-            log.write(packet)
+class UartCapture:
+    """Continuously drain a real 16550 guest COM1 UART while the CPU runs.
 
+    Reading only every 250ms lost actual kernel output and could stall QEMU's
+    socket back-end. A dedicated reader makes the capture backpressure-free.
+    Writes go directly to an unbuffered file consumed by strict verifiers;
+    no expected transcript bytes are ever synthesized.
+    """
+    def __init__(self, link, destination):
+        self.link = link
+        self.destination = destination
+        self.stop = threading.Event()
+        self.error = None
+        self.worker = threading.Thread(target=self._read, daemon=True)
+        self.worker.start()
 
-def send_uart_command(client, command):
-    if command not in (b"services\r", b"exit\r"):
-        raise ValueError("Only fixed acceptance commands may be sent")
-    client.settimeout(5)
-    try:
-        client.sendall(command)
-    finally:
-        client.setblocking(False)
+    def _read(self):
+        try:
+            with self.destination.open("wb", buffering=0) as log:
+                while not self.stop.is_set():
+                    try:
+                        packet = self.link.recv(65536)
+                    except socket.timeout:
+                        continue
+                    if not packet:
+                        raise RuntimeError("Emulated UART disconnected before session complete")
+                    log.write(packet)
+        except (OSError, RuntimeError) as error:
+            if not self.stop.is_set():
+                self.error = error
+
+    def send(self, command):
+        if command not in (b"services\r", b"exit\r"):
+            raise ValueError("Only fixed acceptance commands may be sent")
+        if self.error is not None:
+            raise RuntimeError(f"UART reader stopped: {self.error}")
+        self.link.sendall(command)
+
+    def close(self):
+        self.stop.set()
+        try:
+            self.link.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self.worker.join(timeout=3)
+        self.link.close()
+        if self.worker.is_alive():
+            raise RuntimeError("UART capture thread did not stop")
 
 
 def boot(args):
@@ -200,16 +228,16 @@ def boot(args):
     run_succeeded = False
     interactive_stage = 0
     interactive_start = None
-    serial_link = None
+    serial_capture = None
     with stdout.open("wb") as diagnostic:
         process = subprocess.Popen(qemu, cwd=root, stdin=subprocess.DEVNULL,
                                    stdout=diagnostic, stderr=subprocess.STDOUT)
         try:
             if args.session:
-                serial_link = connect_uart(serial_socket, process)
+                serial_capture = UartCapture(connect_uart(serial_socket, process), serial)
             while time.monotonic() - start < args.timeout:
-                if serial_link is not None:
-                    capture_uart(serial_link, serial)
+                if serial_capture is not None and serial_capture.error is not None:
+                    raise RuntimeError(f"Real UART capture stopped: {serial_capture.error}")
                 content = serial.read_bytes() if serial.exists() else b""
                 if len(content) != last_size:
                     last_size = len(content)
@@ -223,14 +251,14 @@ def boot(args):
                         break
                     interactive_start = time.monotonic()
                     time.sleep(0.25)
-                    send_uart_command(serial_link, b"services\r")
+                    serial_capture.send(b"services\r")
                     interactive_stage = 1
                 if interactive_stage == 1 and (
                     b"core: running (attempts=1)\r\n" in content and
                     b"flaky: failed (attempts=3)\r\n" in content and
                     b"shell: running (attempts=1)\r\nagentos> " in content
                 ):
-                    send_uart_command(serial_link, b"exit\r")
+                    serial_capture.send(b"exit\r")
                     interactive_stage = 2
                 if interactive_stage == 2 and re.search(
                     rb"AGENTOS MANAGER SESSION STOP PID=[0-9a-f]{16} "
@@ -281,12 +309,8 @@ def boot(args):
                       file=sys.stderr, flush=True)
             raise
         finally:
-            if serial_link is not None:
-                try:
-                    capture_uart(serial_link, serial)
-                except OSError:
-                    pass
-                serial_link.close()
+            if serial_capture is not None:
+                serial_capture.close()
             if process.poll() is None:
                 process.terminate()
                 try:
