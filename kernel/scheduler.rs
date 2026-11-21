@@ -27,6 +27,7 @@ struct Task {
     waiting: Option<crate::files::Wait>,
     timed: Option<TimedWait>,
     clock_stall_ticks: u16,
+    last_clock_ms: u64,
     clock_error: bool,
     preemptions: usize,
     process: Option<Process>,
@@ -79,7 +80,7 @@ impl Queue {
             (*context).ss = 16;
             ((top - 8) as *mut usize).write(task_return as usize);
         }
-        self.tasks[self.count] = Some(Task { stack, context: context as usize, runnable: true, waiting: None, timed: None, clock_stall_ticks: 0,
+        self.tasks[self.count] = Some(Task { stack, context: context as usize, runnable: true, waiting: None, timed: None, clock_stall_ticks: 0, last_clock_ms: 0,
                                           clock_error: false, preemptions: 0, process: None });
         self.count += 1;
         Some(())
@@ -104,7 +105,7 @@ impl Queue {
         (*context).rsp = STACK;
         (*context).ss = 0x2b;
         let pid = process.pid;
-        self.tasks[slot] = Some(Task { stack, context: context as usize, runnable: true, waiting: None, timed: None, clock_stall_ticks: 0,
+        self.tasks[slot] = Some(Task { stack, context: context as usize, runnable: true, waiting: None, timed: None, clock_stall_ticks: 0, last_clock_ms: 0,
                                       clock_error: false, preemptions: 0, process: Some(process) });
         self.count = self.count.max(slot+1);
         Ok(pid)
@@ -128,20 +129,21 @@ impl Queue {
 
     /// Called exclusively by the owner CPU with interrupts disabled. The
     /// original syscall is restarted on wake, and checks its own deadline.
-    pub fn block_sleep(&mut self, deadline: u64) {
-        self.block_timed(TimedWait::Sleep(deadline));
+    pub fn block_sleep(&mut self, deadline: u64, now: u64) {
+        self.block_timed(TimedWait::Sleep(deadline), now);
     }
 
-    pub fn block_child(&mut self, pid: usize, deadline: u64) {
-        self.block_timed(TimedWait::Child { pid, deadline });
+    pub fn block_child(&mut self, pid: usize, deadline: u64, now: u64) {
+        self.block_timed(TimedWait::Child { pid, deadline }, now);
     }
 
-    fn block_timed(&mut self, wait: TimedWait) {
+    fn block_timed(&mut self, wait: TimedWait, now: u64) {
         let task = self.tasks[self.current.unwrap()].as_mut().unwrap();
         task.runnable = false;
         task.waiting = None;
         task.timed = Some(wait);
         task.clock_stall_ticks = 0;
+        task.last_clock_ms = now;
         task.clock_error = false;
     }
 
@@ -170,7 +172,12 @@ impl Queue {
                 task.timed = None;
                 task.runnable = true;
             } else if timer_irq {
-                task.clock_stall_ticks = task.clock_stall_ticks.saturating_add(1);
+                if now > task.last_clock_ms {
+                    task.last_clock_ms = now;
+                    task.clock_stall_ticks = 0;
+                } else {
+                    task.clock_stall_ticks = task.clock_stall_ticks.saturating_add(1);
+                }
                 if task.clock_stall_ticks >= CLOCK_STALL_TICKS {
                     task.timed = None;
                     task.clock_error = true;
