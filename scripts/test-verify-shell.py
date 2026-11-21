@@ -14,11 +14,16 @@ pSpec.loader.exec_module(gVerifier)
 
 
 def transcript(aPid=9):
+    pRoot = aPid + 100
     return (b"AGENTOS KERNEL OK STAGE 1\r\n" +
+            f"AGENTOS MANAGER SESSION START PID={pRoot:016x}\r\n"
+            f"AGENTOS MANAGER BEGIN ROOT={pRoot:016x} COUNT=00000003\r\n"
             f"AGENTOS SHELL START PID={aPid:016x}\r\n".encode("ascii") +
             b"AGENTOS SHELL READY\r\nagentos> help\r\n"
             b"help       List commands\r\npid        Show process ID\r\n"
             b"echo TEXT  Print text\r\ncat PATH   Read an initramfs file\r\n"
+            b"services   Show service registry\r\n"
+            b"service start|stop|restart core|flaky\r\n"
             b"exit       Close the shell\r\nagentos> pid\r\n" + str(aPid).encode("ascii") +
             b"\r\nagentos> echo shell-ox\b \bk\r\nshell-ok\r\n"
             b"agentos> cat /stage\r\nAgentOS stage 1\r\n"
@@ -26,8 +31,11 @@ def transcript(aPid=9):
             b"agentos> no-such-command\r\nerror: unknown command or arguments; use help\r\n"
             b"agentos> exit\r\nAGENTOS SHELL EXIT\r\n" +
             f"AGENTOS USER EXIT PID={aPid:016x} CR3=0000000000700000 STATUS=0000000000000000\r\n"
-            f"AGENTOS SHELL STOP PID={aPid:016x} STATUS=0000000000000000 FRAMES=OK\r\n".encode("ascii"))
-
+            f"AGENTOS MANAGER SHUTD ROOT={pRoot:016x} COUNT=00000003\r\n"
+            f"AGENTOS USER KILL PID={aPid+20:016x} PARENT={pRoot:016x} STATUS=0000000000000089\r\n"
+            f"AGENTOS MANAGER ENDED ROOT={pRoot:016x} COUNT=00000003\r\n"
+            f"AGENTOS USER EXIT PID={pRoot:016x} CR3=0000000000710000 STATUS=0000000000000000\r\n"
+            f"AGENTOS MANAGER SESSION STOP PID={pRoot:016x} STATUS=0000000000000000 FRAMES=OK\r\n".encode("ascii"))
 
 class ShellEvidenceTests(unittest.TestCase):
     def setUp(self):
@@ -53,7 +61,7 @@ class ShellEvidenceTests(unittest.TestCase):
         self.rejected(self.pLog.replace(b"\r\nAgentOS stage 1\r\n", b"\r\ncat /stage\r\n"))
 
     def test_wrong_identity_and_pid_command(self):
-        self.rejected(self.pLog.replace(b"SHELL STOP PID=0000000000000009", b"SHELL STOP PID=0000000000000008"))
+        self.rejected(self.pLog.replace(b"MANAGER SESSION STOP PID=000000000000006d", b"MANAGER SESSION STOP PID=000000000000006e"))
         self.rejected(self.pLog.replace(b"USER EXIT PID=0000000000000009", b"USER EXIT PID=0000000000000008"))
         self.rejected(self.pLog.replace(b"pid\r\n9\r\n", b"pid\r\n8\r\n"))
         self.rejected(transcript(0))
@@ -74,7 +82,7 @@ class ShellEvidenceTests(unittest.TestCase):
 
     def test_missing_duplicate_malformed_boundaries(self):
         for pLine in self.pLog.splitlines(keepends=True):
-            if pLine.startswith((b"AGENTOS SHELL START", b"AGENTOS SHELL STOP")):
+            if pLine.startswith((b"AGENTOS SHELL START", b"AGENTOS MANAGER SESSION STOP", b"AGENTOS MANAGER SESSION START")):
                 with self.subTest(line=pLine):
                     self.rejected(self.pLog.replace(pLine, b""))
                     self.rejected(self.pLog.replace(pLine, pLine + pLine))
