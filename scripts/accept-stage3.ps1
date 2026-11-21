@@ -3,7 +3,7 @@ $ErrorActionPreference='Stop'
 $root=Split-Path $PSScriptRoot
 Set-Location $root
 
-# This is the authoritative executable VM profile matrix for stage 3.
+# This is the mandatory current VM integration matrix for stage 3, NOT\n# proof of complete stage-3 acceptance (COW, orphan reparenting and long-lived\n# service registry still require implementation and separate verification).
 # It MUST NOT manufacture acceptance from source compilation or synthetic
 # logs. test-vbox.ps1 independently verifies firmware, kernel, COM1, timer,
 # IPC, PID1, shell and framebuffer, then writes one immutable-by-hash receipt.
@@ -80,4 +80,4 @@ if ($LASTEXITCODE -ne 0) {
     Remove-Item -LiteralPath $summaryPath -Force -ErrorAction SilentlyContinue
     throw 'Stage-3 acceptance receipts did not pass independent matrix verification'
 }
-Write-Output "STAGE3_ACCEPTANCE_PASSED=$summaryPath"
+Write-Output "STAGE3_VM_MATRIX_PASSED=$summaryPath"
