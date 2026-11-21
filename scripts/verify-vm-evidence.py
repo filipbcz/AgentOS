@@ -93,6 +93,8 @@ def verify_run(root, run_dir, require_pass=True):
     require(data.get("build_provenance_sha256") ==
             sha256(root / "build/build-provenance.json"),
             "VM run references a changed build provenance receipt")
+    require(data.get("harness_sha256") == sha256(root / "scripts/test-vbox.ps1"),
+            "VM acceptance test script differs from recorded source")
     require(data.get("vm") == run_dir.name, "VirtualBox VM name does not match run directory")
     require(isinstance(data.get("virtualbox_version"), str) and
             VBox_VERSION.fullmatch(data["virtualbox_version"]),
@@ -147,9 +149,12 @@ def verify_run(root, run_dir, require_pass=True):
     else:
         require(data.get("boot_image_sha256") == sha256(run_dir / "changed.efi"),
                 "Negative VM test boot hash mismatch")
-        require(b"AGENTOS KERNEL OK STAGE 1" not in
-                (run_dir / "com1.log").read_bytes(),
+        log = (run_dir / "com1.log").read_bytes()
+        require(b"AGENTOS KERNEL OK STAGE 1" not in log,
                 "Firmware accepted modified EFI")
+        require(re.search(rb"BdsDxe: failed to load .*HARDDISK.*"
+                          rb"(Access Denied|Security Violation)", log) is not None,
+                "Firmware rejection is unproven; timeout is inconclusive")
     return data
 
 
