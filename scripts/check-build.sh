@@ -101,12 +101,12 @@ printf 'Compiling and linking the kernel with %s and %s\n' "$pRustc" "$pCc"
     -o "$pOut/kernel.elf" "$pOut/libkernel.a" "$pOut/ap-start.o"
 "$pPython" "$pRoot/scripts/verify-kernel-layout.py" "$pOut/kernel.elf"
 
-for pApp in init fault receiver service shell svc_ok svc_fail svc_hang; do
+for pApp in init fault receiver service shell svc_ok svc_fail svc_hang orphan_parent; do
     printf 'Compiling and linking user program %s\n' "$pApp"
     "$pCc" -c "$pRoot/user/$pApp.S" -o "$pOut/$pApp-entry.o"
     pObjects=("$pOut/$pApp-entry.o")
     case "$pApp" in
-        init) pSources=(transfer client supervisor);;
+        init) pSources=(transfer client supervisor orphans);;
         receiver) pSources=(receive);;
         service) pSources=(service);;
         shell) pSources=(shell);;
