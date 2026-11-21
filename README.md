@@ -2,7 +2,7 @@
 
 Vlastní operační systém pro x86-64 podle [technického zadání](ZADANI.md). Aktuální stav, přesné ověřené revize a otevřená přejímka jsou v [plánu implementace](PLAN_IMPLEMENTACE.md). Starší výsledky se nevztahují automaticky na nový obraz.
 
-Etapa 3 obsahuje izolované procesy, nativní ELF ABI, COW, VFS nad initramfs, roury, autentizované lokální IPC, původní PID 1 se správou služeb a interaktivní TTY přes COM1 i PS/2/GOP. Vývoj probíhá ve větvi `dev/stage3-ipc-validation`. Povinné převzetí této verze ve VirtualBoxu zůstává otevřené; QEMU poskytuje samostatný integrační důkaz.
+Etapa 3 obsahuje izolované procesy, nativní ELF ABI, COW, VFS nad initramfs, roury, autentizované lokální IPC, původní PID 1 se správou služeb a interaktivní TTY přes COM1 i PS/2/GOP. Milník 3.1 A přidává demand paging procesů. Vývoj probíhá ve větvi `dev/stage3-ipc-validation`. Povinné převzetí této verze ve VirtualBoxu zůstává otevřené; QEMU poskytuje samostatný integrační důkaz konkrétní ověřené revize.
 
 ## Sestavení
 
@@ -73,7 +73,11 @@ ACPI MADT řídí výběr CPU a IRQ routing. AP startují přes INIT/SIPI. Preem
 
 Bootové zkoušky zachovávají preempci, souběžnou alokaci, vyčerpání paměti, návrat bitmapy a samostatné přibližně 30sekundové měření klidu. Příkaz `idle` navíc měří běžící systém s PID 1, stabilní službou a zablokovaným shellem. Toto druhé měření zachytí periodická probouzení, která by pouhý bootový test neodhalil.
 
-Obecný demand paging a řízená migrace úloh s vyvažováním mezi CPU jsou naplánované v navazujícím **milníku 3.1** [implementačního plánu](PLAN_IMPLEMENTACE.md#31-demand-paging-a-vyvažování-smp). Dosud nejsou implementované: současný loader přiděluje ELF segmenty i uživatelský zásobník před spuštěním a procesy zůstávají na svém CPU. Milník má vlastní podmínky převzetí a je nutný před převzetím Linux ABI a stabilního vydání; přejímka základního profilu etapy 3 ve VirtualBoxu jej nepotvrzuje.
+Demand paging z **milníku 3.1 A** [implementačního plánu](PLAN_IMPLEMENTACE.md#31-demand-paging-a-vyvažování-smp) odděluje rezervované virtuální oblasti od přidělených rámců. Loader rezervuje ELF segmenty a čtyřstránkový uživatelský zásobník; fyzické stránky i potřebné podřízené tabulky vznikají až při oprávněném přístupu. Obsah pochází z neměnného initramfs nebo nulování BSS/anonymní paměti. Jedna metadata stránka drží nejvýše 64 nepřekrývajících se oblastí včetně zásobníku. `.bss` je skutečné ELF `NOBITS`, takže velká rezervace nevytváří stejně velký initramfs.
+
+Stejná cesta obsluhuje CPL3 page fault i kernelové čtení/zápis uživatelského bufferu. Neplatný rozsah vrací `EFAULT` (−14), nedostatek rámců `ENOMEM` (−12). Před kopírováním se ověří a připraví celý rozsah. Při OOM mohou již připravené stránky zůstat rezidentní, ale nezmění se přenášené bajty, pozice souboru ani obsah front. Každé nedokončené jednotlivé mapování vrací nové tabulky; ukončení procesu vrátí i jeho metadata a všechny stránky. Konzolový výstup dostane vlastní kopii nejvýše 256 bajtů a UART/GOP obslouží až po uvolnění zámku alokátoru.
+
+Procesy nadále zůstávají na svém CPU. Řízená migrace a vyvažování patří do dosud neimplementované části **3.1 B**. Přesný stav ověření části A je v plánu; historická přejímka základního profilu etapy 3 ji nepotvrzuje.
 
 ## Uživatelské procesy a nativní ABI v1
 
@@ -110,8 +114,11 @@ Instrukce `syscall` přijímá číslo v RAX a tři argumenty v RDI/RSI/RDX. RAX
 | `0x10017` | `wait_events_until` | IPC/EOF, child exit nebo deadline bez polling smyčky |
 | `0x10018` | `timer_stats` | Čtyři u64: verze 1, čas, timer IRQ, idle timer IRQ |
 | `0x10019` | `ipc_try_send` | Plná schránka vrací −11 bez uspání a bez odeslání |
+| `0x1001a` | `vm_stats` | Osm u64: verze 1, rezervované/rezidentní stránky, tabulky, metadata, demand/COW čítače |
 
 `timer_stats(buffer,32,0)` je pouze čtecí diagnostika; čítače se čtením nenulují. Čas je monotónní vůči epochě daného CPU, nikoli UTC ani synchronizovaný čas mezi CPU. CPU-local procesy v této etapě nemigrují.
+
+`vm_stats(buffer,64,0)` před snímkem připraví svůj výstupní buffer. Počty zahrnují vlastní PML4, uživatelské tabulky a jednu metadata stránku; společná kernelová mapování se nepočítají. Kumulativní počítadla demand alokací, COW kopií a povýšení posledního vlastníka začínají u nového procesu i po `fork` od nuly; aktuální rezervace a rezidentní mapování se dědí. Sdílená stránka se počítá v každém adresním prostoru, takže nejde o celkovou fyzickou spotřebu systému.
 
 ### VFS, roury a lokální zprávové IPC
 
@@ -170,5 +177,7 @@ Testovací skript nastavuje soubor pomocí `-LogLevel` a `-LogOutput`. Strukturo
 `Host checks` spouští skutečné Rust/C host testy, negativní testy ověřovačů, kernel/user linky a PowerShell parser. Syntetické logy ověřují validátory a nikdy se nevydávají za výstup hostovaného jádra.
 
 `QEMU Secure Boot smoke (supplementary)` sestaví podepsaný obraz připnutým toolchainem a bootuje OVMF/QEMU TCG s 1 i 2 CPU. Každý job provede bootový běh a samostatnou rozšířenou relaci: UART příkazy, START/STOP/RESTART, tři skutečné ukončené workery, provozní idle, QMP vstup do emulované PS/2 klávesnice, přesné GOP glyphy a čisté ukončení PID 1. Artefakty `qemu-secureboot-1cpu` a `qemu-secureboot-2cpu` uchovávají obraz, build provenance, logy, snímky a `smoke.json`.
+
+Nové bootové běhy na obou CPU konfiguracích povinně ověřují také `user/demand.c`: skutečnou 16MiB BSS rezervaci s malým počtem rezidentních stránek, vzdálené první přístupy, lazy syscall buffery, COW i dosud nepřítomné oblasti při `fork` a samostatné chyby guard/NX/RO. Log lze znovu prověřit příkazem `python scripts/verify-demand-paging.py --log CESTA_K_COM1_LOG --cpus 1` (nebo `2`). Stejný ověřovač používá aktuální `test-vbox.ps1`; stávající `accept-stage3.ps1` zároveň opakuje celou regresní matici základního profilu.
 
 Přesné dokončené běhy a jejich rozsah jsou evidovány v [etapě 3 plánu](PLAN_IMPLEMENTACE.md#3-izolované-procesy-vfs-ipc-a-terminál). Po jakékoli změně kódu či testovacího scénáře je nutný nový výsledek odpovídající revize. QEMU nepřepisuje stav povinné matice VirtualBoxu.

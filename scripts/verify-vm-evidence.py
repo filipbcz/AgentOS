@@ -7,10 +7,14 @@ altered logs, missing screenshots, and failed/incomplete acceptance runs.
 """
 import argparse
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 import re
 import sys
+
+# An offline receipt check must not dirty the source checkout it verifies.
+sys.dont_write_bytecode = True
 
 
 class EvidenceError(ValueError):
@@ -146,6 +150,18 @@ def verify_run(root, run_dir, require_pass=True):
         log = (run_dir / "com1.log").read_bytes()
         require(b"AGENTOS KERNEL OK STAGE 1\r\n" in log,
                 "Signed VM receipt lacks final kernel boot marker")
+        # Older receipts predate this milestone and remain valid inputs. If a
+        # demand trace is present, verify its contents as well as its hash;
+        # malformed/partial traces must never pass as unrelated serial text.
+        if b"AGENTOS DEMAND" in log:
+            pSpec = importlib.util.spec_from_file_location(
+                "receiptDemandEvidence", Path(__file__).with_name("verify-demand-paging.py"))
+            pVerifier = importlib.util.module_from_spec(pSpec)
+            pSpec.loader.exec_module(pVerifier)
+            try:
+                pVerifier.verify(log.decode("ascii", errors="replace"), cpus)
+            except pVerifier.VerificationError as pError:
+                raise EvidenceError(f"Invalid demand-paging evidence: {pError}") from pError
         if shell:
             starts = list(SESSION_START.finditer(log))
             stops = list(SESSION_STOP.finditer(log))

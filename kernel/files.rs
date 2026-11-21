@@ -1,5 +1,6 @@
 //! Descriptor tables belong to processes. Shared descriptions are reachable
 //! only by dup2 and inheritance on the same CPU, with local IRQs masked.
+#![allow(non_snake_case)]
 use crate::{frames::{Frame, Frames}, paging::UserSpace, process::EFAULT, serial};
 use core::mem;
 use crate::ipc::{Channel, Operation};
@@ -19,7 +20,27 @@ const _: () = assert!(mem::size_of::<[Handle; SLOTS]>() <= 4096 && mem::size_of:
 pub enum Wait { Pipe { end: PipeWait, need: usize }, Socket(*mut Channel, usize, Operation), Terminal(*mut crate::tty::Terminal) }
 #[derive(Clone, Copy)]
 pub struct PipeWait(Handle);
-pub enum Io { Bytes(usize), Sleep(Wait) }
+pub enum Io { Bytes(usize), Sleep(Wait), Output(PendingOutput) }
+
+/// A bounded copy of user bytes, prepared while page allocation is locked.
+/// Complete hardware output only after releasing the shared frame lock. The
+/// descriptor/session remains owned by this CPU until the syscall returns.
+pub struct PendingOutput {
+    fTarget: Handle,
+    fBytes: [u8; 256],
+    fLength: usize,
+}
+
+impl PendingOutput {
+    pub fn complete(self) -> Result<usize, isize> {
+        let pBytes = &self.fBytes[..self.fLength];
+        match self.fTarget {
+            Handle::Console => { unsafe { serial(pBytes); } Ok(self.fLength) }
+            Handle::TerminalOutput(pTerminal) => unsafe { (*pTerminal).write(pBytes) },
+            _ => unreachable!(),
+        }
+    }
+}
 
 impl Wait {
     pub fn ready(self) -> bool {
@@ -131,7 +152,7 @@ impl Descriptors {
         };
         let frame = frames.alloc_zeroed().ok_or(-12isize)?;
         let pair = (r as u64 | ((w as u64) << 32)).to_le_bytes();
-        if space.write(frames, output, &pair).is_none() { frames.release(frame); return Err(EFAULT); }
+        if let Err(error) = space.write(frames, output, &pair) { frames.release(frame); return Err(error); }
         let address = frame.into_address();
         let (first, second) = if socket {
             let p = address as *mut Channel;
@@ -166,7 +187,7 @@ impl Descriptors {
         let Handle::Socket(p, side) = self.handle(fd)? else { return Err(-88); };
         let channel = unsafe { &mut *p };
         let result = match op {
-            Operation::Send => channel.send(side, process.pid, process.credentials, &process.space, address, len),
+            Operation::Send => channel.send(frames, side, process.pid, process.credentials, &process.space, address, len),
             Operation::Receive => channel.receive(frames, side, &process.space, address, len),
         }?;
         Ok(result.map_or(Io::Sleep(Wait::Socket(p, side, op)), Io::Bytes))
@@ -176,13 +197,13 @@ impl Descriptors {
         let end = self.handle(fd)?;
         match end {
             Handle::TerminalInput(p) => {
-                let n = unsafe { (*p).read(len, |bytes| space.write(frames, va, bytes).ok_or(EFAULT))? };
+                let n = unsafe { (*p).read(len, |bytes| space.write(frames, va, bytes))? };
                 Ok(n.map_or(Io::Sleep(Wait::Terminal(p)), Io::Bytes))
             }
             Handle::File(p) => {
                 let file = unsafe { &mut *p };
                 let n = len.min(file.data.len() - file.offset);
-                space.write(frames, va, &file.data[file.offset..file.offset+n]).ok_or(EFAULT)?;
+                space.write(frames, va, &file.data[file.offset..file.offset+n])?;
                 file.offset += n;
                 Ok(Io::Bytes(n))
             }
@@ -191,10 +212,10 @@ impl Descriptors {
                 if len == 0 { return Ok(Io::Bytes(0)); }
                 if pipe.used == 0 && pipe.writers != 0 { return Ok(Io::Sleep(Wait::Pipe { end: PipeWait(end), need: 1 })); }
                 let n = len.min(pipe.used);
-                space.writable(frames, va, n).ok_or(EFAULT)?;
+                space.writable(frames, va, n)?;
                 let first = n.min(PIPE_SIZE - pipe.head);
-                space.write(frames, va, &pipe.buf[pipe.head..pipe.head+first]).ok_or(EFAULT)?;
-                space.write(frames, va+first, &pipe.buf[..n-first]).ok_or(EFAULT)?;
+                space.write(frames, va, &pipe.buf[pipe.head..pipe.head+first])?;
+                space.write(frames, va+first, &pipe.buf[..n-first])?;
                 pipe.head = (pipe.head+n) % PIPE_SIZE;
                 pipe.used -= n;
                 Ok(Io::Bytes(n))
@@ -203,21 +224,15 @@ impl Descriptors {
         }
     }
 
-    pub fn write(&self, space: &UserSpace, fd: usize, va: usize, len: usize) -> Result<Io, isize> {
+    pub fn write(&self, frames: &mut Frames<'_>, space: &UserSpace, fd: usize, va: usize, len: usize) -> Result<Io, isize> {
         let end = self.handle(fd)?;
         match end {
-            Handle::TerminalOutput(p) => {
-                let mut buf = [0; 256];
-                let n = len.min(buf.len());
-                space.read(va, &mut buf[..n]).ok_or(EFAULT)?;
-                unsafe { (*p).write(&buf[..n]).map(Io::Bytes) }
-            }
-            Handle::Console => {
-                let mut buf = [0; 256];
-                if len > buf.len() { return Err(-22); }
-                space.read(va, &mut buf[..len]).ok_or(EFAULT)?;
-                unsafe { serial(&buf[..len]); }
-                Ok(Io::Bytes(len))
+            Handle::TerminalOutput(_) | Handle::Console => {
+                let mut pBytes = [0; 256];
+                if matches!(end, Handle::Console) && len > pBytes.len() { return Err(-22); }
+                let pLength = len.min(pBytes.len());
+                space.read(frames, va, &mut pBytes[..pLength])?;
+                Ok(Io::Output(PendingOutput { fTarget: end, fBytes: pBytes, fLength: pLength }))
             }
             Handle::Writer(p) => {
                 let pipe = unsafe { &mut *p };
@@ -228,10 +243,14 @@ impl Descriptors {
                 if free < need { return Ok(Io::Sleep(Wait::Pipe { end: PipeWait(end), need })); }
                 let n = len.min(free);
                 va.checked_add(n).ok_or(EFAULT)?;
+                // Validate and fault in the entire source before touching
+                // either half of the ring. A later page/OOM failure must not
+                // leave a partial write or commit any pipe bytes.
+                space.readable(frames, va, n)?;
                 let tail = (pipe.head + pipe.used) % PIPE_SIZE;
                 let first = n.min(PIPE_SIZE - tail);
-                space.read(va, &mut pipe.buf[tail..tail+first]).ok_or(EFAULT)?;
-                space.read(va+first, &mut pipe.buf[..n-first]).ok_or(EFAULT)?;
+                space.read(frames, va, &mut pipe.buf[tail..tail+first])?;
+                space.read(frames, va+first, &mut pipe.buf[..n-first])?;
                 pipe.used += n;
                 Ok(Io::Bytes(n))
             }

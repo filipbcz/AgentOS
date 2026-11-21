@@ -46,6 +46,8 @@ ORPHAN_BEGIN = re.compile(r"AGENTOS ORPHAN BEGIN ROOT=([0-9a-f]{16})")
 ORPHAN_END = re.compile(r"AGENTOS ORPHAN ENDED ROOT=([0-9a-f]{16})")
 COW_BEGIN = re.compile(r"AGENTOS COW BEGIN ROOT=([0-9a-f]{16}) CHILD=0000000000000000")
 COW_END = re.compile(r"AGENTOS COW ENDED ROOT=([0-9a-f]{16}) CHILD=([0-9a-f]{16})")
+gDemandBegin = re.compile(r"AGENTOS DEMAND BEGIN ROOT=([0-9a-f]{16}) CHILD=0000000000000000 ADDRESS=0000000000000000")
+gDemandEnd = re.compile(r"AGENTOS DEMAND ENDED ROOT=([0-9a-f]{16}) CHILD=0000000000000000 ADDRESS=0000000000000000")
 
 
 def require(condition, message):
@@ -65,12 +67,14 @@ def verify(text, apic_ids):
     orphan_roots = []
     cow_open = None
     cow_roots = []
+    pDemandOpen = None
+    pDemandRoots = []
     manager_open = False
     for number, line in enumerate(text.splitlines(), 1):
         if line.startswith("AGENTOS MANAGER SESSION START"):
             match = MANAGER_SESSION.fullmatch(line)
             require(match is not None and int(match[1],16)>0 and not manager_open and
-                    supervisor_open is None and orphan_open is None and cow_open is None and
+                    supervisor_open is None and orphan_open is None and cow_open is None and pDemandOpen is None and
                     sum(kind=="check" for kind,_,_ in events)==len(expected_cpus),
                     f"Operational root manager began before CPU process tests completed at {number}")
             manager_open=True
@@ -84,6 +88,32 @@ def verify(text, apic_ids):
             # verify-service-manager.py strictly authenticates the entire
             # ongoing registry/worker/ready/restart subtrace. Do not mistake
             # its worker process EXIT records for IPC transfer children.
+            continue
+        if line.startswith("AGENTOS DEMAND "):
+            pBegin = gDemandBegin.fullmatch(line)
+            pEnd = gDemandEnd.fullmatch(line)
+            require(supervisor_open is None and orphan_open is None and cow_open is None,
+                    f"Demand phase overlaps prior stage at line {number}")
+            if pBegin:
+                require(pDemandOpen is None and len(cow_roots) > len(pDemandRoots) and
+                        int(pBegin[1], 16) == cow_roots[-1],
+                        f"Demand phase is nested or precedes its COW test at line {number}")
+                pDemandOpen = int(pBegin[1], 16)
+            elif pEnd:
+                require(pDemandOpen is not None and int(pEnd[1], 16) == pDemandOpen,
+                        f"Unmatched demand phase end at line {number}")
+                pDemandRoots.append(pDemandOpen)
+                pDemandOpen = None
+            else:
+                require(pDemandOpen is not None, f"Demand event outside interval at line {number}")
+            continue
+        if pDemandOpen is not None:
+            # The dedicated mandatory verifier owns all lazy fork/protection
+            # child exits and faults inside these explicit boundaries.
+            require(not line.startswith(("AGENTOS COW ", "AGENTOS ORPHAN ",
+                                         "AGENTOS SUPERVISOR ", "AGENTOS PROCESS ",
+                                         "AGENTOS SHELL ")),
+                    f"Unterminated demand interval at line {number}")
             continue
         if line.startswith("AGENTOS COW "):
             begin = COW_BEGIN.fullmatch(line)
@@ -176,6 +206,9 @@ def verify(text, apic_ids):
     require(supervisor_open is None, "Unterminated supervisor interval")
     require(orphan_open is None, "Unterminated orphan interval")
     require(cow_open is None, "Unterminated COW interval")
+    require(pDemandOpen is None, "Unterminated demand interval")
+    require(not pDemandRoots or len(pDemandRoots) == len(expected_cpus),
+            "Missing demand interval on one or more CPUs")
     require(not cow_roots or len(cow_roots) == len(expected_cpus),
             "Missing fork/COW interval on one or more CPUs")
     require(not supervised_parents or len(supervised_parents) == len(expected_cpus),
@@ -205,6 +238,9 @@ def verify(text, apic_ids):
         if cow_roots:
             require(cow_roots[len(seen_cpus)] == parent,
                     f"COW interval does not belong to this parent: {context}")
+        if pDemandRoots:
+            require(pDemandRoots[len(seen_cpus)] == parent,
+                    f"Demand interval does not belong to this parent: {context}")
         require(cpu in expected_cpus and cpu not in seen_cpus,
                 f"Unexpected or repeated CPU: {context}")
         require(len(pids) == 4 and 0 not in pids and not (pids & seen_pids),

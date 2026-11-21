@@ -1,5 +1,5 @@
 use crate::{acpi::Platform, exceptions::{hex, Descriptors}, frames::{Exhaustion, Frames, SharedFrames},
-            halt, out, process::{Programs, EFAULT}, scheduler::{Context, Queue}, serial, stress::{self, Load}};
+            halt, out, process::Programs, scheduler::{Context, Queue}, serial, stress::{self, Load}};
 use core::{arch::{asm, x86_64::__cpuid}, cell::UnsafeCell, hint::spin_loop, ptr,
            sync::atomic::{fence, AtomicU32, AtomicUsize, Ordering}};
 
@@ -261,6 +261,7 @@ impl Cpu {
         self.output(&digits);
     }
 
+    #[allow(non_snake_case)]
     unsafe fn process_test(&self) -> Result<(), Error> {
         unsafe fn msr(index: u32, value: u64) {
             asm!("wrmsr", in("ecx") index, in("eax") value as u32, in("edx") (value >> 32) as u32);
@@ -289,9 +290,14 @@ impl Cpu {
         self.schedule();
         let ok = self.load.frames.with(|f| {
             let q = &mut *self.queue.get();
-            if let Some(resident) = resident {
+            if let Some(mut resident) = resident {
                 let valid = pid == 1 && q.parked_root() == Some(pid) &&
-                    q.child_after(pid, 0) == Err(-10) && resident.matches(f);
+                    q.child_after(pid, 0) == Err(-10) &&
+                    // Lazy spawn had no private user tables/data yet. Account
+                    // only the exact frames now reachable from the retained
+                    // PID1 space; every unrelated allocation/free still fails.
+                    q.parkedSpace().map_or(false, |pSpace| pSpace.visitResidentFrames(
+                        |pAddress| resident.includeAllocatedFrame(f, pAddress))) && resident.matches(f);
                 resident.release(f);
                 if valid { (*self.boot_baseline.get()).replace(baseline); }
                 else { baseline.release(f); }
@@ -433,14 +439,20 @@ unsafe extern "C" fn serial_interrupt(context: *mut Context) -> usize {
     cpu.switch(context as usize, false)
 }
 
-/// A genuine CPL3 write protection fault may be a COW fault. Resolve it
-/// in the current address space without killing the process, or reject it
-/// as an ordinary isolation violation. The CPU returns to the *same* RIP.
-pub unsafe fn user_cow_fault(addr: usize) -> bool {
-    let cpu = current_cpu();
-    let queue = &mut *cpu.queue.get();
-    let Some(process) = queue.process() else { return false; };
-    cpu.load.frames.with(|frames| process.space.resolve_cow(frames, addr)) == Some(true)
+/// Retry an authorized demand/COW access at the same user RIP. Kernel
+/// copy-in/out explicitly invokes the pager through physical aliases instead
+/// of taking a nested kernel fault while holding the frame allocator lock.
+#[allow(non_snake_case)]
+pub unsafe fn userPageFault(aAddress: usize, aError: u64) -> bool {
+    let pCpu = current_cpu();
+    let pQueue = &mut *pCpu.queue.get();
+    let Some(pProcess) = pQueue.process() else { return false; };
+    let pResult = pCpu.load.frames.with(|pFrames| pProcess.space.resolveFault(pFrames, aAddress, aError));
+    if pResult == Err(-12) {
+        pCpu.output(b"AGENTOS PAGE OOM PID="); pCpu.hex(pProcess.pid as u64);
+        pCpu.output(b" ADDRESS="); pCpu.hex(aAddress as u64); pCpu.output(b"\r\n");
+    }
+    pResult.is_ok()
 }
 
 pub unsafe fn user_fault(vector: u64, error: u64, addr: u64) -> usize {
@@ -456,6 +468,7 @@ pub unsafe fn user_fault(vector: u64, error: u64, addr: u64) -> usize {
 }
 
 #[no_mangle]
+#[allow(non_snake_case)]
 unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
     let cpu = current_cpu();
     if ctx.rsp >= 1usize << 47 { return user_fault(13, 0, 0); }
@@ -480,8 +493,24 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
                 for (i, field) in fields.iter().enumerate() {
                     bytes[i*8..(i+1)*8].copy_from_slice(&field.to_le_bytes());
                 }
-                cpu.load.frames.with(|f| p.space.write(f, a, &bytes)).map_or(EFAULT, |_| 0)
+                cpu.load.frames.with(|f| p.space.write(f, a, &bytes)).map_or_else(|e| e, |_| 0)
             } else { -5 }
+        }
+        // Versioned read-only VM accounting. Fault in the destination before
+        // taking the snapshot, so its own frames are included consistently.
+        0x1001a => {
+            if b != 64 || c != 0 { -22 }
+            else {
+                cpu.load.frames.with(|f| {
+                    p.space.writable(f, a, 64)?;
+                    let pFields = p.space.stats();
+                    let mut pBytes = [0u8; 64];
+                    for (pIndex, pField) in pFields.iter().enumerate() {
+                        pBytes[pIndex*8..(pIndex+1)*8].copy_from_slice(&pField.to_le_bytes());
+                    }
+                    p.space.write(f, a, &pBytes)
+                }).map_or_else(|e| e, |_| 0)
+            }
         }
         // SYS_WAIT_CHILD_UNTIL(child_pid, absolute_deadline_ms):
         // nonblocking if already reaped/finished, otherwise sleep until child
@@ -524,13 +553,20 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
         }
         op @ (0x10002 | 0x10008 | 0x1000d | 0x1000e | 0x10015 | 0x10019) => {
             let io = match op {
-                0x10002 => p.files.write(&p.space, a, b, c),
+                0x10002 => cpu.load.frames.with(|f| p.files.write(f, &p.space, a, b, c)),
                 0x10008 => cpu.load.frames.with(|f| p.files.read(f, &p.space, a, b, c)),
                 0x1000d | 0x10019 => cpu.load.frames.with(|f| p.files.message(f, crate::ipc::Operation::Send, p, a, b, c)),
                 _ => cpu.load.frames.with(|f| p.files.message(f, crate::ipc::Operation::Receive, p, a, b, c)),
             };
+            // Lazy copy-in may allocate, but slow UART/GOP output must not
+            // keep every other CPU waiting for the shared frame allocator.
+            let io = match io {
+                Ok(crate::files::Io::Output(pOutput)) => pOutput.complete().map(crate::files::Io::Bytes),
+                pOther => pOther,
+            };
             match io {
                 Ok(crate::files::Io::Bytes(n)) => { q.wake_io(); n as isize }
+                Ok(crate::files::Io::Output(_)) => unreachable!(),
                 Ok(crate::files::Io::Sleep(_)) if op == 0x10015 || op == 0x10019 => -11,
                 Ok(crate::files::Io::Sleep(wait)) => {
                     // No bytes committed. Retry SYSCALL with its original
@@ -591,7 +627,7 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
         0x10004 => {
             let mut name = [0; 64];
             if b == 0 || b > name.len() { -22 }
-            else if p.space.read(a, &mut name[..b]).is_none() { EFAULT }
+            else if let Err(error) = cpu.load.frames.with(|f| p.space.read(f, a, &mut name[..b])) { error }
             else { cpu.load.frames.with(|f| q.spawn_process(f, cpu.programs, &name[..b], pid))
                        .map(|v| v as isize).unwrap_or_else(|e| e) }
         }
@@ -618,7 +654,7 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
         0x10007 => {
             let mut path = [0; crate::vfs::PATH_MAX];
             if c != 0 { -30 } else if b > path.len() { -36 }
-            else if p.space.read(a, &mut path[..b]).is_none() { EFAULT }
+            else if let Err(error) = cpu.load.frames.with(|f| p.space.read(f, a, &mut path[..b])) { error }
             else { cpu.programs.vfs.file(&path[..b]).and_then(|data|
                 cpu.load.frames.with(|f| p.files.open(f, data))).map(|n| n as isize).unwrap_or_else(|e| e) }
         }

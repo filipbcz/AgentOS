@@ -244,6 +244,8 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "Orphan reparenting verification failed: $dir" }
         & python "$PSScriptRoot/verify-cow.py" --log "$dir\com1.log" --cpus $Cpus
         if ($LASTEXITCODE -ne 0) { throw "Fork/COW page isolation failed: $dir" }
+        & python "$PSScriptRoot/verify-demand-paging.py" --log "$dir\com1.log" --cpus $Cpus
+        if ($LASTEXITCODE -ne 0) { throw "Demand paging and lazy syscall isolation failed: $dir" }
         & python "$PSScriptRoot/verify-service-manager.py" --log "$dir\com1.log"
         if ($LASTEXITCODE -ne 0) { throw "Persistent service registry readiness/restart evidence failed: $dir" }
         & "$PSScriptRoot/verify-idle.ps1" -RunDir $dir -ApicIds $ids -HostSeconds $hostIdleSeconds

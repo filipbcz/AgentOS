@@ -1,6 +1,6 @@
 //! One bounded message in flight in each direction of a local channel.
 //! Channel access is serialized by its endpoints' CPU with interrupts masked.
-use crate::{frames::Frames, paging::UserSpace, process::{Credentials, EFAULT}};
+use crate::{frames::Frames, paging::UserSpace, process::Credentials};
 
 pub const MAX_MESSAGE: usize = 1024;
 #[derive(Clone, Copy)]
@@ -26,13 +26,13 @@ impl Channel {
         }
     }
 
-    pub fn send(&mut self, side: usize, pid: usize, credentials: Credentials,
+    pub fn send(&mut self, frames: &mut Frames<'_>, side: usize, pid: usize, credentials: Credentials,
                 space: &UserSpace, address: usize, len: usize) -> Result<Option<usize>, isize> {
         if len == 0 || len > MAX_MESSAGE { return Err(-90); }
         if self.refs[1-side] == 0 { return Err(-32); }
         let slot = &mut self.inbox[1-side];
         if slot.length != 0 { return Ok(None); }
-        space.read(address, &mut slot.data[..len]).ok_or(EFAULT)?;
+        space.read(frames, address, &mut slot.data[..len])?;
         slot.peer[..8].copy_from_slice(&(pid as u64).to_le_bytes());
         slot.peer[8..12].copy_from_slice(&credentials.uid.to_le_bytes());
         slot.peer[12..].copy_from_slice(&credentials.gid.to_le_bytes());
@@ -46,9 +46,9 @@ impl Channel {
         if slot.length == 0 { return Ok((self.refs[1-side] == 0).then_some(0)); }
         let len = slot.length;
         if capacity < len { return Err(-90); }
-        space.writable(frames, address, slot.peer.len()+len).ok_or(EFAULT)?;
-        space.write(frames, address, &slot.peer).ok_or(EFAULT)?;
-        space.write(frames, address+slot.peer.len(), &slot.data[..len]).ok_or(EFAULT)?;
+        space.writable(frames, address, slot.peer.len()+len)?;
+        space.write(frames, address, &slot.peer)?;
+        space.write(frames, address+slot.peer.len(), &slot.data[..len])?;
         slot.length = 0;
         Ok(Some(len))
     }

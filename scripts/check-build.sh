@@ -81,6 +81,14 @@ printf 'Testing actual COW paging clone, W^X and OOM rollback with %s\n' "$pRust
 "$pRustc" --edition 2021 --test "$pRoot/scripts/tests/paging-cow-host.rs" -o "$pOut/paging-cow-tests"
 "$pOut/paging-cow-tests"
 
+printf 'Testing exact frame-snapshot accounting for retained lazy processes with %s\n' "$pRustc"
+"$pRustc" --edition 2021 --test "$pRoot/kernel/frames.rs" -o "$pOut/frame-snapshot-tests"
+"$pOut/frame-snapshot-tests"
+
+printf 'Testing actual lazy ELF loader, file/pipe/IPC copies and OOM rollback with %s\n' "$pRustc"
+"$pRustc" --edition 2021 --test "$pRoot/scripts/tests/demand-process-host.rs" -o "$pOut/demand-process-tests"
+"$pOut/demand-process-tests"
+
 printf 'Testing native ELF ABI declaration and malformed input rejection with %s\n' "$pRustc"
 "$pRustc" --edition 2021 --test "$pRoot/kernel/native_abi.rs" -o "$pOut/native-abi-tests"
 "$pOut/native-abi-tests"
@@ -136,7 +144,7 @@ for pApp in init fault receiver service shell svc_ok svc_fail svc_hang orphan_pa
     "$pCc" -c "$pRoot/user/$pEntry.S" -o "$pOut/$pApp-entry.o"
     pObjects=("$pOut/$pApp-entry.o")
     case "$pApp" in
-        init) pSources=(transfer client supervisor orphans forktest service_manager);;
+        init) pSources=(transfer client supervisor orphans forktest demand service_manager);;
         receiver) pSources=(receive);;
         service) pSources=(service);;
         shell) pSources=(shell service_client);;

@@ -192,6 +192,14 @@ impl Queue {
         if !self.active && self.current.is_none() { self.boot_parked } else { None }
     }
 
+    #[allow(non_snake_case)]
+    pub fn parkedSpace(&self) -> Option<&crate::paging::UserSpace> {
+        let pPid = self.parked_root()?;
+        self.tasks.iter().flatten().filter_map(|pTask| pTask.process.as_ref())
+            .find(|pProcess| pProcess.pid == pPid && pProcess.status.is_none())
+            .map(|pProcess| &pProcess.space)
+    }
+
     pub fn resume_boot_root(&mut self, pid: usize) -> Result<(), isize> {
         if self.parked_root() != Some(pid) { return Err(-16); }
         let task = self.tasks.iter_mut().flatten().find(|t| t.process.as_ref()
@@ -581,11 +589,16 @@ mod timed_tests {
         let mut q=queue();
         q.tasks[1]=None;
         q.count=1;
+        assert!(q.parkedSpace().is_none());
         assert_eq!(q.park_boot_root(1),Ok(()));
+        assert!(q.parkedSpace().is_none()); // still executing until schedule returns
         assert_eq!(q.select(0x222, false),10); // back to the kernel caller
         assert_eq!(q.parked_root(),Some(1));
+        assert!(core::ptr::eq(q.parkedSpace().unwrap(),
+            &q.tasks[0].as_ref().unwrap().process.as_ref().unwrap().space));
         assert_eq!(q.resume_boot_root(999),Err(-16));
         assert_eq!(q.resume_boot_root(1),Ok(()));
+        assert!(q.parkedSpace().is_none());
         assert_eq!(q.resume_boot_root(1),Err(-16)); // one-shot
         q.active=true;
         assert_eq!(q.select(0x333,false),0x222); // original saved context

@@ -1,5 +1,5 @@
 use crate::{frames::Frames, paging::{UserSpace, USER_BASE, USER_END}};
-use core::{ptr, sync::atomic::{AtomicUsize, Ordering}};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 pub const EFAULT: isize = -14;
 const ENOEXEC: isize = -8;
@@ -47,7 +47,7 @@ impl Programs {
         // Rejecting an invalid/unmarked note needs no page-table/data frames.
         if !crate::native_abi::validate(elf) { return Err(ENOEXEC); }
         let space = UserSpace::new(frames, self.kernel_root).ok_or(ENOMEM)?;
-        let result = load_elf(&space, frames, elf).and_then(|entry| {
+        let result = load_elf(&space, elf).and_then(|entry| {
             let pid = self.allocate_pid()?;
             let files = crate::files::Descriptors::new(frames).ok_or(ENOMEM)?;
             Ok((entry, pid, files))
@@ -59,7 +59,7 @@ impl Programs {
     }
 }
 
-unsafe fn load_elf(space: &UserSpace, frames: &mut Frames<'_>, elf: &[u8]) -> Result<usize, isize> {
+unsafe fn load_elf(space: &UserSpace, elf: &'static [u8]) -> Result<usize, isize> {
     // Programs::load validated the native ABI before creating this space.
     if elf.get(..7) != Some(b"\x7fELF\x02\x01\x01") || u16_at(elf, 16) != Some(2) ||
         u16_at(elf, 18) != Some(62) || word(elf, 20) != Some(1u32.to_le_bytes()) ||
@@ -89,19 +89,13 @@ unsafe fn load_elf(space: &UserSpace, frames: &mut Frames<'_>, elf: &[u8]) -> Re
         if va < USER_BASE || end > USER_END - (STACK_PAGES+1)*PAGE || va % PAGE != offset % PAGE ||
             !matches!(flags, 4 | 5 | 6) { return Err(ENOEXEC); }
         if flags == 5 && (va..va+filesz).contains(&entry) { executable_entry = true; }
-        let first = va & !(PAGE-1);
-        for page in (first..end).step_by(PAGE) {
-            let physical = space.map(frames, page, flags == 6, flags == 5)?;
-            let start = page.max(va);
-            let stop = (page+PAGE).min(va+filesz);
-            if start < stop {
-                ptr::copy_nonoverlapping(contents.as_ptr().add(start-va), (physical+start-page) as *mut u8, stop-start);
-            }
-        }
+        // Initramfs remains immutable and resident for the system lifetime.
+        // Keep its backing slice and the segment's zero-fill extent; the
+        // first authorized user or syscall access will populate each page.
+        space.reserve(va, memsz, contents, flags == 6, flags == 5)?;
     }
     if !executable_entry { return Err(ENOEXEC); }
-    for page in (USER_END - STACK_PAGES*PAGE..USER_END).step_by(PAGE) {
-        space.map(frames, page, true, false)?;
-    }
+    // The page below the fixed stack extent remains outside all regions.
+    space.reserve(USER_END - STACK_PAGES*PAGE, STACK_PAGES*PAGE, &[], true, false)?;
     Ok(entry)
 }

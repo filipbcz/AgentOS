@@ -5,6 +5,7 @@ SECTIONS {
     .text : { *(.text*) *(.rodata*) } :text
     .note.agentos ALIGN(4) : { KEEP(*(.note.agentos)) } :text :abi
     . = ALIGN(4096);
-    .data : { *(.data*) *(.bss*) } :data
+    .data : { *(.data*) } :data
+    .bss (NOLOAD) : { *(.bss*) *(COMMON) } :data
     /DISCARD/ : { *(.note*) *(.comment*) }
 }

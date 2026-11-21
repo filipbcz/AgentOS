@@ -39,6 +39,7 @@ processes = load("qemu_process_evidence", "verify-processes.py")
 supervisor = load("qemu_supervisor_evidence", "verify-supervisor.py")
 orphans = load("qemu_orphan_evidence", "verify-orphans.py")
 cow = load("qemu_cow_evidence", "verify-cow.py")
+demand = load("qemu_demand_evidence", "verify-demand-paging.py")
 service_manager = load("qemu_service_manager_evidence", "verify-service-manager.py")
 boot_log = load("qemu_boot_log_evidence", "verify-boot-log.py")
 session = load("qemu_stage3_session", "verify-stage3-session.py")
@@ -441,6 +442,7 @@ def boot(args):
     supervisor.verify(text, args.cpus)
     orphans.verify(text, args.cpus)
     cow.verify(text, args.cpus)
+    demand.verify(text, args.cpus)
     service_manager.verify(text)
     session_result = None
     if args.session:

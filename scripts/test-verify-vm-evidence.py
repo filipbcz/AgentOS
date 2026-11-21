@@ -110,6 +110,38 @@ class VmEvidenceTests(unittest.TestCase):
         self.save_manifest()
         self.assertEqual(evidence.verify_run(self.root, self.run)["case"], "loader")
 
+    def demandLog(self):
+        pSpec = importlib.util.spec_from_file_location(
+            "receiptDemandFixtures", Path(__file__).with_name("test-verify-demand-paging.py"))
+        pFixtures = importlib.util.module_from_spec(pSpec)
+        pSpec.loader.exec_module(pFixtures)
+        pScenarios = (pFixtures.scenario() + pFixtures.scenario(33, 1)).replace("\n", "\r\n").encode("ascii")
+        pOriginal = (self.run / "com1.log").read_bytes()
+        return pOriginal.replace(b"AGENTOS MANAGER SESSION START", pScenarios + b"AGENTOS MANAGER SESSION START", 1)
+
+    def testDemandTraceIsStrictlyVerifiedWhenPresent(self):
+        self.write(self.run / "com1.log", self.demandLog())
+        self.manifest["artifacts"]["com1.log"] = evidence.sha256(self.run / "com1.log")
+        self.save_manifest()
+        self.assertEqual(evidence.verify_run(self.root, self.run)["result"], "pass")
+
+    def testRehashedIncompleteOrContradictoryDemandTraceIsRejected(self):
+        pOriginal = self.demandLog()
+        pTouch = next(pLine for pLine in pOriginal.splitlines(keepends=True)
+                      if pLine.startswith(b"AGENTOS DEMAND TOUCH"))
+        for pAltered in (
+            pOriginal.replace(pTouch, b"", 1),
+            pOriginal.replace(b"RESIDENT=0000000000000020", b"RESIDENT=0000000000001020", 1),
+            pOriginal.replace(b"ERROR=0000000000000014", b"ERROR=0000000000000004", 1),
+        ):
+            with self.subTest(log=pAltered):
+                self.write(self.run / "com1.log", pAltered)
+                # The receipt deliberately has the updated hash, exercising
+                # semantic validation independently of tamper detection.
+                self.manifest["artifacts"]["com1.log"] = evidence.sha256(self.run / "com1.log")
+                self.save_manifest()
+                self.rejected()
+
     def test_session_receipt_matches_actual_kernel_producer(self):
         # This contract test reads the real emitter, not another hand-maintained
         # fixture. Renaming a kernel session boundary must update its consumer.
