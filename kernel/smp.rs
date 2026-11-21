@@ -136,9 +136,12 @@ unsafe fn balanceQueues() {
     let pMoved = if pSourceQueue.runnableCount() >= pTargetQueue.runnableCount() + 2 {
         pSourceQueue.moveRunnableTo(pTargetQueue).is_ok()
     } else { false };
+    // Publish the ownership-generation count before either queue is released.
+    // A task that runs (or is reaped) on its new owner must not expose that
+    // transfer while sched_stats still reports the preceding global count.
+    if pMoved { gMigrations.fetch_add(1, Ordering::Relaxed); }
     drop(pSecondGuard); drop(pFirstGuard);
     if pMoved {
-        gMigrations.fetch_add(1, Ordering::Relaxed);
         let pCpu = current_cpu();
         // Include self: this callback may have just returned to an idle
         // kernel caller with its timer disabled before accepting this task.

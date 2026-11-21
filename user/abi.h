@@ -32,7 +32,9 @@
 /* Native ELF ABI v2 replaces the former CPU-local time contract. The loader
  * rejects v1 ELF notes with -8 (ENOEXEC) before allocating a process; rebuild
  * older native programs against this header. All process timestamps and
- * absolute wait deadlines now use one shared boot-epoch HPET clock.
+ * absolute wait deadlines now use one shared boot-epoch HPET clock. A
+ * successful SYS_KILL acknowledges a stop request; collect the completed
+ * exit with SYS_WAIT_CHILD_UNTIL before releasing userspace ownership.
  */
 /* SYS_SCHED_STATS(buffer, 64, 0): eight little-endian u64 fields:
  * version=1, current APIC ID, online scheduler CPU count, this process's
@@ -129,10 +131,16 @@
  * becoming blocked on any one endpoint. Caller buffer includes 16-byte
  * authenticated peer prefix; no data or message is consumed on -11.
  */
-/* SYS_KILL(pid): a process may terminate only its direct child.
- * The child becomes a reapable zombie with exit status 137.
- * Returns 0 when newly terminated and 1 if already a zombie; unknown PID -3,
- * unrelated PID -1, zero/self -22. This is not a general signal ABI. */
+/* SYS_KILL(pid): request termination of a direct child. Returns 0 after
+ * accepting the request and 1 if an exit status was already published;
+ * unknown/collected PID -3, unrelated PID -1, zero/self -22.
+ * The child may still be running on another CPU after returning 0. Its owner
+ * stops execution, closes its descriptors and publishes status 137. A natural
+ * exit that wins the race keeps its original status. SYS_KILL never reaps:
+ * use SYS_WAIT_CHILD_UNTIL with a finite checked boot-epoch deadline to
+ * confirm completion and collect the final status. SYS_TRY_WAIT may still
+ * return -11 after an accepted request. This is not a general signal ABI.
+ */
 #define IPC_MAX_MESSAGE 1024
 
 #ifdef __ASSEMBLER__

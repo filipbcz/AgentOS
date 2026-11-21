@@ -9,7 +9,8 @@
 enum {
     MAX_ATTEMPTS = 3,
     SERVICE_TIMEOUT_MS = 250,
-    RESTART_BACKOFF_MS = 20
+    RESTART_BACKOFF_MS = 20,
+    killTimeoutMs = 1000
 };
 /* Millisecond deadlines are passed to a signed 64-bit syscall ABI. */
 #define MAX_DEADLINE_MS 0x7fffffffffffffffUL
@@ -70,12 +71,24 @@ static int record_duration(unsigned long parent, unsigned long child,
     return os_call(SYS_WRITE,1,(long)line,sizeof(line)-1)==sizeof(line)-1;
 }
 
-/* Kill/collect on a failing wait path to avoid leaving an unowned child.
- * A permanently failed kernel operation cannot guarantee recovery; report it.
+/* Collect the actual status after an accepted termination request. */
+static long collectKilledChild(long aPid) {
+    long pStatus=os_call(SYS_TRY_WAIT,aPid,0,0);
+    if (pStatus!=-11) return pStatus;
+    // A remote owner acknowledges SYS_KILL asynchronously. Use a fresh,
+    // bounded kernel wait; the original service deadline may have expired.
+    long pNow=clock_ms();
+    if (pNow<0) return pNow;
+    if ((unsigned long)pNow>MAX_DEADLINE_MS-killTimeoutMs) return -22;
+    return os_call(SYS_WAIT_CHILD_UNTIL,aPid,pNow+killTimeoutMs,0);
+}
+
+/* Best-effort cleanup on a failing wait path. The caller still reports an
+ * error; a failed clock or acknowledgement cannot claim complete recovery.
  */
 static void cancel_and_collect(long pid) {
-    if (os_call(SYS_KILL,pid,0,0)>=0)
-        (void)os_call(SYS_TRY_WAIT,pid,0,0);
+    long pKilled=os_call(SYS_KILL,pid,0,0);
+    if (pKilled==0 || pKilled==1) (void)collectKilledChild(pid);
 }
 
 /* Returns 0 after collection, 1 if a real monotonic deadline required
@@ -109,14 +122,16 @@ static int collect_child(long child, unsigned long *exit_status,
     // A worker may exit between the timed wait and SYS_KILL. The kernel
     // distinguishes an already-zombie child and preserves its exit status.
     long killed=os_call(SYS_KILL,child,0,0);
-    if (killed<0) {
+    if (killed!=0 && killed!=1) {
         cancel_and_collect(child);
         return -1;
     }
-    long status=os_call(SYS_TRY_WAIT,child,0,0);
+    long status=collectKilledChild(child);
     if (status<0) return -1;
     *exit_status=(unsigned long)status;
-    return killed==0 ? 1 : 0;
+    // A natural exit may win after an accepted request but before the owner
+    // consumes it. Only the collected status proves forced termination.
+    return killed==0 && status==137 ? 1 : 0;
 }
 
 /* 0 = clean completion; 1 = failure budget reached; 2 = stalled child killed;

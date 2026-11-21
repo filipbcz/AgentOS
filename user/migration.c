@@ -4,8 +4,8 @@
  * test affinity, forced-move syscall, fixed PID or shared userspace address
  * space. Every protocol wait and CPU-work phase has a finite HPET deadline. */
 enum { pWorkers = 4, pRounds = 6, pPage = 4096, pWorkMs = 150,
-       pSleepMs = 5000, pTimeoutMs = 15000 };
-enum { pReady = 1, pWork = 2, pRead = 3, pFinish = 4, pExit = 5 };
+       pSleepMs = 5000, pTimeoutMs = 15000, pArmWorkMs = 50, pKillMs = 5000 };
+enum { pReady = 1, pWork = 2, pRead = 3, pFinish = 4, pExit = 5, pArm = 6 };
 static volatile unsigned char gMigrationMemory[8 * pPage] __attribute__((aligned(4096)));
 static int gChannels[pWorkers][2], gPipe[2];
 static long gFile, gRoot;
@@ -50,7 +50,7 @@ static int output(char *aLine, unsigned aLength) {
 }
 
 static int event(const char *aKind, const struct Progress *aProgress,
-                 unsigned long aOffset, unsigned long aDigest) {
+                 unsigned long aDetail, unsigned long aDigest) {
     char pLine[256];
     unsigned pLength = 0;
     appendText(pLine, &pLength, "AGENTOS MIGRATION ");
@@ -64,9 +64,10 @@ static int event(const char *aKind, const struct Progress *aProgress,
     appendField(pLine, &pLength, " NOW=", aProgress->fNow);
     appendField(pLine, &pLength, " UNTIL=", aProgress->fUntil);
     if (aKind[0] == 'I') {
-        appendField(pLine, &pLength, " OFFSET=", aOffset);
+        appendField(pLine, &pLength, " OFFSET=", aDetail);
         appendField(pLine, &pLength, " FNV=", aDigest);
     }
+    if (aKind[0] == 'A') appendField(pLine, &pLength, " TOTAL=", aDetail);
     return output(pLine, pLength);
 }
 
@@ -94,6 +95,24 @@ static int reaped(unsigned aSlot, long aChild, long aStatus) {
     appendField(pLine, &pLength, " CHILD=", aChild);
     appendField(pLine, &pLength, " SLOT=", aSlot);
     appendField(pLine, &pLength, " STATUS=", aStatus);
+    return output(pLine, pLength);
+}
+
+static int killEvent(const char *aKind, unsigned aSlot, const struct Worker *aWorker,
+                     const struct ScheduleStats *aParent, long aNow, long aUntil) {
+    char pLine[256];
+    unsigned pLength = 0;
+    appendText(pLine, &pLength, "AGENTOS MIGRATION ");
+    appendText(pLine, &pLength, aKind);
+    appendField(pLine, &pLength, " ROOT=", gRoot);
+    appendField(pLine, &pLength, " CHILD=", aWorker->fPid);
+    appendField(pLine, &pLength, " SLOT=", aSlot);
+    appendField(pLine, &pLength, " CPU=", aParent->fCpu);
+    appendField(pLine, &pLength, " OWNER=", aWorker->fReport.fCpu);
+    appendField(pLine, &pLength, " TOTAL=", aParent->fTotalMoves);
+    appendField(pLine, &pLength, " NOW=", aNow);
+    appendField(pLine, &pLength, " UNTIL=", aUntil);
+    if (aKind[0] == 'C') appendField(pLine, &pLength, " STATUS=", 137);
     return output(pLine, pLength);
 }
 
@@ -141,10 +160,10 @@ static int observe(struct Progress *aProgress) {
     return 1;
 }
 
-static int workUntil(struct Progress *aProgress, unsigned long aLimit) {
+static int workBefore(struct Progress *aProgress, unsigned long aLimit, unsigned long aDeadline) {
     for (;;) {
         long pNow = now();
-        if (pNow < 0 || (unsigned long)pNow >= aProgress->fUntil) return 0;
+        if (pNow < 0 || (unsigned long)pNow >= aDeadline) return 0;
         if ((unsigned long)pNow >= aLimit) break;
         for (unsigned pIndex = 0; pIndex < 1024; ++pIndex) {
             ++aProgress->fWork;
@@ -153,6 +172,37 @@ static int workUntil(struct Progress *aProgress, unsigned long aLimit) {
         if (!observe(aProgress) || os_call(SYS_YIELD, 0, 0, 0) != 0) return 0;
     }
     return observe(aProgress);
+}
+
+static int workUntil(struct Progress *aProgress, unsigned long aLimit) {
+    return workBefore(aProgress, aLimit, aProgress->fUntil);
+}
+
+/* A counter bracket proves this owner report remained current through the
+ * parent's later KILL/WAIT. SEND need not imply that the sender has blocked.
+ * If necessary, a pair performs bounded work to recreate real imbalance. */
+static int armReport(struct Progress *aProgress, unsigned long aWorkMs, long aTimeout) {
+    long pNow = now();
+    if ((aWorkMs != 0 && aWorkMs != pArmWorkMs) || pNow < 0 ||
+        pNow > aTimeout - (long)aWorkMs ||
+        (aWorkMs && !workBefore(aProgress, pNow + aWorkMs, aTimeout))) return 0;
+    for (;;) {
+        ++aProgress->fWork;
+        if (!observe(aProgress)) return 0;
+        pNow = now();
+        struct ScheduleStats pStats;
+        if (pNow < 0 || pNow >= aTimeout || !scheduleStats(&pStats) ||
+            pStats.fPid != aProgress->fPid || pStats.fParent != (unsigned long)gRoot ||
+            pStats.fMoves < aProgress->fMoves || (unsigned long)pNow < aProgress->fNow) return 0;
+        if (pStats.fCpu != aProgress->fCpu) {
+            if (os_call(SYS_YIELD, 0, 0, 0) != 0) return 0;
+            continue;
+        }
+        aProgress->fMoves = pStats.fMoves;
+        aProgress->fNow = pNow;
+        return event("ARMED", aProgress, pStats.fTotalMoves, 0) &&
+            sendReport(pArm, aProgress, pStats.fTotalMoves);
+    }
 }
 
 static unsigned long expectedDigest(unsigned long aOffset) {
@@ -237,6 +287,8 @@ static void worker(unsigned aSlot) {
         } else if (pCommand.fKind == pExit && pFinished) {
             if (os_call(SYS_CLOSE, gChannels[aSlot][1], 0, 0) != 0) childExit(169);
             childExit(0);
+        } else if (pCommand.fKind == pArm && pFinished) {
+            if (!armReport(&pProgress, pCommand.fValue, pTimeout)) childExit(187);
         } else childExit(170);
     }
 }
@@ -347,17 +399,66 @@ static int migrationScenario(void) {
         if (gMigrationMemory[pIndex * pPage] != 0) return 181;
     for (unsigned pIndex = 0; pIndex < pWorkers; ++pIndex)
         if (!sendCommand(pIndex, pFinish, 0)) return 182;
-    unsigned long pObserved = 0, pChildMoves = 0;
+    unsigned long pWorkObserved = 0;
     for (unsigned pIndex = 0; pIndex < pWorkers; ++pIndex) {
         if (!receiveReport(&pChildren[pIndex], pIndex, pFinish, pTimeout)) return 183;
+        pWorkObserved += pChildren[pIndex].fReport.fObserved;
+    }
+    if (pBefore.fCpus > 1 && pWorkObserved < 2) return 188;
+    unsigned pVictim = pWorkers;
+    struct ScheduleStats pKillParent;
+    for (unsigned pAttempt = 0; pAttempt < 8 && pVictim == pWorkers; ++pAttempt) {
+        for (unsigned pIndex = 0; pIndex < pWorkers; ++pIndex) {
+            pNow = now();
+            if (pNow < 0 || pNow > pTimeout - pKillMs - 20 ||
+                os_call(SYS_SLEEP_UNTIL, pNow + 20, 0, 0) != 0 ||
+                !sendCommand(pIndex, pArm, 0) ||
+                !receiveReport(&pChildren[pIndex], pIndex, pArm, pTimeout) ||
+                !scheduleStats(&pKillParent) || pKillParent.fPid != (unsigned long)gRoot) return 189;
+            const struct Report *pReport = &pChildren[pIndex].fReport;
+            if (pReport->fValue == pKillParent.fTotalMoves &&
+                (pBefore.fCpus == 1 || pReport->fCpu != pKillParent.fCpu)) {
+                pVictim = pIndex;
+                break;
+            }
+        }
+        if (pVictim != pWorkers) break;
+        // Four blocked workers may all be local. Wake a same-CPU pair for
+        // real CPU work so the ordinary balancer can distribute them again.
+        unsigned pFirst = 0, pSecond = 1;
+        int pFound = 0;
+        for (unsigned pI = 0; pI < pWorkers && !pFound; ++pI)
+            for (unsigned pJ = pI + 1; pJ < pWorkers; ++pJ)
+                if (pChildren[pI].fReport.fCpu == pChildren[pJ].fReport.fCpu) {
+                    pFirst = pI; pSecond = pJ; pFound = 1; break;
+                }
+        if (!sendCommand(pFirst, pArm, pArmWorkMs) || !sendCommand(pSecond, pArm, pArmWorkMs) ||
+            !receiveReport(&pChildren[pFirst], pFirst, pArm, pTimeout) ||
+            !receiveReport(&pChildren[pSecond], pSecond, pArm, pTimeout)) return 189;
+    }
+    pNow = now();
+    if (pVictim == pWorkers || pNow < 0 || pNow > pTimeout - pKillMs) return 190;
+    long pKillUntil = pNow + pKillMs;
+    if (!killEvent("KILL", pVictim, &pChildren[pVictim], &pKillParent, pNow, pKillUntil) ||
+        os_call(SYS_KILL, pChildren[pVictim].fPid, 0, 0) != 0 ||
+        os_call(SYS_WAIT_CHILD_UNTIL, pChildren[pVictim].fPid, pKillUntil, 0) != 137) return 191;
+    pNow = now();
+    struct ScheduleStats pCollected;
+    if (pNow < 0 || pNow > pKillUntil || !scheduleStats(&pCollected) ||
+        pCollected.fPid != (unsigned long)gRoot || pCollected.fCpu != pKillParent.fCpu ||
+        pCollected.fTotalMoves != pKillParent.fTotalMoves ||
+        !killEvent("COLLECT", pVictim, &pChildren[pVictim], &pCollected, pNow, pKillUntil)) return 191;
+    unsigned long pObserved = 0, pChildMoves = 0;
+    for (unsigned pIndex = 0; pIndex < pWorkers; ++pIndex) {
         pObserved += pChildren[pIndex].fReport.fObserved;
         pChildMoves += pChildren[pIndex].fReport.fMoves;
     }
     for (unsigned pIndex = 0; pIndex < pWorkers; ++pIndex)
-        if (!sendCommand(pIndex, pExit, 0)) return 184;
+        if (pIndex != pVictim && !sendCommand(pIndex, pExit, 0)) return 184;
     for (unsigned pIndex = 0; pIndex < pWorkers; ++pIndex) {
-        long pStatus = os_call(SYS_WAIT_CHILD_UNTIL, pChildren[pIndex].fPid, pTimeout, 0);
-        if (pStatus != 0 || !reaped(pIndex, pChildren[pIndex].fPid, pStatus) ||
+        long pStatus = pIndex == pVictim ? 137 :
+            os_call(SYS_WAIT_CHILD_UNTIL, pChildren[pIndex].fPid, pTimeout, 0);
+        if (pStatus != (pIndex == pVictim ? 137 : 0) || !reaped(pIndex, pChildren[pIndex].fPid, pStatus) ||
             os_call(SYS_CLOSE, gChannels[pIndex][0], 0, 0) != 0) return 185;
     }
     pNow = now();

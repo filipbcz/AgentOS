@@ -111,7 +111,7 @@ Instrukce `syscall` přijímá číslo v RAX a tři argumenty v RDI/RSI/RDX. RAX
 | `0x1000c` | `ipc_pair` | Obousměrný lokální zprávový kanál |
 | `0x1000d` | `ipc_send` | Atomická zpráva; plná schránka uspí odesílatele |
 | `0x1000e` | `ipc_recv` | Celá zpráva a kernelová identita odesílatele |
-| `0x1000f` | `kill` | Pouze přímý potomek; stav 137, následný reaping |
+| `0x1000f` | `kill` | Žádost o ukončení přímého potomka; dokončení potvrdí `wait` |
 | `0x10010` | `monotonic_ms` | Společné bootové milisekundy HPET |
 | `0x10011` | `wait_child_until` | Potomek nebo absolutní deadline |
 | `0x10012` | `sleep_until` | Uspání do absolutního deadline |
@@ -126,6 +126,8 @@ Instrukce `syscall` přijímá číslo v RAX a tři argumenty v RDI/RSI/RDX. RAX
 | `0x1001b` | `sched_stats` | Osm u64: verze 1, APIC ID, počet CPU, migrace procesu/celku, vzdálené IPI notifikace, PID, PPID |
 
 `timer_stats(buffer,32,0)` je pouze čtecí diagnostika verze 2; čítače se čtením nenulují. Čas i absolutní lhůty jsou srovnatelné mezi CPU a při migraci se nemění; nejde o UTC. IRQ/idle čítače jsou součtem konzistentních párů z každého CPU, čtených pomocí sekvenčního čítače. `sched_stats(buffer,64,0)` zachytí identitu a stav aktuálního procesu; špatná velikost/flags vrací −22, neplatný buffer −14 a OOM −12. Počet vzdálených probouzení znamená odeslané IPI notifikace, nikoli počet probuzených procesů nebo self-IPI.
+
+`kill` v ABI v2 vrací 0 po přijetí žádosti; vlastník procesu ji může dokončit až na jiném CPU. Návrat 1 znamená již ukončeného potomka. `try_wait` tedy může po přijatém požadavku vrátit −11. Konzumenti používají `wait_child_until` s konečnou novou lhůtou a přebírají skutečný status: 137 při nuceném ukončení, případně původní přirozený exit, který žádost předběhl. Správce služeb zachová PID a fd až do úspěšného převzetí výsledku; timeout se neoznačí za dokončený úklid.
 
 `vm_stats(buffer,64,0)` před snímkem připraví svůj výstupní buffer. Počty zahrnují vlastní PML4, uživatelské tabulky a jednu metadata stránku; společná kernelová mapování ani samostatný lifecycle rámec procesu se nepočítají. Kumulativní počítadla demand alokací, COW kopií a povýšení posledního vlastníka začínají u nového procesu i po `fork` od nuly; aktuální rezervace a rezidentní mapování se dědí. Sdílená stránka se počítá v každém adresním prostoru, takže nejde o celkovou fyzickou spotřebu systému.
 

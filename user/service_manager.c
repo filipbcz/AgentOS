@@ -12,6 +12,7 @@
  */
 #define MAX_MS 0x7fffffffffffffffUL
 enum { QUIET_WAKE_MS=60000, READY_TIMEOUT_MS=750, RESTART_BASE_MS=40, RESTART_WINDOW_MS=5000, MAX_ATTEMPTS=3 };
+enum { stopWaitMs=5000 };
 struct record {
     const char *name, *elf;
     unsigned name_length, elf_length, dependency;
@@ -123,14 +124,33 @@ static void finish_endpoint(struct record *service) {
     if (service->fd>=0) { close_fd(service->fd); service->fd=-1; }
 }
 
-/* Reap a child after an authorized direct-child kill. Never mark successful
- * cleanup if the kernel reports a different/foreign process or still alive.
+/* The owner CPU acknowledges an accepted kill asynchronously. A fresh HPET
+ * deadline bounds that acknowledgement; the old READY/control deadline may
+ * already have expired. Only the completed wait consumes the exit status.
+ */
+static long waitForChildExit(long aPid) {
+    long pDeadline=deadline(clock_ms(),stopWaitMs);
+    if (pDeadline<0) return -5;
+    return os_call(SYS_WAIT_CHILD_UNTIL,aPid,pDeadline,0);
+}
+
+/* A remote stop may consume time. Subsequent readiness and restart delays
+ * begin after collection, with the same checked clock range as the loop. */
+static int refreshAfterStop(long *aNow) {
+    long pNow=clock_ms();
+    if (pNow<*aNow || (unsigned long)pNow>MAX_MS-READY_TIMEOUT_MS-200) return 0;
+    *aNow=pNow;
+    return 1;
+}
+
+/* Reap a child after an authorized direct-child kill. Preserve its PID and
+ * endpoint until collection succeeds, including on timeout/clock failure.
  */
 static int kill_and_reap(struct record *service) {
     if (service->pid<=0) return 1;
     long stopped=os_call(SYS_KILL,service->pid,0,0);
     if (stopped!=0 && stopped!=1) return 0;
-    long status=os_call(SYS_TRY_WAIT,service->pid,0,0);
+    long status=waitForChildExit(service->pid);
     if (status<0) return 0;
     service->last_status=status;
     service->pid=0;
@@ -303,7 +323,9 @@ static int apply_command(const struct svc_request *req,long now) {
                 return SVC_BAD_DEPENDENCY;
         if (req->operation==SVC_OP_RESTART && !has_dependency(req->service))
             return SVC_BAD_DEPENDENCY;
+        long pStoppedPid=service->pid;
         if (!kill_and_reap(service)) return SVC_INTERNAL_ERROR;
+        if (pStoppedPid>0 && !refreshAfterStop(&now)) return SVC_INTERNAL_ERROR;
         service->desired=req->operation==SVC_OP_RESTART;
         service->attempts=0;
         service->window_started=-1;
@@ -317,9 +339,25 @@ static int apply_command(const struct svc_request *req,long now) {
     return SVC_OK;
 }
 
+static void finishShellExit(void) {
+    struct record *pShell=&registry[SVC_SHELL];
+    pShell->pid=0;
+    finish_endpoint(pShell);
+    pShell->last_status=0;
+    pShell->state=SVC_STOPPED;
+    shell_active=0;
+    shutdown_requested=1;
+}
+
 static int recover_shell(long now) {
-    if (!kill_and_reap(&registry[SVC_SHELL])) return -1;
-    return failed(SVC_SHELL,now,137);
+    struct record *pShell=&registry[SVC_SHELL];
+    if (!kill_and_reap(pShell)) return -1;
+    // An EOF can follow an ordinary exit after advance_registry observed
+    // the shell alive. The collected status, including an exit racing with
+    // the kill request, determines shutdown versus bounded recovery.
+    if (pShell->last_status==0) { finishShellExit(); return 0; }
+    if (!refreshAfterStop(&now)) return -1;
+    return failed(SVC_SHELL,now,pShell->last_status);
 }
 
 static int check_control(long now) {
@@ -358,12 +396,10 @@ static int advance_registry(long now) {
             // Reaping is always by the immediate owning manager process.
             long status=os_call(SYS_TRY_WAIT,service->pid,0,0);
             if (status>=0) {
-                if (id==SVC_CORE && !suspend_dependents(SVC_CORE)) return -1;
+                if (id==SVC_CORE &&
+                    (!suspend_dependents(SVC_CORE) || !refreshAfterStop(&now))) return -1;
                 if (id==SVC_SHELL && status==0) {
-                    service->pid=0;
-                    finish_endpoint(service);
-                    service->state=SVC_STOPPED;
-                    shutdown_requested=1;
+                    finishShellExit();
                     return 0;
                 }
                 if (failed(id,now,status)!=0) return -1;
@@ -372,10 +408,12 @@ static int advance_registry(long now) {
             if (status!=-11) return -1;
             if (service->state==SVC_STARTING) {
                 int ready=finish_start(id,now);
-                if (ready<0) {
-                    if (!kill_and_reap(service) || failed(id,now,-5)!=0) return -1;
-                } else if (!ready && now>=service->ready_deadline) {
-                    if (!kill_and_reap(service) || failed(id,now,137)!=0) return -1;
+                if (ready<0 || (!ready && now>=service->ready_deadline)) {
+                    // Missing/invalid READY is a policy failure even if the
+                    // child exits naturally while its stop is acknowledged.
+                    // Keep that actual exit status for diagnostics.
+                    if (!kill_and_reap(service) || !refreshAfterStop(&now) ||
+                        failed(id,now,service->last_status)!=0) return -1;
                 }
             }
         } else if (service->desired &&
@@ -450,7 +488,7 @@ static int reap_unmanaged(void) {
         if (status==-11) {
             long stopped=os_call(SYS_KILL,child,0,0);
             if (stopped!=0 && stopped!=1) return 0;
-            status=os_call(SYS_TRY_WAIT,child,0,0);
+            status=waitForChildExit(child);
         }
         if (status<0) return 0;
     }
@@ -487,7 +525,10 @@ int runServiceManager(void) {
         if (advance_registry(now)!=0) { fatal_error=1;break; }
         if (!reap_unmanaged()) { fatal_error=1;break; }
         if (shutdown_requested) break;
+        if (!refreshAfterStop(&now)) { fatal_error=1;break; }
         if (check_control(now)!=0) { fatal_error=1;break; }
+        if (shutdown_requested) break;
+        if (!refreshAfterStop(&now)) { fatal_error=1;break; }
         long next=event_deadline(now);
         long mask=event_mask();
         if (next<0 || mask<0 || os_call(SYS_WAIT_EVENTS_UNTIL,mask,next,0)<0)

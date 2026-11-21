@@ -39,6 +39,12 @@ static struct control controls[8];
 static unsigned control_count;
 static long shell_exit_at, response_failure;
 static int oversized_control;
+/* A remote SYS_KILL accepts a stop request before its owner CPU publishes
+ * the zombie. These controls model that interleaving separately from reap. */
+static long gKillDelayMs, gWaitChildError, gWaitNaturalStatus;
+static long gKillAcknowledgeAt[MAX_CHILDREN], gNaturalStatus[MAX_CHILDREN];
+static unsigned gChildWaitCalls, gPendingKillProbes;
+static int gShellExitOnProbe;
 
 static void reset(void) {
     memset(workers,0,sizeof(workers));
@@ -52,6 +58,10 @@ static void reset(void) {
     spoof_control=spoof_control_sent=shell_disconnect=0;
     core_crash_at=0;core_crashes=0;
     control_count=0;response_failure=0;oversized_control=0;shell_exit_at=1000;
+    gKillDelayMs=gWaitChildError=0;gWaitNaturalStatus=-1;
+    gChildWaitCalls=gPendingKillProbes=0;gShellExitOnProbe=0;
+    memset(gKillAcknowledgeAt,0,sizeof(gKillAcknowledgeAt));
+    for (unsigned pIndex=0;pIndex<MAX_CHILDREN;pIndex++) gNaturalStatus[pIndex]=-1;
     owner_pid=0;shell_active=shutdown_requested=fatal_error=online_announced=0;
     registry[SVC_CORE]=(struct record){
         "core","svc_alive",4,9,SVC_COUNT,1,SVC_DOWN,0,MAX_ATTEMPTS,0,
@@ -137,6 +147,7 @@ static long mock_call(long op,long a,long b,long c) {
             assert(a>=3 && a<32 && openfds[a] && b && c==IPC_MAX_MESSAGE);
             struct worker *w=from_channel(fdchannel[a]);
             if(!w)return -11;
+            if(gNaturalStatus[w-workers]>=0)return 0; // exit closed its final endpoint
             if(w->ack && w->kind==SVC_SHELL && shell_disconnect &&
                ticks>=w->start+80) return 0; // peer EOF without process exit
             struct svc_received_request *packet=(struct svc_received_request *)b;
@@ -193,7 +204,17 @@ static long mock_call(long op,long a,long b,long c) {
         case SYS_TRY_WAIT: {
             struct worker *w=from_pid(a);
             assert(w && !w->reaped);
+            unsigned pIndex=(unsigned)(w-workers);
+            if(gShellExitOnProbe==1 && w->kind==SVC_SHELL && w->ack) {
+                // The status probe observes a live shell. Immediately after
+                // its return another CPU commits exit 0 and endpoint EOF.
+                gShellExitOnProbe=2;gNaturalStatus[pIndex]=0;return -11;
+            }
+            if(gNaturalStatus[pIndex]>=0) {
+                w->reaped=1;total_exits++;return gNaturalStatus[pIndex];
+            }
             if(w->killed) {
+                if(ticks<gKillAcknowledgeAt[pIndex]) {gPendingKillProbes++;return -11;}
                 w->reaped=1;total_exits++;return 137;
             }
             if(w->kind==99 && w->ack) {
@@ -225,8 +246,34 @@ static long mock_call(long op,long a,long b,long c) {
         }
         case SYS_KILL: {
             struct worker *w=from_pid(a);
-            assert(w && !w->reaped && !w->killed);
-            w->killed=1;kill_order[total_kills++]=a;return 0;
+            assert(w && !w->reaped);
+            unsigned pIndex=(unsigned)(w-workers);
+            if(gNaturalStatus[pIndex]>=0)return 1;
+            if(!w->killed) {
+                w->killed=1;kill_order[total_kills++]=a;
+                gKillAcknowledgeAt[pIndex]=ticks+gKillDelayMs;
+            }
+            return 0;
+        }
+        case SYS_WAIT_CHILD_UNTIL: {
+            struct worker *pWorker=from_pid(a);
+            assert(pWorker && !pWorker->reaped && b>=ticks && c==0);
+            assert((unsigned long)b-(unsigned long)ticks<=5000);
+            gChildWaitCalls++;
+            // Registered ownership and descriptors must survive the whole
+            // blocked wait, including an error/timeout return.
+            for(unsigned pId=0;pId<SVC_COUNT;pId++) if(registry[pId].pid==a) {
+                assert(registry[pId].fd<0 || openfds[registry[pId].fd]);
+            }
+            long pStatus=mock_call(SYS_TRY_WAIT,a,0,0);
+            if(pStatus!=-11)return pStatus;
+            if(gWaitChildError)return gWaitChildError;
+            assert(pWorker->killed);
+            unsigned pIndex=(unsigned)(pWorker-workers);
+            if(gKillAcknowledgeAt[pIndex]>b) {ticks=b;return -110;}
+            ticks=gKillAcknowledgeAt[pIndex];
+            if(gWaitNaturalStatus>=0)gNaturalStatus[pIndex]=gWaitNaturalStatus;
+            return mock_call(SYS_TRY_WAIT,a,0,0);
         }
         case SYS_WAIT_EVENTS_UNTIL: {
             assert(a>=0 && (unsigned long)a<=0xffffffffUL && b>=ticks && c==0);
@@ -470,12 +517,14 @@ static void command_authorization_and_dependency(void) {
            registry[SVC_FLAKY].state==SVC_STOPPED &&
            registry[SVC_FLAKY].desired==0);
     request.operation=SVC_OP_START;
+    ticks=520;
     assert(apply_command(&request,520)==SVC_OK &&
            registry[SVC_FLAKY].state==SVC_STARTING &&
            registry[SVC_FLAKY].desired==1 &&
            registry[SVC_FLAKY].attempts==1 && registry[SVC_FLAKY].pid>0);
     long first_pid=registry[SVC_FLAKY].pid;
     request.operation=SVC_OP_RESTART;
+    ticks=540;
     assert(apply_command(&request,540)==SVC_OK &&
            registry[SVC_FLAKY].state==SVC_STARTING &&
            registry[SVC_FLAKY].attempts==1 && registry[SVC_FLAKY].pid!=first_pid);
@@ -555,7 +604,178 @@ static void bounded_control_failures(void) {
            starts_of(SVC_SHELL)==1);
     no_leaked_children_or_channels();
 }
+static struct record *startManagedChildForTest(unsigned aId) {
+    owner_pid=100;ticks=100;
+    if(aId!=SVC_CORE)registry[SVC_CORE].state=SVC_RUNNING;
+    assert(start_entry(aId,ticks)==1);
+    return &registry[aId];
+}
+static void remoteKillWaitsForActualOwnerExit(void) {
+    reset();
+    struct record *pService=startManagedChildForTest(SVC_CORE);
+    long pPid=pService->pid,pFd=pService->fd;
+    gKillDelayMs=25;
+    assert(kill_and_reap(pService));
+    assert(gChildWaitCalls==1 && gPendingKillProbes>0 && ticks==125);
+    assert(from_pid(pPid)->reaped && pService->pid==0 && pService->fd==-1 &&
+           pService->last_status==137 && !openfds[pFd]);
+
+    // The same delayed acknowledgement must succeed in the complete real
+    // shutdown path, not only when the helper is called directly.
+    reset();gKillDelayMs=25;
+    assert(runServiceManager()==0 && gChildWaitCalls==1);
+    no_leaked_children_or_channels();
+}
+static void failedKillWaitPreservesIdentityAndEndpoint(void) {
+    const long pErrors[]={-110,-5,-10};
+    for(unsigned pCase=0;pCase<sizeof(pErrors)/sizeof(pErrors[0]);pCase++) {
+        reset();
+        struct record *pService=startManagedChildForTest(SVC_CORE);
+        long pPid=pService->pid,pFd=pService->fd;
+        pService->last_status=42;
+        gKillDelayMs=pErrors[pCase]==-110?6000:25;
+        gWaitChildError=pErrors[pCase]==-110?0:pErrors[pCase];
+        assert(!kill_and_reap(pService));
+        assert(gChildWaitCalls==1 && !from_pid(pPid)->reaped &&
+               pService->pid==pPid && pService->fd==pFd && openfds[pFd] &&
+               pService->last_status==42);
+        if(pErrors[pCase]==-110)assert(ticks==5100);
+    }
+    // A missing or unrepresentable HPET deadline must fail without issuing
+    // an unbounded wait or discarding ownership of the pending child.
+    const long pClocks[]={-5,(long)(MAX_MS-100)};
+    for(unsigned pCase=0;pCase<sizeof(pClocks)/sizeof(pClocks[0]);pCase++) {
+        reset();
+        struct record *pService=startManagedChildForTest(SVC_CORE);
+        long pPid=pService->pid,pFd=pService->fd;
+        ticks=pClocks[pCase];gKillDelayMs=25;
+        assert(!kill_and_reap(pService));
+        assert(gChildWaitCalls==0 && !from_pid(pPid)->reaped &&
+               pService->pid==pPid && pService->fd==pFd && openfds[pFd]);
+    }
+}
+static void naturalExitWinsAcceptedKillWithoutStatusRewrite(void) {
+    reset();
+    struct record *pService=startManagedChildForTest(SVC_CORE);
+    gKillDelayMs=25;gWaitNaturalStatus=42;
+    assert(kill_and_reap(pService));
+    assert(total_kills==1 && gChildWaitCalls==1 && pService->last_status==42);
+
+    reset();
+    pService=startManagedChildForTest(SVC_CORE);
+    gNaturalStatus[from_pid(pService->pid)-workers]=0;
+    assert(kill_and_reap(pService));
+    assert(total_kills==0 && pService->last_status==0);
+}
+static void remoteOrphanKillUsesBoundedOwnerWait(void) {
+    reset();owner_pid=100;
+    workers[0]=(struct worker){201,0,99,0,0,0,0,0};
+    workers[1]=(struct worker){202,0,SVC_CORE,0,0,0,0,0};
+    count=2;registry[SVC_CORE].pid=202;gKillDelayMs=25;
+    assert(reap_unmanaged());
+    assert(gChildWaitCalls==1 && workers[0].reaped && !workers[1].reaped &&
+           total_kills==1 && ticks==25);
+
+    reset();owner_pid=100;
+    workers[0]=(struct worker){201,0,99,0,0,0,0,0};
+    count=1;gKillDelayMs=6000;
+    assert(!reap_unmanaged());
+    assert(gChildWaitCalls==1 && !workers[0].reaped && ticks==5000);
+}
+static void shellExitBetweenStatusProbeAndEofShutsDown(void) {
+    reset();
+    struct record *pShell=startManagedChildForTest(SVC_SHELL);
+    struct worker *pWorker=from_pid(pShell->pid);
+    pShell->state=SVC_RUNNING;pShell->ready_once=1;
+    pWorker->ack=pWorker->ready_sent=1;shell_active=1;
+    for(unsigned pId=0;pId<SVC_COUNT;pId++)registry[pId].desired=0;
+    gShellExitOnProbe=1;
+    assert(advance_registry(ticks)==0 && gShellExitOnProbe==2 && !shutdown_requested);
+    assert(check_control(ticks)==0);
+    assert(shutdown_requested && !shell_active && pShell->state==SVC_STOPPED &&
+           pShell->pid==0 && pShell->fd==-1 && pShell->last_status==0 &&
+           total_kills==0 && pWorker->reaped);
+
+    reset();gShellExitOnProbe=1;
+    assert(runServiceManager()==0 && gShellExitOnProbe==2 &&
+           starts_of(SVC_SHELL)==1 && ticks==shell_exit_at);
+    no_leaked_children_or_channels();
+
+    // A naturally finishing shell may also win after the stop request was
+    // accepted. Its final zero status still means an orderly session exit.
+    reset();pShell=startManagedChildForTest(SVC_SHELL);
+    pWorker=from_pid(pShell->pid);
+    pShell->state=SVC_RUNNING;pShell->ready_once=1;
+    pWorker->ack=pWorker->ready_sent=1;shell_active=1;
+    shell_disconnect=1;ticks=pWorker->start+80;
+    gKillDelayMs=25;gWaitNaturalStatus=0;
+    assert(check_control(ticks)==0 && shutdown_requested && !shell_active &&
+           pShell->last_status==0 && pShell->state==SVC_STOPPED &&
+           total_kills==1 && pWorker->reaped);
+}
+static void restartAndRecoveryUseTimeAfterRemoteStop(void) {
+    reset();
+    struct record *pService=startManagedChildForTest(SVC_FLAKY);
+    long pOldPid=pService->pid;
+    struct svc_request pRequest={SVC_MAGIC,SVC_VERSION,SVC_OP_RESTART,SVC_FLAKY,0};
+    gKillDelayMs=800;
+    assert(apply_command(&pRequest,ticks)==SVC_OK);
+    assert(ticks==900 && from_pid(pOldPid)->reaped && pService->pid!=pOldPid &&
+           pService->ready_deadline==ticks+READY_TIMEOUT_MS);
+
+    reset();pService=startManagedChildForTest(SVC_SHELL);
+    struct worker *pWorker=from_pid(pService->pid);
+    pService->state=SVC_RUNNING;pService->ready_once=1;
+    pWorker->ack=pWorker->ready_sent=1;shell_active=1;
+    shell_disconnect=1;ticks=pWorker->start+80;gKillDelayMs=800;
+    assert(check_control(ticks)==0 && !shutdown_requested);
+    assert(ticks==980 && pService->state==SVC_BACKOFF &&
+           pService->retry_at==ticks+RESTART_BASE_MS);
+
+    reset();pService=startManagedChildForTest(SVC_CORE);
+    never_ready=1;ticks=pService->ready_deadline;gKillDelayMs=800;
+    assert(advance_registry(ticks)==0);
+    assert(ticks==1650 && pService->state==SVC_BACKOFF &&
+           pService->retry_at==ticks+RESTART_BASE_MS);
+
+    // A core exit first stops its live dependent. Its own restart backoff
+    // must start after that remote stop, not before the blocking traversal.
+    reset();pService=startManagedChildForTest(SVC_CORE);
+    pService->state=SVC_RUNNING;
+    from_pid(pService->pid)->ack=1;
+    struct record *pShell=startManagedChildForTest(SVC_SHELL);
+    pShell->state=SVC_RUNNING;from_pid(pShell->pid)->ack=1;shell_active=1;
+    core_crash_at=ticks;gKillDelayMs=800;
+    assert(advance_registry(ticks)==0 && core_crashes==1);
+    assert(ticks==900 && pService->last_status==73 && pService->state==SVC_BACKOFF &&
+           pService->retry_at==ticks+RESTART_BASE_MS && pShell->pid==0 &&
+           pShell->state==SVC_DOWN);
+}
+static void readinessFailureKeepsTheCollectedNaturalStatus(void) {
+    for(unsigned pMalformed=0;pMalformed<2;pMalformed++) {
+        const long pStatuses[]={0,42};
+        for(unsigned pCase=0;pCase<sizeof(pStatuses)/sizeof(pStatuses[0]);pCase++) {
+            reset();
+            struct record *pService=startManagedChildForTest(SVC_CORE);
+            long pPid=pService->pid;
+            if(pMalformed) {spoof_ready=1;ticks+=20;}
+            else {never_ready=1;ticks=pService->ready_deadline;}
+            gKillDelayMs=25;gWaitNaturalStatus=pStatuses[pCase];
+            assert(advance_registry(ticks)==0 && from_pid(pPid)->reaped);
+            assert(pService->last_status==pStatuses[pCase] &&
+                   pService->state==SVC_BACKOFF && pService->pid==0 &&
+                   pService->retry_at==ticks+RESTART_BASE_MS);
+        }
+    }
+}
 int main(void){
+    remoteKillWaitsForActualOwnerExit();
+    failedKillWaitPreservesIdentityAndEndpoint();
+    naturalExitWinsAcceptedKillWithoutStatusRewrite();
+    remoteOrphanKillUsesBoundedOwnerWait();
+    shellExitBetweenStatusProbeAndEofShutsDown();
+    restartAndRecoveryUseTimeAfterRemoteStop();
+    readinessFailureKeepsTheCollectedNaturalStatus();
     normal_session();
     failure_injection();
     dependency_failure_and_restart_window();
@@ -564,6 +784,6 @@ int main(void){
     command_authorization_and_dependency();
     full_loop_command_lifecycle();
     bounded_control_failures();
-    puts("Persistent manager lifecycle, immediate commands, recovery, bounded IPC, restart budget and shutdown passed");
+    puts("Persistent manager lifecycle, asynchronous stops, exit races, bounded IPC, restart budget and shutdown passed");
     return 0;
 }

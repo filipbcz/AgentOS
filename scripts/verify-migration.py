@@ -20,14 +20,18 @@ gBoundary = re.compile(
     rf"AGENTOS MIGRATION (BEGIN|ENDED) ROOT=({gHex}) CPUS=({gHex}) "
     rf"WORKERS=({gHex}) OBSERVED=({gHex}) MIGRATIONS=({gHex}) WAKEUPS=({gHex}) NOW=({gHex})")
 gEvent = re.compile(
-    rf"AGENTOS MIGRATION (START|MOVED|IO|SLEEP|DONE) ROOT=({gHex}) CHILD=({gHex}) "
+    rf"AGENTOS MIGRATION (START|MOVED|IO|SLEEP|DONE|ARMED) ROOT=({gHex}) CHILD=({gHex}) "
     rf"SLOT=({gHex}) CPU=({gHex}) MOVES=({gHex}) WORK=({gHex}) NOW=({gHex}) UNTIL=({gHex})"
-    rf"(?: OFFSET=({gHex}) FNV=({gHex}))?")
+    rf"(?: OFFSET=({gHex}) FNV=({gHex}))?(?: TOTAL=({gHex}))?")
 gAuth = re.compile(
     rf"AGENTOS MIGRATION AUTH ROOT=({gHex}) CHILD=({gHex}) SLOT=({gHex}) "
     rf"UID=({gHex}) GID=({gHex}) SENDER=({gHex}) READER=({gHex}) FNV=({gHex})")
 gReap = re.compile(
     rf"AGENTOS MIGRATION REAP ROOT=({gHex}) CHILD=({gHex}) SLOT=({gHex}) STATUS=({gHex})")
+gKillProof = re.compile(
+    rf"AGENTOS MIGRATION (KILL|COLLECT) ROOT=({gHex}) CHILD=({gHex}) SLOT=({gHex}) "
+    rf"CPU=({gHex}) OWNER=({gHex}) TOTAL=({gHex}) NOW=({gHex}) UNTIL=({gHex})(?: STATUS=({gHex}))?")
+gKill = re.compile(rf"AGENTOS USER KILL PID=({gHex}) PARENT=({gHex}) STATUS=0000000000000089")
 gExit = re.compile(rf"AGENTOS USER EXIT PID=({gHex}) CR3=({gHex}) STATUS=({gHex})")
 gSession = re.compile(rf"AGENTOS MANAGER SESSION START PID=({gHex})")
 gPark = re.compile(rf"AGENTOS USER PARK PID=({gHex}) CR3=({gHex}) STATUS=0000000000000000")
@@ -84,7 +88,8 @@ def verify(aText, aCpus=None):
     pPriorPids = {int(pMatch[1], 16) for pLine in pLines[:pBeginAt]
                   if (pMatch := re.match(rf"AGENTOS USER (?:EXIT|FAULT|KILL) PID=({gHex})", pLine))}
     pStates, pPids = {}, set()
-    pMoveEvents = 0
+    pMoveEvents, pWorkMoveEvents, pMaxArmTotal = 0, 0, pMoves
+    pKill = None
     pIoOrder, pAuthOrder, pReapOrder = [], [], []
     for pIndex, pLine in enumerate(pLines):
         if not pBeginAt < pIndex < pEndAt:
@@ -103,6 +108,8 @@ def verify(aText, aCpus=None):
                     f"Invalid worker identity, CPU, work or time at line {pIndex + 1}")
             require((pKind == "IO") == (pMatch[10] is not None and pMatch[11] is not None),
                     "Only I/O records carry offset and digest fields")
+            require((pKind == "ARMED") == (pMatch[12] is not None),
+                    "Only a fresh owner report carries the migration counter")
             if pKind == "START":
                 require(pSlot not in pStates and pChild not in pPids and pChild not in pPriorPids and
                         pUntil - pNow == 5000 and pWork == 1,
@@ -116,7 +123,8 @@ def verify(aText, aCpus=None):
             pState = pStates[pSlot]
             require(pState["pid"] == pChild and pUntil == pState["until"] and
                     pTaskMoves >= pState["moves"] and pWork >= pState["work"] and pNow >= pState["now"] and
-                    pState["phase"] not in ("done", "exited", "reaped"),
+                    pState["phase"] not in ("kill_requested", "collected", "exited", "reaped") and
+                    pKill is None,
                     "Migration changed identity/deadline, lost work/time, or continued after completion")
             if pKind == "MOVED":
                 require(aCpus == 2 and pCpuId != pState["cpu"] and
@@ -124,6 +132,12 @@ def verify(aText, aCpus=None):
                         "A migration must change CPU after prior execution and advance work/time/counter")
                 pState["observed"] += 1
                 pMoveEvents += 1
+                if pState["phase"] in ("done", "armed"):
+                    require(len(pStates) == pWorkers and
+                            all(pValue["phase"] in ("done", "armed") for pValue in pStates.values()),
+                            "Final owner handshake began before every original deadline completed")
+                else:
+                    pWorkMoveEvents += 1
             else:
                 require(pCpuId == pState["cpu"], "CPU changed without a MOVED continuation record")
                 if pKind == "IO":
@@ -142,6 +156,16 @@ def verify(aText, aCpus=None):
                     require(pState["phase"] == "sleep" and pNow >= pUntil,
                             "Worker completed before authenticated I/O or its original deadline")
                     pState["phase"] = "done"
+                    pState["armWork"] = pWork
+                elif pKind == "ARMED":
+                    pArmTotal = int(pMatch[12], 16)
+                    require(pState["phase"] in ("done", "armed") and len(pStates) == pWorkers and
+                            all(pValue["phase"] in ("done", "armed") for pValue in pStates.values()) and
+                            pWork > pState["armWork"] and
+                            pArmTotal >= max(pMoves, pTaskMoves, pState.get("armTotal", 0)),
+                            "Owner report is stale, repeated, or precedes completed workload")
+                    pState.update(phase="armed", armWork=pWork, armTotal=pArmTotal)
+                    pMaxArmTotal = max(pMaxArmTotal, pArmTotal)
             pState.update(cpu=pCpuId, moves=pTaskMoves, work=pWork, now=pNow)
             continue
         pMatch = gAuth.fullmatch(pLine)
@@ -157,6 +181,46 @@ def verify(aText, aCpus=None):
             pState["auth"] = True
             pAuthOrder.append(pSlot)
             continue
+        pMatch = gKillProof.fullmatch(pLine)
+        if pMatch:
+            pKind = pMatch[1]
+            pOwner, pChild, pSlot, pCallerCpu, pOwnerCpu, pTotal, pNow, pUntil = (
+                int(pValue, 16) for pValue in pMatch.groups()[1:9])
+            require(pOwner == pRoot and pSlot in pStates and pStates[pSlot]["pid"] == pChild and
+                    pStartTime <= pNow <= pUntil <= 0x7fffffffffffffff and
+                    0 <= pCallerCpu < 255 and 0 <= pOwnerCpu < 255 and
+                    (not pKnownCpus or pCallerCpu in pKnownCpus and pOwnerCpu in pKnownCpus),
+                    "Invalid kill/collect identity, CPU or bounded deadline")
+            pState = pStates[pSlot]
+            if pKind == "KILL":
+                require(pKill is None and pMatch[10] is None and pState["phase"] == "armed" and
+                        len(pStates) == pWorkers and
+                        all(pValue["phase"] in ("done", "armed") for pValue in pStates.values()) and
+                        pOwnerCpu == pState["cpu"] and pTotal == pState["armTotal"] and
+                        pTotal >= pMaxArmTotal and pNow >= pState["now"] and pUntil - pNow == 5000 and
+                        ((aCpus == 2 and pCallerCpu != pOwnerCpu) or
+                         (aCpus == 1 and pCallerCpu == pOwnerCpu)),
+                        "Kill lacks a fresh owner snapshot and a real configured local/remote branch")
+                pKill = {"pid": pChild, "slot": pSlot, "caller": pCallerCpu, "owner": pOwnerCpu,
+                         "total": pTotal, "now": pNow, "until": pUntil, "collected": False}
+            else:
+                require(pKill is not None and pMatch[10] is not None and int(pMatch[10], 16) == 137 and
+                        pState["phase"] == "kill_requested" and not pKill["collected"] and
+                        (pChild, pSlot, pCallerCpu, pOwnerCpu, pTotal, pUntil) ==
+                        (pKill["pid"], pKill["slot"], pKill["caller"], pKill["owner"],
+                         pKill["total"], pKill["until"]) and pNow >= pKill["now"],
+                        "Kill did not complete with status 137 before its original deadline and without migration")
+                pState["phase"] = "collected"
+                pKill.update(collected=True, collectNow=pNow)
+            continue
+        pMatch = gKill.fullmatch(pLine)
+        if pMatch:
+            pChild, pParent = (int(pValue, 16) for pValue in pMatch.groups())
+            require(pKill is not None and pChild == pKill["pid"] and pParent == pRoot and
+                    pStates[pKill["slot"]]["phase"] == "armed",
+                    "Kernel kill request differs from the selected live child or is duplicated")
+            pStates[pKill["slot"]]["phase"] = "kill_requested"
+            continue
         pMatch = gExit.fullmatch(pLine)
         if pMatch:
             pChild, pRootPage, pStatus = (int(pValue, 16) for pValue in pMatch.groups())
@@ -164,16 +228,20 @@ def verify(aText, aCpus=None):
             require(len(pSlots) == 1 and pRootPage > 0 and pRootPage % 4096 == 0 and pStatus == 0,
                     "Unknown worker, invalid CR3 or failed process exit")
             pState = pStates[pSlots[0]]
-            require(pState["phase"] == "done" and len(pStates) == pWorkers and
-                    all(pValue["phase"] in ("done", "exited", "reaped") for pValue in pStates.values()),
+            require(pKill is not None and pKill["collected"] and
+                    pState["phase"] in ("done", "armed") and len(pStates) == pWorkers and
+                    all(pValue["phase"] in ("done", "armed", "collected", "exited", "reaped")
+                        for pValue in pStates.values()),
                     "Worker exited before successful completion or twice")
             pState["phase"] = "exited"
             continue
         pMatch = gReap.fullmatch(pLine)
         if pMatch:
             pOwner, pChild, pSlot, pStatus = (int(pValue, 16) for pValue in pMatch.groups())
-            require(pOwner == pRoot and pSlot in pStates and pStatus == 0 and
-                    pStates[pSlot]["pid"] == pChild and pStates[pSlot]["phase"] == "exited",
+            require(pKill is not None and pOwner == pRoot and pSlot in pStates and
+                    pStates[pSlot]["pid"] == pChild and
+                    ((pSlot == pKill["slot"] and pStatus == 137 and pStates[pSlot]["phase"] == "collected") or
+                     (pSlot != pKill["slot"] and pStatus == 0 and pStates[pSlot]["phase"] == "exited")),
                     "Parent did not reap exactly the actually exited worker")
             pStates[pSlot]["phase"] = "reaped"
             pReapOrder.append(pSlot)
@@ -182,11 +250,13 @@ def verify(aText, aCpus=None):
                 f"Unexpected or malformed kernel/guest event in migration interval at line {pIndex + 1}")
     pEndRoot, pEndCpus, pEndWorkers, pEndObserved, pEndMoves, pEndWakes, pEndTime = (
         int(pValue, 16) for pValue in pEnd.groups()[1:])
-    require(pEndRoot == pRoot and pEndCpus == aCpus and pEndWorkers == pWorkers and
+    require(pKill is not None and pKill["collected"] and
+            pEndRoot == pRoot and pEndCpus == aCpus and pEndWorkers == pWorkers and
             pEndObserved == pMoveEvents and set(pStates) == set(range(pWorkers)) and
             all(pState["phase"] == "reaped" for pState in pStates.values()) and
             pIoOrder == pAuthOrder == pReapOrder == list(range(pWorkers)) and
             pEndTime >= max(pState["now"] for pState in pStates.values()) and
+            pEndTime >= pKill["collectNow"] and pEndMoves >= pKill["total"] and
             pEndTime - pStartTime < 15000 and pEndMoves - pMoves >=
             sum(pState["moves"] for pState in pStates.values()) and pEndWakes >= pWakeups,
             "Migration interval did not finish all workers, I/O, deadlines and reaping consistently")
@@ -195,9 +265,12 @@ def verify(aText, aCpus=None):
                 all(pState["moves"] == pState["startMoves"] == 0 for pState in pStates.values()),
                 "Single-CPU run claims impossible migrations")
     else:
-        require(pMoveEvents >= 2 and pEndMoves - pMoves >= pMoveEvents and pEndWakes > pWakeups,
+        require(pWorkMoveEvents >= 2 and pEndMoves - pMoves >= pMoveEvents and pEndWakes > pWakeups,
                 "Two-CPU run lacks repeated actual migration and cross-CPU wakeups")
     return {"root": pRoot, "cpus": aCpus, "workers": pWorkers, "observed_moves": pMoveEvents,
+            "work_observed_moves": pWorkMoveEvents, "killed_pid": pKill["pid"],
+            "kill_parent_cpu": pKill["caller"], "kill_owner_cpu": pKill["owner"],
+            "kill_migration_counter": pKill["total"], "remote_kill": aCpus == 2,
             "migrations": pEndMoves - pMoves, "cross_cpu_wakeups": pEndWakes - pWakeups,
             "begin_line": pBeginAt, "end_line": pEndAt}
 
@@ -213,7 +286,7 @@ def main():
         print(f"Migration acceptance failed: {pError}", file=sys.stderr)
         return 1
     print(f"Verified {pResult['workers']} workers, {pResult['observed_moves']} actual CPU continuations, "
-          "shared I/O, authenticated IPC, original deadlines and reaping")
+          "shared I/O, authenticated IPC, original deadlines, live kill/collect and reaping")
     return 0
 
 

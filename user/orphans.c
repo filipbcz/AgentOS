@@ -5,6 +5,18 @@
  * stop any remaining descendant. No speculative claims about global PID1.
  */
 #define MAX_DEADLINE 0x7fffffffffffffffUL
+enum { killTimeoutMs = 1000 };
+
+static long collectKilledChild(long aPid) {
+    long pStatus=os_call(SYS_TRY_WAIT,aPid,0,0);
+    if (pStatus!=-11) return pStatus;
+    long pNow=os_call(SYS_MONOTONIC_MS,0,0,0);
+    if (pNow<0) return pNow;
+    if ((unsigned long)pNow>MAX_DEADLINE-killTimeoutMs) return -22;
+    // The child can live on another CPU. Wait for its owner to publish the
+    // actual status without polling or reusing the parent's old deadline.
+    return os_call(SYS_WAIT_CHILD_UNTIL,aPid,pNow+killTimeoutMs,0);
+}
 
 static int boundary(const char *phase, long root) {
     char line[]="AGENTOS ORPHAN BEGIN ROOT=0000000000000000\r\n";
@@ -47,7 +59,7 @@ int run_orphans(void) {
         os_call(SYS_KILL,parent,0,0)!=-3) return 76;
     if (!report("ADOPT",root,parent,adopted,0)) return 77;
     if (os_call(SYS_KILL,adopted,0,0)!=0) return 78;
-    if (os_call(SYS_TRY_WAIT,adopted,0,0)!=137) return 79;
+    if (collectKilledChild(adopted)!=137) return 79;
     if (os_call(SYS_CHILD_AFTER,0,0,0)!=-10) return 80;
     if (!report("REAPS",root,parent,adopted,137)) return 81;
     return boundary("ENDED",root) ? 0 : 82;

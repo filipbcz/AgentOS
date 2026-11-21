@@ -31,6 +31,15 @@ def event(aName, aSlot, aCpu, aMoves, aWork, aNow):
     return pLine
 
 
+def killProof(aKind, aCpus, aNow):
+    pTotal = 3 if aCpus == 2 else 0
+    pOwner = 1 if aCpus == 2 else 0
+    pLine = (f"AGENTOS MIGRATION {aKind} ROOT=0000000000000001 CHILD=0000000000000047 "
+             f"SLOT=0000000000000001 CPU=0000000000000000 OWNER={pOwner:016x} TOTAL={pTotal:016x} "
+             f"NOW={aNow:016x} UNTIL={11041:016x}")
+    return pLine + (" STATUS=0000000000000089" if aKind == "COLLECT" else "")
+
+
 def block(aCpus=2):
     pMoved = 2 if aCpus == 2 else 0
     pLines = [boundary("BEGIN", aCpus, 0, 0, 0, 990)]
@@ -51,12 +60,17 @@ def block(aCpus=2):
     for pSlot in range(4):
         pLines.append(event("DONE", pSlot, pSlot % aCpus, pMoved if pSlot == 0 else 0,
                             3000, 6001 + pSlot * 10))
-    for pSlot in (2, 0, 3, 1):
+    pLines += [event("ARMED", 1, 1 % aCpus, 0, 3001, 6040) +
+               f" TOTAL={pMoved + (1 if aCpus == 2 else 0):016x}",
+               killProof("KILL", aCpus, 6041),
+               "AGENTOS USER KILL PID=0000000000000047 PARENT=0000000000000001 STATUS=0000000000000089",
+               killProof("COLLECT", aCpus, 6042)]
+    for pSlot in (2, 0, 3):
         pLines.append(f"AGENTOS USER EXIT PID={70 + pSlot:016x} CR3={0x400000 + pSlot * 4096:016x} "
                       "STATUS=0000000000000000")
     for pSlot in range(4):
         pLines.append(f"AGENTOS MIGRATION REAP ROOT=0000000000000001 CHILD={70 + pSlot:016x} "
-                      f"SLOT={pSlot:016x} STATUS=0000000000000000")
+                      f"SLOT={pSlot:016x} STATUS={137 if pSlot == 1 else 0:016x}")
     pLines.append(boundary("ENDED", aCpus, pMoved, pMoved + (1 if aCpus == 2 else 0),
                            12 if aCpus == 2 else 0, 6050))
     return pLines
@@ -83,6 +97,10 @@ class MigrationEvidenceTests(unittest.TestCase):
             pResult = gMigration.verify(pLog, pCpus)
             self.assertEqual(pResult["workers"], 4)
             self.assertEqual(pResult["observed_moves"], 2 if pCpus == 2 else 0)
+            self.assertEqual(pResult["work_observed_moves"], 2 if pCpus == 2 else 0)
+            self.assertEqual(pResult["killed_pid"], 71)
+            self.assertEqual(pResult["remote_kill"], pCpus == 2)
+            self.assertEqual(pResult["kill_owner_cpu"], 1 if pCpus == 2 else 0)
             self.assertEqual(pManager.verify(pLog), (1, 105))
 
     def testEveryProtocolRecordIsRequiredAndDuplicatesAreRejected(self):
@@ -161,6 +179,57 @@ class MigrationEvidenceTests(unittest.TestCase):
         self.rejected(pLog + event("MOVED", 0, 1, 3, 4000, 7000))
         self.rejected(pLog.replace("AGENTOS MANAGER SESSION START PID=0000000000000001", ""))
         self.rejected(pLog.replace("AGENTOS USER PARK PID=0000000000000001", "AGENTOS USER PARK PID=0000000000000002"))
+
+    def testRemoteKillRequiresFreshOwnerAndUnchangedGlobalCounterThroughCollection(self):
+        pLog = scenario()
+        pKill = killProof("KILL", 2, 6041)
+        pCollected = killProof("COLLECT", 2, 6042)
+        for pBefore,pAfter in (
+            (pKill,pKill.replace("OWNER=0000000000000001","OWNER=0000000000000000")),
+            (pKill,pKill.replace("CPU=0000000000000000","CPU=0000000000000001")),
+            (pKill,pKill.replace("TOTAL=0000000000000003","TOTAL=0000000000000004")),
+            (pCollected,pCollected.replace("TOTAL=0000000000000003","TOTAL=0000000000000004")),
+            (pCollected,pCollected.replace("CPU=0000000000000000","CPU=0000000000000001")),
+            (pCollected,pCollected.replace("STATUS=0000000000000089","STATUS=0000000000000000")),
+            (pCollected,pCollected.replace(f"NOW={6042:016x}",f"NOW={11042:016x}")),
+            (pCollected,pCollected.replace(f"UNTIL={11041:016x}",f"UNTIL={11042:016x}")),
+            ("USER KILL PID=0000000000000047","USER KILL PID=0000000000000046"),
+            ("CHILD=0000000000000047 SLOT=0000000000000001 STATUS=0000000000000089",
+             "CHILD=0000000000000047 SLOT=0000000000000001 STATUS=0000000000000000"),
+        ):
+            with self.subTest(mutation=pAfter):
+                self.rejected(pLog.replace(pBefore,pAfter,1))
+        pFakeExit = "AGENTOS USER EXIT PID=0000000000000047 CR3=0000000000401000 STATUS=0000000000000089"
+        self.rejected(pLog.replace(pCollected,pFakeExit))
+
+    def testArmRefreshMayMoveButCannotReplaceOriginalWorkloadMigrations(self):
+        pLog = scenario()
+        pArm = event("ARMED", 1, 1, 0, 3001, 6040) + " TOTAL=0000000000000003"
+        pRefresh = (event("MOVED", 0, 1, 3, 3001, 6035) + "\r\n" +
+                    event("ARMED", 0, 1, 3, 3002, 6036) + " TOTAL=0000000000000003\r\n")
+        pChanged = pLog.replace(pArm,pRefresh+pArm).replace(
+            "WORKERS=0000000000000004 OBSERVED=0000000000000002",
+            "WORKERS=0000000000000004 OBSERVED=0000000000000003")
+        pResult = gMigration.verify(pChanged,2)
+        self.assertEqual(pResult["observed_moves"],3)
+        self.assertEqual(pResult["work_observed_moves"],2)
+        pEarlyMove = event("MOVED", 0, 0, 2, 200, 1200)
+        # Keep every identity/CPU/counter transition valid while moving one
+        # of the two continuations past DONE. ARM work must not replace the
+        # original asymmetric-load acceptance criterion.
+        pOnlyOneEarly = pLog.replace(pEarlyMove+"\r\n", "")
+        for pKind,pWork,pNow in (("IO",1000,1300),("SLEEP",2000,5800),("DONE",3000,6001)):
+            pOnlyOneEarly = pOnlyOneEarly.replace(event(pKind,0,0,2,pWork,pNow),
+                                                 event(pKind,0,1,1,pWork,pNow))
+        pAuth = next(pLine for pLine in pLog.splitlines()
+                     if pLine.startswith("AGENTOS MIGRATION AUTH ROOT=0000000000000001 CHILD=0000000000000046"))
+        pOnlyOneEarly = pOnlyOneEarly.replace(pAuth,pAuth.replace("SENDER=0000000000000000",
+                                                                "SENDER=0000000000000001"))
+        pLateMove = (event("MOVED",0,0,2,3001,6035)+"\r\n"+
+                     event("ARMED",0,0,2,3002,6036)+" TOTAL=0000000000000003\r\n")
+        pOnlyOneEarly = pOnlyOneEarly.replace(pArm,pLateMove+pArm)
+        with self.assertRaisesRegex(gMigration.VerificationError,"Two-CPU run lacks repeated actual migration"):
+            gMigration.verify(pOnlyOneEarly,2)
 
     def testServiceVerifierCannotSkipAnIncompleteMigrationInterval(self):
         pManager = imported("verify-service-manager.py", "brokenMigrationManager")
