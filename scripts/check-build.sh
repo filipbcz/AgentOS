@@ -82,7 +82,7 @@ printf 'Testing actual COW paging clone, W^X and OOM rollback with %s\n' "$pRust
 "$pOut/paging-cow-tests"
 
 printf 'Testing exact frame-snapshot accounting for retained lazy processes with %s\n' "$pRustc"
-"$pRustc" --edition 2021 --test "$pRoot/kernel/frames.rs" -o "$pOut/frame-snapshot-tests"
+"$pRustc" --edition 2021 --test "$pRoot/scripts/tests/frame-snapshot-host.rs" -o "$pOut/frame-snapshot-tests"
 "$pOut/frame-snapshot-tests"
 
 printf 'Testing actual lazy ELF loader, file/pipe/IPC copies and OOM rollback with %s\n' "$pRustc"

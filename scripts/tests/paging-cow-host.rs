@@ -1,7 +1,8 @@
 //! Test the actual kernel/paging.rs clone/resolve implementation using
 //! page-aligned owned host memory; suppress only privileged TLB instructions.
 //! Every page table and data leaf uses the same actual pointer-walk code.
-#![allow(dead_code)]
+// lowerCamelCase follows the project's naming convention in this harness.
+#![allow(dead_code, non_snake_case)]
 use std::{marker::PhantomData, ptr};
 
 pub struct BootInfo {
