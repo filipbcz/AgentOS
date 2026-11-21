@@ -55,12 +55,15 @@ pub struct Queue {
     count: usize,
     current: Option<usize>,
     caller: usize,
+    /// First parent=0 userspace task of this CPU run. Never reassign while
+    /// it is alive; no parent/child relationship crosses CPU ownership.
+    init_pid: Option<usize>,
     pub active: bool,
 }
 
 impl Queue {
     pub fn new() -> Self {
-        Self { tasks: core::array::from_fn(|_| None), count: 0, current: None, caller: 0, active: false }
+        Self { tasks: core::array::from_fn(|_| None), count: 0, current: None, caller: 0, init_pid: None, active: false }
     }
 
     pub fn spawn(&mut self, frames: &mut Frames<'_>, entry: extern "C" fn(usize), arg: usize) -> Option<()> {
@@ -108,6 +111,7 @@ impl Queue {
         self.tasks[slot] = Some(Task { stack, context: context as usize, runnable: true, waiting: None, timed: None, clock_stall_ticks: 0, last_clock_ms: 0,
                                       clock_error: false, preemptions: 0, process: Some(process) });
         self.count = self.count.max(slot+1);
+        if parent == 0 && self.init_pid.is_none() { self.init_pid = Some(pid); }
         Ok(pid)
     }
 
@@ -215,6 +219,48 @@ impl Queue {
         Some(self.tasks[self.current?].as_ref()?.stack.address() + 4096)
     }
 
+    /// Reassign all immediate children of an exiting process to this CPU's
+    /// root user task. An already-exited child must also be adopted: its
+    /// reaping right cannot remain attached to an uncollectable dead parent.
+    /// If the root itself exits, no replacement supervisor exists. Fail
+    /// closed by stopping all remaining userspace processes; reap() later
+    /// frees their address spaces on the kernel stack, never in an IRQ.
+    fn orphan_children(&mut self, frames: &mut Frames<'_>, exited_pid: usize) {
+        let reaper = self.init_pid.filter(|&root| root != exited_pid &&
+            self.tasks.iter().flatten().any(|t| t.process.as_ref()
+                .map_or(false, |p| p.pid == root && p.status.is_none())));
+        if let Some(root) = reaper {
+            for task in self.tasks.iter_mut().flatten() {
+                if let Some(process) = task.process.as_mut() {
+                    if process.parent == exited_pid { process.parent = root; }
+                }
+            }
+        } else if self.init_pid == Some(exited_pid) {
+            // The root supervisor died. No ordinary user task can adopt the
+            // descendants. Prevent indefinitely runnable unattended services.
+            self.init_pid = None;
+            for task in self.tasks.iter_mut().flatten() {
+                let Some(process) = task.process.as_mut() else { continue; };
+                if process.pid == exited_pid || process.status.is_some() { continue; }
+                process.files.close_all(frames);
+                process.status = Some(137);
+                process.parent = 0;
+                task.runnable = false;
+                task.waiting = None;
+                task.timed = None;
+            }
+        }
+    }
+
+    /// Enumerate only caller-owned children, in PID order. This is useful
+    /// when a child was created by another process and adopted by init.
+    /// The PID cursor avoids returning an unrelated task or private identity.
+    pub fn child_after(&self, parent: usize, cursor: usize) -> Result<usize, isize> {
+        self.tasks.iter().flatten().filter_map(|task| task.process.as_ref())
+            .filter(|process| process.parent == parent && process.pid > cursor)
+            .map(|process| process.pid).min().ok_or(-10)
+    }
+
     pub fn terminate(&mut self, status: usize, frames: &mut Frames<'_>) {
         let task = self.tasks[self.current.unwrap()].as_mut().unwrap();
         let process = task.process.as_mut().unwrap();
@@ -222,6 +268,7 @@ impl Queue {
         let pid = process.pid;
         process.status = Some(status);
         task.runnable = false;
+        self.orphan_children(frames, pid);
         self.wake_child(pid);
         self.wake_io();
     }
@@ -252,6 +299,7 @@ impl Queue {
             break;
         }
         if !found { return Err(-3); }
+        if !already_exited { self.orphan_children(frames, pid); }
         self.wake_child(pid);
         // A closed channel or pipe can unblock other tasks on this CPU.
         self.wake_io();
@@ -310,6 +358,7 @@ impl Queue {
         assert!(!self.active && self.current.is_none());
         for i in 0..self.count { self.release_task(i, frames); }
         self.count = 0;
+        self.init_pid = None;
     }
 }
 
