@@ -48,7 +48,7 @@ static struct worker *from_pid(long pid) {
     return NULL;
 }
 static struct worker *from_channel(unsigned channel) {
-    for(unsigned i=0;i<count;i++) if(workers[i].channel==channel && !workers[i].reaped)
+    for(unsigned i=0;i<count;i++) if((unsigned)workers[i].channel==channel && !workers[i].reaped)
         return &workers[i];
     return NULL;
 }
