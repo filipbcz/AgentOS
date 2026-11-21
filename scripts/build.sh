@@ -32,7 +32,7 @@ printf 'AgentOS stage 1\n' > stage
 for app in init fault receiver service shell svc_ok svc_fail svc_hang orphan_parent; do
     gcc-13 -c "$root/user/$app.S" -o user.o
     objects=(user.o)
-    case "$app" in init) sources=(transfer client supervisor orphans);; receiver) sources=(receive);; service) sources=(service);; shell) sources=(shell);; *) sources=();; esac
+    case "$app" in init) sources=(transfer client supervisor orphans forktest);; receiver) sources=(receive);; service) sources=(service);; shell) sources=(shell);; *) sources=();; esac
     for src in "${sources[@]}"; do
         gcc-13 -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
             -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large -c "$root/user/$src.c" -o "$src.o"
