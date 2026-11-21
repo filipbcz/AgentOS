@@ -77,7 +77,7 @@ Demand paging z **milníku 3.1 A** [implementačního plánu](PLAN_IMPLEMENTACE.
 
 Stejná cesta obsluhuje CPL3 page fault i kernelové čtení/zápis uživatelského bufferu. Neplatný rozsah vrací `EFAULT` (−14), nedostatek rámců `ENOMEM` (−12). Před kopírováním se ověří a připraví celý rozsah. Při OOM mohou již připravené stránky zůstat rezidentní, ale nezmění se přenášené bajty, pozice souboru ani obsah front. Každé nedokončené jednotlivé mapování vrací nové tabulky; ukončení procesu vrátí i jeho metadata a všechny stránky. Konzolový výstup dostane vlastní kopii nejvýše 256 bajtů a UART/GOP obslouží až po uvolnění zámku alokátoru.
 
-Procesy nadále zůstávají na svém CPU. Řízená migrace a vyvažování patří do dosud neimplementované části **3.1 B**. Přesný stav ověření části A je v plánu; historická přejímka základního profilu etapy 3 ji nepotvrzuje.
+Procesy nadále zůstávají na svém CPU. Řízená migrace a vyvažování patří do dosud neimplementované části **3.1 B**. Část A prošla [host CI](https://github.com/filipbcz/AgentOS/actions/runs/44957373668) a [QEMU na 1/2 CPU](https://github.com/filipbcz/AgentOS/actions/runs/44957373682) pro revizi `9f4dde5b7a98eb847f8e82273cab7a902e6ae7e1`, včetně interaktivních relací a závěrečného návratu rámců. Přesná měření, identita obrazu a otevřené zkoušky jsou v plánu. Testy této verze ve VirtualBoxu a na fyzickém HP zde provedené nejsou.
 
 ## Uživatelské procesy a nativní ABI v1
 

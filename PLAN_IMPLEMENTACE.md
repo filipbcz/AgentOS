@@ -138,7 +138,7 @@ Současné procesy mají jedno vlákno, CPU-local fd/IPC a monotónní epochu, o
 
 ### 3.1. Demand paging a vyvažování SMP
 
-**Stav k 2026-11-21: část A implementována a připravena k ověření v CI; část B zůstává navržená a neimplementovaná.** Tento milník přiřazuje dva požadavky zadání, které původní plán nepojmenoval v žádné etapě. Přejímka zůstává otevřená; historické host/QEMU výsledky etapy 3 nové chování nepotvrzují. Aktuální bootové scénáře doplňují ověření demand pagingu a opakují původní regrese.
+**Stav k 2026-11-21: část A implementována a ověřena host CI a skutečným QEMU na 1/2 CPU; část B zůstává navržená a neimplementovaná.** Tento milník přiřazuje dva požadavky zadání, které původní plán nepojmenoval v žádné etapě. Přejímka ve VirtualBoxu zůstává otevřená. Nové důkazy části A jsou uvedeny níže pro konkrétní revizi; historické výsledky etapy 3 je nenahrazují. Aktuální bootové scénáře ověřují demand paging a opakují původní regrese.
 
 | Požadavek zadání | Odpovědná část milníku | Návaznost |
 |---|---|---|
@@ -153,7 +153,7 @@ Oddělit evidenci rezervovaných virtuálních oblastí, jejich práv a zdroje o
 
 Sjednotit tuto cestu s COW a kernelovým čtením/zápisem uživatelských bufferů: platná dosud nepřítomná stránka musí fungovat i při syscallu, neplatný přístup musí skončit odpovídající chybou. `fork` musí zachovat rezervace i obsah před prvním načtením stránky i po něm. OOM, selhání částečné alokace a ukončení procesu musí mít definovaný výsledek, vrátit všechny rozpracované prostředky a zachovat ostatní procesy. První přejímka používá anonymní paměť a neměnný initramfs, takže není závislá na hotovém ext4.
 
-**Dotčená rozhraní.** Správa oblastí a PTE v `kernel/paging.rs`, životní cyklus/loader v `kernel/process.rs`, page fault a syscall copy-in/copy-out, evidence rámců a jejich referencí. Přesná veřejná rozhraní, chybové návraty a potřebné změny ABI se doplní při implementaci spolu s konzumenty a testy.
+**Dotčená rozhraní.** Správa oblastí a PTE v `kernel/paging.rs`, životní cyklus/loader v `kernel/process.rs`, page fault a syscall copy-in/copy-out, evidence rámců a jejich referencí. Implementovaný kontrakt, chybové návraty a aditivní změnu ABI popisují následující odstavce, `user/abi.h` a README; testy používají skutečné implementace pageru i jeho konzumentů.
 
 ##### Implementace části A a její hranice
 
@@ -165,9 +165,35 @@ Sjednotit tuto cestu s COW a kernelovým čtením/zápisem uživatelských buffe
 
 ##### Ověření a předání části A
 
-Lokálně prošlo 139 Python testů ověřovačů a C harness entrypointů, kontrola syntaxe Python/Bash a link všech 12 nativních uživatelských ELF s kontrolou ABI note. Nová Rust sada testuje skutečný pager, loader, VFS, fd a IPC s vlastněnou zarovnanou host pamětí, OOM body, rollback a zachování dat; další testy ověřují přesné započítání živých rámců do snapshotu. Lokální prostředí nemá Rust ani hypervizor, proto **Rust/kernel link a skutečný QEMU běh této implementace zatím čekají na CI**; tento odstavec se po jejich dokončení doplní konkrétní revizí a důkazy.
+Ověřená funkční revize je [`9f4dde5b7a98eb847f8e82273cab7a902e6ae7e1`](https://github.com/filipbcz/AgentOS/commit/9f4dde5b7a98eb847f8e82273cab7a902e6ae7e1). [Host CI](https://github.com/filipbcz/AgentOS/actions/runs/44957373668) a [QEMU CI](https://github.com/filipbcz/AgentOS/actions/runs/44957373682) skončily `success`. Oba workflow skutečně testovaly čistý GitHub merge checkout `4a0fb41919be3fbe45a832950541674df4c0c4b7`; jeho strom `71d5d48759cea12156f50f5a2636cbee240c2c87` je shodný se stromem uvedené funkční revize. Následný zápis výsledků mění pouze README a tento plán. Toolchain: Rust 1.75.0, GCC 13.3.0 a připnutý `scripts/toolchain.lock`.
 
-`user/demand.c` běží v původním initu na 1/2 CPU. Rezervuje 16 MiB skutečného BSS, měří málo rezidentních stránek a jejich přírůstek po čtyřech vzdálených přístupech, ověřuje lazy file/pipe/IPC buffery, fork nad rezidentními i nepřítomnými oblastmi a ukončení samostatných potomků při guard/NX/RO přístupu. `verify-demand-paging.py` kontroluje čítače, přesnou posloupnost, identitu, adresy a chybové kódy skutečných faultů. `qemu-smoke.py` a `test-vbox.ps1` jej v nových pozitivních sériových bězích vyžadují. Host OOM testy neznamenají provedenou guest zkoušku vyčerpání paměti demand procesem.
+| Kontrola finální revize | Výsledek |
+|---|---|
+| Python ověřovače a harness entrypointy | 141 testů v 17 sadách prošlo |
+| Rust host sady nad skutečným kódem | 191 spuštění testů ve 14 sadách prošlo; sdílené moduly se v některých sadách opakují |
+| Samostatné C harnessy | Všechny 4 prošly |
+| Nativní uživatelské programy | Všech 12 ELF se sestavilo a prošlo kontrolou ABI note |
+| Kernel a trap návrat | Link prošel; W^X 23 RX / 2 RO+NX / 1 RW+NX stránek, návratový stub 41 instrukcí |
+| PowerShell harnessy | Parsování prošlo |
+| OVMF Secure Boot / QEMU TCG, 256 MiB, 1 a 2 CPU | Na obou konfiguracích prošel běžný boot i interaktivní UART+PS/2/GOP relace |
+| Runtime idle v interaktivní relaci | V obou konfiguracích 5 001 ms, 6 timer IRQ, z toho 6 idle IRQ |
+| Ukončení interaktivní relace | Původní PID 1 skončil se stavem 0; v obou konfiguracích přesný návrat bitmapy `FRAMES=OK` |
+
+Rust testy obsahují 17 kontrol pageru, 5 kontrol přesného započítání živých rámců do snapshotu a 16 spuštění v integrační sadě loader/VFS/fd/IPC včetně 6 sdílených ABI testů. Používají vlastněnou zarovnanou host paměť a skutečný kernelový kód, řízená místa OOM, rollback a kontrolu zachování dat. První host běh odhalil chybu samostatné kompilace snapshot testů: `pub(super)` nemohlo být v kořeni testovacího crate. Finální revize přidává obalový modul zachovávající produkční viditelnost; celá sada výše byla potom znovu úspěšně provedena. Lokálně prošla syntaxe Python/Bash, Python kontroly a link všech 12 ELF s GCC 14.2; Rust a QEMU výsledky pocházejí ze skutečných běhů GitHub CI.
+
+`user/demand.c` běží v původním initu na 1/2 CPU. Rezervuje 16 MiB skutečného BSS, ověřuje lazy file/pipe/IPC buffery, fork nad rezidentními i nepřítomnými oblastmi a ukončení samostatných potomků při guard/NX/RO přístupu. Ve všech čtyřech skutečných bootech finálního QEMU běhu naměřil na každém testovaném CPU následující hodnoty pro svůj adresní prostor:
+
+| Metrika (stránka 4 KiB) | Před řídkými přístupy | Po řídkých přístupech |
+|---|---:|---:|
+| Rezervované virtuální stránky včetně obrazu a zásobníku | 4 112 | 4 112 |
+| Rezidentní uživatelské stránky | 6 (24 KiB) | 11 (44 KiB) |
+| Soukromé stránkovací tabulky včetně root | 6 (24 KiB) | 9 (36 KiB) |
+| Metadata oblastí | 1 (4 KiB) | 1 (4 KiB) |
+| Kumulativní demand materializace | 6 | 11 |
+
+Čtyři cílené vzdálené přístupy spolu s dalším přístupem běhu/reportování vytvořily celkem pět uživatelských stránek; velká nevyužitá část rezervace zůstala nepřítomná. Čísla popisují jeden adresní prostor, nikoli unikátní fyzickou spotřebu celého OS. Testy zachytily skutečné guard/NX/RO page faulty s kódy 4/20/6 a převzetí ukončených potomků. `verify-demand-paging.py` kontroluje čítače, přesnou posloupnost, identitu, adresy a chybové kódy; `qemu-smoke.py` a `test-vbox.ps1` jej v nových pozitivních sériových bězích vyžadují. **Řízené OOM a rollback jsou ověřené host testy; samostatná guest zkouška vyčerpání paměti demand procesem provedena nebyla.**
+
+Artefakty [1 CPU](https://github.com/filipbcz/AgentOS/actions/runs/44957373682/artifacts/14728262311) a [2 CPU](https://github.com/filipbcz/AgentOS/actions/runs/44957373682/artifacts/14728002770) obsahují COM1 logy, vstup relace, GOP/PS/2 snímky, podepsané i nepodepsané EFI, build provenance a výsledné `smoke.json`. Byly staženy, porovnány jejich SHA-256 a opakovány striktní kontroly skutečných logů a obrazových dat. Obě nezávislá sestavení mají shodný nepodepsaný EFI hash `1f09b2b8c9f2e8e556c54ce487b5f9d28c24422aad4ca78e977423309e9c8365` a initramfs hash `98a4a604ffb2057483cda40b1ea44f2bdbe415aefa891c09e027b5cfba82a143`. Podepsané EFI mají SHA-256 `47e3c766040a37889bf877abc4d27c9aeee207d4e2a7b1962af2cac4946abd34` (1 CPU) a `1054b906974170711cbc16f1798b7e3d2e5462757037b975844a9ad397ac5317` (2 CPU); každý job používá vlastní dočasný podpisový klíč. Délka těchto běhů zahrnuje úmyslné třicetisekundové bootové měření klidu a není měřením limitu studeného startu vydání.
 
 Přejímka ve VirtualBoxu zůstává neprovedená. Aktuální `scripts/accept-stage3.ps1` sestaví nový obraz a provede 13 profilů s rozšířeným bootovým scénářem. Výsledné COM1 logy pro 1/2 CPU lze samostatně ověřit přes `python scripts/verify-demand-paging.py --log CESTA_K_COM1_LOG --cpus 1` nebo `2`; celý souhrn dál vyžaduje čistý odpovídající Git checkout. Následující implementační práce je část B; úspěch testů části A ji neuzavírá.
 
