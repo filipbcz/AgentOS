@@ -43,6 +43,8 @@ SUPERVISOR_BEGIN = re.compile(r"AGENTOS SUPERVISOR BEGIN PARENT=([0-9a-f]{16})")
 SUPERVISOR_END = re.compile(r"AGENTOS SUPERVISOR ENDED PARENT=([0-9a-f]{16})")
 ORPHAN_BEGIN = re.compile(r"AGENTOS ORPHAN BEGIN ROOT=([0-9a-f]{16})")
 ORPHAN_END = re.compile(r"AGENTOS ORPHAN ENDED ROOT=([0-9a-f]{16})")
+COW_BEGIN = re.compile(r"AGENTOS COW BEGIN ROOT=([0-9a-f]{16}) CHILD=0000000000000000")
+COW_END = re.compile(r"AGENTOS COW ENDED ROOT=([0-9a-f]{16}) CHILD=([0-9a-f]{16})")
 
 
 def require(condition, message):
@@ -60,7 +62,32 @@ def verify(text, apic_ids):
     supervised_parents = []
     orphan_open = None
     orphan_roots = []
+    cow_open = None
+    cow_roots = []
     for number, line in enumerate(text.splitlines(), 1):
+        if line.startswith("AGENTOS COW "):
+            begin = COW_BEGIN.fullmatch(line)
+            end = COW_END.fullmatch(line)
+            require(supervisor_open is None and orphan_open is None,
+                    f"COW phase overlaps prior stage at line {number}")
+            if begin:
+                require(cow_open is None and len(orphan_roots) > len(cow_roots),
+                        f"Nested COW phase or missing orphan test at line {number}")
+                cow_open = int(begin[1], 16)
+                require(cow_open > 0, f"Zero fork root at line {number}")
+            elif end:
+                require(cow_open is not None and cow_open == int(end[1], 16) and
+                        int(end[2], 16) != 0,
+                        f"Unmatched COW phase end at line {number}")
+                cow_roots.append(cow_open)
+                cow_open = None
+            else:
+                require(cow_open is not None, f"COW event outside phase at line {number}")
+            continue
+        if cow_open is not None:
+            # verify-cow.py checks the exact forked child, exit and parent
+            # isolation evidence; do not mistake its USER EXIT for pipe IPC.
+            continue
         if line.startswith("AGENTOS ORPHAN "):
             begin = ORPHAN_BEGIN.fullmatch(line)
             end = ORPHAN_END.fullmatch(line)
@@ -107,7 +134,8 @@ def verify(text, apic_ids):
             # We must not interpret its service-child exits as IPC child exits.
             continue
         if line.startswith("AGENTOS SHELL START"):
-            require(orphan_open is None, "Unterminated orphan interval before shell")
+            require(orphan_open is None and cow_open is None,
+                    "Unterminated orphan/COW interval before shell")
             match = SHELL_START.fullmatch(line)
             require(match is not None and int(match[1], 16) != 0,
                     f"Malformed shell phase boundary at line {number}")
@@ -127,6 +155,9 @@ def verify(text, apic_ids):
 
     require(supervisor_open is None, "Unterminated supervisor interval")
     require(orphan_open is None, "Unterminated orphan interval")
+    require(cow_open is None, "Unterminated COW interval")
+    require(not cow_roots or len(cow_roots) == len(expected_cpus),
+            "Missing fork/COW interval on one or more CPUs")
     require(not supervised_parents or len(supervised_parents) == len(expected_cpus),
             "Missing supervisor interval on one or more CPUs")
     require(not orphan_roots or len(orphan_roots) == len(expected_cpus),
@@ -151,6 +182,9 @@ def verify(text, apic_ids):
         if orphan_roots:
             require(orphan_roots[len(seen_cpus)] == parent,
                     f"Orphan interval does not belong to this parent: {context}")
+        if cow_roots:
+            require(cow_roots[len(seen_cpus)] == parent,
+                    f"COW interval does not belong to this parent: {context}")
         require(cpu in expected_cpus and cpu not in seen_cpus,
                 f"Unexpected or repeated CPU: {context}")
         require(len(pids) == 4 and 0 not in pids and not (pids & seen_pids),
