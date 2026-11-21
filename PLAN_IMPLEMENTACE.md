@@ -56,11 +56,11 @@ Každý řádek odpovídá jednomu měřicímu oknu. Stopky hostitele zaznamenal
 
 **Navazuje na 1.** Zavést alokaci stránek, stránkování, ochrany paměti, ACPI/APIC, obsluhu výjimek a přerušení. Nad nimi spustit preemptivní plánovač, synchronizaci, monotónní čas a čekání bez trvalého pollingu.
 
-**Převzetí.** Test na 1 a 2 vCPU a následně na HP spustí identifikovatelnou úlohu na každém dostupném CPU. Zátěž ověří souběžnou alokaci a uvolňování stránek, preempci a probuzení časovačem. Ověří se ochranné stránky, NX a chování při vyčerpání paměti. V klidu se změří probuzení procesorů a režie jádra. Tím se uzavře celek B.
+**Převzetí.** Test na 1 a 2 vCPU a následně na HP spustí identifikovatelnou úlohu na každém dostupném CPU. Zátěž ověří souběžnou alokaci a uvolňování stránek, preempci a probuzení časovačem. Ověří se ochranné stránky, NX a chování při vyčerpání paměti. V klidu se změří probuzení procesorů a režie jádra. Tím se ověří základ celku B; obecný demand paging a řízené vyvažování SMP podle § 4.3–4.4 mají vlastní implementaci a přejímku v milníku 3.1, který potřebuje také skutečné procesy z etapy 3.
 
 ### 3. Izolované procesy, VFS, IPC a terminál
 
-**Aktuální stav k 2026-11-21: implementováno, jádro a uživatelské programy ověřeny host testy a skutečným QEMU; povinná přejímka ve VirtualBoxu zůstává otevřená.** Pracovní větev je `dev/stage3-ipc-validation`, [draft PR #1](https://github.com/filipbcz/AgentOS/pull/1). `main` se nemění. Starší průběžné zápisy byly přesunuty beze změny věcného obsahu do [historie etapy 3](docs/HISTORY_STAGE3_BEFORE_COMPLETION.md); aktuální stav určuje pouze tato část.
+**Aktuální stav základního profilu k 2026-11-21: implementováno, jádro a uživatelské programy ověřeny host testy a skutečným QEMU; povinná přejímka ve VirtualBoxu zůstává otevřená.** Pracovní větev je `dev/stage3-ipc-validation`, [draft PR #1](https://github.com/filipbcz/AgentOS/pull/1). `main` se nemění. Starší průběžné zápisy byly přesunuty beze změny věcného obsahu do [historie etapy 3](docs/HISTORY_STAGE3_BEFORE_COMPLETION.md); aktuální stav určuje pouze tato část. Nově přiřazené požadavky na demand paging a vyvažování SMP jsou samostatně sledované v navazujícím milníku 3.1 a tento stav ani dosavadní důkazy je nepotvrzují.
 
 **Navazuje na 2.** Implementovat uživatelský režim, nativní syscall ABI, loader ELF, adresní prostory včetně copy-on-write, popisovače a identitu procesů. Z initramfs spustit PID 1. Přidat VFS, roury, lokální IPC s identitou volajícího, TTY, shell, PS/2 vstup a správu služeb. Textový shell pracuje přes TTY, správní operace přes služby podle § 3.
 
@@ -117,7 +117,7 @@ Lokálně dále prošly čtyři C harnessy, freestanding link všech user progra
 
 Finální CI zahrnuje i čekání na kompletní poslední TCP řádek, kontrolu aktuálního čistého Git checkoutu, zákaz bytecode cache samotného ověřovače/QEMU harness a odstranění starého souhrnu před novým sestavením. Všech 12 regresních testů souhrnu včetně pěti testů se skutečnými dočasnými Git repozitáři prošlo. Předchozí implementační commit `6905d203f86e73feb86b29343acd139671c15ab6` měl také zelené host i QEMU běhy; pro aktuální předání jsou rozhodující finální výsledky výše.
 
-#### Jediný zbývající přejímací krok této etapy
+#### Jediný zbývající přejímací krok základního profilu etapy 3
 
 Na Windows s VirtualBoxem **7.1.12**, WSL `Ubuntu-24.04` a potřebným toolchainem, z čisté aktuální vývojové větve:
 
@@ -134,11 +134,50 @@ Souhrnný úspěch je `STAGE3_VM_MATRIX_PASSED`, důkazy zůstávají v `build/r
 
 Registr je konečný profil tří služeb z podepsaného initramfs: timer/IPC `core`, záměrně padající `flaky`, shell. Přihlášení, účty, LUKS2/ext4, bezpečný unmount/flush a A/B potvrzování závisí na etapách 4–10; jejich absence se nevydává za ověřenou kritickou službu. Shell `exit` dnes ukončí systémovou testovací relaci; přihlašovací služba v etapě 7 přinese opakované uživatelské relace. Úplný shell celek C včetně trvalého přesměrování zůstává v etapě 7 podle původního kritéria.
 
-Současné procesy mají jedno vlákno, CPU-local fd/IPC a monotónní epochu, osm task slotů na CPU, 32 fd, bootovací UID/GID 1000. Migrace, mezi-CPU IPC, vícevláknové POSIX ABI, dynamické service manifests a perzistentní audit nejsou v tomto základním profilu implementované. Změna těchto hranic musí rozšířit vlastnictví/TLB/protokolové testy. Fyzické HP, dlouhodobá provozní zátěž a širší platformní podpora zůstávají vlastními navazujícími zkouškami; QEMU výsledky je nenahrazují.
+Současné procesy mají jedno vlákno, CPU-local fd/IPC a monotónní epochu, osm task slotů na CPU, 32 fd, bootovací UID/GID 1000. ELF segmenty a uživatelský zásobník se mapují před spuštěním; existující COW není obecný demand paging. Demand paging, migrace a nutné mezi-CPU probouzení/IPC jsou přiřazeny milníku 3.1 níže. Vícevláknové POSIX ABI, dynamické service manifests a perzistentní audit nejsou v tomto základním profilu implementované. Změna těchto hranic musí rozšířit vlastnictví/TLB/protokolové testy. Fyzické HP, dlouhodobá provozní zátěž a širší platformní podpora zůstávají vlastními navazujícími zkouškami; QEMU výsledky je nenahrazují.
+
+### 3.1. Demand paging a vyvažování SMP
+
+**Stav k 2026-11-21: navrženo, neimplementováno, neověřeno.** Tento milník přiřazuje dva požadavky zadání, které původní plán nepojmenoval v žádné etapě. Jeho přejímka je samostatná; dosavadní host/QEMU výsledky a připravená 13profilová matice etapy 3 ověřují pouze její základní profil.
+
+| Požadavek zadání | Odpovědná část milníku | Návaznost |
+|---|---|---|
+| § 4.3 — demand paging pro procesy | 3.1 A: procesová paměť a obsluha page faultu | Adresní prostory, ELF a COW z etapy 3 |
+| § 4.4 — řízený přesun úloh mezi CPU a vyvažování zátěže | 3.1 B: plánovač SMP a vlastnictví prostředků | SMP/časovače z etapy 2 a procesy, IPC a čekání z etapy 3 |
+
+**Navazuje na 2 a 3.** Doporučené pořadí je dokončit základní profil etapy 3, poté část A a následně část B včetně jejich společných regresí. Obě části patří do společných kernelových rozhraní, která později použije také Linux ABI. Nízké ovladače etapy 4 mohou vznikat souběžně; převzetí etapy 9 a stabilního vydání v etapě 12 vyžaduje dokončený milník 3.1. Dosavadní číslování etap 4–12 zůstává zachováno.
+
+#### A. Demand paging procesové paměti
+
+Oddělit evidenci rezervovaných virtuálních oblastí, jejich práv a zdroje obsahu od přidělených fyzických rámců. Platný první přístup má přidělit a vynulovat anonymní stránku nebo načíst příslušnou část ELF z initramfs, včetně správného nulování BSS. Obsluha nesmí zpřístupnit nulovou adresu, guard zásobníku ani stránky mimo povolené oblasti; zachová NX a W^X. Podporované oblasti a jejich limity musí být dokumentované.
+
+Sjednotit tuto cestu s COW a kernelovým čtením/zápisem uživatelských bufferů: platná dosud nepřítomná stránka musí fungovat i při syscallu, neplatný přístup musí skončit odpovídající chybou. `fork` musí zachovat rezervace i obsah před prvním načtením stránky i po něm. OOM, selhání částečné alokace a ukončení procesu musí mít definovaný výsledek, vrátit všechny rozpracované prostředky a zachovat ostatní procesy. První přejímka používá anonymní paměť a neměnný initramfs, takže není závislá na hotovém ext4.
+
+**Dotčená rozhraní.** Správa oblastí a PTE v `kernel/paging.rs`, životní cyklus/loader v `kernel/process.rs`, page fault a syscall copy-in/copy-out, evidence rámců a jejich referencí. Přesná veřejná rozhraní, chybové návraty a potřebné změny ABI se doplní při implementaci spolu s konzumenty a testy.
+
+#### B. Řízená migrace a vyvažování SMP
+
+Zachovat samostatné fronty CPU a zavést měřitelné vyvažování skutečné zátěže přesunem spustitelných úloh. Popsat pravidla výběru zdrojového/cílového CPU, bezpečný okamžik přesunu a synchronizaci front bez jednoho globálního zámku plánovače. Úloha smí mít právě jednoho vlastníka a nesmí současně běžet na dvou CPU. Připnutí zůstane jen pro zdůvodněné CPU/zařízení vázané úlohy; obecné procesy se musejí skutečně přesouvat. Vyvažování musí zachovat tickless klid bez trvalého pollingu.
+
+Odstranit vazbu identity procesu, rodičovství, fd, rour, IPC a čekacích front na původní CPU. Přesun musí zachovat PID, oprávnění a otevřené prostředky, umožnit probuzení z jiného CPU a bezpečné dokončení/ukončení potomka. Zajistit přenos kontextu, správné CR3 a kernelový zásobník, synchronizaci referencí COW a invalidaci TLB před opětovným použitím mapování či rámců. Změna nesmí uvolnit prostředek, který ještě používá jiné CPU nebo zařízení.
+
+Monotónní čas a platné lhůty nesmějí při migraci změnit význam. Nahradit dnešní CPU-local předpoklady v `kernel/scheduler.rs`, `kernel/smp.rs`, `kernel/stack.rs`, `kernel/paging.rs` a fd/IPC vrstvách a určit společnou časovou doménu nebo ekvivalentní mechanismus zachovávající lhůty. Rozhraní v `user/abi.h`, zejména `monotonic_ms`, časovaná čekání a `timer_stats`, musí dostat výslovné rozhodnutí o kompatibilitě/verzování; současné v1 nelze tiše předefinovat. Souběžná vlákna jednoho adresního prostoru, TLS a futexy se doplní a samostatně prověří v etapě 9 nad těmito kernelovými mechanismy.
+
+#### Převzetí milníku 3.1
+
+Připravit host testy algoritmů a selhání, integrační testy z uživatelského prostoru a skutečné běhy ve VirtualBoxu 7.1.12 s 256 MiB na 1 a 2 vCPU. Protokol uvede commit, hash obrazu, konfiguraci, logy a měřené hodnoty. QEMU může poskytovat průběžné regresní důkazy; fyzické ověření na HP se eviduje odděleně a zopakuje v etapě 12.
+
+1. **Skutečně odložená alokace.** Po rezervaci oblasti doložit počet rezidentních datových rámců; nevyužité stránky se nesmějí přidělit předem. První oprávněné přístupy v uživatelském režimu i přes syscall musí vytvořit jen potřebné stránky se správným obsahem ELF/BSS/anonymní paměti. Režii metadat a tabulek vykázat odděleně.
+2. **Izolace, COW a návrat prostředků.** Ověřit `fork` před prvním přístupem i po něm, soukromé zápisy rodiče/potomka, chybné adresy, ochrany a řízené OOM. Po ukončení a rollbacku se musí evidence rámců, tabulek a metadat vrátit do výchozího stavu; druhý proces a jádro pokračují.
+3. **Skutečné vyvažování.** Na 2 vCPU vytvořit nevyváženou frontu a doložit, že plánovač přesunul existující úlohu na druhé CPU a ta tam pokračovala. Počáteční rozmístění úloh na obě CPU tento požadavek nesplňuje. Ověřit zachování identity, právě jedno vykonávání každé úlohy a dokončení práce bez hladovění.
+4. **Migrace za provozu.** Při opakovaných přesunech ověřit lazy page fault/COW, syscally, roury, IPC a mezi-CPU probuzení, ukončení/reaping, monotónní čas a neztracené lhůty. Zahrnout závody přesunu s probuzením a ukončením, plnou cílovou frontu a znovupoužití zásobníků bez zastaralého TLB; nesmí vzniknout ztracená úloha, dvojí běh ani deadlock.
+5. **Regrese původního základu.** Na 1 vCPU musí systém fungovat bez potřeby druhého CPU. Na 1/2 vCPU znovu projdou dotčené testy etap 2 a 3, včetně PID 1/služeb, TTY, ochranných stránek a měření probuzení v klidu. Teprve tento protokol uzavírá oba doplněné požadavky § 4.3–4.4; původní výsledky etapy 3 je nenahrazují.
 
 ### 4. Ovladače a bloková zařízení na obou platformách
 
 **Potřebuje 2; uživatelské zkoušky využijí 3.** Zprovoznit PCI/PCIe, přerušení MSI/MSI-X, DMA mapování a blokové rozhraní s dokončením a vyprázdněním zápisů. Podle pořadí v § 5.1 připojit AHCI a NVMe, transport VirtIO-net, xHCI, USB HID, USB Mass Storage a kabelový Realtek. Síťové ovladače zde stačí dovést k odeslání a příjmu rámce.
+
+Vývoj může běžet souběžně s 3.1. Rozhraní pro dokončení I/O a probouzení musí respektovat možné přesunutí čekajícího procesu na jiné CPU. Aktivní DMA buffery mají stabilní fyzické rámce po celou dobu přístupu zařízení; demand paging ani migrace úlohy nesmějí tuto evidenci obejít. Po propojení s 3.1 se zopakují dotčené I/O a timeout testy.
 
 **Převzetí.** Na VDI, vyhrazeném USB a vyhrazeném NVMe zapsat vzorek do předem určené testovací oblasti, vynutit dokončení zápisu a po restartu porovnat obsah. Timeout či odpojení USB musí ukončit čekání, DMA buffery se smějí uvolnit až po zastavení přenosu. Na HP ověřit vestavěnou i USB klávesnici a přenos známého ethernetového rámce.
 
@@ -168,9 +207,9 @@ Současné procesy mají jedno vlákno, CPU-local fd/IPC a monotónní epochu, o
 
 ### 9. Linux ABI pro skutečné binárky
 
-**Základ může začít po 3; převzetí potřebuje 6–8.** Od zaváděcího zásobníku ELF postupovat k souborům, procesům, signálům, vláknům, TLS vláken, futexům, socketům a epoll. Vést tabulku podporovaných syscallů, příznaků a chyb. Stejné kontroly VFS a identity použít pro obě ABI.
+**Základ může začít po 3; převzetí potřebuje 3.1 a 6–8.** Od zaváděcího zásobníku ELF postupovat k souborům, procesům, paměťovým operacím, signálům, vláknům, TLS vláken, futexům, socketům a epoll. Paměťové syscally a plánování použijí společné kernelové mechanismy z 3.1. Vést tabulku podporovaných syscallů, příznaků a chyb. Stejné kontroly VFS a identity použít pro obě ABI.
 
-**Převzetí.** Na Linuxu i AgentOS spustit totožné statické binárky s evidovaným SHA-256. Porovnat výstup a návratové kódy skriptu BusyBoxu, chybného otevření, vícevláknového programu s musl a loopback testu s timeoutem a probuzením `epoll_wait`. Zopakovat zkoušky soukromého a sdíleného souboru z etapy 7 nativní i linuxovou cestou. Výsledky uzavírají celek F.
+**Převzetí.** Na Linuxu i AgentOS spustit totožné statické binárky s evidovaným SHA-256. Porovnat výstup a návratové kódy skriptu BusyBoxu, chybného otevření, vícevláknového programu s musl a loopback testu s timeoutem a probuzením `epoll_wait`. Zopakovat zkoušky soukromého a sdíleného souboru z etapy 7 nativní i linuxovou cestou. Rozšířit regrese 3.1 o skutečně souběžná vlákna sdílející adresní prostor na 2 vCPU: lazy page faulty, změny mapování/TLB, TLS, futex probuzení a migraci při zachování lhůt. Výsledky uzavírají celek F.
 
 ### 10. Podepsané aktualizace A/B a servisní médium
 
@@ -186,7 +225,7 @@ Současné procesy mají jedno vlákno, CPU-local fd/IPC a monotónní epochu, o
 
 ### 12. Společná přejímka vydání
 
-**Potřebuje všechny předchozí etapy.** S jediným kandidátem vydání zopakovat celky A–G podle § 11, včetně instalace, obnovy a přihlášení na fyzickém HP. Doložit shodný hash před podpisem ze dvou čistých sestavení a reprodukovatelné médium ze stejného podepsaného artefaktu. Přiložit postup sestavení, instalace, správy klíčů a obnovy, vývojářskou dokumentaci a protokol výsledků dle § 9–11.
+**Potřebuje všechny předchozí etapy včetně 3.1.** S jediným kandidátem vydání zopakovat celky A–G podle § 11, včetně demand pagingu a vyvažování SMP z 3.1, instalace, obnovy a přihlášení na fyzickém HP. Doložit shodný hash před podpisem ze dvou čistých sestavení a reprodukovatelné médium ze stejného podepsaného artefaktu. Přiložit postup sestavení, instalace, správy klíčů a obnovy, vývojářskou dokumentaci a protokol výsledků dle § 9–11.
 
 | Měření | Podmínka převzetí |
 |---|---|

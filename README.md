@@ -73,6 +73,8 @@ ACPI MADT řídí výběr CPU a IRQ routing. AP startují přes INIT/SIPI. Preem
 
 Bootové zkoušky zachovávají preempci, souběžnou alokaci, vyčerpání paměti, návrat bitmapy a samostatné přibližně 30sekundové měření klidu. Příkaz `idle` navíc měří běžící systém s PID 1, stabilní službou a zablokovaným shellem. Toto druhé měření zachytí periodická probouzení, která by pouhý bootový test neodhalil.
 
+Obecný demand paging a řízená migrace úloh s vyvažováním mezi CPU jsou naplánované v navazujícím **milníku 3.1** [implementačního plánu](PLAN_IMPLEMENTACE.md#31-demand-paging-a-vyvažování-smp). Dosud nejsou implementované: současný loader přiděluje ELF segmenty i uživatelský zásobník před spuštěním a procesy zůstávají na svém CPU. Milník má vlastní podmínky převzetí a je nutný před převzetím Linux ABI a stabilního vydání; přejímka základního profilu etapy 3 ve VirtualBoxu jej nepotvrzuje.
+
 ## Uživatelské procesy a nativní ABI v1
 
 Programy jsou statické ELF64 `ET_EXEC` pro x86-64, spouštěné v CPL3 z podepsaného initramfs. Každý musí obsahovat právě jednu `PT_NOTE` s vlastníkem `AgentOS\0`, typem 1 a descriptor `{u32 version=1, u32 flags=0}`. Společná [hlavička](user/abi.h) a [linker script](user/user.ld) ji přidávají automaticky. Build i loader odmítají chybějící, duplicitní, nepodporovanou nebo poškozenou note. Neoznačený ELF je vyhrazen budoucímu Linux ABI a nyní vrací `ENOEXEC`.
