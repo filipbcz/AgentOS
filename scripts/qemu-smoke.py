@@ -102,7 +102,7 @@ def capture_uart(client, destination):
 
 
 def send_uart_command(client, command):
-    if command not in (b"services\\r", b"exit\\r"):
+    if command not in (b"services\r", b"exit\r"):
         raise ValueError("Only fixed acceptance commands may be sent")
     client.settimeout(5)
     try:
