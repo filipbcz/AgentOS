@@ -58,7 +58,8 @@ mod tests {
     fn roundsDownAndNeverDecreasesOnCounterRegression() {
         let clock = Clock::new(3_000_000);
         assert!(clock.start(5_000));
-        assert_eq!(clock.millis(3_004_999), Some(0));
+        assert_eq!(clock.millis(7_999), Some(0));
+        assert_eq!(clock.millis(8_000), Some(1));
         assert_eq!(clock.millis(3_005_000), Some(1_000));
         assert_eq!(clock.millis(5_000), Some(1_000));
         assert_eq!(clock.millis(1), Some(1_000));
