@@ -12,10 +12,11 @@ SECTIONS {
   .text : { *(.text .text.*) } :code
   . = ALIGN(4096);
   kernel_ro = .;
-  .rodata : { *(.rodata .rodata.*) *(.data.rel.ro*) *(.got .got.*) } :code
+  .rodata : { *(.rodata .rodata.*) } :code
   . = ALIGN(4096);
   kernel_rw = .;
-  .data : { *(.data .data.*) *(.sdata .sdata.*) } :code
+  .data : { *(.data .data.*) *(.sdata .sdata.*)
+            *(.data.rel.ro .data.rel.ro.*) *(.got .got.*) } :code
   .bss (NOLOAD) : { *(.bss .bss.*) *(COMMON) *(.sbss .sbss.*) } :code
   . = ALIGN(4096);
   kernel_end = .;
