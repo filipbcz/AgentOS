@@ -199,6 +199,8 @@ static void command_authorization_and_dependency(void) {
     request.operation=SVC_OP_START;
     request.service=SVC_FLAKY;
     registry[SVC_CORE].state=SVC_FAILED;
+    registry[SVC_FLAKY].desired=0;
+    registry[SVC_FLAKY].state=SVC_STOPPED;
     assert(apply_command(&request,20)==SVC_BAD_DEPENDENCY);
     request.service=SVC_COUNT;
     assert(apply_command(&request,20)==SVC_BAD_REQUEST);
