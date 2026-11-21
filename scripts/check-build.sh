@@ -86,6 +86,11 @@ printf 'Testing PID1 supervision and forced-child cleanup with %s\n' "$pCc"
     "$pRoot/scripts/tests/supervisor-host.c" -o "$pOut/supervisor-tests"
 "$pOut/supervisor-tests"
 
+printf 'Testing actual CPU-local orphan program and failure injection with %s\n' "$pCc"
+"$pCc" -std=c11 -O2 -Wall -Wextra -Werror -fno-stack-protector \
+    "$pRoot/scripts/tests/orphans-host.c" -o "$pOut/orphans-tests"
+"$pOut/orphans-tests"
+
 printf 'Testing per-CPU monotonic TSC time conversion with %s\n' "$pRustc"
 "$pRustc" --edition 2021 --test "$pRoot/kernel/monotonic.rs" -o "$pOut/monotonic-tests"
 "$pOut/monotonic-tests"
