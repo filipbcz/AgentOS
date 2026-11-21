@@ -88,11 +88,24 @@ def boot(args):
     if vm_vars.exists():
         vm_vars.unlink()
     cert = Path.home() / ".local/share/agentos/stage1-test-keys/db.crt"
+    # Avoid convenience enrollment shortcuts: define the exact authority
+    # chain explicitly. The same isolated test certificate signs the EFI and
+    # is inserted as PK, KEK and db with the db.esl owner GUID from build.sh.
+    # Firmware rejecting BOOTX64.EFI before kernel entry must be debuggable.
+    owner = "d7663630-f07a-4739-bc6f-b9f6d6444865"
     subprocess.run(["virt-fw-vars",
                     "--input", str(args.ovmf_vars),
                     "--output", str(vm_vars),
-                    "--enroll-cert", str(cert), "--sb"], check=True)
+                    "--set-pk", owner, str(cert),
+                    "--add-kek", owner, str(cert),
+                    "--add-db", owner, str(cert),
+                    "--secure-boot"], check=True)
     assert vm_vars.is_file() and vm_vars.stat().st_size > 0
+    # Ensure the exact X.509 DER bytes are really inside the generated flash.
+    der = subprocess.check_output(["openssl", "x509", "-in", str(cert),
+                                   "-outform", "der"])
+    if der not in vm_vars.read_bytes():
+        raise RuntimeError("QEMU OVMF Secure Boot NVRAM is missing our signed EFI certificate")
     # Record exactly what firmware was provisioned with, before OVMF alters
     # its NVRAM. The image is known signed; Access Denied may instead mean its
     # signer was never enrolled in db or SecureBoot/SetupMode is inconsistent.
