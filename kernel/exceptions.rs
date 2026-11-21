@@ -79,6 +79,13 @@ pub(super) unsafe fn hex(value: u64) {
 #[no_mangle]
 unsafe extern "C" fn dispatch_exception(trap: &mut Trap, cr2: u64, operand: u64) -> usize {
     if trap.cs & 3 == 3 && matches!(trap.vector, 0 | 1 | 3..=7 | 10..=14 | 16 | 17 | 19 | 21) {
+        // Present + write + user is the only fault that may promote a
+        // previously shared COW leaf. An NX access, missing page or
+        // supervisor-only page remains a fatal fault for the user task.
+        if trap.vector == 14 && trap.error & 7 == 7 &&
+           crate::smp::user_cow_fault(cr2 as usize) {
+            return 0; // IRETQ retries the faulting user instruction
+        }
         return crate::smp::user_fault(trap.vector, trap.error, cr2);
     }
     let nx = ptr::addr_of!(nx_target) as u64;
