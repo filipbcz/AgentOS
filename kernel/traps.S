@@ -36,7 +36,14 @@ isr_common:
         pop \reg
     .endr
     add rsp, 16
-    iretq
+    // Successful user #PF/COW retry takes this direct IRETQ path rather
+    // than restore_context. Undo the entry SWAPGS using saved CS at RSP+8.
+    // Without it, the next user SYSCALL swaps to GS base 0 and crashes at
+    // native_syscall's first gs:[8] access (observed CR2=0x8).
+    test byte ptr [rsp+8], 3
+    jz 9f
+    swapgs
+9:  iretq
 
 .global timer_gate, serial_gate, keyboard_gate, spurious_gate, wait_for_irq, after_hlt
 // Only the measured HLT path leaves RDI pointing at a pair of timestamps.
