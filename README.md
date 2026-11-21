@@ -19,6 +19,27 @@ wsl -d Ubuntu-24.04 -- bash scripts/build.sh
 
 `check-build.sh` provede hostitelské testy, překlad/linkování skutečného jádra a všech 12 uživatelských ELF, kontrolu oprávnění kernelových segmentů, trap návratů a nativní ABI note. Přepínače `RUSTC`, `CC`, `LD` a `PYTHON` vybírají spustitelné soubory; skript nic nestahuje. Výsledky jsou v `build/check/`.
 
+Textové soubory repozitáře používají konce řádků **LF** podle `.gitattributes`, také při checkoutu ve Windows. Toto pravidlo má přednost před `core.autocrlf`; automaticky rozpoznané binární soubory Git ponechá beze změny.
+
+### Oprava staršího Windows checkoutu s CRLF
+
+Chyba Bash `set: pipefail` / `invalid option name` hned na začátku hostitelské kontroly obvykle znamená, že skript obsahuje CRLF a Bash dostal argument `pipefail\r`. Starší checkout mohl tyto konce řádků vytvořit ještě před přidáním `.gitattributes`. Samotný `git pull` nemusí přepsat všechny již existující pracovní soubory.
+
+Po aktualizaci větve spusť z kořene projektu v PowerShellu jednorázovou opravu. Zachová aktuální obsahové změny, převede CRLF na LF a zapíše UTF-8 bez BOM. Zahrnuje také `toolchain.lock`, protože CR na konci jeho řádků by poškodilo porovnání připnutých verzí balíčků.
+
+```powershell
+git pull --ff-only
+$pUtf8 = [System.Text.UTF8Encoding]::new($false)
+Get-ChildItem .\scripts\*.sh, .\scripts\toolchain.lock | ForEach-Object {
+    $pText = [System.IO.File]::ReadAllText($_.FullName)
+    [System.IO.File]::WriteAllText($_.FullName, $pText.Replace("`r`n", "`n"), $pUtf8)
+}
+```
+
+Kontrola `git ls-files --eol -- 'scripts/*.sh' scripts/toolchain.lock` má u těchto souborů ukázat `i/lf` a `w/lf`. Potom znovu spusť původní sestavení nebo `scripts/accept-stage3.ps1`.
+
+### Podepsaný obraz
+
 `build.sh` kontroluje připnutý toolchain, sestaví deterministický newc initramfs a vlastní GNU-EFI loader s vloženým ELF jádra, zavolá podpis a ověří jej. Výsledkem je `build/agentos.efi`. Dvě opakovaná sestavení se porovnávají podle SHA-256 **nepodepsaného** `build/agentos.unsigned.efi`.
 
 Při prvním sestavení vznikne místní testovací podpisový klíč v `~/.local/share/agentos/stage1-test-keys`, případně pod `XDG_DATA_HOME`. Do projektu se exportují veřejná data pro firmware. `build/build-provenance.json` váže hash obrazu, initramfs, certifikátu a toolchain locku na commit a čistý pracovní strom. Jde o kontrolovatelný záznam sestavení, nikoli nezávislou kryptografickou atestaci.

@@ -268,6 +268,12 @@ Rozšířený migrační scénář po původní zátěži vybere živého potomk
 
 VirtualBox a fyzické HP zůstávají neprovedené. Přejímka celého milníku 3.1 vyžaduje následující společná kritéria; testy vyčerpání paměti demand procesem v guestu se stále nesmějí zaměnit za již provedené host OOM kontroly. Další implementační oblastí je etapa 4: PCI/PCIe, DMA a blokové rozhraní. Její vývoj může pokračovat během odložené hardwarové přejímky, ale otevřené testy 3.1 zůstávají podmínkou převzetí celého milníku.
 
+##### Windows checkout a spuštění přejímky
+
+Při prvním spuštění `accept-stage3.ps1` z Windows checkoutu se objevilo `set: pipefail` / `invalid option name` na řádku 5 `check-build.sh`, ještě před kompilací a spuštěním VM. Repozitář dosud neměl pravidlo pro konce řádků; CRLF mění argument Bash na `pipefail\r`. Doplněné `.gitattributes` nastavuje `* text=auto eol=lf`, včetně textových vstupů build skriptů. Starší existující soubory může být nutné převést jednorázově; README obsahuje PowerShell postup zachovávající obsahové úpravy a zahrnující všechny `.sh` i `scripts/toolchain.lock`.
+
+Ověření opravy používá izolovaný Git checkout s `core.autocrlf=true`: bez atributů reprodukuje chybu na řádku 5, s novým pravidlem uchová LF a Bash projde nastavením `pipefail`. Kontroluje se také nezměněný binární vzorek, LF v toolchain locku a zachování obsahu při jednorázové normalizaci. Jde o ověření přípravy zdrojů; nepředstavuje nový běh jádra ani uzavření přejímky ve VirtualBoxu.
+
 #### Převzetí milníku 3.1
 
 Připravit host testy algoritmů a selhání, integrační testy z uživatelského prostoru a skutečné běhy ve VirtualBoxu 7.1.12 s 256 MiB na 1 a 2 vCPU. Protokol uvede commit, hash obrazu, konfiguraci, logy a měřené hodnoty. QEMU může poskytovat průběžné regresní důkazy; fyzické ověření na HP se eviduje odděleně a zopakuje v etapě 12.
