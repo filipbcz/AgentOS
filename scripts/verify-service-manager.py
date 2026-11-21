@@ -18,6 +18,7 @@ import sys
 
 
 HEX=r"[0-9a-f]{16}"
+PARK=re.compile(rf"AGENTOS USER PARK PID=({HEX}) CR3=({HEX}) STATUS=0000000000000000")
 SESSION=re.compile(rf"AGENTOS MANAGER SESSION START PID=({HEX})")
 PHASE=re.compile(rf"AGENTOS MANAGER (BEGIN|ONLIN|SHUTD|ENDED) ROOT=({HEX}) COUNT=00000003")
 EVENT=re.compile(rf"AGENTOS MANAGER (START|READY|RETRY|LIMIT) ROOT=({HEX}) SERVICE=(core |flaky|shell) PID=({HEX}) ATTEMPT=([0-9a-f]{{8}})")
@@ -37,6 +38,13 @@ def verify(text):
     start,match=starts[0]
     root=int(match[1],16)
     require(root==1,"Operational manager must retain original BSP PID 1")
+    parked=[(i,PARK.fullmatch(line)) for i,line in enumerate(lines[:start])
+            if line.startswith("AGENTOS USER PARK")]
+    require(len(parked)==1 and parked[0][1] is not None and
+            int(parked[0][1][1],16)==root and
+            int(parked[0][1][2],16)!=0 and int(parked[0][1][2],16)%4096==0,
+            "Original PID 1 never parked after boot tests or used invalid CR3")
+
     shell=[i for i,v in enumerate(lines) if v.startswith("AGENTOS SHELL START")]
     require(len(shell)==1 and shell[0]>start,"Expected one shell child after root manager startup")
     shell_index=shell[0]

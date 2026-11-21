@@ -10,6 +10,7 @@ spec.loader.exec_module(v)
 def transcript():
     root=1
     lines=[
+        f"AGENTOS USER PARK PID={root:016x} CR3=0000000000700000 STATUS=0000000000000000",
         f"AGENTOS MANAGER SESSION START PID={root:016x}",
         f"AGENTOS MANAGER BEGIN ROOT={root:016x} COUNT=00000003",
         f"AGENTOS MANAGER START ROOT={root:016x} SERVICE=core  PID={101:016x} ATTEMPT=00000001",
@@ -56,6 +57,7 @@ class ManagerEvidenceTests(unittest.TestCase):
     def test_wrong_identity_and_exit_status_are_rejected(self):
         sample=transcript()
         for old,new in (
+            ("AGENTOS USER PARK PID=0000000000000001","AGENTOS USER PARK PID=0000000000000002"),
             ("ROOT=0000000000000001","ROOT=0000000000000002"),
             ("SERVICE=core ","SERVICE=coreX"),
             ("SERVICE=flaky PID=0000000000000066","SERVICE=flaky PID=0000000000000065"),

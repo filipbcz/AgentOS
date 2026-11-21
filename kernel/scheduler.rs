@@ -580,7 +580,7 @@ mod timed_tests {
         q.tasks[1]=None;
         q.count=1;
         assert_eq!(q.park_boot_root(1),Ok(()));
-        assert_eq!(q.select(0x222, false),0x222); // back to the kernel
+        assert_eq!(q.select(0x222, false),10); // back to the kernel caller
         assert_eq!(q.parked_root(),Some(1));
         assert_eq!(q.resume_boot_root(999),Err(-16));
         assert_eq!(q.resume_boot_root(1),Ok(()));
