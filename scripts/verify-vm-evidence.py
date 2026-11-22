@@ -24,8 +24,9 @@ class EvidenceError(ValueError):
 HEX_SHA = re.compile(r"[0-9a-f]{64}\Z")
 HEX_COMMIT = re.compile(r"[0-9a-f]{40}\Z")
 VBox_VERSION = re.compile(r"7\.1\.12(?:r[0-9]+)?\Z")
+# "COM1.log" collides with reserved COM1 device name on Windows.
 ARTIFACTS = frozenset({
-    "esp.raw", "esp.vdi", "changed.efi", "com1.log", "com1-input.bin",
+    "esp.raw", "esp.vdi", "changed.efi", "serial-com1.log", "com1-input.bin",
     "display.png", "shell-before.png", "shell-keyboard.png", "failure.png"
 })
 BUILD_ARTIFACTS = frozenset({
@@ -125,7 +126,7 @@ def verify_run(root, run_dir, require_pass=True):
     artifacts = data.get("artifacts")
     require(isinstance(artifacts, dict) and set(artifacts) <= ARTIFACTS,
             "Run contains invalid artifact names")
-    expected = {"esp.raw", "esp.vdi", "com1.log", "display.png"}
+    expected = {"esp.raw", "esp.vdi", "serial-com1.log", "display.png"}
     if case != "signed":
         expected.add("changed.efi")
     elif shell:
@@ -147,7 +148,7 @@ def verify_run(root, run_dir, require_pass=True):
     if case == "signed":
         require(data.get("boot_image_sha256") == image["artifacts"]["agentos.efi"],
                 "VM boot image is not the signed build artifact")
-        log = (run_dir / "com1.log").read_bytes()
+        log = (run_dir / "serial-com1.log").read_bytes()
         require(b"AGENTOS KERNEL OK STAGE 1\r\n" in log,
                 "Signed VM receipt lacks final kernel boot marker")
         # Older receipts predate this milestone and remain valid inputs. If a
@@ -190,7 +191,7 @@ def verify_run(root, run_dir, require_pass=True):
     else:
         require(data.get("boot_image_sha256") == sha256(run_dir / "changed.efi"),
                 "Negative VM test boot hash mismatch")
-        log = (run_dir / "com1.log").read_bytes()
+        log = (run_dir / "serial-com1.log").read_bytes()
         require(b"AGENTOS KERNEL OK STAGE 1" not in log,
                 "Firmware accepted modified EFI")
         require(re.search(rb"BdsDxe: failed to load .*HARDDISK.*"

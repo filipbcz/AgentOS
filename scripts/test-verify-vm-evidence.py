@@ -49,7 +49,7 @@ class VmEvidenceTests(unittest.TestCase):
         self.write(self.run / "shell-before.png", b"mock prompt")
         self.write(self.run / "shell-keyboard.png", b"mock typed response")
         self.write(self.run / "com1-input.bin", b"mock transmitted UART bytes")
-        self.write(self.run / "com1.log",
+        self.write(self.run / "serial-com1.log",
                    b"AGENTOS KERNEL OK STAGE 1\r\n"
                    b"AGENTOS MANAGER SESSION START PID=0000000000000001\r\n"
                    b"AGENTOS MANAGER SESSION STOP PID=0000000000000001 "
@@ -67,7 +67,7 @@ class VmEvidenceTests(unittest.TestCase):
             "artifacts": {
                 name: evidence.sha256(self.run / name)
                 for name in ("esp.raw", "esp.vdi", "display.png",
-                             "shell-before.png", "shell-keyboard.png", "com1.log", "com1-input.bin")
+                             "shell-before.png", "shell-keyboard.png", "serial-com1.log", "com1-input.bin")
             },
         }
         self.save_manifest()
@@ -111,15 +111,20 @@ class VmEvidenceTests(unittest.TestCase):
         with self.assertRaises((evidence.EvidenceError, OSError)):
             evidence.verify_run(self.root, self.run, require_pass=False)
 
+    def test_windows_reserved_com1_log_artifact_is_rejected(self):
+        self.manifest["artifacts"]["com1.log"] = self.manifest["artifacts"].pop("serial-com1.log")
+        self.save_manifest()
+        self.rejected()
+
     def test_valid_mutation_rejected_by_firmware(self):
         self.manifest.update({"case": "loader", "shell": False, "keyboard": False})
         self.write(self.run / "changed.efi", b"altered signed EFI")
-        self.write(self.run / "com1.log", b"BdsDxe: failed to load EFI\\BOOT\\BOOTX64.EFI HARDDISK Access Denied\r\n")
+        self.write(self.run / "serial-com1.log", b"BdsDxe: failed to load EFI\\BOOT\\BOOTX64.EFI HARDDISK Access Denied\r\n")
         self.manifest["boot_image_sha256"] = evidence.sha256(self.run / "changed.efi")
         for name in ("shell-before.png", "shell-keyboard.png"):
             self.manifest["artifacts"].pop(name)
         self.manifest["artifacts"]["changed.efi"] = evidence.sha256(self.run / "changed.efi")
-        self.manifest["artifacts"]["com1.log"] = evidence.sha256(self.run / "com1.log")
+        self.manifest["artifacts"]["serial-com1.log"] = evidence.sha256(self.run / "serial-com1.log")
         self.save_manifest()
         self.assertEqual(evidence.verify_run(self.root, self.run)["case"], "loader")
 
@@ -129,12 +134,12 @@ class VmEvidenceTests(unittest.TestCase):
         pFixtures = importlib.util.module_from_spec(pSpec)
         pSpec.loader.exec_module(pFixtures)
         pScenarios = (pFixtures.scenario() + pFixtures.scenario(33, 1)).replace("\n", "\r\n").encode("ascii")
-        pOriginal = (self.run / "com1.log").read_bytes()
+        pOriginal = (self.run / "serial-com1.log").read_bytes()
         return pOriginal.replace(b"AGENTOS MANAGER SESSION START", pScenarios + b"AGENTOS MANAGER SESSION START", 1)
 
     def testDemandTraceIsStrictlyVerifiedWhenPresent(self):
-        self.write(self.run / "com1.log", self.demandLog())
-        self.manifest["artifacts"]["com1.log"] = evidence.sha256(self.run / "com1.log")
+        self.write(self.run / "serial-com1.log", self.demandLog())
+        self.manifest["artifacts"]["serial-com1.log"] = evidence.sha256(self.run / "serial-com1.log")
         self.save_manifest()
         self.assertEqual(evidence.verify_run(self.root, self.run)["result"], "pass")
 
@@ -148,10 +153,10 @@ class VmEvidenceTests(unittest.TestCase):
             pOriginal.replace(b"ERROR=0000000000000014", b"ERROR=0000000000000004", 1),
         ):
             with self.subTest(log=pAltered):
-                self.write(self.run / "com1.log", pAltered)
+                self.write(self.run / "serial-com1.log", pAltered)
                 # The receipt deliberately has the updated hash, exercising
                 # semantic validation independently of tamper detection.
-                self.manifest["artifacts"]["com1.log"] = evidence.sha256(self.run / "com1.log")
+                self.manifest["artifacts"]["serial-com1.log"] = evidence.sha256(self.run / "serial-com1.log")
                 self.save_manifest()
                 self.rejected()
 
@@ -164,8 +169,8 @@ class VmEvidenceTests(unittest.TestCase):
         log = (b"AGENTOS KERNEL OK STAGE 1\r\n" +
                prefixes[0].encode() + b"0000000000000001\r\n" +
                prefixes[1].encode() + b"0000000000000001 STATUS=0000000000000000 FRAMES=OK\r\n")
-        self.write(self.run / "com1.log", log)
-        self.manifest["artifacts"]["com1.log"] = evidence.sha256(self.run / "com1.log")
+        self.write(self.run / "serial-com1.log", log)
+        self.manifest["artifacts"]["serial-com1.log"] = evidence.sha256(self.run / "serial-com1.log")
         self.save_manifest()
         self.assertEqual(evidence.verify_run(self.root, self.run)["result"], "pass")
 
@@ -179,8 +184,8 @@ class VmEvidenceTests(unittest.TestCase):
         return b"AGENTOS KERNEL OK STAGE 1\r\n"+pFixtures.migrationTranscript(2,True)
 
     def testMigrationTraceIsStrictlyVerifiedWhenPresent(self):
-        self.write(self.run / "com1.log", self.migrationLog())
-        self.manifest["artifacts"]["com1.log"] = evidence.sha256(self.run / "com1.log")
+        self.write(self.run / "serial-com1.log", self.migrationLog())
+        self.manifest["artifacts"]["serial-com1.log"] = evidence.sha256(self.run / "serial-com1.log")
         self.save_manifest()
         self.assertEqual(evidence.verify_run(self.root, self.run)["result"], "pass")
 
@@ -194,8 +199,8 @@ class VmEvidenceTests(unittest.TestCase):
             pOriginal.replace(b"UID=00000000000003e8", b"UID=0000000000000000", 1),
         ):
             with self.subTest(log=pAltered):
-                self.write(self.run / "com1.log", pAltered)
-                self.manifest["artifacts"]["com1.log"] = evidence.sha256(self.run / "com1.log")
+                self.write(self.run / "serial-com1.log", pAltered)
+                self.manifest["artifacts"]["serial-com1.log"] = evidence.sha256(self.run / "serial-com1.log")
                 self.save_manifest()
                 self.rejected()
 
@@ -209,13 +214,13 @@ class VmEvidenceTests(unittest.TestCase):
         ):
             with self.subTest(cpus=pCpus,log=pAltered):
                 self.manifest["cpus"] = pCpus
-                self.write(self.run / "com1.log",pAltered)
-                self.manifest["artifacts"]["com1.log"] = evidence.sha256(self.run / "com1.log")
+                self.write(self.run / "serial-com1.log",pAltered)
+                self.manifest["artifacts"]["serial-com1.log"] = evidence.sha256(self.run / "serial-com1.log")
                 self.save_manifest()
                 self.rejected()
 
     def test_old_duplicate_foreign_or_failed_session_receipt_is_rejected(self):
-        path = self.run / "com1.log"
+        path = self.run / "serial-com1.log"
         original = path.read_bytes()
         for altered in (
             original.replace(b"MANAGER SESSION STOP", b"SHELL STOP"),
@@ -226,7 +231,7 @@ class VmEvidenceTests(unittest.TestCase):
         ):
             with self.subTest(log=altered):
                 self.write(path, altered)
-                self.manifest["artifacts"]["com1.log"] = evidence.sha256(path)
+                self.manifest["artifacts"]["serial-com1.log"] = evidence.sha256(path)
                 self.save_manifest()
                 self.rejected()
 
@@ -281,9 +286,9 @@ class VmEvidenceTests(unittest.TestCase):
         self.write(self.root / "scripts/toolchain.lock", b"unexpected compiler")
         self.rejected()
         self.write(self.root / "scripts/toolchain.lock", b"locked compiler versions\n")
-        log = self.run / "com1.log"
+        log = self.run / "serial-com1.log"
         self.write(log, b"AGENTOS SHELL STOP PID=0 STATUS=0000000000000000 FRAMES=OK\r\n")
-        self.manifest["artifacts"]["com1.log"] = evidence.sha256(log)
+        self.manifest["artifacts"]["serial-com1.log"] = evidence.sha256(log)
         self.save_manifest()
         self.rejected()
 

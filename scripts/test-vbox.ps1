@@ -136,7 +136,7 @@ $serial=@{Listener=$null; Client=$null; Stream=$null; Log=$null; Input=$null;
 $serial.Listener=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0)
 $serial.Listener.Start(1)
 $port=$serial.Listener.LocalEndpoint.Port
-$serial.Log=[IO.File]::Open("$dir\com1.log",'Create','Write','ReadWrite')
+$serial.Log=[IO.File]::Open("$dir\serial-com1.log",'Create','Write','ReadWrite')
 if ($Shell) {
     $serial.Input=[IO.File]::Open("$dir\com1-input.bin",'Create','Write','ReadWrite')
 }
@@ -204,20 +204,20 @@ try {
     }
     VBox controlvm $vm screenshotpng "$dir\display.png"
     # Windows readers (ReadAllText, Select-String, Python) cannot reliably open
-    # com1.log while the PowerShell FileStream still has a write handle.
+    # serial-com1.log while the PowerShell FileStream still has a write handle.
     # No Receive-Serial calls occur during the offline checks below; any new
     # UART bytes remain queued by TCP until the writer is reopened.
     $serial.Log.Flush()
     $serial.Log.Dispose()
     $serial.Log=$null
     if ($Case -eq 'signed') {
-        $tasks = @(Select-String -LiteralPath "$dir\com1.log" -Pattern '^AGENTOS TASK (BSP|AP) APIC=([0-9a-f]{16}) TIMER-WAKES=0000000000000003$')
+        $tasks = @(Select-String -LiteralPath "$dir\serial-com1.log" -Pattern '^AGENTOS TASK (BSP|AP) APIC=([0-9a-f]{16}) TIMER-WAKES=0000000000000003$')
         $ids = @($tasks | ForEach-Object { $_.Matches[0].Groups[2].Value } | Sort-Object -Unique)
         $bootstrap = @($tasks | Where-Object { $_.Matches[0].Groups[1].Value -eq 'BSP' })
         if ($tasks.Count -ne $Cpus -or $ids.Count -ne $Cpus -or $bootstrap.Count -ne 1) {
             throw "Expected one task with three timer wakeups on each of $Cpus distinct CPUs: $dir"
         }
-        $workers = @(Select-String -LiteralPath "$dir\com1.log" -Pattern '^AGENTOS SCHED APIC=([0-9a-f]{16}) TASK=(000000000000000[01]) PREEMPTIONS=([0-9a-f]{16}) PAGES=0000000000001000$')
+        $workers = @(Select-String -LiteralPath "$dir\serial-com1.log" -Pattern '^AGENTOS SCHED APIC=([0-9a-f]{16}) TASK=(000000000000000[01]) PREEMPTIONS=([0-9a-f]{16}) PAGES=0000000000001000$')
         $seen = @{}
         foreach ($worker in $workers) {
             $fields = $worker.Matches[0].Groups
@@ -229,40 +229,40 @@ try {
             $seen[$key] = $true
         }
         if ($seen.Count -ne 2 * $Cpus) { throw "Missing preempted workers: $dir" }
-        $stress = @(Select-String -LiteralPath "$dir\com1.log" -Pattern '^AGENTOS FRAME STRESS BITMAP OK HELD=([0-9a-f]{16}) FREE-BEFORE=([0-9a-f]{16}) FREE-AFTER=([0-9a-f]{16})$')
+        $stress = @(Select-String -LiteralPath "$dir\serial-com1.log" -Pattern '^AGENTOS FRAME STRESS BITMAP OK HELD=([0-9a-f]{16}) FREE-BEFORE=([0-9a-f]{16}) FREE-AFTER=([0-9a-f]{16})$')
         if ($stress.Count -ne 1) { throw "Missing final bitmap comparison: $dir" }
         $fields = $stress[0].Matches[0].Groups
         if ([Convert]::ToUInt64($fields[1].Value,16) -ne 16 * $Cpus -or
             $fields[2].Value -ne $fields[3].Value) { throw "Incorrect frame accounting: $dir" }
         foreach ($pattern in @('AGENTOS OWN CR3=[0-9a-f]{13}000', 'AGENTOS IDT OK: BP PF-NULL PF-GUARD PF-WP PF-NX')) {
-            if (!(Select-String -LiteralPath "$dir\com1.log" -Pattern $pattern -Quiet)) { throw "Missing $pattern in $dir" }
+            if (!(Select-String -LiteralPath "$dir\serial-com1.log" -Pattern $pattern -Quiet)) { throw "Missing $pattern in $dir" }
         }
-        if (!(Select-String -LiteralPath "$dir\com1.log" -SimpleMatch 'AGENTOS PHYSICAL FRAMES OK' -Quiet)) {
+        if (!(Select-String -LiteralPath "$dir\serial-com1.log" -SimpleMatch 'AGENTOS PHYSICAL FRAMES OK' -Quiet)) {
             throw "Physical frame probe missing: $dir"
         }
         Verify-Console "$dir\display.png"
-        if (!(Select-String -LiteralPath "$dir\com1.log" -SimpleMatch 'AGENTOS KERNEL STACK GUARD OK' -Quiet)) {
+        if (!(Select-String -LiteralPath "$dir\serial-com1.log" -SimpleMatch 'AGENTOS KERNEL STACK GUARD OK' -Quiet)) {
             throw "Kernel stack guard fault probes missing: $dir"
         }
-        & python "$PSScriptRoot/verify-boot-log.py" --log "$dir\com1.log" --level $LogLevel --output $LogOutput
+        & python "$PSScriptRoot/verify-boot-log.py" --log "$dir\serial-com1.log" --level $LogLevel --output $LogOutput
         if ($LASTEXITCODE -ne 0) { throw "BOOT.LOG sink/severity verification failed: $dir" }
-        & "$PSScriptRoot/verify-processes.ps1" -Log "$dir\com1.log" -ApicIds $ids
-        & python "$PSScriptRoot/verify-supervisor.py" --log "$dir\com1.log" --cpus $Cpus
+        & "$PSScriptRoot/verify-processes.ps1" -Log "$dir\serial-com1.log" -ApicIds $ids
+        & python "$PSScriptRoot/verify-supervisor.py" --log "$dir\serial-com1.log" --cpus $Cpus
         if ($LASTEXITCODE -ne 0) { throw "Service supervision verification failed: $dir" }
-        & python "$PSScriptRoot/verify-orphans.py" --log "$dir\com1.log" --cpus $Cpus
+        & python "$PSScriptRoot/verify-orphans.py" --log "$dir\serial-com1.log" --cpus $Cpus
         if ($LASTEXITCODE -ne 0) { throw "Orphan reparenting verification failed: $dir" }
-        & python "$PSScriptRoot/verify-cow.py" --log "$dir\com1.log" --cpus $Cpus
+        & python "$PSScriptRoot/verify-cow.py" --log "$dir\serial-com1.log" --cpus $Cpus
         if ($LASTEXITCODE -ne 0) { throw "Fork/COW page isolation failed: $dir" }
-        & python "$PSScriptRoot/verify-demand-paging.py" --log "$dir\com1.log" --cpus $Cpus
+        & python "$PSScriptRoot/verify-demand-paging.py" --log "$dir\serial-com1.log" --cpus $Cpus
         if ($LASTEXITCODE -ne 0) { throw "Demand paging and lazy syscall isolation failed: $dir" }
-        & python "$PSScriptRoot/verify-migration.py" --log "$dir\com1.log" --cpus $Cpus
+        & python "$PSScriptRoot/verify-migration.py" --log "$dir\serial-com1.log" --cpus $Cpus
         if ($LASTEXITCODE -ne 0) { throw "Actual process migration and cross-CPU state preservation failed: $dir" }
-        & python "$PSScriptRoot/verify-service-manager.py" --log "$dir\com1.log"
+        & python "$PSScriptRoot/verify-service-manager.py" --log "$dir\serial-com1.log"
         if ($LASTEXITCODE -ne 0) { throw "Persistent service registry readiness/restart evidence failed: $dir" }
         & "$PSScriptRoot/verify-idle.ps1" -RunDir $dir -ApicIds $ids -HostSeconds $hostIdleSeconds
         if ($Shell) {
             # Resume the same COM1 log after all boot-time file verifiers.
-            $serial.Log=[IO.File]::Open("$dir\com1.log",'Append','Write','ReadWrite')
+            $serial.Log=[IO.File]::Open("$dir\serial-com1.log",'Append','Write','ReadWrite')
             Receive-Serial $serial
             $match=[regex]::Match($serial.Text.ToString(),'(?m)^AGENTOS SHELL START PID=([0-9a-f]{16})\r\n')
             if (!$match.Success) { throw 'Managed shell identity missing' }
@@ -297,11 +297,11 @@ try {
             $serial.Log.Flush()
             $serial.Log.Dispose()
             $serial.Log=$null
-            $verifyArgs=@('--log',"$dir\com1.log",'--input',"$dir\com1-input.bin",'--cpus',[string]$Cpus)
+            $verifyArgs=@('--log',"$dir\serial-com1.log",'--input',"$dir\com1-input.bin",'--cpus',[string]$Cpus)
             if ($Keyboard) { $verifyArgs+='--keyboard' }
             & python "$PSScriptRoot/verify-stage3-session.py" @verifyArgs
             if ($LASTEXITCODE -ne 0) { throw "Stage-3 interactive verification failed: $dir" }
-            & python "$PSScriptRoot/verify-boot-log.py" --log "$dir\com1.log" --level $LogLevel --output $LogOutput
+            & python "$PSScriptRoot/verify-boot-log.py" --log "$dir\serial-com1.log" --level $LogLevel --output $LogOutput
             if ($LASTEXITCODE -ne 0) { throw 'BOOT.LOG policy violated during interactive session' }
         }
     } elseif ($serial.Text.ToString() -notmatch 'BdsDxe: failed to load [^\r\n]*HARDDISK[^\r\n]*(Access Denied|Security Violation)') {
@@ -329,6 +329,8 @@ try {
     throw
 } finally {
     # Close and flush host-owned COM1 capture before measuring hashes.
+    # COM1.log is a reserved Windows device filename, including the extension;
+    # serial-com1.log is safe for Test-Path and Get-FileHash.
     try {
         if ($null -ne $serial) {
             foreach ($handle in @($serial.Stream,$serial.Client,$serial.Log,$serial.Input)) {
@@ -341,7 +343,7 @@ try {
     } finally {
         try {
             $artifactHashes=@{}
-            foreach ($name in @('esp.raw','esp.vdi','changed.efi','com1.log',
+            foreach ($name in @('esp.raw','esp.vdi','changed.efi','serial-com1.log',
                                 'com1-input.bin','display.png','shell-before.png',
                                 'shell-keyboard.png','failure.png')) {
                 $file=Join-Path $dir $name
