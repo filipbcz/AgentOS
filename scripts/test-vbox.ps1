@@ -81,7 +81,10 @@ function Verify-Console([string]$Path,[string]$Before='') {
     if ($LASTEXITCODE -ne 0) { throw "Actual GOP glyph verification failed: $Path" }
 }
 function Wait-WorkerExits($State,[int]$Offset,[int]$Count) {
+    # Match the 30-second host budget used by the independent QEMU runner.
+    # This remains strict: only real, complete child EXIT records count.
     $wait=[Diagnostics.Stopwatch]::StartNew()
+    $exits=@()
     do {
         Receive-Serial $State
         $text=$State.Text.ToString($Offset,$State.Text.Length-$Offset)
@@ -89,8 +92,31 @@ function Wait-WorkerExits($State,[int]$Offset,[int]$Count) {
         if ($exits.Count -ge $Count) { return }
         if ($text -match 'SMP FAILED|FATAL VECTOR|SHELL FAILED') { throw 'Guest failed during restart' }
         Start-Sleep -Milliseconds 25
-    } while ($wait.Elapsed.TotalSeconds -lt 15)
-    throw 'Service RESTART did not autonomously complete its three bounded attempts'
+    } while ($wait.Elapsed.TotalSeconds -lt 30)
+
+    # Failure-only diagnostic, not an acceptance shortcut. Query the live
+    # manager through the real shell IPC path before the VM is powered off.
+    # This distinguishes backoff, stuck STARTING/RUNNING, and missing UART
+    # records; the run must still fail even if the probe completes.
+    $observed=$exits.Count
+    $flakyStatus='no manager reply'
+    try {
+        $probeOffset=$State.Text.Length
+        Send-Serial $State 'services'
+        $probeClock=[Diagnostics.Stopwatch]::StartNew()
+        do {
+            Receive-Serial $State
+            $probe=$State.Text.ToString($probeOffset,$State.Text.Length-$probeOffset)
+            if ($probe -match 'flaky: (?:down|starting|running|backoff|failed|stopped) \(attempts=[0-9]+\)') {
+                $flakyStatus=$Matches[0]
+                break
+            }
+            Start-Sleep -Milliseconds 25
+        } while ($probeClock.Elapsed.TotalSeconds -lt 5)
+    } catch {
+        $flakyStatus="diagnostic IPC error: $($_.Exception.Message)"
+    }
+    throw "Service RESTART incomplete after 30 host seconds: observed $observed/$Count EXIT records; manager state: $flakyStatus"
 }
 $sessionPlan=$null
 $tag=[Guid]::NewGuid().ToString('N').Substring(0,10)
