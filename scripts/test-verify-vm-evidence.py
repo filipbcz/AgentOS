@@ -98,6 +98,19 @@ class VmEvidenceTests(unittest.TestCase):
         self.save_manifest()
         self.assertEqual(evidence.verify_run(self.root, self.run)["shell"], True)
 
+    def testFailedBootScreenshotIsHashedButDoesNotCountAsAcceptance(self):
+        self.write(self.run / "failure.png", b"UEFI firmware console")
+        self.manifest["result"] = "fail"
+        self.manifest["failure_message"] = "Kernel marker missing"
+        self.manifest["artifacts"]["failure.png"] = evidence.sha256(self.run / "failure.png")
+        self.save_manifest()
+        self.assertEqual(
+            evidence.verify_run(self.root, self.run, require_pass=False)["result"], "fail")
+        self.rejected()
+        self.write(self.run / "failure.png", b"changed UEFI firmware console")
+        with self.assertRaises((evidence.EvidenceError, OSError)):
+            evidence.verify_run(self.root, self.run, require_pass=False)
+
     def test_valid_mutation_rejected_by_firmware(self):
         self.manifest.update({"case": "loader", "shell": False, "keyboard": False})
         self.write(self.run / "changed.efi", b"altered signed EFI")

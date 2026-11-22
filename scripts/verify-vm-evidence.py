@@ -26,7 +26,7 @@ HEX_COMMIT = re.compile(r"[0-9a-f]{40}\Z")
 VBox_VERSION = re.compile(r"7\.1\.12(?:r[0-9]+)?\Z")
 ARTIFACTS = frozenset({
     "esp.raw", "esp.vdi", "changed.efi", "com1.log", "com1-input.bin",
-    "display.png", "shell-before.png", "shell-keyboard.png"
+    "display.png", "shell-before.png", "shell-keyboard.png", "failure.png"
 })
 BUILD_ARTIFACTS = frozenset({
     "agentos.unsigned.efi", "agentos.efi", "db.cer", "db.esl"

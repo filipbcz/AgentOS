@@ -71,7 +71,7 @@ Skript nejprve provede hostitelské kontroly a sestaví podepsaný obraz. Potom 
 python scripts/verify-stage3-suite.py --root . --manifest build/runs/stage3-acceptance.json
 ```
 
-Každý běh uchovává konfiguraci, verzi VirtualBoxu, skutečný COM1 log, screenshoty a JSON záznam s hashi obrazu, důkazů a testovacího skriptu. Interaktivní profil přidává skutečně odeslané UART bajty do `com1-input.bin`; klávesnicový profil zachovává snímky před příkazem a po něm. Selhání nezanechá platný souhrn z předchozího běhu. `-SkipBuild` je určen jen pro opakování nad stejným čistým commitem a odpovídajícím obrazem.
+Každý běh uchovává konfiguraci, verzi VirtualBoxu, skutečný COM1 log, screenshoty a JSON záznam s hashi obrazu, důkazů a testovacího skriptu. Interaktivní profil přidává skutečně odeslané UART bajty do `com1-input.bin`; klávesnicový profil zachovává snímky před příkazem a po něm. Selhání nezanechá platný souhrn z předchozího běhu. Pokud VM selže během bootu, harness ještě **před vypnutím** zkusí pořídit `failure.png` a uloží jeho hash do neúspěšného `acceptance.json`; snímek je diagnostika, nikoli doklad úspěšné přejímky. COM1 log při selhání firmware může zcela chybět. `-SkipBuild` je určen jen pro opakování nad stejným čistým commitem a odpovídajícím obrazem.
 
 Jednotlivý profil lze zopakovat samostatně:
 

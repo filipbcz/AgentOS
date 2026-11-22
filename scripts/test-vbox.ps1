@@ -293,6 +293,16 @@ try {
     }
     $runSucceeded=$true
 } finally {
+    # Preserve what the UEFI firmware actually displayed during a failed first boot.
+    # COM1 can be absent until our loader runs; capture before powering off.
+    if (!$runSucceeded) {
+        try {
+            VBox controlvm $vm screenshotpng "$dir\failure.png"
+            Write-Warning "Captured failed VM screen before power-off: $dir\failure.png"
+        } catch {
+            Write-Warning "Could not capture failed VM screen: $_"
+        }
+    }
     try { VBox controlvm $vm poweroff; $shutdownSucceeded=$true } catch {
         if ($runSucceeded) { throw }
         Write-Warning "VM power-off after a failed run also failed: $_"
@@ -317,7 +327,7 @@ try {
             $artifactHashes=@{}
             foreach ($name in @('esp.raw','esp.vdi','changed.efi','com1.log',
                                 'com1-input.bin','display.png','shell-before.png',
-                                'shell-keyboard.png')) {
+                                'shell-keyboard.png','failure.png')) {
                 $file=Join-Path $dir $name
                 if (Test-Path -LiteralPath $file -PathType Leaf) {
                     $artifactHashes[$name]=(Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
