@@ -53,14 +53,47 @@ function Wait-Serial($State,[string]$Pattern,[int]$Offset=0,[int]$Seconds=10) {
     throw "Timed out waiting for shell response: $Pattern"
 }
 function Send-Serial($State,[string]$Command) {
-    # Pace bytes so this first UART profile need not rely on host-side bursts.
+    # A fixed 2-ms host delay is NOT UART RX flow control on VirtualBox/NEM.
+    # An asynchronous USER EXIT can monopolize the guest UART during input.
+    # Confirm each actual TTY echo before sending the next byte.
     $bytes=[Text.Encoding]::ASCII.GetBytes($Command+"`r")
-    foreach ($byte in $bytes) {
+    $offset=$State.Text.Length
+    $echoed=''
+    for ($index=0; $index -lt $bytes.Length; $index++) {
+        $byte=$bytes[$index]
+        $echo=if ($byte -eq 13) { "`r`n" }
+              elseif ($byte -eq 8) { "`b `b" }
+              else { [string][char]$byte }
+        $echoed+=$echo
         $State.Stream.WriteByte($byte)
         $State.Input.WriteByte($byte)
         $State.Input.Flush()
-        Receive-Serial $State
-        Start-Sleep -Milliseconds 2
+        $ack=[Diagnostics.Stopwatch]::StartNew()
+        $confirmed=$false
+        do {
+            Receive-Serial $State
+            $raw=$State.Text.ToString($offset,$State.Text.Length-$offset)
+            # Only complete, well-formed kernel EXIT/KILL events are removed.
+            $clean=if ($null -ne $sessionPlan) {
+                [regex]::Replace($raw,$sessionPlan.kernel_event_pattern,'')
+            } else { $raw }
+            if ($byte -eq 13) {
+                # Enter can execute and print the reply before the host polls.
+                $confirmed=$clean.StartsWith($echoed,[StringComparison]::Ordinal)
+            } else {
+                # Exact match also waits for any in-flight kernel event to
+                # finish printing before we transmit the next input byte.
+                $confirmed=[string]::Equals($clean,$echoed,[StringComparison]::Ordinal)
+            }
+            if ($confirmed) { break }
+            if ($raw -match 'SMP FAILED|FATAL VECTOR|SHELL FAILED') {
+                throw 'Guest failed while acknowledging COM1 input'
+            }
+            Start-Sleep -Milliseconds 10
+        } while ($ack.Elapsed.TotalSeconds -lt 10)
+        if (!$confirmed) {
+            throw "COM1 input echo stalled after byte $($index+1)/$($bytes.Length) for '$Command': expected $($echoed.Length) echo chars, observed $($clean.Length)"
+        }
     }
 }
 # Exercise the real PS/2 controller; VBox's API accepts PC/XT Set 1, then
