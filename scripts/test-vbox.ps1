@@ -92,8 +92,14 @@ function Send-Serial($State,[string]$Command) {
             Start-Sleep -Milliseconds 10
         } while ($ack.Elapsed.TotalSeconds -lt 10)
         if (!$confirmed) {
-            throw "COM1 input echo stalled after byte $($index+1)/$($bytes.Length) for '$Command': expected $($echoed.Length) echo chars, observed $($clean.Length)"
+            $hexByte='{0:X2}' -f [int]$byte
+            throw "COM1 echo missing after byte $($index+1)/$($bytes.Length) (0x$hexByte) for '$Command': expected $($echoed.Length) echo chars, observed $($clean.Length). Guest may have processed input even when UART TX failed."
         }
+        # An echo acknowledges the guest's write to the emulated UART, not
+        # completion of its transmitter or its RX interrupt/EOI. Permit
+        # VirtualBox/NEM to finish both before injecting the next byte.
+        # Deliberately keep the strict full-transcript verifier unchanged.
+        Start-Sleep -Milliseconds 20
     }
 }
 # Exercise the real PS/2 controller; VBox's API accepts PC/XT Set 1, then
