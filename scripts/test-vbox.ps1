@@ -195,7 +195,7 @@ try {
         $readyTimer=[Diagnostics.Stopwatch]::StartNew()
         do {
             Receive-Serial $serial
-            $readyText=[IO.File]::ReadAllText("$dir\com1.log")
+            $readyText=$serial.Text.ToString()
             if ($readyText -match 'AGENTOS SHELL READY\r\nagentos> ') { break }
             if ($readyText -match 'SMP FAILED|FATAL VECTOR|SHELL FAILED') { throw 'Guest failed before shell readiness' }
             Start-Sleep -Milliseconds 25
@@ -203,6 +203,13 @@ try {
         if ($readyText -notmatch 'AGENTOS SHELL READY\r\nagentos> ') { throw 'Operational shell did not become ready' }
     }
     VBox controlvm $vm screenshotpng "$dir\display.png"
+    # Windows readers (ReadAllText, Select-String, Python) cannot reliably open
+    # com1.log while the PowerShell FileStream still has a write handle.
+    # No Receive-Serial calls occur during the offline checks below; any new
+    # UART bytes remain queued by TCP until the writer is reopened.
+    $serial.Log.Flush()
+    $serial.Log.Dispose()
+    $serial.Log=$null
     if ($Case -eq 'signed') {
         $tasks = @(Select-String -LiteralPath "$dir\com1.log" -Pattern '^AGENTOS TASK (BSP|AP) APIC=([0-9a-f]{16}) TIMER-WAKES=0000000000000003$')
         $ids = @($tasks | ForEach-Object { $_.Matches[0].Groups[2].Value } | Sort-Object -Unique)
@@ -254,6 +261,9 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "Persistent service registry readiness/restart evidence failed: $dir" }
         & "$PSScriptRoot/verify-idle.ps1" -RunDir $dir -ApicIds $ids -HostSeconds $hostIdleSeconds
         if ($Shell) {
+            # Resume the same COM1 log after all boot-time file verifiers.
+            $serial.Log=[IO.File]::Open("$dir\com1.log",'Append','Write','ReadWrite')
+            Receive-Serial $serial
             $match=[regex]::Match($serial.Text.ToString(),'(?m)^AGENTOS SHELL START PID=([0-9a-f]{16})\r\n')
             if (!$match.Success) { throw 'Managed shell identity missing' }
             $shellPid=[Convert]::ToUInt64($match.Groups[1].Value,16)
@@ -283,6 +293,10 @@ try {
                 # read can otherwise end halfway through the final line.
                 Wait-Serial $serial '\[INFO\] INTERACTIVE SHELL STOPPED\r\n$' 0 15
             }
+            # Freeze the final UART log before the Python verifiers read it.
+            $serial.Log.Flush()
+            $serial.Log.Dispose()
+            $serial.Log=$null
             $verifyArgs=@('--log',"$dir\com1.log",'--input',"$dir\com1-input.bin",'--cpus',[string]$Cpus)
             if ($Keyboard) { $verifyArgs+='--keyboard' }
             & python "$PSScriptRoot/verify-stage3-session.py" @verifyArgs
