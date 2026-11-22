@@ -86,17 +86,21 @@ class VmEvidenceTests(unittest.TestCase):
 
     def rejected(self):
         with self.assertRaises((evidence.EvidenceError, OSError)):
-            evidence.verify_run(self.root, self.run)
+            self.verify_legacy()
 
-    def test_valid_signed_keyboard_and_serial_profiles(self):
-        self.assertEqual(evidence.verify_run(self.root, self.run)["cpus"], 2)
+    def verify_legacy(self, require_pass=True):
+        # The historical fixtures omit one or both milestone traces.
+        return evidence.verify_run(self.root, self.run, require_pass, legacy_traces=True)
+
+    def test_legacy_signed_keyboard_and_serial_profiles(self):
+        self.assertEqual(self.verify_legacy()["cpus"], 2)
         self.manifest["keyboard"] = False
         self.write(self.run / "com1-input.bin", b"help\r")
         self.manifest["artifacts"].pop("shell-keyboard.png")
         self.manifest["artifacts"]["com1-input.bin"] = evidence.sha256(
             self.run / "com1-input.bin")
         self.save_manifest()
-        self.assertEqual(evidence.verify_run(self.root, self.run)["shell"], True)
+        self.assertEqual(self.verify_legacy()["shell"], True)
 
     def testFailedBootScreenshotIsHashedButDoesNotCountAsAcceptance(self):
         self.write(self.run / "failure.png", b"UEFI firmware console")
@@ -105,11 +109,11 @@ class VmEvidenceTests(unittest.TestCase):
         self.manifest["artifacts"]["failure.png"] = evidence.sha256(self.run / "failure.png")
         self.save_manifest()
         self.assertEqual(
-            evidence.verify_run(self.root, self.run, require_pass=False)["result"], "fail")
+            self.verify_legacy(require_pass=False)["result"], "fail")
         self.rejected()
         self.write(self.run / "failure.png", b"changed UEFI firmware console")
         with self.assertRaises((evidence.EvidenceError, OSError)):
-            evidence.verify_run(self.root, self.run, require_pass=False)
+            self.verify_legacy(require_pass=False)
 
     def test_windows_reserved_com1_log_artifact_is_rejected(self):
         self.manifest["artifacts"]["com1.log"] = self.manifest["artifacts"].pop("serial-com1.log")
@@ -128,20 +132,20 @@ class VmEvidenceTests(unittest.TestCase):
         self.save_manifest()
         self.assertEqual(evidence.verify_run(self.root, self.run)["case"], "loader")
 
-    def demandLog(self):
+    def demandLog(self, base=None):
         pSpec = importlib.util.spec_from_file_location(
             "receiptDemandFixtures", Path(__file__).with_name("test-verify-demand-paging.py"))
         pFixtures = importlib.util.module_from_spec(pSpec)
         pSpec.loader.exec_module(pFixtures)
         pScenarios = (pFixtures.scenario() + pFixtures.scenario(33, 1)).replace("\n", "\r\n").encode("ascii")
-        pOriginal = (self.run / "serial-com1.log").read_bytes()
+        pOriginal = base if base is not None else (self.run / "serial-com1.log").read_bytes()
         return pOriginal.replace(b"AGENTOS MANAGER SESSION START", pScenarios + b"AGENTOS MANAGER SESSION START", 1)
 
     def testDemandTraceIsStrictlyVerifiedWhenPresent(self):
         self.write(self.run / "serial-com1.log", self.demandLog())
         self.manifest["artifacts"]["serial-com1.log"] = evidence.sha256(self.run / "serial-com1.log")
         self.save_manifest()
-        self.assertEqual(evidence.verify_run(self.root, self.run)["result"], "pass")
+        self.assertEqual(self.verify_legacy()["result"], "pass")
 
     def testRehashedIncompleteOrContradictoryDemandTraceIsRejected(self):
         pOriginal = self.demandLog()
@@ -172,7 +176,7 @@ class VmEvidenceTests(unittest.TestCase):
         self.write(self.run / "serial-com1.log", log)
         self.manifest["artifacts"]["serial-com1.log"] = evidence.sha256(self.run / "serial-com1.log")
         self.save_manifest()
-        self.assertEqual(evidence.verify_run(self.root, self.run)["result"], "pass")
+        self.assertEqual(self.verify_legacy()["result"], "pass")
 
     def migrationLog(self):
         pSpec = importlib.util.spec_from_file_location(
@@ -187,7 +191,27 @@ class VmEvidenceTests(unittest.TestCase):
         self.write(self.run / "serial-com1.log", self.migrationLog())
         self.manifest["artifacts"]["serial-com1.log"] = evidence.sha256(self.run / "serial-com1.log")
         self.save_manifest()
-        self.assertEqual(evidence.verify_run(self.root, self.run)["result"], "pass")
+        self.assertEqual(self.verify_legacy()["result"], "pass")
+
+    def test_current_receipt_requires_both_rehashed_traces(self):
+        complete = self.demandLog(self.migrationLog())
+        path = self.run / "serial-com1.log"
+        for shell in (True, False):
+            self.manifest.update(shell=shell, keyboard=shell)
+            for missing, reason in (((), None),
+                                    ((b"AGENTOS DEMAND",), "demand-paging"),
+                                    ((b"AGENTOS MIGRATION",), "migration"),
+                                    ((b"AGENTOS DEMAND", b"AGENTOS MIGRATION"), "demand-paging")):
+                with self.subTest(shell=shell, missing=missing):
+                    self.write(path, b"".join(line for line in complete.splitlines(keepends=True)
+                                              if not line.startswith(missing)))
+                    self.manifest["artifacts"][path.name] = evidence.sha256(path)
+                    self.save_manifest()
+                    if reason is None:
+                        self.assertEqual(evidence.verify_run(self.root, self.run)["result"], "pass")
+                    else:
+                        with self.assertRaisesRegex(evidence.EvidenceError, f"Missing required {reason}"):
+                            evidence.verify_run(self.root, self.run)
 
     def testRehashedPartialOrFabricatedMigrationIsRejected(self):
         pOriginal = self.migrationLog()

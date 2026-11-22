@@ -90,7 +90,7 @@ def verify_build(root, commit=None):
     return data
 
 
-def verify_run(root, run_dir, require_pass=True):
+def verify_run(root, run_dir, require_pass=True, *, legacy_traces=False):
     root, run_dir = Path(root), Path(run_dir)
     data = json_file(run_dir / "acceptance.json")
     require(data.get("schema") == 1, "Unsupported VM receipt schema")
@@ -151,10 +151,12 @@ def verify_run(root, run_dir, require_pass=True):
         log = (run_dir / "serial-com1.log").read_bytes()
         require(b"AGENTOS KERNEL OK STAGE 1\r\n" in log,
                 "Signed VM receipt lacks final kernel boot marker")
-        # Older receipts predate this milestone and remain valid inputs. If a
-        # demand trace is present, verify its contents as well as its hash;
-        # malformed/partial traces must never pass as unrelated serial text.
-        if b"AGENTOS DEMAND" in log:
+        has_demand = b"AGENTOS DEMAND" in log
+        has_migration = b"AGENTOS MIGRATION" in log
+        if not legacy_traces:
+            require(has_demand, "Missing required demand-paging evidence in COM1")
+            require(has_migration, "Missing required migration evidence in COM1")
+        if has_demand:
             pSpec = importlib.util.spec_from_file_location(
                 "receiptDemandEvidence", Path(__file__).with_name("verify-demand-paging.py"))
             pVerifier = importlib.util.module_from_spec(pSpec)
@@ -163,7 +165,7 @@ def verify_run(root, run_dir, require_pass=True):
                 pVerifier.verify(log.decode("ascii", errors="replace"), cpus)
             except pVerifier.VerificationError as pError:
                 raise EvidenceError(f"Invalid demand-paging evidence: {pError}") from pError
-        if b"AGENTOS MIGRATION" in log:
+        if has_migration:
             pSpec = importlib.util.spec_from_file_location(
                 "receiptMigrationEvidence", Path(__file__).with_name("verify-migration.py"))
             pVerifier = importlib.util.module_from_spec(pSpec)
@@ -179,7 +181,7 @@ def verify_run(root, run_dir, require_pass=True):
                     starts[0][1] == stops[0][1] == b"0000000000000001" and
                     starts[0].end() <= stops[0].start(),
                     "Signed shell receipt lacks successful clean exit")
-            if b"AGENTOS MIGRATION" in log:
+            if has_migration:
                 pSpec = importlib.util.spec_from_file_location(
                     "receiptSessionEvidence", Path(__file__).with_name("verify-stage3-session.py"))
                 pVerifier = importlib.util.module_from_spec(pSpec)
@@ -204,12 +206,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--run-dir", type=Path)
+    parser.add_argument("--legacy-traces", action="store_true",
+                        help="Inspect a historical receipt that predates demand paging or migration")
     parser.add_argument("--commit")
     args = parser.parse_args()
+    if args.legacy_traces and not args.run_dir:
+        parser.error("--legacy-traces requires --run-dir")
     try:
         if args.run_dir:
-            data = verify_run(args.root, args.run_dir)
-            print(f"VM acceptance receipt verified: {data['vm']}, "
+            data = verify_run(args.root, args.run_dir, legacy_traces=args.legacy_traces)
+            label = "Historical VM receipt" if args.legacy_traces else "VM acceptance receipt"
+            print(f"{label} verified: {data['vm']}, "
                   f"commit {data['source_commit']}, {data['cpus']} vCPU")
         else:
             data = verify_build(args.root, args.commit)
