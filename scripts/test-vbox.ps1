@@ -12,7 +12,19 @@ Set-Location $root
 # Prevent simultaneous VirtualBox/NEM power-on from this workspace.
 $lock=[IO.File]::Open((Join-Path $root 'build/test.lock'),'OpenOrCreate','ReadWrite','None')
 $serial=$null
+$vmRegistered=$false
+$previousPowerState=0
 try {
+if (-not ('AgentOS.HostPower' -as [type])) {
+    Add-Type -Namespace AgentOS -Name HostPower -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("kernel32.dll")]
+public static extern uint SetThreadExecutionState(uint flags);
+public const uint SystemRequired = 0x80000001; // continuous, system awake
+public const uint Continuous = 0x80000000;
+'@
+}
+$previousPowerState=[AgentOS.HostPower]::SetThreadExecutionState([AgentOS.HostPower]::SystemRequired)
+if (!$previousPowerState) { throw 'Windows could not hold the host awake for the timed VM run' }
 $vbox=Join-Path $env:ProgramFiles 'Oracle\VirtualBox\VBoxManage.exe'
 function VBox { & $vbox @args; if ($LASTEXITCODE) { throw "VBoxManage failed: $($args[0])" } }
 function Receive-Serial($State) {
@@ -190,6 +202,7 @@ $bootImageHash=(Get-FileHash (Join-Path $root $efi) -Algorithm SHA256).Hash.ToLo
 if ($LASTEXITCODE) { throw 'disk build failed' }
 VBox convertfromraw "$dir\esp.raw" "$dir\esp.vdi" --format VDI
 VBox createvm --name $vm --basefolder $dir --ostype Other_64 --register
+$vmRegistered=$true
 VBox modifyvm $vm --memory 256 --cpus $Cpus --firmware efi64 --paravirt-provider minimal --x86-hpet on --graphicscontroller vmsvga --vram 16 --ioapic on --nic1 none --audio-enabled off --boot1 disk --boot2 none --boot3 none --boot4 none --uart1 0x3f8 4
 if ($Keyboard) { VBox modifyvm $vm --keyboard ps2 }
 # All acceptance profiles use the SAME host-owned COM1 capture. In file mode,
@@ -407,6 +420,10 @@ try {
         }
     } finally {
         try {
+            if ($vmRegistered) {
+                # Unregister only this run's VM; its disk and logs are hashed evidence.
+                VBox unregistervm $vm
+            }
             $artifactHashes=@{}
             foreach ($name in @('esp.raw','esp.vdi','changed.efi','serial-com1.log',
                                 'com1-input.bin','display.png','shell-before.png',
@@ -459,6 +476,9 @@ try {
             if ($runSucceeded) { throw }
             Write-Warning "Unable to write failure evidence receipt: $_"
         } finally {
+            if ($previousPowerState) {
+                [void][AgentOS.HostPower]::SetThreadExecutionState(($previousPowerState -bor [AgentOS.HostPower]::Continuous))
+            }
             $lock.Dispose()
         }
     }
