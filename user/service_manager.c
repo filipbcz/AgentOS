@@ -11,13 +11,13 @@
  * That boot policy never prevents recovery of an established shell session.
  */
 #define MAX_MS 0x7fffffffffffffffUL
-enum { QUIET_WAKE_MS=60000, READY_TIMEOUT_MS=750, RESTART_BASE_MS=40, RESTART_WINDOW_MS=5000, MAX_ATTEMPTS=3 };
+enum { QUIET_WAKE_MS=60000, READY_TIMEOUT_MS=5000, RESTART_BASE_MS=40, RESTART_WINDOW_MS=5000, MAX_ATTEMPTS=3 };
 enum { stopWaitMs=5000 };
 struct record {
     const char *name, *elf;
     unsigned name_length, elf_length, dependency;
     unsigned char desired, state, attempts, limit, ready_once;
-    long pid, fd, ready_deadline, retry_at, last_status, window_started;
+    long pid, fd, ready_deadline, retry_at, last_status, ready_since;
 };
 
 static struct record registry[SVC_COUNT] = {
@@ -136,7 +136,7 @@ static long waitForChildExit(long aPid) {
 
 /* A remote stop may consume time. Subsequent readiness and restart delays
  * begin after collection, with the same checked clock range as the loop. */
-static int refreshAfterStop(long *aNow) {
+static int refreshClock(long *aNow) {
     long pNow=clock_ms();
     if (pNow<*aNow || (unsigned long)pNow>MAX_MS-READY_TIMEOUT_MS-200) return 0;
     *aNow=pNow;
@@ -168,11 +168,7 @@ static int start_entry(unsigned id,long now) {
      * a tight crash loop still gets exactly MAX_ATTEMPTS starts. Once FAILED,
      * the operator must explicitly rearm the service; no silent retries.
      */
-    if (service->window_started<0 ||
-        now-service->window_started>=RESTART_WINDOW_MS) {
-        service->window_started=now;
-        service->attempts=0;
-    }
+    service->ready_since=-1; // stable uptime begins at authenticated READY
     if (service->attempts >= service->limit) {
         service->state=SVC_FAILED;
         return 0;
@@ -198,8 +194,9 @@ static int start_entry(unsigned id,long now) {
     service->pid=child;
     service->fd=manager_fd;
     service->state=SVC_STARTING;
+    if (!manager_event("START",id) || !refreshClock(&now)) return -1;
     service->ready_deadline=deadline(now,READY_TIMEOUT_MS);
-    if (service->ready_deadline<0 || !manager_event("START",id)) return -1;
+    if (service->ready_deadline<0) return -1;
     return 1;
 }
 
@@ -227,6 +224,7 @@ static int finish_start(unsigned id, long now) {
         received.data.request.operation!=SVC_OP_READY || received.data.request.service!=id ||
         received.data.request.reserved!=0) return -1;
     service->state=SVC_RUNNING;
+    service->ready_since=now;
     service->ready_once=1;
     service->retry_at=0;
     if (id==SVC_SHELL) {
@@ -241,7 +239,6 @@ static int finish_start(unsigned id, long now) {
     // The stable worker waits on this lifetime channel after READY. Keeping
     // both endpoints open lets it block on IPC instead of waking periodically.
     if (id==SVC_FLAKY) finish_endpoint(service);
-    (void)now;
     return 1;
 }
 
@@ -258,7 +255,7 @@ static int suspend_dependents(unsigned dependency) {
         if (!kill_and_reap(service)) return 0;
         service->state=service->desired?SVC_DOWN:SVC_STOPPED;
         service->attempts=0;
-        service->window_started=-1;
+        service->ready_since=-1;
         service->retry_at=0;
         service->ready_once=0;
         if (id==SVC_SHELL) shell_active=0;
@@ -277,9 +274,9 @@ static int failed(unsigned id,long now,long status) {
     finish_endpoint(service);
     service->last_status=status;
     if (id==SVC_SHELL) shell_active=0;
-    if (service->window_started>=0 &&
-        now-service->window_started>=RESTART_WINDOW_MS) {
-        service->window_started=now;
+    if (service->state==SVC_RUNNING && service->ready_since>=0 &&
+        now-service->ready_since>=RESTART_WINDOW_MS) {
+        service->ready_since=now;
         service->attempts=0;
     }
     if (!service->desired) {
@@ -312,7 +309,7 @@ static int apply_command(const struct svc_request *req,long now) {
         if (service->desired && service->state!=SVC_FAILED &&
             service->state!=SVC_STOPPED) return SVC_ALREADY_RUNNING;
         if (!has_dependency(req->service)) return SVC_BAD_DEPENDENCY;
-        service->desired=1;service->attempts=0;service->window_started=-1;service->retry_at=now;
+        service->desired=1;service->attempts=0;service->ready_since=-1;service->retry_at=now;
         service->state=SVC_DOWN;
     } else {
         // Never kill the authenticated caller's prerequisite before it
@@ -325,10 +322,10 @@ static int apply_command(const struct svc_request *req,long now) {
             return SVC_BAD_DEPENDENCY;
         long pStoppedPid=service->pid;
         if (!kill_and_reap(service)) return SVC_INTERNAL_ERROR;
-        if (pStoppedPid>0 && !refreshAfterStop(&now)) return SVC_INTERNAL_ERROR;
+        if (pStoppedPid>0 && !refreshClock(&now)) return SVC_INTERNAL_ERROR;
         service->desired=req->operation==SVC_OP_RESTART;
         service->attempts=0;
-        service->window_started=-1;
+        service->ready_since=-1;
         service->retry_at=now;
         service->state=service->desired?SVC_DOWN:SVC_STOPPED;
     }
@@ -356,7 +353,7 @@ static int recover_shell(long now) {
     // the shell alive. The collected status, including an exit racing with
     // the kill request, determines shutdown versus bounded recovery.
     if (pShell->last_status==0) { finishShellExit(); return 0; }
-    if (!refreshAfterStop(&now)) return -1;
+    if (!refreshClock(&now)) return -1;
     return failed(SVC_SHELL,now,pShell->last_status);
 }
 
@@ -382,11 +379,13 @@ static int check_control(long now) {
     return send_response(shell->fd,code)?0:recover_shell(now);
 }
 
-static int can_start(unsigned id) {
+static int can_start(unsigned id,long now) {
     if (!has_dependency(id)) return 0;
     return id!=SVC_SHELL || online_announced ||
         !registry[SVC_FLAKY].desired || registry[SVC_FLAKY].state==SVC_FAILED ||
-        reaches(SVC_FLAKY,SVC_SHELL)>0;
+        reaches(SVC_FLAKY,SVC_SHELL)>0 ||
+        (registry[SVC_FLAKY].state==SVC_RUNNING &&
+         now-registry[SVC_FLAKY].ready_since>=RESTART_WINDOW_MS);
 }
 
 static int advance_registry(long now) {
@@ -397,7 +396,7 @@ static int advance_registry(long now) {
             long status=os_call(SYS_TRY_WAIT,service->pid,0,0);
             if (status>=0) {
                 if (id==SVC_CORE &&
-                    (!suspend_dependents(SVC_CORE) || !refreshAfterStop(&now))) return -1;
+                    (!suspend_dependents(SVC_CORE) || !refreshClock(&now))) return -1;
                 if (id==SVC_SHELL && status==0) {
                     finishShellExit();
                     return 0;
@@ -412,14 +411,14 @@ static int advance_registry(long now) {
                     // Missing/invalid READY is a policy failure even if the
                     // child exits naturally while its stop is acknowledged.
                     // Keep that actual exit status for diagnostics.
-                    if (!kill_and_reap(service) || !refreshAfterStop(&now) ||
+                    if (!kill_and_reap(service) || !refreshClock(&now) ||
                         failed(id,now,service->last_status)!=0) return -1;
                 }
             }
         } else if (service->desired &&
                    (service->state==SVC_DOWN ||
                     (service->state==SVC_BACKOFF && now>=service->retry_at)) &&
-                   can_start(id)) {
+                   can_start(id,now)) {
             // The optional unstable service gets three real attempts during
             // boot probation. Once exhausted, the shell remains available
             // for diagnosis and manual restart; no background crash can
@@ -442,16 +441,22 @@ static int advance_registry(long now) {
 static long event_deadline(long now) {
     long next=deadline(now,QUIET_WAKE_MS);
     if (next<0) return -1;
+    if (!online_announced && registry[SVC_FLAKY].state==SVC_RUNNING &&
+        registry[SVC_SHELL].desired && has_dependency(SVC_SHELL)) {
+        long probation=deadline(registry[SVC_FLAKY].ready_since,RESTART_WINDOW_MS);
+        if (probation<0) return -1;
+        if (probation>now && probation<next) next=probation;
+    }
     for (unsigned id=0;id<SVC_COUNT;id++) {
         const struct record *service=&registry[id];
         // State changes earlier in this iteration can make a dependency
         // runnable after its array position has already been visited.
         if (!service->pid && service->desired && service->state==SVC_DOWN &&
-            can_start(id)) return now;
+            can_start(id,now)) return now;
         if (service->pid>0 && service->state==SVC_STARTING &&
             service->ready_deadline<next) next=service->ready_deadline;
         if (!service->pid && service->desired && service->state==SVC_BACKOFF &&
-            can_start(id) && service->retry_at<next) next=service->retry_at;
+            can_start(id,now) && service->retry_at<next) next=service->retry_at;
     }
     return next;
 }
@@ -525,10 +530,10 @@ int runServiceManager(void) {
         if (advance_registry(now)!=0) { fatal_error=1;break; }
         if (!reap_unmanaged()) { fatal_error=1;break; }
         if (shutdown_requested) break;
-        if (!refreshAfterStop(&now)) { fatal_error=1;break; }
+        if (!refreshClock(&now)) { fatal_error=1;break; }
         if (check_control(now)!=0) { fatal_error=1;break; }
         if (shutdown_requested) break;
-        if (!refreshAfterStop(&now)) { fatal_error=1;break; }
+        if (!refreshClock(&now)) { fatal_error=1;break; }
         long next=event_deadline(now);
         long mask=event_mask();
         if (next<0 || mask<0 || os_call(SYS_WAIT_EVENTS_UNTIL,mask,next,0)<0)

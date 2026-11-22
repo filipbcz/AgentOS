@@ -91,6 +91,9 @@ def verify(root, manifest_path):
         receipt.require(receipt.sha256(directory / "acceptance.json") == digest,
                         f"Acceptance receipt modified: {vm}")
         observed = receipt.verify_run(root, directory)
+        if observed["case"] == "signed":
+            receipt.require("idle.csv" in observed["artifacts"],
+                            f"Missing verified host/guest idle measurement: {vm}")
         profile = (observed["case"], observed["cpus"], observed["shell"],
                    observed["keyboard"], observed["boot_log_level"],
                    observed["boot_log_output"])

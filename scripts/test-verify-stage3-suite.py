@@ -43,6 +43,7 @@ class SuiteTests(unittest.TestCase):
                 "case": case, "cpus": cpus, "shell": shell, "keyboard": keyboard,
                 "boot_log_level": level, "boot_log_output": output,
                 "source_commit": SHA,
+                "artifacts": {"idle.csv": IMAGE} if case == "signed" else {},
             }
         self.summary_file = self.runs / "stage3-acceptance.json"
         self.save()
@@ -84,6 +85,11 @@ class SuiteTests(unittest.TestCase):
         vm = self.summary["runs"][0]["vm"]
         path = self.runs / vm / "acceptance.json"
         path.write_bytes(path.read_bytes() + b"tamper")
+        self.rejects()
+
+    def test_missing_timed_idle_evidence_fails(self):
+        signed = next(run for run in self.observed.values() if run["case"] == "signed")
+        signed["artifacts"].clear()
         self.rejects()
 
     def test_unexpected_profile_does_not_substitute_for_required_profile(self):

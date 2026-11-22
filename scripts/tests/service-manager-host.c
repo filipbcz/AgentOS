@@ -395,12 +395,13 @@ static void dependency_failure_and_restart_window(void) {
     struct record *flaky=&registry[SVC_FLAKY];
     flaky->state=SVC_RUNNING;
     flaky->attempts=3;
-    flaky->window_started=10;
+    flaky->ready_since=10;
     assert(failed(SVC_FLAKY,RESTART_WINDOW_MS+10,42)==0);
     assert(flaky->attempts==0 && flaky->state==SVC_BACKOFF &&
            flaky->retry_at==RESTART_WINDOW_MS+10+RESTART_BASE_MS);
-    assert(start_entry(SVC_FLAKY,flaky->retry_at)==1);
-    assert(flaky->attempts==1 && flaky->window_started==RESTART_WINDOW_MS+10);
+    ticks=flaky->retry_at;
+    assert(start_entry(SVC_FLAKY,ticks)==1);
+    assert(flaky->attempts==1 && flaky->ready_since<0);
     assert(flaky->pid>0);
     assert(kill_and_reap(flaky));
     reset();
@@ -409,7 +410,7 @@ static void dependency_failure_and_restart_window(void) {
     flaky=&registry[SVC_FLAKY];
     flaky->state=SVC_RUNNING;
     flaky->attempts=3;
-    flaky->window_started=10;
+    flaky->ready_since=10;
     assert(failed(SVC_FLAKY,RESTART_WINDOW_MS+9,42)==0);
     assert(flaky->state==SVC_FAILED && flaky->attempts==3);
 }
@@ -735,7 +736,7 @@ static void restartAndRecoveryUseTimeAfterRemoteStop(void) {
     reset();pService=startManagedChildForTest(SVC_CORE);
     never_ready=1;ticks=pService->ready_deadline;gKillDelayMs=800;
     assert(advance_registry(ticks)==0);
-    assert(ticks==1650 && pService->state==SVC_BACKOFF &&
+    assert(ticks==100+READY_TIMEOUT_MS+800 && pService->state==SVC_BACKOFF &&
            pService->retry_at==ticks+RESTART_BASE_MS);
 
     // A core exit first stops its live dependent. Its own restart backoff
@@ -769,6 +770,13 @@ static void readinessFailureKeepsTheCollectedNaturalStatus(void) {
     }
 }
 int main(void){
+    reset();
+    registry[SVC_CORE].state=SVC_RUNNING;registry[SVC_CORE].pid=101;
+    registry[SVC_FLAKY].state=SVC_RUNNING;registry[SVC_FLAKY].pid=102;
+    registry[SVC_FLAKY].ready_since=100;
+    assert(!can_start(SVC_SHELL,100));
+    assert(event_deadline(100)==100+RESTART_WINDOW_MS);
+    assert(can_start(SVC_SHELL,100+RESTART_WINDOW_MS));
     remoteKillWaitsForActualOwnerExit();
     failedKillWaitPreservesIdentityAndEndpoint();
     naturalExitWinsAcceptedKillWithoutStatusRewrite();

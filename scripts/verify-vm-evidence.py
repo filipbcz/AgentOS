@@ -27,7 +27,7 @@ VBox_VERSION = re.compile(r"7\.1\.12(?:r[0-9]+)?\Z")
 # "COM1.log" collides with reserved COM1 device name on Windows.
 ARTIFACTS = frozenset({
     "esp.raw", "esp.vdi", "changed.efi", "serial-com1.log", "com1-input.bin",
-    "display.png", "shell-before.png", "shell-keyboard.png", "failure.png"
+    "display.png", "shell-before.png", "shell-keyboard.png", "idle.csv", "failure.png"
 })
 BUILD_ARTIFACTS = frozenset({
     "agentos.unsigned.efi", "agentos.efi", "db.cer", "db.esl"
