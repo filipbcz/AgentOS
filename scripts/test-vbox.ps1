@@ -127,19 +127,21 @@ VBox convertfromraw "$dir\esp.raw" "$dir\esp.vdi" --format VDI
 VBox createvm --name $vm --basefolder $dir --ostype Other_64 --register
 VBox modifyvm $vm --memory 256 --cpus $Cpus --firmware efi64 --paravirt-provider minimal --x86-hpet on --graphicscontroller vmsvga --vram 16 --ioapic on --nic1 none --audio-enabled off --boot1 disk --boot2 none --boot3 none --boot4 none --uart1 0x3f8 4
 if ($Keyboard) { VBox modifyvm $vm --keyboard ps2 }
+# All acceptance profiles use the SAME host-owned COM1 capture. In file mode,
+# a fresh VBox EFI VM can reach the graphical shell without producing a
+# readable COM1 file; the former harness then timed out despite a working guest.
+# TCP capture also makes absent UART data distinguishable from a failed boot.
+$serial=@{Listener=$null; Client=$null; Stream=$null; Log=$null; Input=$null;
+          Buffer=(New-Object byte[] 4096); Text=(New-Object Text.StringBuilder)}
+$serial.Listener=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0)
+$serial.Listener.Start(1)
+$port=$serial.Listener.LocalEndpoint.Port
+$serial.Log=[IO.File]::Open("$dir\com1.log",'Create','Write','ReadWrite')
 if ($Shell) {
-    $serial=@{Listener=$null; Client=$null; Stream=$null; Log=$null; Input=$null;
-              Buffer=(New-Object byte[] 4096); Text=(New-Object Text.StringBuilder)}
-    $serial.Listener=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0)
-    $serial.Listener.Start(1)
-    $port=$serial.Listener.LocalEndpoint.Port
-    $serial.Log=[IO.File]::Open("$dir\com1.log",'Create','Write','ReadWrite')
     $serial.Input=[IO.File]::Open("$dir\com1-input.bin",'Create','Write','ReadWrite')
-    # VBox 7.1 tcpclient requires a listening socket before the VM starts.
-    VBox modifyvm $vm --uart-mode1 tcpclient "127.0.0.1:$port"
-} else {
-    VBox modifyvm $vm --uartmode1 file "$dir\com1.log"
 }
+# VBox 7.1 tcpclient requires an active listener before startvm.
+VBox modifyvm $vm --uart-mode1 tcpclient "127.0.0.1:$port"
 VBox storagectl $vm --name SATA --add sata --controller IntelAhci
 VBox storageattach $vm --storagectl SATA --port 0 --device 0 --type hdd --medium "$dir\esp.vdi"
 VBox modifynvram $vm inituefivarstore
@@ -153,39 +155,39 @@ $shutdownSucceeded=$false
 try {
     VBox startvm $vm --type headless
     $timer=[Diagnostics.Stopwatch]::StartNew()
-    if ($Shell) {
-        do {
-            Receive-Serial $serial
-            if ($null -ne $serial.Client) { break }
-            Start-Sleep -Milliseconds 25
-        } while ($timer.Elapsed.TotalSeconds -lt 10)
-        if ($null -eq $serial.Client) { throw 'VM did not connect its COM1 TCP client' }
-    }
+    # Connect before examining guest output, regardless of interactive mode.
+    do {
+        Receive-Serial $serial
+        if ($null -ne $serial.Client) { break }
+        Start-Sleep -Milliseconds 25
+    } while ($timer.Elapsed.TotalSeconds -lt 30)
+    if ($null -eq $serial.Client) { throw "COM1 TCP connection missing: $dir" }
     $idleStart=$null
     $found=$false
     do {
         Start-Sleep -Milliseconds 500
         Receive-Serial $serial
-        if (Test-Path "$dir\com1.log") {
-            if ($Case -eq 'signed' -and $null -eq $idleStart -and
-                (Select-String -LiteralPath "$dir\com1.log" -SimpleMatch 'AGENTOS IDLE BEGIN' -Quiet)) {
-                $idleStart=$timer.Elapsed.TotalSeconds
-            }
-            $found=[bool](Select-String -LiteralPath "$dir\com1.log" -SimpleMatch 'AGENTOS KERNEL OK STAGE 1' -Quiet)
-            if ($Case -eq 'signed' -and (Select-String -LiteralPath "$dir\com1.log" -Pattern 'SMP FAILED|FATAL VECTOR|ACPI DISCOVERY FAILED' -Quiet)) {
-                throw "Guest reported a boot failure: $dir"
-            }
+        $bootText=$serial.Text.ToString()
+        if ($Case -eq 'signed' -and $null -eq $idleStart -and
+            $bootText.Contains('AGENTOS IDLE BEGIN')) {
+            $idleStart=$timer.Elapsed.TotalSeconds
+        }
+        $found=$bootText.Contains('AGENTOS KERNEL OK STAGE 1')
+        if ($Case -eq 'signed' -and $bootText -match 'SMP FAILED|FATAL VECTOR|ACPI DISCOVERY FAILED') {
+            throw "Guest reported a boot failure: $dir"
         }
         if ($found -and $Case -eq 'signed') {
+            if ($null -eq $idleStart) { throw "Kernel marker preceded idle marker: $dir" }
             $hostIdleSeconds=$timer.Elapsed.TotalSeconds-$idleStart
             break
         }
         if ($found -and $Case -ne 'signed') { throw 'Firmware accepted a modified boot image' }
-        if ($Case -ne 'signed' -and (Test-Path "$dir\com1.log") -and
-            (Select-String -LiteralPath "$dir\com1.log" -Pattern 'Security Violation|Access Denied' -Quiet)) { break }
+        if ($Case -ne 'signed' -and $bootText -match 'Security Violation|Access Denied') { break }
     } while (($null -eq $idleStart -and $timer.Elapsed.TotalSeconds -lt 120) -or
              ($null -ne $idleStart -and ($timer.Elapsed.TotalSeconds - $idleStart) -lt 60))
-    if ($Case -eq 'signed' -and !$found) { throw "Kernel marker missing: $dir" }
+    if ($Case -eq 'signed' -and !$found) {
+        throw "Kernel marker missing in COM1 TCP capture (received $($serial.Text.Length) characters): $dir"
+    }
     if ($Case -eq 'signed') {
         # The guest always enters its operational TTY. Capture its explicit
         # readiness state, with a preserved boot header, rather than racing
@@ -288,8 +290,8 @@ try {
             & python "$PSScriptRoot/verify-boot-log.py" --log "$dir\com1.log" --level $LogLevel --output $LogOutput
             if ($LASTEXITCODE -ne 0) { throw 'BOOT.LOG policy violated during interactive session' }
         }
-    } elseif (!(Select-String -LiteralPath "$dir\com1.log" -Pattern 'BdsDxe: failed to load .*HARDDISK.*(Access Denied|Security Violation)' -Quiet)) {
-        throw "Missing firmware rejection; timeout is inconclusive: $dir"
+    } elseif ($serial.Text.ToString() -notmatch 'BdsDxe: failed to load [^\r\n]*HARDDISK[^\r\n]*(Access Denied|Security Violation)') {
+        throw "Missing firmware rejection in COM1 TCP capture; timeout is inconclusive: $dir"
     }
     $runSucceeded=$true
 } finally {
@@ -312,7 +314,7 @@ try {
     $runError=$_.Exception.Message
     throw
 } finally {
-    # Close and flush all captured COM1 bytes before measuring hashes.
+    # Close and flush host-owned COM1 capture before measuring hashes.
     try {
         if ($null -ne $serial) {
             foreach ($handle in @($serial.Stream,$serial.Client,$serial.Log,$serial.Input)) {
