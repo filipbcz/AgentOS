@@ -127,6 +127,9 @@ impl Oxford {
     unsafe fn exchange(&self, vector: u8, cpu: u8, byte: u8) -> Result<(), Error> {
         let uart = self.base + 4096;
         let before = RECEIVED.load(Ordering::Acquire);
+        // Wait for the previous transmit shift register to drain with the
+        // receiver's loopback disconnected. Only the ISR can consume RX.
+        until(|| rd::<u8>(uart + 5) & 0x40 != 0, b"Oxford transmitter busy")?;
         if rd::<u32>(self.base + 8) & 1 != 0 { return Err(b"Oxford RX already asserted"); }
         let msix = vector == MSIX;
         if msix {
@@ -135,6 +138,8 @@ impl Oxford {
                 return Err(b"MSI-X vector mask or stale pending bit");
             }
         }
+        wr(uart + 4, 0x18u8); // local loopback and OUT2
+        wr(self.base + 0x0c, 1u32);
         wr(uart, byte);
         asm!("sti", options(nostack));
         let result = (|| {
@@ -182,8 +187,7 @@ impl Oxford {
             wr(uart + 3, 3u8); // 8N1, DLAB clear
             wr(uart + 1, 0u8);
             wr(uart + 2, 0u8); // single-byte RX
-            wr(uart + 4, 0x18u8); // local loopback and OUT2
-            wr(self.base + 0x0c, 1u32);
+            wr(self.base + 0x10, 1u32); // arm the source separately for each transfer
             for (vector, cap) in [(MSI, m.msi), (MSIX, m.msix)] {
                 if cap == 0 { continue; }
                 m.route(vector, cpu)?;
@@ -194,9 +198,9 @@ impl Oxford {
             Ok(())
         })();
         wr(self.base + 0x10, 1u32);
-        wr(self.base + 4097, 0u8);
+        wr(self.base + 0x1000 + 1, 0u8);
         m.disable();
-        wr(self.base + 4100, 0u8);
+        wr(self.base + 0x1000 + 4, 0u8);
         wr(self.cfg + 4, cmd);
         result
     }
@@ -224,6 +228,10 @@ pub unsafe fn acknowledge() -> u64 {
     let pending = rd::<u32>(port.base + 8) & 1 != 0;
     let iir = rd::<u8>(uart + 2);
     if !pending || iir & 15 != 4 { return 0; }
+    // End this one-byte transfer while RBR still contains its byte. The
+    // transmitter may finish draining after RX is ready (VBox 7.1.12).
+    wr(port.base + 0x10, 1u32);
+    wr(uart + 4, 0u8);
     // LSR reads update the Oxford interrupt output. Consume RX before that
     // read so the still-asserted condition cannot request a second message.
     let byte = rd::<u8>(uart);

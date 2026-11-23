@@ -290,6 +290,8 @@ Připravit host testy algoritmů a selhání, integrační testy z uživatelské
 
 **Potřebuje 2; uživatelské zkoušky využijí 3.** Zprovoznit PCI/PCIe, přerušení MSI/MSI-X, DMA mapování a blokové rozhraní s dokončením a vyprázdněním zápisů. Podle pořadí v § 5.1 připojit AHCI a NVMe, transport VirtIO-net, xHCI, USB HID, USB Mass Storage a kabelový Realtek. Síťové ovladače zde stačí dovést k odeslání a příjmu rámce.
 
+**Přerušení od zařízení ve VirtualBoxu.** Po podepsaném sestavení spustit `scripts/test-vbox.ps1 -DeviceIrq -Cpus 1` a potom `scripts/test-vbox.ps1 -DeviceIrq -Cpus 2`. Profil na ICH9 přidá samostatný sériový řadič Oxford OXPCIe958 (`1415:c308`). Každý procesor dostane na vlastní APIC dva bajty přes MSI a další dva přes MSI-X. Obsluha ověří příčinu RX, přečte bajt, potvrdí uvolnění zdroje a ukončí přerušení v místním APIC. U MSI-X musí zpráva nejprve zůstat čekající při zamaskované položce tabulky a doručit se až po odmaskování. Ověřovač porovnává COM1 se skutečnou konfigurací PCI a kontroluje obsah, cílový CPU, vektor a počty obsluh.
+
 Vývoj může běžet souběžně s 3.1. Rozhraní pro dokončení I/O a probouzení musí respektovat možné přesunutí čekajícího procesu na jiné CPU. Aktivní DMA buffery mají stabilní fyzické rámce po celou dobu přístupu zařízení; demand paging ani migrace úlohy nesmějí tuto evidenci obejít. Po propojení s 3.1 se zopakují dotčené I/O a timeout testy.
 
 **Převzetí.** Na VDI, vyhrazeném USB a vyhrazeném NVMe zapsat vzorek do předem určené testovací oblasti, vynutit dokončení zápisu a po restartu porovnat obsah. Timeout či odpojení USB musí ukončit čekání, DMA buffery se smějí uvolnit až po zastavení přenosu. Na HP ověřit vestavěnou i USB klávesnici a přenos známého ethernetového rámce.
