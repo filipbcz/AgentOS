@@ -25,7 +25,8 @@ HEX_SHA = re.compile(r"[0-9a-f]{64}\Z")
 HEX_COMMIT = re.compile(r"[0-9a-f]{40}\Z")
 VBox_VERSION = re.compile(r"7\.1\.12(?:r[0-9]+)?\Z")
 # "COM1.log" collides with reserved COM1 device name on Windows.
-from ahci_block_evidence import ARTIFACTS as BLOCK_ARTIFACTS
+BLOCK_ARTIFACTS = frozenset({"block.raw", "block-after.raw", "block.vdi", "block-restart.txt", "block-db.esl",
+                             "block-write-com1.log", "block-write-vbox.log", "block-read-vbox.log"})
 
 ARTIFACTS = frozenset({
     "esp.raw", "esp.vdi", "changed.efi", "serial-com1.log", "com1-input.bin",
@@ -134,6 +135,7 @@ def verify_run(root, run_dir, require_pass=True, *, legacy_traces=False):
         require(image.get("profile") == "ahci-block" and data.get("ahci_block") is True and
                 data.get("pci_chipset") == "ich9", "Missing or inconsistent AHCI block profile")
         expected.update(BLOCK_ARTIFACTS)
+        require(artifacts.get("block-db.esl") == image["artifacts"]["db.esl"], "Cold boot trust database changed")
     dma_artifacts = {"dma.raw", "dma.vdi", "vbox-ahci.log"}
     if image.get("profile") == "ahci-dma" or "ahci_dma" in data or dma_artifacts & set(artifacts):
         require(image.get("profile") == "ahci-dma" and data.get("ahci_dma") is True and

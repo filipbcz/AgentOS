@@ -63,7 +63,7 @@ function Wait-Serial($State,[string]$Pattern,[int]$Offset=0,[int]$Seconds=10) {
         $clean=$text
         if ($null -ne $sessionPlan) { $clean=[regex]::Replace($text,$sessionPlan.kernel_event_pattern,'') }
         if ([regex]::IsMatch($clean,$Pattern)) { return }
-        if ($text -match 'SMP FAILED|FATAL VECTOR|SHELL FAILED') { throw 'Guest failed during shell test' }
+        if ($text -match 'SMP FAILED|FATAL VECTOR|SHELL FAILED|AGENTOS PCI FAILED|BdsDxe: No bootable option') { throw "Guest failed while waiting for $Pattern" }
         Start-Sleep -Milliseconds 25
     } while ($wait.Elapsed.TotalSeconds -lt $Seconds)
     throw "Timed out waiting for shell response: $Pattern"
@@ -277,11 +277,22 @@ try {
         VBox controlvm $vm poweroff
         $serial.Stream.Dispose()
         $serial.Log.Dispose()
+        # Release the powered-off session and reopen the same persistent VM
+        # definition. Both its enrolled varstore and disk attachments survive.
+        VBox unregistervm $vm
+        $vmRegistered=$false
+        VBox registervm "$dir\$vm\$vm.vbox"
+        $vmRegistered=$true
+        VBox modifynvram $vm queryvar --name=db "--filename=$dir\block-db.esl"
+        if ((Get-FileHash "$dir\block-db.esl").Hash -ne (Get-FileHash "$root\build\db.esl").Hash) {
+            throw 'Cold VM lost its enrolled signing certificate'
+        }
         $info=@(VBox showvminfo $vm --machinereadable)
         if ($info -notcontains 'VMState="poweroff"') { throw 'Write boot did not power off' }
         [IO.File]::WriteAllLines("$dir\block-restart.txt",[string[]]$info)
         Copy-Item -LiteralPath "$dir\$vm\Logs\VBox.log" -Destination "$dir\block-write-vbox.log"
         VBox clonemedium disk "$dir\block.vdi" "$dir\block-after.raw" --format RAW
+        VBox closemedium disk "$dir\block-after.raw"
         $serial=Open-Serial 'serial-com1.log'
     }
     VBox startvm $vm --type headless
@@ -483,7 +494,7 @@ try {
             $artifactHashes=@{}
             $blockFiles=@()
             if ($AhciBlock) {
-                $blockFiles=@('block.raw','block.vdi','block-after.raw','block-restart.txt',
+                $blockFiles=@('block.raw','block.vdi','block-after.raw','block-restart.txt','block-db.esl',
                               'block-write-com1.log','block-write-vbox.log','block-read-vbox.log')
                 if (Test-Path -LiteralPath "$dir\$vm\Logs\VBox.log") {
                     Copy-Item -LiteralPath "$dir\$vm\Logs\VBox.log" -Destination "$dir\block-read-vbox.log"

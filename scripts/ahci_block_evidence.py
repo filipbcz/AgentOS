@@ -3,9 +3,8 @@ import argparse
 import os
 from pathlib import Path
 import re
+import uuid
 
-ARTIFACTS = {"block.raw", "block-after.raw", "block.vdi", "block-restart.txt",
-             "block-write-com1.log", "block-write-vbox.log", "block-read-vbox.log"}
 SIZE = 8 << 20
 HEADER = 2048 * 512
 MAGIC = b"AgentOS-VDI-test"
@@ -69,6 +68,10 @@ def verify(run, cpus):
         else:
             require(stat("ReqsWrite") == stat("BytesWritten") == 0, "Recovery boot rewrote the disk")
     power = (run / "block-restart.txt").read_text("utf-8-sig").splitlines()
+    with (run / "block.vdi").open("rb") as disk:
+        disk.seek(392)  # VDI 1.1 creation UUID
+        medium = uuid.UUID(bytes_le=disk.read(16))
+    require(f'"SATA-ImageUUID-0-0"="{medium}"' in power, "Cold restart used another medium")
     require(f'name="{run.name}"' in power and 'VMState="poweroff"' in power and starts[0] < starts[1],
             "Missing cold power-off boundary between boots")
 
