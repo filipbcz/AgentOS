@@ -4,7 +4,7 @@
  * test affinity, forced-move syscall, fixed PID or shared userspace address
  * space. Every protocol wait and CPU-work phase has a finite HPET deadline. */
 enum { pWorkers = 4, pRounds = 6, pPage = 4096, pWorkMs = 150,
-       pSleepMs = 5000, pTimeoutMs = 15000, pArmWorkMs = 50, pKillMs = 5000 };
+       pSleepMs = 5000, pSleepWindowMs = 250, pTimeoutMs = 15000, pArmWorkMs = 50, pKillMs = 5000 };
 enum { pReady = 1, pWork = 2, pRead = 3, pFinish = 4, pExit = 5, pArm = 6 };
 static volatile unsigned char gMigrationMemory[8 * pPage] __attribute__((aligned(4096)));
 static int gChannels[pWorkers][2], gPipe[2];
@@ -164,18 +164,31 @@ static int workBefore(struct Progress *aProgress, unsigned long aLimit, unsigned
     for (;;) {
         long pNow = now();
         if (pNow < 0 || (unsigned long)pNow >= aDeadline) return 0;
-        if ((unsigned long)pNow >= aLimit) break;
+        if ((unsigned long)pNow >= aLimit) return 1;
         for (unsigned pIndex = 0; pIndex < 1024; ++pIndex) {
             ++aProgress->fWork;
             __asm__ volatile ("" : "+r"(aProgress->fWork) :: "memory");
         }
         if (!observe(aProgress) || os_call(SYS_YIELD, 0, 0, 0) != 0) return 0;
     }
-    return observe(aProgress);
 }
 
 static int workUntil(struct Progress *aProgress, unsigned long aLimit) {
     return workBefore(aProgress, aLimit, aProgress->fUntil);
+}
+
+static int sleepToDeadline(struct Progress *aProgress) {
+    long pWindow = (long)aProgress->fUntil - pSleepWindowMs;
+    if (os_call(SYS_SLEEP_UNTIL, pWindow, 0, 0) != 0) return 0;
+    long pEntry = now();
+    if (pEntry < pWindow || (unsigned long)pEntry >= aProgress->fUntil ||
+        os_call(SYS_SLEEP_UNTIL, aProgress->fUntil, 0, 0) != 0) return 0;
+    long pWake = now();
+    if (pWake < (long)aProgress->fUntil) return 0;
+    /* Publish the actual entry time after waking: serial output must not
+     * consume the interval between this measurement and the blocking call. */
+    aProgress->fNow = pEntry;
+    return event("SLEEP", aProgress, 0, 0);
 }
 
 /* A counter bracket proves this owner report remained current through the
@@ -269,12 +282,8 @@ static void worker(unsigned aSlot) {
             pReadDone = 1;
         } else if (pCommand.fKind == pFinish) {
             if (!pReadDone || pFinished ||
-                !workUntil(&pProgress, pProgress.fUntil - 250)) childExit(164);
-            pNow = now();
-            if (pNow < 0 || (unsigned long)pNow >= pProgress.fUntil) childExit(165);
-            pProgress.fNow = pNow;
-            if (!event("SLEEP", &pProgress, 0, 0) ||
-                os_call(SYS_SLEEP_UNTIL, pProgress.fUntil, 0, 0) != 0) childExit(165);
+                !workUntil(&pProgress, pProgress.fUntil - pWorkers * pSleepWindowMs)) childExit(164);
+            if (!sleepToDeadline(&pProgress)) childExit(165);
             ++pProgress.fWork;
             if (!observe(&pProgress)) childExit(166);
             pNow = now();
@@ -355,11 +364,16 @@ static int migrationScenario(void) {
         if (pChild < 0) return 174;
         if (pChild == 0) worker(pIndex);
         pChildren[pIndex].fPid = pChild;
+        if (!receiveReport(&pChildren[pIndex], pIndex, pReady, pTimeout)) return 176;
+        /* Give each worker a distinct final sleep window on a shared vCPU.
+         * Each deadline is still fixed by the child's clock before any work. */
+        if (pIndex + 1 < pWorkers &&
+            os_call(SYS_SLEEP_UNTIL, pChildren[pIndex].fReport.fNow + pSleepWindowMs, 0, 0) != 0)
+            return 176;
     }
     if (os_call(SYS_CLOSE, gPipe[1], 0, 0) != 0) return 175;
     for (unsigned pIndex = 0; pIndex < pWorkers; ++pIndex)
-        if (os_call(SYS_CLOSE, gChannels[pIndex][1], 0, 0) != 0 ||
-            !receiveReport(&pChildren[pIndex], pIndex, pReady, pTimeout)) return 176;
+        if (os_call(SYS_CLOSE, gChannels[pIndex][1], 0, 0) != 0) return 176;
     // READY proves these tasks have run and published their identities. Wake
     // only a same-CPU pair; all other children and then the parent stay asleep.
     for (unsigned pRound = 1; pRound <= pRounds; ++pRound) {

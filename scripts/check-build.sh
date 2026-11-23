@@ -126,6 +126,10 @@ printf 'Testing actual managed service worker timer readiness, IPC handshake and
     "$pRoot/scripts/tests/service-worker-host.c" -o "$pOut/service-worker-tests"
 "$pOut/service-worker-tests"
 
+"$pCc" -std=c11 -O2 -Wall -Wextra -Werror \
+    "$pRoot/scripts/tests/migration-host.c" -o "$pOut/migration-tests"
+"$pOut/migration-tests"
+
 printf 'Testing actual orphan program and failure injection with %s\n' "$pCc"
 "$pCc" -std=c11 -O2 -Wall -Wextra -Werror -fno-stack-protector \
     "$pRoot/scripts/tests/orphans-host.c" -o "$pOut/orphans-tests"
