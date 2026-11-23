@@ -342,7 +342,7 @@ impl Cpu {
         serial(b" APIC="); hex(id as u64);
         serial(b" TIMER-WAKES="); hex(wakes as u64);
         serial(b"\r\n");
-        Ok(())
+        crate::pci_irq::exercise(id)
     }
 
     unsafe fn schedule(&self) {
@@ -635,6 +635,18 @@ unsafe extern "C" fn timer_interrupt(context: *mut Context) -> usize {
         return user_fault(13, 0, 0);
     }
     cpu.switch(context as usize, true)
+}
+
+#[no_mangle]
+unsafe extern "C" fn pci_interrupt(context: *mut Context, vector: u8) -> usize {
+    let cpu = current_cpu();
+    let isr = 0x100 + 16 * (vector as usize / 32);
+    let bit = 1 << (vector % 32);
+    let in_service = cpu.apic.read(isr) & bit != 0;
+    let sample = crate::pci_irq::acknowledge();
+    cpu.apic.write(0xb0, 0);
+    crate::pci_irq::record(vector, cpu.apic.id(), in_service && cpu.apic.read(isr) & bit == 0, sample);
+    context as usize
 }
 
 #[no_mangle]

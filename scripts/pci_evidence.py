@@ -80,3 +80,26 @@ def verify_inventory(log, dump, chipset):
     for i, (observed, wanted) in enumerate(zip(actual, expected)):
         require(observed == wanted, f"PCI record {i + 1}: expected {wanted!r}, got {observed!r}")
     require(len(actual) == len(expected), "Missing or extra guest PCI records")
+
+
+def verify_device_irqs(log, dump, cpus):
+    devices = [bdf for bdf, data in config_spaces(dump).items() if data[:4] == b"\x15\x14\x08\xc3"]
+    require(len(devices) == 1, "Expected one Oxford PCIe serial controller")
+    bdf = devices[0]
+    require(re.search(rf"(?m)^AGENTOS PCI DEV {re.escape(bdf)} ID=1415:c308 CLASS=070002 "
+                      r"REV=.. MSI=(?!00)[0-9a-f]{2} MSIX=(?!00)[0-9a-f]{2} ", log),
+            "Oxford did not expose MSI and MSI-X")
+    tasks = re.findall(r"(?m)^AGENTOS TASK (BSP|AP) APIC=([0-9a-f]{16}) TIMER-WAKES=0000000000000003\r?$", log)
+    require([role for role, _ in tasks] == ["BSP"] + ["AP"] * (cpus - 1) and
+            len({apic for _, apic in tasks}) == cpus, "Missing CPU identity for device delivery")
+    expected = []
+    for _, apic in tasks:
+        cpu = int(apic, 16)
+        for mode, vector in (("MSI", 0xe4), ("MSIX", 0xe5)):
+            for pattern in (0x53, 0xa6):
+                byte = pattern ^ cpu ^ vector
+                expected.append(f"AGENTOS DEVICE IRQ BDF={bdf} MODE={mode} VECTOR={vector:02x} "
+                                f"APIC={cpu:02x} TX={byte:02x} RX={byte:02x} IIR=04 ACK=1 EOI=1 "
+                                f"PENDING={int(mode == 'MSIX')} COUNT={len(expected)+1}")
+    actual = [line for line in log.splitlines() if line.startswith("AGENTOS DEVICE IRQ")]
+    require(actual == expected, "Incomplete, duplicate or inconsistent PCI interrupt delivery")

@@ -104,6 +104,21 @@ keyboard_gate:
     save_context
     call keyboard_interrupt
     jmp restore_context
+.macro device_gate name, vector
+    .global \name
+\name:
+    test byte ptr [rsp+8], 3
+    jz 1f
+    swapgs
+1:
+    cld
+    save_context
+    mov esi, \vector
+    call pci_interrupt
+    jmp restore_context
+.endm
+device_gate msi_gate, 0xe4
+device_gate msix_gate, 0xe5
 reschedule_gate:
     test byte ptr [rsp+8], 3
     jz 1f

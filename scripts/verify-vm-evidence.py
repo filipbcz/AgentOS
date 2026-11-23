@@ -127,6 +127,9 @@ def verify_run(root, run_dir, require_pass=True, *, legacy_traces=False):
     require(isinstance(artifacts, dict) and set(artifacts) <= ARTIFACTS,
             "Run contains invalid artifact names")
     expected = {"esp.raw", "esp.vdi", "serial-com1.log", "display.png"}
+    if "device_irqs" in data:
+        require(data["device_irqs"] is True and data.get("pci_chipset") == "ich9",
+                "Invalid device interrupt profile")
     if "pci_chipset" in data or "vbox-pci.txt" in artifacts:
         require(case == "signed" and data.get("pci_chipset") in ("piix3", "ich9"),
                 "Missing or invalid VirtualBox PCI profile")
@@ -154,10 +157,13 @@ def verify_run(root, run_dir, require_pass=True, *, legacy_traces=False):
                 "VM boot image is not the signed build artifact")
         log = (run_dir / "serial-com1.log").read_bytes()
         if "pci_chipset" in data:
-            from pci_evidence import verify_inventory
+            from pci_evidence import verify_inventory, verify_device_irqs
             try:
-                verify_inventory(log.decode("ascii", errors="replace"),
-                                 (run_dir / "vbox-pci.txt").read_text("ascii"), data["pci_chipset"])
+                guest = log.decode("ascii", errors="replace")
+                dump = (run_dir / "vbox-pci.txt").read_text("ascii")
+                verify_inventory(guest, dump, data["pci_chipset"])
+                if data.get("device_irqs") or "1415-c308" in dump or "AGENTOS DEVICE IRQ" in guest:
+                    verify_device_irqs(guest, dump, cpus)
             except ValueError as error:
                 raise EvidenceError(f"Invalid PCI inventory: {error}") from error
         require(b"AGENTOS KERNEL OK STAGE 1\r\n" in log,

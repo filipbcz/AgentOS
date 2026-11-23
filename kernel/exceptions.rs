@@ -13,6 +13,8 @@ extern "C" {
     fn serial_gate();
     fn keyboard_gate();
     fn reschedule_gate();
+    fn msi_gate();
+    fn msix_gate();
     fn spurious_gate();
     fn load_descriptors(gdt: &Descriptor, idt: &Descriptor);
     fn probe_break() -> u64;
@@ -63,6 +65,8 @@ impl Descriptors {
         install_gate(crate::tty::VECTOR as usize, serial_gate as usize as u64);
         install_gate(crate::tty::KEYBOARD_VECTOR as usize, keyboard_gate as usize as u64);
         install_gate(0xe3, reschedule_gate as usize as u64);
+        install_gate(crate::pci_irq::MSI as usize, msi_gate as usize as u64);
+        install_gate(crate::pci_irq::MSIX as usize, msix_gate as usize as u64);
         install_gate(0xff, spurious_gate as usize as u64);
         Some(Self { gdt, idt })
     }

@@ -8,6 +8,7 @@ mod paging;
 mod exceptions;
 mod acpi;
 mod pci;
+mod pci_irq;
 mod smp;
 mod scheduler;
 mod stress;
@@ -154,7 +155,10 @@ pub unsafe extern "sysv64" fn kernel_main(info: &BootInfo) -> ! {
     }
     serial(b"AGENTOS IDT OK: BP PF-NULL PF-GUARD PF-WP PF-NX\r\n");
     log.event(1, b"PAGING AND IDT READY");
-    if let Err(reason) = pci::inventory(windows) {
+    if let Err(reason) = pci::inventory(windows).and_then(|device| {
+        if let Some(device) = device { device.bind(root, &mut frames)?; }
+        Ok(())
+    }) {
         serial(b"AGENTOS PCI FAILED: "); serial(reason); serial(b"\r\n"); halt();
     }
     if info.initramfs < info.image_base || info.initramfs.checked_add(info.initramfs_size)

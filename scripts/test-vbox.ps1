@@ -4,10 +4,15 @@ param([ValidateSet('signed','loader','kernel','initrd')][string]$Case='signed',
       [switch]$Keyboard,
       [ValidateSet('quiet','info','debug')][string]$LogLevel='info',
       [ValidateSet('serial','screen','both','none')][string]$LogOutput='both',
-      [ValidateSet('piix3','ich9')][string]$PciChipset)
+      [ValidateSet('piix3','ich9')][string]$PciChipset,
+      [switch]$DeviceIrq)
 $ErrorActionPreference='Stop'
 if ($Shell -and $Case -ne 'signed') { throw '-Shell requires the signed case' }
 if ($Keyboard -and !$Shell) { throw '-Keyboard requires -Shell' }
+if ($DeviceIrq) {
+    if ($PciChipset -and $PciChipset -ne 'ich9') { throw 'The message interrupt profile requires ICH9' }
+    $PciChipset='ich9'
+}
 if ($PciChipset -and $Case -ne 'signed') { throw 'PCI discovery requires a signed boot' }
 $root=Split-Path $PSScriptRoot
 Set-Location $root
@@ -203,6 +208,14 @@ VBox modifyvm $vm --memory 256 --cpus $Cpus --firmware efi64 --paravirt-provider
 if ($Keyboard) { VBox modifyvm $vm --keyboard ps2 }
 if ($PciChipset) {
     VBox modifyvm $vm --chipset $PciChipset --nic1 nat --nic-type1 virtio --cable-connected1 off
+}
+if ($DeviceIrq) {
+    $ox='VBoxInternal/Devices/oxpcie958uart/0'
+    VBox setextradata $vm "$ox/Trusted" 1
+    VBox setextradata $vm "$ox/PCIDeviceNo" 16
+    VBox setextradata $vm "$ox/PCIFunctionNo" 0
+    VBox setextradata $vm "$ox/Config/UartCount" 1
+    VBox setextradata $vm "$ox/Config/MsiXSupported" 1
 }
 # One local duplex pipe per VM carries the actual UART bytes in both directions.
 # Keep a read outstanding even while the harness checks an echo or screenshot.
@@ -451,6 +464,7 @@ try {
             }
             $receiptFile=Join-Path $dir 'acceptance.json'
             if ($PciChipset) { $receipt.pci_chipset=$PciChipset }
+            if ($DeviceIrq) { $receipt.device_irqs=$true }
             $tempReceipt="$receiptFile.tmp"
             $json=$receipt | ConvertTo-Json -Depth 6
             [IO.File]::WriteAllText($tempReceipt,$json+[Environment]::NewLine,[Text.UTF8Encoding]::new($false))

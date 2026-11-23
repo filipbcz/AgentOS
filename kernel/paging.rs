@@ -426,6 +426,30 @@ impl Tables<'_, '_> {
     }
 }
 
+// Add a device page before the first secondary CPU or process is started.
+pub unsafe fn map_device(root: usize, frames: &mut Frames<'_>, address: usize) -> Option<()> {
+    if address >= USER_BASE || address & (PAGE - 1) != 0 { return None; }
+    Tables { root, frames }.identity(address, PAGE, MMIO)?;
+    asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
+    Some(())
+}
+
+// Grant write access only to the driver's previously mapped ECAM function.
+pub unsafe fn claim_config(root: usize, page: usize) -> Option<()> {
+    if page >= USER_BASE || page & (PAGE - 1) != 0 { return None; }
+    let mut node = root;
+    for shift in [39, 30, 21] {
+        let entry = *((node as *const u64).add((page >> shift) & 511));
+        if entry & PRESENT == 0 || entry & (1 << 7) != 0 { return None; }
+        node = (entry & ADDRESS) as usize;
+    }
+    let leaf = (node as *mut u64).add((page >> 12) & 511);
+    if *leaf & !(1 << 5) != (page as u64 | (MMIO & !WRITE) | PRESENT) { return None; }
+    *leaf |= WRITE;
+    asm!("invlpg [{}]", in(reg) page, options(nostack, preserves_flags));
+    Some(())
+}
+
 /// Called once by the BSP with interrupts disabled, on the loader-provided stack.
 pub unsafe fn install(info: &BootInfo, map: &[u8], frames: &mut Frames<'_>, platform: &crate::acpi::Platform,
                       pci_windows: impl Iterator<Item=(usize, usize)>) -> Option<usize> {

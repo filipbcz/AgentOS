@@ -26,7 +26,7 @@ impl Config {
     }
 }
 
-struct Console;
+pub(super) struct Console;
 impl Write for Console {
     fn write_str(&mut self, text: &str) -> fmt::Result {
         unsafe { crate::serial(text.as_bytes()); }
@@ -87,7 +87,8 @@ fn capabilities(read: &impl Fn(u8) -> u32, header: u8) -> Result<[u8; 3], Error>
     Ok(caps)
 }
 
-unsafe fn scan(config: Config, segment: u16, first: u8, last: u8) -> Result<usize, Error> {
+unsafe fn scan(config: Config, segment: u16, first: u8, last: u8,
+               oxford: &mut Option<crate::pci_irq::Oxford>) -> Result<usize, Error> {
     let mut count = 0;
     for bus in first..=last {
         for device in 0..32 {
@@ -102,6 +103,14 @@ unsafe fn scan(config: Config, segment: u16, first: u8, last: u8) -> Result<usiz
                 let header = (read(0x0c) >> 16) as u8;
                 let layout = header & 0x7f;
                 let [msi, msix, pcie] = capabilities(&read, layout)?;
+                if id == 0xc308_1415 && class_rev >> 8 == 0x070002 && layout == 0 &&
+                    (msi != 0 || msix != 0) && oxford.is_none() {
+                    if let Config::Ecam(w) = &config {
+                        let bdf = (u16::from(bus) << 8) | u16::from(device * 8 + function);
+                        let page = w.base + (usize::from(bdf) << 12);
+                        *oxford = Some(crate::pci_irq::Oxford::discover(segment, bdf, page, msi, msix)?);
+                    }
+                }
                 let _ = write!(Console, "AGENTOS PCI DEV {:04x}:{:02x}:{:02x}.{} ID={:04x}:{:04x} CLASS={:06x} REV={:02x} MSI={:02x} MSIX={:02x} PCIE={:02x}\r\n",
                     segment, bus, device, function, id as u16, id >> 16, class_rev >> 8, class_rev as u8, msi, msix, pcie);
                 resources(&read, layout, &mut |slot, kind, address| {
@@ -116,16 +125,17 @@ unsafe fn scan(config: Config, segment: u16, first: u8, last: u8) -> Result<usiz
     Ok(count)
 }
 
-pub unsafe fn inventory(windows: &[Ecam]) -> Result<(), Error> {
+pub unsafe fn inventory(windows: &[Ecam]) -> Result<Option<crate::pci_irq::Oxford>, Error> {
+    let mut oxford = None;
     let count = if windows.is_empty() {
         crate::serial(b"AGENTOS PCI CONFIG CF8\r\n");
-        scan(Config::Ports, 0, 0, 255)?
+        scan(Config::Ports, 0, 0, 255, &mut oxford)?
     } else {
         crate::serial(b"AGENTOS PCI CONFIG ECAM\r\n");
         let mut count = 0;
-        for &w in windows { count += scan(Config::Ecam(w), w.segment, w.first, w.last)?; }
+        for &w in windows { count += scan(Config::Ecam(w), w.segment, w.first, w.last, &mut oxford)?; }
         count
     };
     let _ = write!(Console, "AGENTOS PCI END FUNCTIONS={}\r\n", count);
-    Ok(())
+    Ok(oxford)
 }
