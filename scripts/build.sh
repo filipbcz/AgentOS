@@ -2,6 +2,15 @@
 set -euo pipefail
 export LC_ALL=C SOURCE_DATE_EPOCH=0
 root=$(cd "$(dirname "$0")/.." && pwd)
+profile=default
+rust_flags=()
+if [[ $# -eq 1 && $1 == --ahci-dma ]]; then
+    profile=ahci-dma
+    rust_flags=(--cfg ahci_dma_acceptance)
+elif [[ $# -ne 0 ]]; then
+    echo 'Usage: build.sh [--ahci-dma]' >&2
+    exit 2
+fi
 while IFS='=' read -r package expected || [[ -n "$package" ]]; do
     if ! actual=$(dpkg-query -W -f='${Version}' "$package" 2>/dev/null); then
         printf 'Missing pinned build package: %s (required version %s)\n' "$package" "$expected" >&2
@@ -24,7 +33,7 @@ rust_version=$(/usr/bin/rustc --version)
 [[ "$rust_version" == "rustc 1.75.0 "* ]] || { printf 'Pinned Rust compiler mismatch: %s\n' "$rust_version" >&2; exit 1; }
 /usr/bin/rustc --edition 2021 --crate-type staticlib -C lto=fat -C opt-level=2 -C panic=abort \
     -C relocation-model=static -C no-redzone=yes -C overflow-checks=no \
-    --remap-path-prefix="$root"=/agentos "$root/kernel/main.rs" -o libkernel.a
+    "${rust_flags[@]}" --remap-path-prefix="$root"=/agentos "$root/kernel/main.rs" -o libkernel.a
 gcc-13 -c -o ap-start.o "$root/kernel/ap-start.S"
 ld --build-id=none --gc-sections -T "$root/kernel/kernel.ld" -o kernel.elf libkernel.a ap-start.o
 python3 "$root/scripts/verify-kernel-layout.py" kernel.elf
@@ -74,14 +83,14 @@ cert-to-efi-sig-list -g d7663630-f07a-4739-bc6f-b9f6d6444865 "$keys/db.crt" "$ou
 # A reproducible *receipt*, not a cryptographic attestation. Its hashes
 # bind the signed EFI to the current Git tree, toolchain lock and signing db.
 # Do not copy private signing keys or include wall-clock timestamps here.
-python3 - "$root" "$out" "$work/initramfs.cpio" <<'PY'
+python3 - "$root" "$out" "$work/initramfs.cpio" "$profile" <<'PY'
 import hashlib
 import json
 from pathlib import Path
 import subprocess
 import sys
 
-root, out, initrd = (Path(value) for value in sys.argv[1:])
+root, out, initrd = map(Path, sys.argv[1:4])
 def run(*cmd):
     return subprocess.check_output(cmd, cwd=root, text=True).strip()
 def digest(path):
@@ -92,6 +101,7 @@ def digest(path):
     return result.hexdigest()
 
 receipt = {
+    "profile": sys.argv[4],
     "schema": 1,
     "source_commit": run("git", "rev-parse", "--verify", "HEAD"),
     "source_clean": not bool(run("git", "status", "--porcelain", "--untracked-files=normal")),

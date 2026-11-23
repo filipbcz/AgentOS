@@ -5,12 +5,13 @@ param([ValidateSet('signed','loader','kernel','initrd')][string]$Case='signed',
       [ValidateSet('quiet','info','debug')][string]$LogLevel='info',
       [ValidateSet('serial','screen','both','none')][string]$LogOutput='both',
       [ValidateSet('piix3','ich9')][string]$PciChipset,
-      [switch]$DeviceIrq)
+      [switch]$DeviceIrq,
+      [switch]$AhciDma)
 $ErrorActionPreference='Stop'
 if ($Shell -and $Case -ne 'signed') { throw '-Shell requires the signed case' }
 if ($Keyboard -and !$Shell) { throw '-Keyboard requires -Shell' }
-if ($DeviceIrq) {
-    if ($PciChipset -and $PciChipset -ne 'ich9') { throw 'The message interrupt profile requires ICH9' }
+if ($DeviceIrq -or $AhciDma) {
+    if ($PciChipset -and $PciChipset -ne 'ich9') { throw 'The device profile requires ICH9' }
     $PciChipset='ich9'
 }
 if ($PciChipset -and $Case -ne 'signed') { throw 'PCI discovery requires a signed boot' }
@@ -187,6 +188,8 @@ if ($LASTEXITCODE -ne 0 -or $dirty.Count -ne 0) {
 & python "$PSScriptRoot/verify-vm-evidence.py" --root $root --commit $sourceCommit
 if ($LASTEXITCODE -ne 0) { throw 'Signed EFI build provenance check failed; rebuild from this exact commit' }
 $vboxVersion=(& $vbox --version).Trim()
+$buildProfile=(Get-Content -Raw (Join-Path $root 'build/build-provenance.json') | ConvertFrom-Json).profile
+if ([bool]$AhciDma -ne ($buildProfile -eq 'ahci-dma')) { throw 'Use build.sh --ahci-dma with -AhciDma, or build.sh for normal boots' }
 if ($LASTEXITCODE -ne 0 -or $vboxVersion -notmatch '^7\.1\.12(?:r[0-9]+)?$') {
     throw "VirtualBox 7.1.12 required for comparable acceptance: $vboxVersion"
 }
@@ -228,8 +231,20 @@ if ($Shell) {
     $serial.Input=[IO.File]::Open("$dir\com1-input.bin",'Create','Write','ReadWrite')
 }
 VBox modifyvm $vm --uart-mode1 client "\\.\pipe\$vm"
-VBox storagectl $vm --name SATA --add sata --controller IntelAhci
-VBox storageattach $vm --storagectl SATA --port 0 --device 0 --type hdd --medium "$dir\esp.vdi"
+if ($AhciDma) {
+    & python scripts/ahci_dma_evidence.py --create "$dir\dma.raw"
+    if ($LASTEXITCODE) { throw 'AHCI fixture creation failed' }
+    VBox convertfromraw "$dir\dma.raw" "$dir\dma.vdi" --format VDI
+    VBox storagectl $vm --name Boot --add ide --controller PIIX4
+    VBox storageattach $vm --storagectl Boot --port 0 --device 0 --type hdd --medium "$dir\esp.vdi"
+    VBox modifyvm $vm --iommu none
+    VBox bandwidthctl $vm add DmaDisk --type disk --limit 32768
+    VBox storagectl $vm --name SATA --add sata --controller IntelAhci --portcount 1 --hostiocache off
+    VBox storageattach $vm --storagectl SATA --port 0 --device 0 --type hdd --medium "$dir\dma.vdi" --bandwidthgroup DmaDisk
+} else {
+    VBox storagectl $vm --name SATA --add sata --controller IntelAhci
+    VBox storageattach $vm --storagectl SATA --port 0 --device 0 --type hdd --medium "$dir\esp.vdi"
+}
 VBox modifynvram $vm inituefivarstore
 # Seed the db variable (including UEFI attributes), then replace its contents in this new VM.
 VBox modifynvram $vm enrollmssignatures
@@ -255,7 +270,7 @@ try {
             $idleStart=$timer.Elapsed.TotalSeconds
         }
         $found=$bootText.Contains('AGENTOS KERNEL OK STAGE 1')
-        if ($Case -eq 'signed' -and $bootText -match 'SMP FAILED|FATAL VECTOR|ACPI DISCOVERY FAILED') {
+        if ($Case -eq 'signed' -and $bootText -match 'SMP FAILED|FATAL VECTOR|ACPI DISCOVERY FAILED|AGENTOS PCI FAILED') {
             throw "Guest reported a boot failure: $dir"
         }
         if ($found -and $Case -eq 'signed') {
@@ -434,7 +449,7 @@ try {
             $artifactHashes=@{}
             foreach ($name in @('esp.raw','esp.vdi','changed.efi','serial-com1.log',
                                 'com1-input.bin','display.png','shell-before.png',
-                                'shell-keyboard.png','idle.csv','failure.png','vbox-pci.txt')) {
+                                'shell-keyboard.png','idle.csv','failure.png','vbox-pci.txt','dma.raw','dma.vdi')) {
                 $file=Join-Path $dir $name
                 if (Test-Path -LiteralPath $file -PathType Leaf) {
                     $artifactHashes[$name]=(Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -465,6 +480,7 @@ try {
             $receiptFile=Join-Path $dir 'acceptance.json'
             if ($PciChipset) { $receipt.pci_chipset=$PciChipset }
             if ($DeviceIrq) { $receipt.device_irqs=$true }
+            if ($AhciDma) { $receipt.ahci_dma=$true }
             $tempReceipt="$receiptFile.tmp"
             $json=$receipt | ConvertTo-Json -Depth 6
             [IO.File]::WriteAllText($tempReceipt,$json+[Environment]::NewLine,[Text.UTF8Encoding]::new($false))

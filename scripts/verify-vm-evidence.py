@@ -27,7 +27,8 @@ VBox_VERSION = re.compile(r"7\.1\.12(?:r[0-9]+)?\Z")
 # "COM1.log" collides with reserved COM1 device name on Windows.
 ARTIFACTS = frozenset({
     "esp.raw", "esp.vdi", "changed.efi", "serial-com1.log", "com1-input.bin",
-    "display.png", "shell-before.png", "shell-keyboard.png", "idle.csv", "failure.png", "vbox-pci.txt"
+    "display.png", "shell-before.png", "shell-keyboard.png", "idle.csv", "failure.png", "vbox-pci.txt",
+    "dma.raw", "dma.vdi"
 })
 BUILD_ARTIFACTS = frozenset({
     "agentos.unsigned.efi", "agentos.efi", "db.cer", "db.esl"
@@ -127,6 +128,10 @@ def verify_run(root, run_dir, require_pass=True, *, legacy_traces=False):
     require(isinstance(artifacts, dict) and set(artifacts) <= ARTIFACTS,
             "Run contains invalid artifact names")
     expected = {"esp.raw", "esp.vdi", "serial-com1.log", "display.png"}
+    if image.get("profile") == "ahci-dma" or "ahci_dma" in data or {"dma.raw", "dma.vdi"} & set(artifacts):
+        require(image.get("profile") == "ahci-dma" and data.get("ahci_dma") is True and
+                data.get("pci_chipset") == "ich9", "Missing or inconsistent AHCI DMA profile")
+        expected.update(("dma.raw", "dma.vdi"))
     if "device_irqs" in data:
         require(data["device_irqs"] is True and data.get("pci_chipset") == "ich9",
                 "Invalid device interrupt profile")
@@ -156,6 +161,12 @@ def verify_run(root, run_dir, require_pass=True, *, legacy_traces=False):
         require(data.get("boot_image_sha256") == image["artifacts"]["agentos.efi"],
                 "VM boot image is not the signed build artifact")
         log = (run_dir / "serial-com1.log").read_bytes()
+        if data.get("ahci_dma"):
+            from ahci_dma_evidence import verify
+            try:
+                verify(log.decode("ascii", errors="replace"), run_dir / "dma.raw")
+            except ValueError as error:
+                raise EvidenceError(f"Invalid AHCI DMA evidence: {error}") from error
         if "pci_chipset" in data:
             from pci_evidence import verify_inventory, verify_device_irqs
             try:

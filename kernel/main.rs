@@ -9,6 +9,8 @@ mod exceptions;
 mod acpi;
 mod pci;
 mod pci_irq;
+mod dma;
+mod ahci;
 mod smp;
 mod scheduler;
 mod stress;
@@ -155,8 +157,11 @@ pub unsafe extern "sysv64" fn kernel_main(info: &BootInfo) -> ! {
     }
     serial(b"AGENTOS IDT OK: BP PF-NULL PF-GUARD PF-WP PF-NX\r\n");
     log.event(1, b"PAGING AND IDT READY");
-    if let Err(reason) = pci::inventory(windows).and_then(|device| {
-        if let Some(device) = device { device.bind(root, &mut frames)?; }
+    if let Err(reason) = pci::inventory(windows).and_then(|devices| {
+        if let Some(device) = devices.oxford { device.bind(root, &mut frames)?; }
+        if cfg!(ahci_dma_acceptance) {
+            devices.ahci.ok_or(b"AHCI missing" as &[u8])?.exercise(root, &mut frames)?;
+        }
         Ok(())
     }) {
         serial(b"AGENTOS PCI FAILED: "); serial(reason); serial(b"\r\n"); halt();
