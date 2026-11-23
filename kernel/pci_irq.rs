@@ -156,6 +156,7 @@ impl Oxford {
         let count = RECEIVED.load(Ordering::Acquire);
         if count != before + 1 || rx != byte || iir & 15 != 4 || delivered != vector ||
             apic != cpu || service != 3 || (msix && rd::<u32>(self.messages.pending) & 1 != 0) {
+            let _ = writeln!(Console, "DEVICE IRQ MISMATCH vector={vector:02x} cpu={cpu} tx={byte:02x} sample={sample:016x} before={before} after={count}\r");
             return Err(b"Oxford interrupt source, vector, CPU, data or EOI mismatch");
         }
         let _ = writeln!(Console, "AGENTOS DEVICE IRQ BDF={:04x}:{:02x}:{:02x}.{} MODE={} VECTOR={:02x} APIC={:02x} TX={:02x} RX={:02x} IIR={:02x} ACK={} EOI={} PENDING={} COUNT={}\r",
@@ -171,11 +172,12 @@ impl Oxford {
         if (m.msi != 0 && rd::<u16>(m.msi + 2) & 1 != 0) ||
             (m.msix != 0 && rd::<u16>(m.msix + 2) & ENABLE_X != 0) { return Err(b"Oxford already routed"); }
         wr(self.cfg + 4, cmd | INTX_DISABLE | 2);
+        if rd::<u16>(self.cfg + 4) & (INTX_DISABLE | 2) != INTX_DISABLE | 2 ||
+            rd::<u32>(self.base) != 0x00070002 || rd::<u32>(self.base + 4) == 0 {
+            wr(self.cfg + 4, cmd);
+            return Err(b"Oxford memory decode or device identity");
+        }
         let result = (|| {
-            if rd::<u16>(self.cfg + 4) & (INTX_DISABLE | 2) != INTX_DISABLE | 2 ||
-                rd::<u32>(self.base) != 0x00070002 || rd::<u32>(self.base + 4) == 0 {
-                return Err(b"Oxford memory decode or device identity" as Error);
-            }
             let uart = self.base + 4096;
             wr(uart + 3, 3u8); // 8N1, DLAB clear
             wr(uart + 1, 0u8);
@@ -221,9 +223,12 @@ pub unsafe fn acknowledge() -> u64 {
     let uart = port.base + 4096;
     let pending = rd::<u32>(port.base + 8) & 1 != 0;
     let iir = rd::<u8>(uart + 2);
-    if !pending || iir & 15 != 4 || rd::<u8>(uart + 5) & 0x1f != 1 { return 0; }
+    if !pending || iir & 15 != 4 { return 0; }
+    // LSR reads update the Oxford interrupt output. Consume RX before that
+    // read so the still-asserted condition cannot request a second message.
     let byte = rd::<u8>(uart);
-    let cleared = rd::<u32>(port.base + 8) & 1 == 0 && rd::<u8>(uart + 2) & 1 != 0;
+    let cleared = rd::<u8>(uart + 5) & 0x1f == 0 && rd::<u32>(port.base + 8) & 1 == 0 &&
+                  rd::<u8>(uart + 2) & 1 != 0;
     u64::from(byte) | (u64::from(iir) << 8) | (u64::from(cleared) << 32)
 }
 
