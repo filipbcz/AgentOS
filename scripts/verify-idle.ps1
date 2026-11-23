@@ -1,7 +1,7 @@
 param([Parameter(Mandatory)][string]$RunDir, [Parameter(Mandatory)][string[]]$ApicIds,
       [Parameter(Mandatory)][double]$HostSeconds)
 $ErrorActionPreference = 'Stop'
-$log = Join-Path $RunDir 'com1.log'
+$log = Join-Path $RunDir 'serial-com1.log'
 function Record([string]$pattern) {
     $hits = @(Select-String -LiteralPath $log -Pattern $pattern)
     if ($hits.Count -ne 1) { throw "Expected one record matching $pattern in $log" }

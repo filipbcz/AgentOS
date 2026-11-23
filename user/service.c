@@ -12,6 +12,9 @@ int serve(void) {
     struct ipc_peer peer = incoming.sender;
     if (!peer.pid || peer.pid == self || peer.uid != 1000 || peer.gid != 1000 ||
         incoming.data.claimed.pid != 0 || incoming.data.claimed.uid != 0 || incoming.data.claimed.gid != 0) return 33;
+    // The authenticated IPC peer is our parent; an unprivileged service must
+    // never be able to terminate that process with SYS_KILL.
+    if (os_call(SYS_KILL, peer.pid, 0, 0) != -1) return 36;
     if (!report("AGENTOS IPC SERVICE PID=", peer, self)) return 34;
     struct response reply = {answer(incoming.data.challenge), peer};
     return os_call(SYS_IPC_SEND, fd, (long)&reply, sizeof(reply)) == sizeof(reply) ? 0 : 35;

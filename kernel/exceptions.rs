@@ -10,6 +10,9 @@ extern "C" {
     static nx_target: u8;
     static probe_pass: u8;
     fn timer_gate();
+    fn serial_gate();
+    fn keyboard_gate();
+    fn reschedule_gate();
     fn spurious_gate();
     fn load_descriptors(gdt: &Descriptor, idt: &Descriptor);
     fn probe_break() -> u64;
@@ -25,9 +28,16 @@ pub struct Descriptors { gdt: usize, idt: usize }
 
 impl Descriptors {
     pub unsafe fn new(frames: &mut Frames<'_>) -> Option<Self> {
-        let idt = frames.alloc_zeroed()?.into_address();
-        let gdt = frames.alloc_zeroed()?.into_address();
-        let emergency_top = frames.alloc()?.into_address() + 4096;
+        let idt = frames.alloc_zeroed()?;
+        let Some(gdt) = frames.alloc_zeroed() else {
+            frames.release(idt); return None;
+        };
+        let Some(emergency) = crate::stack::KernelStack::allocate(frames) else {
+            frames.release(gdt); frames.release(idt); return None;
+        };
+        let idt = idt.into_address();
+        let gdt = gdt.into_address();
+        let emergency_top = emergency.into_top();
         // GDT and the 104-byte long-mode TSS share a permanently owned frame.
         let tss = gdt + 64;
         ptr::write_unaligned((tss + 36) as *mut u64, emergency_top as u64); // IST1
@@ -50,6 +60,9 @@ impl Descriptors {
         };
         for (i, &addr) in vectors.iter().enumerate() { install_gate(i, addr); }
         install_gate(0xe0, timer_gate as usize as u64);
+        install_gate(crate::tty::VECTOR as usize, serial_gate as usize as u64);
+        install_gate(crate::tty::KEYBOARD_VECTOR as usize, keyboard_gate as usize as u64);
+        install_gate(0xe3, reschedule_gate as usize as u64);
         install_gate(0xff, spurious_gate as usize as u64);
         Some(Self { gdt, idt })
     }
@@ -75,6 +88,13 @@ pub(super) unsafe fn hex(value: u64) {
 #[no_mangle]
 unsafe extern "C" fn dispatch_exception(trap: &mut Trap, cr2: u64, operand: u64) -> usize {
     if trap.cs & 3 == 3 && matches!(trap.vector, 0 | 1 | 3..=7 | 10..=14 | 16 | 17 | 19 | 21) {
+        // The pager checks the complete hardware error code and region
+        // permissions before handling a demand page or an explicit COW leaf.
+        // Protection/guard faults still terminate only the offending task.
+        if trap.vector == 14 &&
+           crate::smp::userPageFault(cr2 as usize, trap.error) {
+            return 0; // IRETQ retries the faulting user instruction
+        }
         return crate::smp::user_fault(trap.vector, trap.error, cr2);
     }
     let nx = ptr::addr_of!(nx_target) as u64;
@@ -101,3 +121,7 @@ pub unsafe fn probe(guard: u64) -> bool {
     probe_break() == 1 && probe_read(0) == 1 && probe_read(guard) == 1 &&
         probe_ro(ro) == 1 && probe_nx(ro) == 1
 }
+
+/// Exercise a real supervisor page fault on either unmapped kernel-stack
+/// guard. The narrowly matched probe instruction is the only recovery path.
+pub unsafe fn probe_guard(guard: usize) -> bool { probe_read(guard as u64) == 1 }

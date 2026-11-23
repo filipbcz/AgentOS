@@ -1,5 +1,6 @@
+#![allow(non_snake_case)]
 use crate::{frames::Frames, paging::{UserSpace, USER_BASE, USER_END}};
-use core::{ptr, sync::atomic::{AtomicUsize, Ordering}};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 pub const EFAULT: isize = -14;
 const ENOEXEC: isize = -8;
@@ -8,7 +9,12 @@ const PAGE: usize = 4096;
 const STACK_PAGES: usize = 4;
 pub const STACK: usize = USER_END - 16;
 
-pub struct Programs { pub vfs: crate::vfs::Vfs, pub kernel_root: usize, next_pid: AtomicUsize }
+pub struct Programs {
+    pub vfs: crate::vfs::Vfs,
+    pub kernel_root: usize,
+    next_pid: AtomicUsize,
+    pub fRegistry: crate::lifecycle::Registry,
+}
 #[derive(Clone, Copy)]
 pub struct Credentials { pub uid: u32, pub gid: u32 }
 impl Credentials {
@@ -19,9 +25,36 @@ pub struct Process {
     pub space: UserSpace,
     pub entry: usize,
     pub pid: usize,
+    /// Owner-local cache. Cross-CPU parent/status decisions use fLifecycle;
+    /// synchronizeMetadata refreshes this cache at kernel entry.
     pub parent: usize,
     pub status: Option<usize>,
     pub files: crate::files::Descriptors,
+    pub fLifecycle: crate::lifecycle::Entry,
+}
+
+impl Process {
+    pub fn synchronizeMetadata(&mut self, aFrames: &mut Frames<'_>) -> crate::lifecycle::Snapshot {
+        let pState = self.fLifecycle.snapshot(aFrames);
+        self.parent = pState.fParent;
+        self.status = pState.fStatus;
+        pState
+    }
+
+    pub fn finish(&mut self, aFrames: &mut Frames<'_>, aStatus: usize) {
+        if self.status.is_some() { return; }
+        self.files.close_all(aFrames);
+        self.fLifecycle.finish(aFrames, aStatus);
+        self.synchronizeMetadata(aFrames);
+    }
+
+    /// The owner must have switched away from this address space and its
+    /// kernel stack before reclaiming a process marked collected remotely.
+    pub fn release(self, aFrames: &mut Frames<'_>) {
+        self.files.release(aFrames);
+        unsafe { self.space.release(aFrames); }
+        self.fLifecycle.release(aFrames);
+    }
 }
 
 fn word<const N: usize>(data: &[u8], at: usize) -> Option<[u8; N]> {
@@ -31,27 +64,45 @@ fn u16_at(data: &[u8], at: usize) -> Option<u16> { Some(u16::from_le_bytes(word(
 fn u64_at(data: &[u8], at: usize) -> Option<usize> { Some(u64::from_le_bytes(word(data, at)?) as usize) }
 
 impl Programs {
-    pub fn new(archive: &'static [u8], kernel_root: usize) -> Self {
-        Self { vfs: crate::vfs::Vfs::new(archive), kernel_root, next_pid: AtomicUsize::new(1) }
+    /// Reserve a never-reused process ID, including across fork and spawn.
+    pub fn allocate_pid(&self) -> Result<usize, isize> {
+        self.next_pid.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+            |p| (p < isize::MAX as usize).then_some(p + 1)).map_err(|_| -11isize)
     }
 
+    pub fn new(archive: &'static [u8], kernel_root: usize) -> Self {
+        Self { vfs: crate::vfs::Vfs::new(archive), kernel_root, next_pid: AtomicUsize::new(1),
+            fRegistry: crate::lifecycle::Registry::new() }
+    }
+
+    /// Programs must remain at a stable address while any returned Process
+    /// lives. Production Programs is allocated once before CPU startup.
     pub unsafe fn load(&self, frames: &mut Frames<'_>, name: &[u8], parent: usize, credentials: Credentials) -> Result<Process, isize> {
         let elf = self.vfs.file(name)?;
+        // Discriminate the native ABI before even allocating a private root.
+        // Rejecting an invalid/unmarked note needs no page-table/data frames.
+        if !crate::native_abi::validate(elf) { return Err(ENOEXEC); }
         let space = UserSpace::new(frames, self.kernel_root).ok_or(ENOMEM)?;
-        let result = load_elf(&space, frames, elf).and_then(|entry| {
-            let pid = self.next_pid.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
-                |p| (p < isize::MAX as usize).then_some(p+1)).map_err(|_| -11isize)?;
+        let result = load_elf(&space, elf).and_then(|entry| {
+            let pid = self.allocate_pid()?;
             let files = crate::files::Descriptors::new(frames).ok_or(ENOMEM)?;
-            Ok((entry, pid, files))
+            let lifecycle = match self.fRegistry.register(frames, pid, parent) {
+                Ok(pEntry) => pEntry,
+                Err(pError) => { files.release(frames); return Err(pError); }
+            };
+            Ok((entry, pid, files, lifecycle))
         });
         match result {
-            Ok((entry, pid, files)) => Ok(Process { space, entry, pid, parent, credentials, status: None, files }),
+            Ok((entry, pid, files, lifecycle)) => Ok(Process {
+                space, entry, pid, parent, credentials, status: None, files, fLifecycle: lifecycle,
+            }),
             Err(error) => { space.release(frames); Err(error) }
         }
     }
 }
 
-unsafe fn load_elf(space: &UserSpace, frames: &mut Frames<'_>, elf: &[u8]) -> Result<usize, isize> {
+unsafe fn load_elf(space: &UserSpace, elf: &'static [u8]) -> Result<usize, isize> {
+    // Programs::load validated the native ABI before creating this space.
     if elf.get(..7) != Some(b"\x7fELF\x02\x01\x01") || u16_at(elf, 16) != Some(2) ||
         u16_at(elf, 18) != Some(62) || word(elf, 20) != Some(1u32.to_le_bytes()) ||
         u16_at(elf, 52) != Some(64) || u16_at(elf, 54) != Some(56) { return Err(ENOEXEC); }
@@ -80,19 +131,13 @@ unsafe fn load_elf(space: &UserSpace, frames: &mut Frames<'_>, elf: &[u8]) -> Re
         if va < USER_BASE || end > USER_END - (STACK_PAGES+1)*PAGE || va % PAGE != offset % PAGE ||
             !matches!(flags, 4 | 5 | 6) { return Err(ENOEXEC); }
         if flags == 5 && (va..va+filesz).contains(&entry) { executable_entry = true; }
-        let first = va & !(PAGE-1);
-        for page in (first..end).step_by(PAGE) {
-            let physical = space.map(frames, page, flags == 6, flags == 5)?;
-            let start = page.max(va);
-            let stop = (page+PAGE).min(va+filesz);
-            if start < stop {
-                ptr::copy_nonoverlapping(contents.as_ptr().add(start-va), (physical+start-page) as *mut u8, stop-start);
-            }
-        }
+        // Initramfs remains immutable and resident for the system lifetime.
+        // Keep its backing slice and the segment's zero-fill extent; the
+        // first authorized user or syscall access will populate each page.
+        space.reserve(va, memsz, contents, flags == 6, flags == 5)?;
     }
     if !executable_entry { return Err(ENOEXEC); }
-    for page in (USER_END - STACK_PAGES*PAGE..USER_END).step_by(PAGE) {
-        space.map(frames, page, true, false)?;
-    }
+    // The page below the fixed stack extent remains outside all regions.
+    space.reserve(USER_END - STACK_PAGES*PAGE, STACK_PAGES*PAGE, &[], true, false)?;
     Ok(entry)
 }

@@ -1,0 +1,3 @@
+# Keep text identical in Windows checkouts and WSL/Linux builds.
+# Bash scripts and toolchain.lock require LF; auto preserves binary files.
+* text=auto eol=lf

@@ -1,1 +1,5 @@
 /build/
+
+# Transient files produced by Python regression tests.
+__pycache__/
+*.py[cod]

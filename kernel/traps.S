@@ -36,9 +36,16 @@ isr_common:
         pop \reg
     .endr
     add rsp, 16
-    iretq
+    // Successful user #PF/COW retry takes this direct IRETQ path rather
+    // than restore_context. Undo the entry SWAPGS using saved CS at RSP+8.
+    // Without it, the next user SYSCALL swaps to GS base 0 and crashes at
+    // native_syscall's first gs:[8] access (observed CR2=0x8).
+    test byte ptr [rsp+8], 3
+    jz 9f
+    swapgs
+9:  iretq
 
-.global timer_gate, spurious_gate, wait_for_irq, after_hlt
+.global timer_gate, serial_gate, keyboard_gate, reschedule_gate, spurious_gate, wait_for_irq, after_hlt
 // Only the measured HLT path leaves RDI pointing at a pair of timestamps.
 // Timestamp before saving SIMD state or acknowledging the interrupt, so its
 // handler and return path are charged to active time.
@@ -78,8 +85,38 @@ timer_gate:
     .endm
     save_context
     call timer_interrupt
+    jmp restore_context
+serial_gate:
+    test byte ptr [rsp+8], 3
+    jz 1f
+    swapgs
+1:
+    cld
+    save_context
+    call serial_interrupt
+    jmp restore_context
+keyboard_gate:
+    test byte ptr [rsp+8], 3
+    jz 1f
+    swapgs
+1:
+    cld
+    save_context
+    call keyboard_interrupt
+    jmp restore_context
+reschedule_gate:
+    test byte ptr [rsp+8], 3
+    jz 1f
+    swapgs
+1:
+    cld
+    save_context
+    call reschedule_interrupt
 restore_context:
     mov rsp, rax
+    // A queue may publish the outgoing stack only after RSP has actually
+    // left it. FXSAVE/GPR state remains intact above this callback's stack.
+    call finish_context_switch
     fxrstor64 [rsp]
     add rsp, 512
     .irp reg,r15,r14,r13,r12,rbp,rbx,r11,r10,r9,r8,rdi,rsi,rdx,rcx,rax

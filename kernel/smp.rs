@@ -1,7 +1,8 @@
+#![allow(non_snake_case, non_upper_case_globals)]
 use crate::{acpi::Platform, exceptions::{hex, Descriptors}, frames::{Exhaustion, Frames, SharedFrames},
-            halt, out, process::{Programs, EFAULT}, scheduler::{Context, Queue}, serial, stress::{self, Load}};
+            halt, out, process::Programs, scheduler::{Context, Queue}, serial, stress::{self, Load}};
 use core::{arch::{asm, x86_64::__cpuid}, cell::UnsafeCell, hint::spin_loop, ptr,
-           sync::atomic::{fence, AtomicU32, AtomicUsize, Ordering}};
+           sync::atomic::{fence, AtomicBool, AtomicU32, AtomicUsize, Ordering}};
 
 extern "C" {
     static ap_start: u8;
@@ -26,6 +27,130 @@ const IDLE_PHASE: u32 = 3;
 const OOM_CHECKED: u32 = 4;
 const IDLE_FINISHED: u32 = 5;
 const PROCESSES_FINISHED: u32 = 6;
+const RUNTIME_PHASE: u32 = 4;
+const RESCHEDULE: u32 = 0xe3;
+const EMPTY_CPU: AtomicUsize = AtomicUsize::new(0);
+static gCpus: [AtomicUsize; 255] = [EMPTY_CPU; 255];
+static gOnlineCount: AtomicUsize = AtomicUsize::new(0);
+static gRuntimeEnabled: AtomicBool = AtomicBool::new(false);
+static gPmPort: AtomicUsize = AtomicUsize::new(0);
+static gTerminal: AtomicUsize = AtomicUsize::new(0);
+static gMigrations: AtomicUsize = AtomicUsize::new(0);
+static gRemoteWakeups: AtomicUsize = AtomicUsize::new(0);
+
+// All runqueue entries, including selection and the retiring-stack hazard,
+// are protected by their own CPU gate. IRQs must already be masked. A transfer
+// takes two gates in APIC-ID order; no frame/TTY lock may precede a queue gate.
+struct QueueGuard<'a> { fCpu: &'a Cpu }
+impl core::ops::Deref for QueueGuard<'_> {
+    type Target = Queue;
+    fn deref(&self) -> &Queue { unsafe { &*self.fCpu.queue.get() } }
+}
+impl core::ops::DerefMut for QueueGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Queue { unsafe { &mut *self.fCpu.queue.get() } }
+}
+impl Drop for QueueGuard<'_> {
+    fn drop(&mut self) {
+        self.fCpu.fRunnable.store(self.runnableCount(), Ordering::Release);
+        self.fCpu.fHasSlot.store(self.hasFreeSlot(), Ordering::Release);
+        self.fCpu.fQueueLocked.store(false, Ordering::Release);
+    }
+}
+
+// Runtime diagnostics are published as complete lines, serialized by the
+// shared terminal (or the early UART gate), never as interleaved fragments.
+struct Diagnostic { fBytes: [u8; 320], fLength: usize }
+impl Diagnostic {
+    fn new(aPrefix: &[u8]) -> Self {
+        let mut pLine = Self { fBytes: [0; 320], fLength: 0 };
+        pLine.text(aPrefix); pLine
+    }
+    fn text(&mut self, aBytes: &[u8]) {
+        self.fBytes[self.fLength..self.fLength + aBytes.len()].copy_from_slice(aBytes);
+        self.fLength += aBytes.len();
+    }
+    fn field(&mut self, aName: &[u8], aValue: u64) {
+        self.text(aName);
+        for pShift in (0..16).rev() {
+            self.fBytes[self.fLength] = b"0123456789abcdef"[((aValue >> (pShift * 4)) & 15) as usize];
+            self.fLength += 1;
+        }
+    }
+    unsafe fn publish(mut self, aCpu: &Cpu) {
+        self.text(b"\r\n"); aCpu.output(&self.fBytes[..self.fLength]);
+    }
+}
+
+unsafe fn registeredCpus() -> impl Iterator<Item = &'static Cpu> {
+    gCpus.iter().filter_map(|pSlot| {
+        let pAddress = pSlot.load(Ordering::Acquire);
+        (pAddress != 0).then(|| &*(pAddress as *const Cpu))
+    })
+}
+
+unsafe fn notifyRemote() {
+    if !gRuntimeEnabled.load(Ordering::Acquire) { return; }
+    let pCurrent = current_cpu();
+    for pCpu in registeredCpus() {
+        if pCpu.expected_id != pCurrent.expected_id && pCpu.fRuntimeReady.load(Ordering::Acquire) {
+            pCurrent.requestReschedule(pCpu);
+        }
+    }
+}
+
+unsafe fn timerSnapshot() -> (u64, u64) {
+    let mut pTotal = 0u64; let mut pIdle = 0u64;
+    for pCpu in registeredCpus() {
+        let (pTimers, pIdles) = loop {
+            let pBefore = pCpu.fTimerSequence.load(Ordering::Acquire);
+            if pBefore & 1 != 0 { spin_loop(); continue; }
+            let pTimers = pCpu.runtime_timer_irqs.load(Ordering::Relaxed);
+            let pIdles = pCpu.runtime_idle_irqs.load(Ordering::Relaxed);
+            fence(Ordering::Acquire);
+            if pBefore == pCpu.fTimerSequence.load(Ordering::Relaxed) { break (pTimers, pIdles); }
+        };
+        pTotal += pTimers as u64; pIdle += pIdles as u64;
+    }
+    (pTotal, pIdle)
+}
+
+// Event-driven load balancing. Require a difference of at least two runnable
+// tasks; only already executed, saved user contexts can be moved. Publishing
+// the whole Task under the ordered pair of queue gates makes ownership atomic.
+unsafe fn balanceQueues() {
+    if !gRuntimeEnabled.load(Ordering::Acquire) || gOnlineCount.load(Ordering::Acquire) < 2 { return; }
+    let pTarget = registeredCpus().filter(|pCpu| pCpu.fRuntimeReady.load(Ordering::Acquire) &&
+        pCpu.fHasSlot.load(Ordering::Acquire))
+        .min_by_key(|pCpu| pCpu.fRunnable.load(Ordering::Acquire));
+    let pSource = registeredCpus().filter(|pCpu| pCpu.fRuntimeReady.load(Ordering::Acquire))
+        .max_by_key(|pCpu| pCpu.fRunnable.load(Ordering::Acquire));
+    let (Some(pSource), Some(pTarget)) = (pSource, pTarget) else { return; };
+    if pSource.expected_id == pTarget.expected_id ||
+        pSource.fRunnable.load(Ordering::Acquire) < pTarget.fRunnable.load(Ordering::Acquire) + 2 { return; }
+    let (pFirst, pSecond) = if pSource.expected_id < pTarget.expected_id { (pSource, pTarget) } else { (pTarget, pSource) };
+    let Some(mut pFirstGuard) = pFirst.tryQueue() else { return; };
+    let Some(mut pSecondGuard) = pSecond.tryQueue() else { return; };
+    let (pSourceQueue, pTargetQueue) = if pSource.expected_id < pTarget.expected_id {
+        (&mut *pFirstGuard, &mut *pSecondGuard)
+    } else { (&mut *pSecondGuard, &mut *pFirstGuard) };
+    let pMoved = if pSourceQueue.runnableCount() >= pTargetQueue.runnableCount() + 2 {
+        pSourceQueue.moveRunnableTo(pTargetQueue).is_ok()
+    } else { false };
+    // Publish the ownership-generation count before either queue is released.
+    // A task that runs (or is reaped) on its new owner must not expose that
+    // transfer while sched_stats still reports the preceding global count.
+    if pMoved { gMigrations.fetch_add(1, Ordering::Relaxed); }
+    drop(pSecondGuard); drop(pFirstGuard);
+    if pMoved {
+        let pCpu = current_cpu();
+        // Include self: this callback may have just returned to an idle
+        // kernel caller with its timer disabled before accepting this task.
+        pCpu.requestReschedule(pTarget);
+        // The source's next quantum/deadline was computed before the move.
+        if pSource.expected_id != pCpu.expected_id { pCpu.requestReschedule(pSource); }
+    }
+}
+
 
 unsafe fn timestamp() -> u64 {
     let (lo, hi): (u32, u32);
@@ -124,6 +249,16 @@ struct Cpu {
     expected_id: u8,
     interval: u32,
     tsc_hz: u64,
+    clock: crate::monotonic::Clock,
+    timer_policy: UnsafeCell<crate::timer::Timer>,
+    runtime_timer_irqs: AtomicUsize,
+    fTimerSequence: AtomicUsize,
+    fQueueLocked: AtomicBool,
+    fRuntimeReady: AtomicBool,
+    fWakePending: AtomicBool,
+    fRunnable: AtomicUsize,
+    fHasSlot: AtomicBool,
+    runtime_idle_irqs: AtomicUsize,
     interrupts: AtomicU32,
     hlt_wakes: AtomicU32,
     complete: AtomicU32,
@@ -131,16 +266,34 @@ struct Cpu {
     idle: UnsafeCell<IdleSample>,
     descriptors: Option<Descriptors>,
     queue: UnsafeCell<Queue>,
+    boot_baseline: UnsafeCell<Option<crate::frames::BitmapSnapshot>>,
+    terminal: UnsafeCell<*mut crate::tty::Terminal>,
     load: &'static Load,
     released: [AtomicUsize; stress::TASKS],
 }
 
-// The owner changes queue state with IRQs disabled. The BSP prepares it before
-// startup and reads/reaps it only after acquiring the completion signal.
+// Queue state is protected by its per-CPU gate with local IRQs disabled.
+// Boot-only raw accesses occur before runtime publication or after an explicit
+// completion barrier. Shared resources additionally require the Frames gate.
 unsafe impl Sync for Cpu {}
 const _: () = assert!(core::mem::size_of::<Cpu>() <= PAGE && core::mem::size_of::<Load>() <= PAGE);
 
 impl Cpu {
+    fn lockQueue(&self) -> QueueGuard<'_> {
+        loop { if let Some(pGuard) = self.tryQueue() { return pGuard; } spin_loop(); }
+    }
+    fn tryQueue(&self) -> Option<QueueGuard<'_>> {
+        self.fQueueLocked.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok().map(|_| QueueGuard { fCpu: self })
+    }
+    unsafe fn requestReschedule(&self, aTarget: &Cpu) {
+        if aTarget.fWakePending.swap(true, Ordering::AcqRel) { return; }
+        let pClock = PmClock(gPmPort.load(Ordering::Relaxed) as u16);
+        if self.apic.send(aTarget.expected_id, RESCHEDULE, &pClock).is_err() {
+            serial(b"SMP FAILED: reschedule IPI delivery\r\n"); halt();
+        }
+        if aTarget.expected_id != self.expected_id { gRemoteWakeups.fetch_add(1, Ordering::Relaxed); }
+    }
     unsafe fn create(frames: &mut Frames<'_>, apic: Lapic, id: u8, interval: u32, tsc_hz: u64,
                      descriptors: Option<Descriptors>, load: &'static Load, programs: &'static Programs,
                      rsp0: usize) -> Result<&'static Self, Error> {
@@ -148,9 +301,15 @@ impl Cpu {
         let cpu = addr as *mut Self;
         cpu.write(Self { self_address: addr, syscall_user_rsp: UnsafeCell::new(0), syscall_stack: UnsafeCell::new(0),
                          rsp0, programs, apic, expected_id: id, interval, tsc_hz,
+                         clock: crate::monotonic::Clock::new(tsc_hz),
+                         timer_policy: UnsafeCell::new(crate::timer::Timer::new(interval)),
+                         runtime_timer_irqs: AtomicUsize::new(0), fTimerSequence: AtomicUsize::new(0),
+                         fQueueLocked: AtomicBool::new(false), fRuntimeReady: AtomicBool::new(false),
+                         fWakePending: AtomicBool::new(false), fRunnable: AtomicUsize::new(0),
+                         fHasSlot: AtomicBool::new(true), runtime_idle_irqs: AtomicUsize::new(0),
                          interrupts: AtomicU32::new(0), hlt_wakes: AtomicU32::new(0),
-                         complete: AtomicU32::new(0), phase: AtomicU32::new(0),
-                         idle: UnsafeCell::new(IdleSample::default()), descriptors, load, queue: UnsafeCell::new(Queue::new()),
+                         complete: AtomicU32::new(0), phase: AtomicU32::new(0), terminal: UnsafeCell::new(ptr::null_mut()),
+                         idle: UnsafeCell::new(IdleSample::default()), descriptors, load, queue: UnsafeCell::new(Queue::new()), boot_baseline: UnsafeCell::new(None),
                          released: core::array::from_fn(|_| AtomicUsize::new(0)) });
         for i in 0..stress::TASKS {
             (*(*cpu).queue.get()).spawn(frames, allocation_task, i).ok_or(b"task stack" as Error)?;
@@ -161,6 +320,7 @@ impl Cpu {
     unsafe fn run_task(&self) -> Result<(), Error> {
         let id = self.apic.id();
         if id != self.expected_id { return Err(b"wrong executing APIC ID"); }
+        if !self.clock.start(timestamp()) { return Err(b"monotonic clock initialization"); }
         asm!("wrmsr", in("ecx") 0xc0000101u32, in("eax") self.self_address as u32,
              in("edx") (self.self_address >> 32) as u32);
         self.apic.write(0x320, TIMER);    // one-shot, unmasked
@@ -187,26 +347,143 @@ impl Cpu {
 
     unsafe fn schedule(&self) {
         (*self.queue.get()).active = true;
-        self.apic.write(0x320, TIMER | (1 << 17)); // periodic time slices
-        self.apic.write(0x380, self.interval);
+        // The first quantum enters the run queue from the kernel caller.
+        // Subsequent arms are one-shot: runnable quantum, earliest deadline,
+        // or a sparse independent-clock watchdog when every task is asleep.
+        self.apic.write(0x320, MASK | TIMER);
+        self.apic.write(0x380, 0);
+        let now = crate::hpet::millis();
+        (*self.timer_policy.get()).reset(now);
+        self.arm_timer(true, None, now.unwrap_or(0));
         while ptr::addr_of!((*self.queue.get()).active).read_volatile() { wait_for_irq(); }
         self.apic.write(0x320, MASK | TIMER);
         self.apic.write(0x380, 0);
     }
 
+    unsafe fn runtimeWorker(&self) -> ! {
+        {
+            let mut pQueue = self.lockQueue();
+            pQueue.setRuntimeIdle(true);
+        }
+        (*self.timer_policy.get()).reset(crate::hpet::millis());
+        self.apic.write(0x320, MASK | TIMER);
+        self.apic.write(0x380, 0);
+        self.fRuntimeReady.store(true, Ordering::Release);
+        // The first reschedule IPI records this kernel caller context before
+        // selecting incoming work. Empty AP queues keep IF-enabled HLT.
+        loop { wait_for_irq(); }
+    }
+
+    unsafe fn runtimeSession(&self, aRootPid: usize) -> Result<usize, Error> {
+        {
+            let mut pQueue = self.lockQueue();
+            pQueue.setRuntimeIdle(true);
+        }
+        self.fRuntimeReady.store(true, Ordering::Release);
+        gRuntimeEnabled.store(true, Ordering::Release);
+        let pNow = crate::hpet::millis();
+        (*self.timer_policy.get()).reset(pNow);
+        self.arm_timer(true, None, pNow.unwrap_or(0));
+        let mut pStatus = None;
+        loop {
+            let mut pChanged = false;
+            if pStatus.is_none() {
+                match self.load.frames.with(|pFrames| self.programs.fRegistry.collect(pFrames, 0, aRootPid)) {
+                    Ok(pExit) => { pStatus = Some(pExit); pChanged = true; }
+                    Err(-11) => (),
+                    Err(_) => { serial(b"SMP FAILED: runtime root identity\r\n"); halt(); },
+                }
+            }
+            // Executing here means no user task owns this CPU's active stack.
+            // Local reaping must also progress on a single-CPU machine without
+            // relying on a remote IPI to consume its final collected zombie.
+            {
+                let mut pQueue = self.lockQueue();
+                self.load.frames.with(|pFrames| {
+                    pChanged |= pQueue.processPendingKills(pFrames);
+                    pChanged |= pQueue.collectRetired(pFrames) != 0;
+                    pQueue.wake_io(pFrames);
+                });
+                let pNow = crate::hpet::millis().unwrap_or(0);
+                self.arm_timer(pQueue.runnableCount() != 0, pQueue.next_deadline(), pNow);
+            }
+            if pChanged { notifyRemote(); }
+            if let Some(pExit) = pStatus {
+                if self.load.frames.with(|pFrames| !self.programs.fRegistry.hasProcesses(pFrames)) {
+                    let mut pQueue = self.lockQueue();
+                    pQueue.setRuntimeIdle(false);
+                    pQueue.active = false;
+                    drop(pQueue);
+                    self.apic.write(0x320, MASK | TIMER);
+                    self.apic.write(0x380, 0);
+                    self.fRuntimeReady.store(false, Ordering::Release);
+                    gRuntimeEnabled.store(false, Ordering::Release);
+                    return Ok(pExit);
+                }
+            }
+            wait_for_irq();
+        }
+    }
+
+    unsafe fn arm_timer(&self, runnable: bool, deadline: Option<u64>, now: u64) {
+        match (*self.timer_policy.get()).plan(runnable, deadline, now) {
+            crate::timer::Action::Keep => (),
+            crate::timer::Action::Disable => {
+                self.apic.write(0x320, MASK | TIMER);
+                self.apic.write(0x380, 0);
+            }
+            crate::timer::Action::Arm(counts) => {
+                self.apic.write(0x320, TIMER); // one-shot, never periodic
+                self.apic.write(0x380, counts);
+            }
+        }
+    }
+
     unsafe fn switch(&self, outgoing: usize, timer: bool) -> usize {
-        let queue = &mut *self.queue.get();
+        let mut pGuard = self.lockQueue();
+        let queue = &mut *pGuard;
+        let scheduled = queue.active;
+        let measured = crate::hpet::millis();
+        let now = measured.unwrap_or(0);
+        let mut pChanged = false;
+        if scheduled {
+            let clock_error = (*self.timer_policy.get()).sample(self.apic.read(0x390), measured);
+            self.load.frames.with(|pFrames| {
+                pChanged |= queue.processPendingKills(pFrames);
+                pChanged |= queue.collectRetired(pFrames) != 0;
+                queue.wake_io(pFrames);
+                queue.wake_timed(pFrames, now, clock_error);
+            });
+        }
         let next = queue.select(outgoing, timer);
+        if scheduled { self.arm_timer(queue.running(), queue.next_deadline(), now); }
         let root = if let Some(p) = queue.process() {
             let top = queue.user_stack_top().unwrap();
             ptr::write_unaligned(self.rsp0 as *mut usize, top);
             self.syscall_stack.get().write(top);
             p.space.root
         } else { self.programs.kernel_root };
-        if root != active_root() { asm!("mov cr3, {}", in(reg) root); }
+        drop(pGuard);
+        if pChanged { notifyRemote(); }
+        // PCID and PGE are disabled. Always flush, even for the same CR3:
+        // shared kernel-stack virtual slots may have been reused by another
+        // CPU while this CPU was running a different owner/context.
+        asm!("mov cr3, {}", in(reg) root);
         next
     }
 
+    unsafe fn output(&self, bytes: &[u8]) {
+        let terminal = gTerminal.load(Ordering::Acquire) as *mut crate::tty::Terminal;
+        if terminal.is_null() { serial(bytes); } else { (*terminal).diagnostic(bytes); }
+    }
+
+    unsafe fn hex(&self, value: u64) {
+        let mut digits = [b'0'; 16];
+        for (i, d) in digits.iter_mut().enumerate() { *d = b"0123456789abcdef"[((value >> (60 - i*4)) & 15) as usize]; }
+        self.output(&digits);
+    }
+
+    #[allow(non_snake_case)]
     unsafe fn process_test(&self) -> Result<(), Error> {
         unsafe fn msr(index: u32, value: u64) {
             asm!("wrmsr", in("ecx") index, in("eax") value as u32, in("edx") (value >> 32) as u32);
@@ -223,17 +500,37 @@ impl Cpu {
         msr(0xc0000082, native_syscall as usize as u64);
         msr(0xc0000084, 0xffff_ffff);
         asm!("rdmsr", "or eax, 1", "wrmsr", in("ecx") 0xc0000080u32, out("eax") _, out("edx") _);
-        let snapshot = self.load.frames.with(|f| f.snapshot()).ok_or(b"process snapshot" as Error)?;
+        // BSP's first process is the actual numeric PID 1, retained through
+        // the boot tests; AP tests still use independent finite sessions.
+        let bsp_root = self.descriptors.is_none();
+        let baseline = self.load.frames.with(|f| f.snapshot()).ok_or(b"process snapshot" as Error)?;
         let pid = self.load.frames.with(|f| (*self.queue.get()).spawn_process(f, self.programs, b"init", 0))
             .map_err(|_| b"user init ELF" as Error)?;
+        let resident = if bsp_root {
+            Some(self.load.frames.with(|f| f.snapshot()).ok_or(b"PID1 test snapshot" as Error)?)
+        } else { None };
         self.schedule();
         let ok = self.load.frames.with(|f| {
             let q = &mut *self.queue.get();
-            let result = q.collect(f, 0, pid);
-            q.reap(f);
-            let matched = snapshot.matches(f);
-            snapshot.release(f);
-            result == Ok(0) && matched && f.probe()
+            if let Some(mut resident) = resident {
+                let valid = pid == 1 && q.parked_root() == Some(pid) &&
+                    q.child_after(f, pid, 0) == Err(-10) &&
+                    // Lazy spawn had no private user tables/data yet. Account
+                    // only the exact frames now reachable from the retained
+                    // PID1 space; every unrelated allocation/free still fails.
+                    q.parkedSpace().map_or(false, |pSpace| pSpace.visitResidentFrames(
+                        |pAddress| resident.includeAllocatedFrame(f, pAddress))) && resident.matches(f);
+                resident.release(f);
+                if valid { (*self.boot_baseline.get()).replace(baseline); }
+                else { baseline.release(f); }
+                valid && f.probe()
+            } else {
+                let result = q.collect(f, 0, pid);
+                q.reap(f);
+                let matched = baseline.matches(f);
+                baseline.release(f);
+                result == Ok(0) && matched && f.probe()
+            }
         });
         if !ok { return Err(b"user process result or frame leak"); }
         serial(b"AGENTOS PROCESS OK APIC="); hex(self.expected_id as u64);
@@ -311,7 +608,7 @@ extern "C" fn allocation_task(slot: usize) {
 #[no_mangle]
 unsafe extern "C" fn finish_task() -> ! {
     asm!("cli", options(nostack));
-    (*current_cpu().queue.get()).finish_current();
+    current_cpu().lockQueue().finish_current();
     loop { wait_for_irq(); }
 }
 
@@ -325,72 +622,334 @@ unsafe extern "C" fn timer_interrupt(context: *mut Context) -> usize {
     cpu.apic.write(0xb0, 0);              // EOI before returning to the task
     if (*context).rip == ptr::addr_of!(after_hlt) as usize { cpu.hlt_wakes.fetch_add(1, Ordering::Release); }
     cpu.interrupts.fetch_add(1, Ordering::Release);
+    let (pScheduled, pIdle) = {
+        let pQueue = cpu.lockQueue(); (pQueue.active, pQueue.all_blocked())
+    };
+    if pScheduled {
+        cpu.fTimerSequence.fetch_add(1, Ordering::AcqRel);
+        cpu.runtime_timer_irqs.fetch_add(1, Ordering::Relaxed);
+        if pIdle { cpu.runtime_idle_irqs.fetch_add(1, Ordering::Relaxed); }
+        cpu.fTimerSequence.fetch_add(1, Ordering::Release);
+    }
     if (*context).user() && (*context).rsp >= (1usize << 47) {
         return user_fault(13, 0, 0);
     }
     cpu.switch(context as usize, true)
 }
 
+#[no_mangle]
+unsafe extern "C" fn keyboard_interrupt(context: *mut Context) -> usize {
+    let cpu = current_cpu();
+    let terminal = *cpu.terminal.get();
+    if cpu.apic.read(0x170) & 4 == 0 || terminal.is_null() {
+        serial(b"SMP FAILED: unexpected keyboard interrupt\r\n"); halt();
+    }
+    (*terminal).keyboard_interrupt();
+    cpu.apic.write(0xb0, 0);
+    if (*context).user() && (*context).rsp >= 1usize << 47 { return user_fault(13, 0, 0); }
+    // Device state is committed and its TTY gate released before queue/frame
+    // readiness checks. Pending IPI closes the check-to-block race remotely.
+    notifyRemote();
+    cpu.switch(context as usize, false)
+}
+
+#[no_mangle]
+unsafe extern "C" fn serial_interrupt(context: *mut Context) -> usize {
+    let cpu = current_cpu();
+    let terminal = *cpu.terminal.get();
+    if cpu.apic.read(0x170) & 2 == 0 || terminal.is_null() {
+        serial(b"SMP FAILED: unexpected serial interrupt\r\n"); halt();
+    }
+    (*terminal).interrupt();
+    cpu.apic.write(0xb0, 0); // Device deasserted/rearmed before EOI.
+    if (*context).user() && (*context).rsp >= 1usize << 47 { return user_fault(13, 0, 0); }
+    // Device state is committed and its TTY gate released before queue/frame
+    // readiness checks. Pending IPI closes the check-to-block race remotely.
+    notifyRemote();
+    cpu.switch(context as usize, false)
+}
+
+#[no_mangle]
+unsafe extern "C" fn reschedule_interrupt(aContext: *mut Context) -> usize {
+    let pCpu = current_cpu();
+    if pCpu.apic.read(0x170) & 8 == 0 {
+        serial(b"SMP FAILED: unexpected reschedule interrupt\r\n"); halt();
+    }
+    pCpu.fWakePending.store(false, Ordering::Release);
+    pCpu.apic.write(0xb0, 0);
+    if (*aContext).user() && (*aContext).rsp >= 1usize << 47 { return user_fault(13, 0, 0); }
+    pCpu.switch(aContext as usize, false)
+}
+
+#[no_mangle]
+unsafe extern "C" fn finish_context_switch() {
+    let pCpu = current_cpu();
+    let pFreed = {
+        let mut pQueue = pCpu.lockQueue();
+        pQueue.completeSwitch();
+        pCpu.load.frames.with(|pFrames| pQueue.collectRetired(pFrames))
+    };
+    if pFreed != 0 { notifyRemote(); }
+    balanceQueues();
+}
+
+/// Retry an authorized demand/COW access at the same user RIP. Kernel
+/// copy-in/out explicitly invokes the pager through physical aliases instead
+/// of taking a nested kernel fault while holding the frame allocator lock.
+#[allow(non_snake_case)]
+pub unsafe fn userPageFault(aAddress: usize, aError: u64) -> bool {
+    let pCpu = current_cpu();
+    let pQueue = pCpu.lockQueue();
+    let Some(pProcess) = pQueue.process() else { return false; };
+    let pResult = pCpu.load.frames.with(|pFrames| pProcess.space.resolveFault(pFrames, aAddress, aError));
+    if pResult == Err(-12) {
+        let mut pLine = Diagnostic::new(b"AGENTOS PAGE OOM");
+        pLine.field(b" PID=", pProcess.pid as u64);
+        pLine.field(b" ADDRESS=", aAddress as u64); pLine.publish(pCpu);
+    }
+    pResult.is_ok()
+}
+
 pub unsafe fn user_fault(vector: u64, error: u64, addr: u64) -> usize {
     let cpu = current_cpu();
-    let q = &mut *cpu.queue.get();
+    let mut pGuard = cpu.lockQueue();
+    let q = &mut *pGuard;
     let p = q.process().unwrap();
-    serial(b"AGENTOS USER FAULT PID="); hex(p.pid as u64);
-    serial(b" PARENT="); hex(p.parent as u64); serial(b" CR3="); hex(active_root() as u64);
-    serial(b" VECTOR="); hex(vector); serial(b" ERROR="); hex(error);
-    serial(b" ADDRESS="); hex(addr); serial(b"\r\n");
+    let pParent = cpu.load.frames.with(|pFrames| cpu.programs.fRegistry.parentOf(pFrames, p.pid)).unwrap_or(0);
+    let mut pLine = Diagnostic::new(b"AGENTOS USER FAULT");
+    pLine.field(b" PID=", p.pid as u64); pLine.field(b" PARENT=", pParent as u64);
+    pLine.field(b" CR3=", active_root() as u64); pLine.field(b" VECTOR=", vector);
+    pLine.field(b" ERROR=", error); pLine.field(b" ADDRESS=", addr); pLine.publish(cpu);
     cpu.load.frames.with(|f| q.terminate(256 + vector as usize, f));
+    drop(pGuard); notifyRemote();
     cpu.switch(0, false)
 }
 
 #[no_mangle]
+#[allow(non_snake_case)]
 unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
     let cpu = current_cpu();
     if ctx.rsp >= 1usize << 47 { return user_fault(13, 0, 0); }
-    let q = &mut *cpu.queue.get();
+    let mut pGuard = cpu.lockQueue();
+    let q = &mut *pGuard;
+    let pChanged = cpu.load.frames.with(|pFrames| {
+        let pKilled = q.processPendingKills(pFrames);
+        pKilled | (q.collectRetired(pFrames) != 0)
+    });
+    if q.process().map_or(false, |pProcess| pProcess.status.is_some()) {
+        drop(pGuard); notifyRemote(); return cpu.switch(0, false);
+    }
     let p = q.process_mut().unwrap();
     let pid = p.pid;
     let [a, b, c] = [ctx.registers[10], ctx.registers[11], ctx.registers[12]]; // RDI, RSI, RDX
+    let pNotify = pChanged || matches!(ctx.registers[14], 0x10002..=0x10005 | 0x10008..=0x1000f |
+        0x10011 | 0x10014 | 0x10015 | 0x10019);
+    macro_rules! switchNow {
+        ($pOutgoing:expr) => {{
+            let pOutgoing = $pOutgoing;
+            drop(pGuard);
+            if pNotify { notifyRemote(); }
+            return cpu.switch(pOutgoing, false);
+        }};
+    }
     let result: isize = match ctx.registers[14] {
         0x10001 => pid as isize,
-        op @ (0x10002 | 0x10008 | 0x1000d | 0x1000e) => {
+        // Native ABI v2 uses one HPET boot epoch on every CPU.
+        0x10010 => crate::hpet::millis().map(|v| v as isize).unwrap_or(-5),
+        // Read-only, versioned global timer diagnostics. All fields are
+        // captured with IF=0, and the destination is validated before writing.
+        // Counts cover scheduled operation, excluding boot/idle timer probes.
+        0x10018 => {
+            if b != 32 || c != 0 { -22 }
+            else if let Some(now) = crate::hpet::millis() {
+                let (pTimers, pIdle) = timerSnapshot();
+                let fields = [2u64, now, pTimers, pIdle];
+                let mut bytes = [0u8; 32];
+                for (i, field) in fields.iter().enumerate() {
+                    bytes[i*8..(i+1)*8].copy_from_slice(&field.to_le_bytes());
+                }
+                cpu.load.frames.with(|f| p.space.write(f, a, &bytes)).map_or_else(|e| e, |_| 0)
+            } else { -5 }
+        }
+        // Scheduling identity is sampled while this CPU owns the task gate.
+        0x1001b => {
+            if b != 64 || c != 0 { -22 }
+            else {
+                let pMigrations = q.currentMigrations();
+                let pProcess = q.process().unwrap();
+                cpu.load.frames.with(|pFrames| {
+                    let pParent = cpu.programs.fRegistry.parentOf(pFrames, pid).ok_or(-3isize)?;
+                    let pFields = [1u64, cpu.expected_id as u64, gOnlineCount.load(Ordering::Acquire) as u64,
+                        pMigrations as u64, gMigrations.load(Ordering::Relaxed) as u64,
+                        gRemoteWakeups.load(Ordering::Relaxed) as u64, pid as u64, pParent as u64];
+                    let mut pBytes = [0u8; 64];
+                    for (pIndex, pValue) in pFields.iter().enumerate() {
+                        pBytes[pIndex*8..(pIndex+1)*8].copy_from_slice(&pValue.to_le_bytes());
+                    }
+                    pProcess.space.write(pFrames, a, &pBytes)
+                }).map_or_else(|pError| pError, |_| 0)
+            }
+        }
+        // Versioned read-only VM accounting. Fault in the destination before
+        // taking the snapshot, so its own frames are included consistently.
+        0x1001a => {
+            if b != 64 || c != 0 { -22 }
+            else {
+                cpu.load.frames.with(|f| {
+                    p.space.writable(f, a, 64)?;
+                    let pFields = p.space.stats();
+                    let mut pBytes = [0u8; 64];
+                    for (pIndex, pField) in pFields.iter().enumerate() {
+                        pBytes[pIndex*8..(pIndex+1)*8].copy_from_slice(&pField.to_le_bytes());
+                    }
+                    p.space.write(f, a, &pBytes)
+                }).map_or_else(|e| e, |_| 0)
+            }
+        }
+        // SYS_WAIT_CHILD_UNTIL(child_pid, absolute_deadline_ms):
+        // nonblocking if already reaped/finished, otherwise sleep until child
+        // termination or the shared monotonic deadline. Reaps on success.
+        0x10011 => {
+            if b > isize::MAX as usize { -22 }
+            else if q.take_clock_error() { -5 }
+            else {
+                match cpu.load.frames.with(|f| q.collect(f, pid, a)) {
+                    Ok(status) => status as isize,
+                    Err(-11) => match crate::hpet::millis() {
+                        None => -5,
+                        Some(now) if now >= b as u64 => -110,
+                        Some(now) => {
+                            q.block_child(a, b as u64, now);
+                            ctx.rip -= 2;
+                            switchNow!(ctx as *mut Context as usize);
+                        }
+                    },
+                    Err(error) => error,
+                }
+            }
+        }
+        // SYS_SLEEP_UNTIL(absolute_deadline_ms): timer-driven sleep. It must
+        // not treat a frozen shared counter as actual passage of time.
+        0x10012 => {
+            if a > isize::MAX as usize { -22 }
+            else if q.take_clock_error() { -5 }
+            else {
+                match crate::hpet::millis() {
+                    None => -5,
+                    Some(now) if now >= a as u64 => 0,
+                    Some(now) => {
+                        q.block_sleep(a as u64, now);
+                        ctx.rip -= 2;
+                        switchNow!(ctx as *mut Context as usize);
+                    }
+                }
+            }
+        }
+        op @ (0x10002 | 0x10008 | 0x1000d | 0x1000e | 0x10015 | 0x10019) => {
             let io = match op {
-                0x10002 => p.files.write(&p.space, a, b, c),
-                0x10008 => p.files.read(&p.space, a, b, c),
-                0x1000d => p.files.message(crate::ipc::Operation::Send, p, a, b, c),
-                _ => p.files.message(crate::ipc::Operation::Receive, p, a, b, c),
+                0x10002 => cpu.load.frames.with(|f| p.files.write(f, &p.space, a, b, c)),
+                0x10008 => cpu.load.frames.with(|f| p.files.read(f, &p.space, a, b, c)),
+                0x1000d | 0x10019 => cpu.load.frames.with(|f| p.files.message(f, crate::ipc::Operation::Send, p, a, b, c)),
+                _ => cpu.load.frames.with(|f| p.files.message(f, crate::ipc::Operation::Receive, p, a, b, c)),
+            };
+            // Lazy copy-in may allocate, but slow UART/GOP output must not
+            // keep every other CPU waiting for the shared frame allocator.
+            let io = match io {
+                Ok(crate::files::Io::Output(pOutput)) => pOutput.complete().map(crate::files::Io::Bytes),
+                pOther => pOther,
             };
             match io {
-                Ok(crate::files::Io::Bytes(n)) => { q.wake_io(); n as isize }
+                Ok(crate::files::Io::Bytes(n)) => { cpu.load.frames.with(|f| q.wake_io(f)); n as isize }
+                Ok(crate::files::Io::Output(_)) => unreachable!(),
+                Ok(crate::files::Io::Sleep(_)) if op == 0x10015 || op == 0x10019 => -11,
                 Ok(crate::files::Io::Sleep(wait)) => {
                     // No bytes committed. Retry SYSCALL with its original
                     // registers when data, space, or the last close wakes it.
                     ctx.rip -= 2;
                     q.block(wait);
-                    return cpu.switch(ctx as *mut Context as usize, false);
+                    switchNow!(ctx as *mut Context as usize);
                 }
-                Err(error) => error,
+                Err(error) => { cpu.load.frames.with(|f| q.wake_io(f)); error }
+            }
+        }
+        // Bootstrap-only pause: not a general process or service control.
+        0x10016 => {
+            if pid != 1 || cpu.load.frames.with(|f| q.park_boot_root(f, pid)).is_err() { -16 }
+            else {
+                let mut pLine = Diagnostic::new(b"AGENTOS USER PARK");
+                pLine.field(b" PID=", pid as u64); pLine.field(b" CR3=", active_root() as u64);
+                pLine.field(b" STATUS=", 0); pLine.publish(cpu);
+                ctx.registers[14] = 0;
+                switchNow!(ctx as *mut Context as usize);
+            }
+        }
+        // Atomic wait on a validated set of shared IPC endpoints and any
+        // exited direct child. An IPI retries readiness after a remote IPC or exit event.
+        // Bit 32 of the positive result denotes a child exit; bits 0..31
+        // denote sockets with queued messages or EOF, 0 denotes timeout.
+        0x10017 => {
+            if a > u32::MAX as usize || b > isize::MAX as usize || c != 0 { -22 }
+            else if q.take_clock_error() { -5 }
+            else {
+                match cpu.load.frames.with(|f| q.process().unwrap().files.ipc_ready_mask(f, a as u32)) {
+                    Err(error) => error,
+                    Ok(mask) => {
+                        let events = mask as usize |
+                            if cpu.load.frames.with(|f| q.has_exited_child(f, pid)) { 1usize << 32 } else { 0 };
+                        if events != 0 { events as isize }
+                        else {
+                            match crate::hpet::millis() {
+                                None => -5,
+                                Some(now) if now >= b as u64 => 0,
+                                Some(now) => {
+                                    q.block_events(a as u32, b as u64, now);
+                                    ctx.rip -= 2;
+                                    switchNow!(ctx as *mut Context as usize);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         0x10003 => {
-            serial(b"AGENTOS USER EXIT PID="); hex(pid as u64);
-            serial(b" CR3="); hex(active_root() as u64); serial(b" STATUS="); hex((a & 255) as u64); serial(b"\r\n");
+            let mut pLine = Diagnostic::new(b"AGENTOS USER EXIT");
+            pLine.field(b" PID=", pid as u64); pLine.field(b" CR3=", active_root() as u64);
+            pLine.field(b" STATUS=", (a & 255) as u64); pLine.publish(cpu);
             cpu.load.frames.with(|f| q.terminate(a & 255, f));
-            return cpu.switch(0, false);
+            switchNow!(0);
         }
         0x10004 => {
             let mut name = [0; 64];
             if b == 0 || b > name.len() { -22 }
-            else if p.space.read(a, &mut name[..b]).is_none() { EFAULT }
+            else if let Err(error) = cpu.load.frames.with(|f| p.space.read(f, a, &mut name[..b])) { error }
             else { cpu.load.frames.with(|f| q.spawn_process(f, cpu.programs, &name[..b], pid))
                        .map(|v| v as isize).unwrap_or_else(|e| e) }
         }
         0x10005 => cpu.load.frames.with(|f| q.collect(f, pid, a)).map(|v| v as isize).unwrap_or_else(|e| e),
-        0x10006 => { ctx.registers[14] = 0; return cpu.switch(ctx as *mut Context as usize, false); }
+        // Parent gets the new PID. The child resumes at the same return RIP
+        // with RAX=0, a private kernel stack and COW userspace pages.
+        0x10014 => cpu.load.frames.with(|f| q.fork_process(f, cpu.programs, ctx))
+            .map(|v| v as isize).unwrap_or_else(|e| e),
+        // Child enumeration is owner-scoped, never global. The zero cursor
+        // returns the oldest living or zombie direct child (including
+        // grandchildren adopted when their intermediate parent exited).
+        0x10013 => if a > isize::MAX as usize { -22 }
+            else { cpu.load.frames.with(|f| q.child_after(f, pid, a)).map(|v| v as isize).unwrap_or_else(|e| e) },
+        0x1000f => {
+            let result = cpu.load.frames.with(|f| q.kill_child(f, pid, a));
+            if matches!(result, Ok(0)) {
+                let mut pLine = Diagnostic::new(b"AGENTOS USER KILL");
+                pLine.field(b" PID=", a as u64); pLine.field(b" PARENT=", pid as u64);
+                pLine.field(b" STATUS=", 137); pLine.publish(cpu);
+            }
+            result.map(|v| v as isize).unwrap_or_else(|e| e)
+        }
+        0x10006 => { ctx.registers[14] = 0; switchNow!(ctx as *mut Context as usize); }
         0x10007 => {
             let mut path = [0; crate::vfs::PATH_MAX];
             if c != 0 { -30 } else if b > path.len() { -36 }
-            else if p.space.read(a, &mut path[..b]).is_none() { EFAULT }
+            else if let Err(error) = cpu.load.frames.with(|f| p.space.read(f, a, &mut path[..b])) { error }
             else { cpu.programs.vfs.file(&path[..b]).and_then(|data|
                 cpu.load.frames.with(|f| p.files.open(f, data))).map(|n| n as isize).unwrap_or_else(|e| e) }
         }
@@ -398,13 +957,20 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
             let res = cpu.load.frames.with(|f| if ctx.registers[14] == 0x10009 {
                 p.files.close(f, a)
             } else { p.files.dup2(f, a, b) });
-            q.wake_io();
+            cpu.load.frames.with(|f| q.wake_io(f));
             res.map(|v| v as isize).unwrap_or_else(|e| e)
         }
         op @ (0x1000a | 0x1000c) => cpu.load.frames.with(|f| p.files.pair(f, &p.space, a, op == 0x1000c)).map(|v| v as isize).unwrap_or_else(|e| e),
         _ => -38,
     };
+    // A lifecycle operation may also have consumed a remote stop request for
+    // its caller. A published zombie must never return to user instructions.
+    if q.process().map_or(false, |pProcess| pProcess.status.is_some()) {
+        drop(pGuard); notifyRemote(); return cpu.switch(0, false);
+    }
     ctx.registers[14] = result as usize;
+    drop(pGuard);
+    if pNotify { notifyRemote(); }
     ctx as *mut Context as usize
 }
 
@@ -428,7 +994,11 @@ unsafe extern "C" fn ap_main(cpu: &'static Cpu) -> ! {
             cpu.complete.store(PROCESSES_FINISHED, Ordering::Release);
             while cpu.phase.load(Ordering::Acquire) < IDLE_PHASE { spin_loop(); }
             match cpu.measure_idle() {
-                Ok(()) => cpu.complete.store(IDLE_FINISHED, Ordering::Release),
+                Ok(()) => {
+                    cpu.complete.store(IDLE_FINISHED, Ordering::Release);
+                    while cpu.phase.load(Ordering::Acquire) < RUNTIME_PHASE { spin_loop(); }
+                    cpu.runtimeWorker();
+                },
                 Err(reason) => {
                     serial(b"SMP FAILED: "); serial(reason); serial(b"\r\n");
                     cpu.complete.store(3, Ordering::Release);
@@ -482,10 +1052,17 @@ unsafe fn start_ap(cpu: &Cpu, root: usize, base: usize, stack: usize, clock: &Pm
 
 pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Frames<'static>,
                   bsp_rsp0: usize, archive: &'static [u8], log: &mut crate::BootLog<'_>) -> Result<(), Error> {
+    let guard_probe = crate::stack::KernelStack::allocate(&mut frames).ok_or(b"kernel guard stack" as Error)?;
+    let guarded = crate::exceptions::probe_guard(guard_probe.guard()) &&
+        crate::exceptions::probe_guard(guard_probe.top());
+    guard_probe.release(&mut frames);
+    if !guarded { return Err(b"kernel stack guard probe"); }
+    serial(b"AGENTOS KERNEL STACK GUARD OK\r\n");
     if platform.legacy_pic { out(0x21, 0xff); out(0xa1, 0xff); }
     let apic = Lapic(platform.lapic);
     apic.enable()?;
     let clock = PmClock(platform.timer_port);
+    gPmPort.store(platform.timer_port as usize, Ordering::Relaxed);
     let (interval, tsc_hz) = apic.calibrate(&clock)?;
     log.event(2, b"APIC TIMER READY");
     let bsp = apic.id();
@@ -498,6 +1075,7 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
     storage.write(Load::new(SharedFrames::new(frames), ids.len()));
     let load = &*storage;
     let boot_cpu = load.frames.with(|f| Cpu::create(f, apic, bsp, interval, tsc_hz, None, load, programs, bsp_rsp0))?;
+    gCpus[bsp as usize].store(boot_cpu.self_address, Ordering::Release);
     boot_cpu.run_task()?;
     let mut cpus = [None; 255];
     cpus[bsp as usize] = Some(boot_cpu);
@@ -508,10 +1086,13 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
             let rsp0 = descriptors.rsp0_slot();
             Cpu::create(f, apic, id, interval, tsc_hz, Some(descriptors), load, programs, rsp0)
         })?;
-        let stack = load.frames.with(|f| f.alloc()).ok_or(b"AP stack" as Error)?.into_address() + PAGE;
+        let stack = load.frames.with(crate::stack::KernelStack::allocate)
+            .ok_or(b"AP stack" as Error)?.into_top();
+        gCpus[id as usize].store(cpu.self_address, Ordering::Release);
         start_ap(cpu, root, base, stack, &clock)?;
         cpus[id as usize] = Some(cpu);
     }
+    gOnlineCount.store(ids.len(), Ordering::Release);
     log.event(1, b"PROCESSORS ONLINE");
     let baseline = load.frames.with(|f| f.snapshot()).ok_or(b"bitmap snapshot" as Error)?;
     load.started.store(true, Ordering::Release);
@@ -575,5 +1156,78 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
         serial(b" TSC-TOTAL="); hex(sample.elapsed);
         serial(b" TSC-ACTIVE="); hex(sample.active); serial(b"\r\n");
     }
+    for pCpu in cpus.iter().flatten().filter(|pCpu| pCpu.expected_id != bsp) {
+        pCpu.phase.store(RUNTIME_PHASE, Ordering::Release);
+    }
+    let pStart = clock.now();
+    for pCpu in cpus.iter().flatten().filter(|pCpu| pCpu.expected_id != bsp) {
+        while !pCpu.fRuntimeReady.load(Ordering::Acquire) {
+            if clock.elapsed(pStart) > 2 * PM_HZ { return Err(b"runtime CPU startup timeout"); }
+            spin_loop();
+        }
+    }
+
+    Ok(())
+}
+
+/// Resume the original numeric BSP PID 1 after boot and idle acceptance.
+/// It gains a trusted terminal without changing PID or reaper ownership.
+pub unsafe fn shell(platform: &Platform, info: &crate::BootInfo) -> Result<(), Error> {
+    let cpu = current_cpu();
+    let baseline = (*cpu.boot_baseline.get()).take().ok_or(b"PID1 baseline missing" as Error)?;
+    let Some(storage) = cpu.load.frames.with(|f| f.alloc()) else {
+        cpu.load.frames.with(|f| baseline.release(f));
+        return Err(b"TTY allocation");
+    };
+    let terminal = storage.address() as *mut crate::tty::Terminal;
+    let mut initialized = false;
+    let started = (|| -> Result<usize, Error> {
+        terminal.write(crate::tty::Terminal::new(platform, cpu.expected_id)?);
+        initialized = true;
+        // The BSP TTY owns the mapped GOP framebuffer for the entire shell
+        // session; the serial path remains available if GOP validation fails.
+        if let Some(screen) = crate::fb_console::Console::below_boot_status(
+            info.framebuffer, info.width as usize, info.height as usize,
+            info.stride as usize, info.pixel_format
+        ) {
+            (*terminal).attach_screen(screen);
+        } else {
+            let _ = crate::logger::LOGGER.record(timestamp(), cpu.expected_id as u32,
+                crate::log_policy::Level::Error, b"TTY GOP unavailable");
+        }
+        let queue = &mut *cpu.queue.get();
+        let pid = queue.parked_root().ok_or(b"PID1 not parked" as Error)?;
+        if pid != 1 { return Err(b"invalid PID1 identity"); }
+        queue.terminal(pid, terminal).map_err(|_| b"PID1 terminal descriptors" as Error)?;
+        queue.resume_boot_root(pid).map_err(|_| b"PID1 resume" as Error)?;
+        let _ = crate::logger::LOGGER.record(timestamp(), cpu.expected_id as u32,
+            crate::log_policy::Level::Info, b"service manager session started");
+        serial(b"AGENTOS MANAGER SESSION START PID="); hex(pid as u64); serial(b"\r\n");
+        cpu.terminal.get().write(terminal);
+        gTerminal.store(terminal as usize, Ordering::Release);
+        (*terminal).enable();
+        let pStatus = cpu.runtimeSession(pid)?;
+        if pStatus != 0 { return Err(b"service manager exit status"); }
+        Ok(pid)
+    })();
+    if initialized { (*terminal).disable(); }
+    cpu.terminal.get().write(ptr::null_mut());
+    gTerminal.store(0, Ordering::Release);
+    let mut pCleanupQueue = cpu.lockQueue();
+    let result = cpu.load.frames.with(|f| {
+        let q = &mut *pCleanupQueue;
+        let status = started;
+        q.reap(f);
+        f.release(storage);
+        let matched = baseline.matches(f);
+        baseline.release(f);
+        if matched && f.probe() { status } else { Err(b"manager session frame leak" as Error) }
+    });
+    drop(pCleanupQueue);
+    let pid = result?;
+    let _ = crate::logger::LOGGER.record(timestamp(), cpu.expected_id as u32,
+        crate::log_policy::Level::Info, b"service manager session stopped");
+    serial(b"AGENTOS MANAGER SESSION STOP PID="); hex(pid as u64);
+    serial(b" STATUS=0000000000000000 FRAMES=OK\r\n");
     Ok(())
 }

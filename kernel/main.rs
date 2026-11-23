@@ -3,6 +3,7 @@
 
 use core::{arch::asm, panic::PanicInfo, ptr::write_volatile};
 mod frames;
+mod stack;
 mod paging;
 mod exceptions;
 mod acpi;
@@ -10,9 +11,24 @@ mod smp;
 mod scheduler;
 mod stress;
 mod process;
+mod lifecycle;
+mod hpet;
+mod native_abi;
 mod files;
 mod ipc;
 mod vfs;
+mod line;
+mod ioapic;
+mod tty;
+mod keyboard;
+mod ps2;
+mod log_policy;
+mod log_ring;
+mod logger;
+mod monotonic;
+mod timer;
+mod fb_console;
+use fb_console::glyph;
 
 // Version 3, shared with boot/loader.c. Addresses are identity mapped at handoff.
 #[repr(C)]
@@ -42,13 +58,37 @@ fn halt() -> ! {
 }
 
 #[panic_handler]
-fn panic(_: &PanicInfo) -> ! { halt() }
+#[allow(non_snake_case)]
+fn panic(aInfo: &PanicInfo) -> ! {
+    // Keep failure evidence available even before a terminal exists. Bounded
+    // formatting uses no allocator and cannot recursively overflow its buffer.
+    struct PanicText { fBytes: [u8; 256], fLength: usize }
+    impl core::fmt::Write for PanicText {
+        fn write_str(&mut self, aText: &str) -> core::fmt::Result {
+            let pLength = aText.len().min(self.fBytes.len() - self.fLength);
+            self.fBytes[self.fLength..self.fLength + pLength].copy_from_slice(&aText.as_bytes()[..pLength]);
+            self.fLength += pLength;
+            Ok(())
+        }
+    }
+    let mut pText = PanicText { fBytes: [0; 256], fLength: 0 };
+    let _ = core::fmt::write(&mut pText, format_args!("AGENTOS KERNEL PANIC: {}\r\n", aInfo));
+    unsafe { serial(&pText.fBytes[..pText.fLength]); }
+    halt()
+}
 
 unsafe fn out(port: u16, value: u8) {
     asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack));
 }
 
+unsafe fn input(port: u16) -> u8 {
+    let value: u8;
+    asm!("in al, dx", in("dx") port, out("al") value, options(nomem, nostack));
+    value
+}
+
 const COM: u16 = 0x3f8;
+static SERIAL_LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 unsafe fn init_serial() {
     out(COM + 1, 0);
@@ -61,6 +101,12 @@ unsafe fn init_serial() {
 }
 
 unsafe fn serial(message: &[u8]) {
+    // Each call publishes one complete message. Mask local interrupts before
+    // taking the SMP gate, so the UART IRQ cannot recursively wait on it.
+    let flags: usize;
+    asm!("pushfq", "pop {}", "cli", out(reg) flags);
+    while SERIAL_LOCK.compare_exchange_weak(false, true, core::sync::atomic::Ordering::Acquire,
+        core::sync::atomic::Ordering::Relaxed).is_err() { core::hint::spin_loop(); }
     for &byte in message {
         for _ in 0..100_000 {
             let status: u8;
@@ -68,27 +114,8 @@ unsafe fn serial(message: &[u8]) {
             if status & 0x20 != 0 { out(COM, byte); break; }
         }
     }
-}
-
-// Five-bit rows, most significant pixel on the left.
-fn glyph(c: u8) -> [u8; 7] {
-    match c {
-        b'A' => [14,17,17,31,17,17,17], b'G' => [14,17,16,23,17,17,14],
-        b'E' => [31,16,16,30,16,16,31], b'N' => [17,25,25,21,19,19,17],
-        b'T' => [31,4,4,4,4,4,4], b'O' => [14,17,17,17,17,17,14],
-        b'S' => [15,16,16,14,1,1,30], b'K' => [17,18,20,24,20,18,17],
-        b'R' => [30,17,17,30,20,18,17], b'L' => [16,16,16,16,16,16,31],
-        b'B' => [30,17,17,30,17,17,30], b'C' => [14,17,16,16,16,17,14],
-        b'D' => [30,17,17,17,17,17,30], b'F' => [31,16,16,30,16,16,16],
-        b'H' => [17,17,17,31,17,17,17], b'I' => [14,4,4,4,4,4,14],
-        b'J' => [7,2,2,2,2,18,12], b'M' => [17,27,21,21,17,17,17],
-        b'P' => [30,17,17,30,16,16,16], b'Q' => [14,17,17,17,21,18,13],
-        b'U' => [17,17,17,17,17,17,14], b'V' => [17,17,17,17,17,10,4],
-        b'W' => [17,17,17,21,21,27,17], b'X' => [17,17,10,4,10,17,17],
-        b'Y' => [17,17,10,4,4,4,4], b'Z' => [31,1,2,4,8,16,31],
-        b'[' => [14,8,8,8,8,8,14], b']' => [14,2,2,2,2,2,14],
-        b'1' => [4,12,4,4,4,4,14], _ => [0; 7],
-    }
+    SERIAL_LOCK.store(false, core::sync::atomic::Ordering::Release);
+    if flags & 0x200 != 0 { asm!("sti", options(nomem, nostack)); }
 }
 
 #[no_mangle]
@@ -109,12 +136,16 @@ pub unsafe extern "sysv64" fn kernel_main(info: &BootInfo) -> ! {
     serial(b"AGENTOS PHYSICAL FRAMES OK\r\n");
     let Some(platform) = acpi::discover(info, map) else { log.event(0, b"ACPI DISCOVERY FAILED"); halt(); };
     log.event(2, b"ACPI TABLES READY");
-    let Some(descriptors) = exceptions::Descriptors::new(&mut frames) else { log.event(0, b"IDT INIT FAILED"); halt(); };
-    descriptors.load();
     smp::copy_startup(info.ap_boot);
-    let Some(root) = paging::install(info, map, &mut frames, platform.lapic) else {
+    let Some(root) = paging::install(info, map, &mut frames, &platform) else {
         log.event(0, b"PAGING INIT FAILED"); halt();
     };
+    // IST stacks use the guarded pool in the newly active kernel page tables.
+    let Some(descriptors) = exceptions::Descriptors::new(&mut frames) else { log.event(0, b"IDT INIT FAILED"); halt(); };
+    descriptors.load();
+    if let Err(reason) = hpet::init(platform.hpet) {
+        serial(b"GLOBAL CLOCK FAILED: "); serial(reason); serial(b"\r\n"); halt();
+    }
     serial(b"AGENTOS OWN CR3="); exceptions::hex(root as u64); serial(b"\r\n");
     if !exceptions::probe(info.stack_base) || !frames.probe() {
         log.event(0, b"EXCEPTION OR RAM PROBE FAILED"); halt();
@@ -134,6 +165,11 @@ pub unsafe extern "sysv64" fn kernel_main(info: &BootInfo) -> ! {
     serial(b"\r\n");
     let scale = ((info.width as usize - 16) / (MESSAGE.len() * 6)).clamp(1, 4);
     draw(info, MESSAGE, 8, 16, scale);
+    log.event(1, b"STARTING INTERACTIVE SHELL");
+    if let Err(reason) = smp::shell(&platform, info) {
+        log.event(0, b"SHELL FAILED");
+        serial(b"SHELL FAILED: "); serial(reason); serial(b"\r\n");
+    } else { log.event(1, b"INTERACTIVE SHELL STOPPED"); }
     halt()
 }
 
@@ -158,7 +194,7 @@ pub struct BootLog<'a> { info: &'a BootInfo, row: usize, scale: usize }
 impl<'a> BootLog<'a> {
     fn new(info: &'a BootInfo) -> Self {
         let mut log = Self { info, row: 52, scale: ((info.width as usize - 16)/240).clamp(1, 2) };
-        log.clear_from(0);
+        if info.log_level & 0x200 != 0 { log.clear_from(0); }
         log
     }
     fn clear_from(&mut self, top: usize) {
@@ -169,9 +205,24 @@ impl<'a> BootLog<'a> {
         }
     }
     fn event(&mut self, level: u64, message: &[u8]) {
-        if level > self.info.log_level { return; }
-        let prefix: &[u8] = match level { 0 => b"[ERROR] ", 1 => b"[INFO] ", _ => b"[DEBUG] " };
-        unsafe { serial(prefix); serial(message); serial(b"\r\n"); }
+        let severity = match level {
+            0 => log_policy::Level::Error,
+            1 => log_policy::Level::Info,
+            _ => log_policy::Level::Debug,
+        };
+        // History is independent of display policy: even BOOT.LOG=none leaves
+        // bounded diagnostics for later kernel inspection. The logger never
+        // performs UART/MMIO while holding its nonblocking SMP/IRQ gate.
+        let _ = logger::LOGGER.record(0, 0, severity, message);
+        let policy = log_policy::Policy::new(self.info.log_level);
+        let serial_enabled = policy.enabled(severity, log_policy::Sink::Serial);
+        let screen_enabled = policy.enabled(severity, log_policy::Sink::Screen);
+        if !serial_enabled && !screen_enabled { return; }
+        let prefix = log_policy::Policy::prefix(severity);
+        if serial_enabled {
+            unsafe { serial(prefix); serial(message); serial(b"\r\n"); }
+        }
+        if !screen_enabled { return; }
         if self.row+7*self.scale > self.info.height as usize { self.clear_from(52); self.row = 52; }
         draw(self.info, prefix, 8, self.row, self.scale);
         draw(self.info, message, 8+6*self.scale*prefix.len(), self.row, self.scale);

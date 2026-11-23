@@ -3,36 +3,55 @@ set -euo pipefail
 export LC_ALL=C SOURCE_DATE_EPOCH=0
 root=$(cd "$(dirname "$0")/.." && pwd)
 while IFS='=' read -r package expected || [[ -n "$package" ]]; do
-    actual=$(dpkg-query -W -f='${Version}' "$package")
+    if ! actual=$(dpkg-query -W -f='${Version}' "$package" 2>/dev/null); then
+        printf 'Missing pinned build package: %s (required version %s)\n' "$package" "$expected" >&2
+        exit 1
+    fi
     [[ "$actual" == "$expected" ]] || { echo "$package: expected $expected, found $actual" >&2; exit 1; }
+    printf 'Pinned build dependency: %s=%s\n' "$package" "$actual"
 done < "$root/scripts/toolchain.lock"
 out="$root/build"
 mkdir -p "$out"
+# Never leave a success receipt from a previous build if the new build fails.
+rm -f "$out/build-provenance.json"
 work=$(mktemp -d)
-trap 'rm -f "$work"/{libkernel.a,ap-start.o,kernel.elf,initramfs.cpio,layout.ld,loader.o,payload.o,loader.so,stage,user.o,transfer.o,client.o,receive.o,service.o,init,fault,receiver,service,data/transfer.bin}; rmdir "$work/data" "$work"' EXIT
+# Work directory was exclusively created by mktemp. New ELF programs and C
+# objects must never make a successful, signed build fail in the EXIT trap.
+trap 'rm -rf -- "$work"' EXIT
 cd "$work"
 mkdir data
-[[ $(rustc --version) == "rustc 1.75.0 "* ]]
-rustc --edition 2021 --crate-type staticlib -C lto=fat -C opt-level=2 -C panic=abort \
+rust_version=$(/usr/bin/rustc --version)
+[[ "$rust_version" == "rustc 1.75.0 "* ]] || { printf 'Pinned Rust compiler mismatch: %s\n' "$rust_version" >&2; exit 1; }
+/usr/bin/rustc --edition 2021 --crate-type staticlib -C lto=fat -C opt-level=2 -C panic=abort \
     -C relocation-model=static -C no-redzone=yes -C overflow-checks=no \
     --remap-path-prefix="$root"=/agentos "$root/kernel/main.rs" -o libkernel.a
 gcc-13 -c -o ap-start.o "$root/kernel/ap-start.S"
 ld --build-id=none --gc-sections -T "$root/kernel/kernel.ld" -o kernel.elf libkernel.a ap-start.o
+python3 "$root/scripts/verify-kernel-layout.py" kernel.elf
+python3 "$root/scripts/verify-trap-return.py" kernel.elf
+# Preserve the exact linked ELF for symbolization of a real guest fault.
+cp kernel.elf "$out/kernel.elf"
 printf 'AgentOS stage 1\n' > stage
-for app in init fault receiver service; do
-    gcc-13 -c "$root/user/$app.S" -o user.o
+for app in init fault receiver service shell svc_ok svc_fail svc_hang orphan_parent manager svc_alive svc_flaky; do
+    entry="$app"
+    if [[ "$app" == svc_alive || "$app" == svc_flaky ]]; then entry=svc_worker; fi
+    gcc-13 -c "$root/user/$entry.S" -o user.o
     objects=(user.o)
-    case "$app" in init) sources=(transfer client);; receiver) sources=(receive);; service) sources=(service);; *) sources=();; esac
+    case "$app" in init) sources=(transfer client supervisor orphans forktest demand migration service_manager);; receiver) sources=(receive);; service) sources=(service);; shell) sources=(shell service_client);; manager) sources=(service_manager);; svc_alive|svc_flaky) sources=(svc_worker);; *) sources=();; esac
     for src in "${sources[@]}"; do
+        defines=()
+        if [[ "$app" == svc_flaky ]]; then defines=(-DAGENTOS_FLAKY); fi
         gcc-13 -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
-            -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large -c "$root/user/$src.c" -o "$src.o"
+            -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large "${defines[@]}" -c "$root/user/$src.c" -o "$src.o"
         objects+=("$src.o")
     done
     ld --build-id=none -z noexecstack -s -T "$root/user/user.ld" -o "$app" "${objects[@]}"
+    python3 "$root/scripts/verify-user-abi.py" "$app"
 done
 awk 'BEGIN {for (i=0;i<8193;i++) printf "%c",(i*73+int(i/251)*19)%256}' > data/transfer.bin
-touch -d @0 stage init fault receiver service data/transfer.bin data
-printf '%s\n' stage init fault receiver service data data/transfer.bin | cpio --quiet --reproducible --owner=0:0 -o -H newc > initramfs.cpio
+touch -d @0 stage init fault receiver service shell svc_ok svc_fail svc_hang orphan_parent manager svc_alive svc_flaky data/transfer.bin data
+printf '%s\n' stage init fault receiver service shell svc_ok svc_fail svc_hang orphan_parent manager svc_alive svc_flaky data data/transfer.bin | cpio --quiet --reproducible --owner=0:0 -o -H newc > initramfs.cpio
+cp initramfs.cpio "$out/initramfs.cpio"
 gcc-13 -I/usr/include/efi -I/usr/include/efi/x86_64 -DGNU_EFI_USE_MS_ABI \
     -O2 -Wall -Wextra -Werror -fpic -ffreestanding -fno-stack-protector -fshort-wchar \
     -mno-red-zone -c "$root/boot/loader.c" -o loader.o
@@ -52,4 +71,43 @@ sbsign --key "$keys/db.key" --cert "$keys/db.crt" --output "$out/agentos.efi" "$
 sbverify --cert "$keys/db.crt" "$out/agentos.efi"
 openssl x509 -in "$keys/db.crt" -outform der -out "$out/db.cer"
 cert-to-efi-sig-list -g d7663630-f07a-4739-bc6f-b9f6d6444865 "$keys/db.crt" "$out/db.esl"
+# A reproducible *receipt*, not a cryptographic attestation. Its hashes
+# bind the signed EFI to the current Git tree, toolchain lock and signing db.
+# Do not copy private signing keys or include wall-clock timestamps here.
+python3 - "$root" "$out" "$work/initramfs.cpio" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+root, out, initrd = (Path(value) for value in sys.argv[1:])
+def run(*cmd):
+    return subprocess.check_output(cmd, cwd=root, text=True).strip()
+def digest(path):
+    result = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            result.update(block)
+    return result.hexdigest()
+
+receipt = {
+    "schema": 1,
+    "source_commit": run("git", "rev-parse", "--verify", "HEAD"),
+    "source_clean": not bool(run("git", "status", "--porcelain", "--untracked-files=normal")),
+    "toolchain_lock_sha256": digest(root / "scripts/toolchain.lock"),
+    "rustc_version": run("/usr/bin/rustc", "--version"),
+    "gcc_version": run("gcc-13", "-dumpfullversion"),
+    "initramfs_sha256": digest(initrd),
+    "artifacts": {
+        name: digest(out / name)
+        for name in ("agentos.unsigned.efi", "agentos.efi", "db.cer", "db.esl")
+    },
+}
+path = out / "build-provenance.json"
+temporary = out / "build-provenance.json.tmp"
+temporary.write_text(json.dumps(receipt, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+temporary.replace(path)
+print(f"Build provenance: {path} (commit {receipt['source_commit']}, clean={receipt['source_clean']})")
+PY
 sha256sum "$out/"*.efi

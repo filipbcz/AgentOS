@@ -18,8 +18,13 @@ impl Frame {
 
 pub struct Frames<'a> {
     free: &'a mut [usize],
+    // One reference for every allocated page, including page tables. Forked
+    // user PTEs can retain a page without transferring its original owner.
+    refs: &'a mut [u16],
     next_word: usize,
     available: usize,
+    // Shared kernel PML4 with a permanently prepared guarded-stack subtree.
+    kernel_root: usize,
 }
 
 pub struct SharedFrames {
@@ -68,6 +73,13 @@ pub(super) fn ram(desc: &[u8]) -> Option<(usize, usize)> {
 
 impl Frames<'_> {
     pub fn available(&self) -> usize { self.available }
+    pub fn kernel_root(&self) -> Option<usize> {
+        (self.kernel_root != 0).then_some(self.kernel_root)
+    }
+    pub(super) fn install_kernel_root(&mut self, root: usize) {
+        assert!(self.kernel_root == 0 && root != 0 && root % PAGE == 0);
+        self.kernel_root = root;
+    }
 
     // Allocate all snapshot pages before copying so their own bits are included.
     pub fn snapshot(&mut self) -> Option<BitmapSnapshot> {
@@ -96,12 +108,18 @@ impl Frames<'_> {
         let regions = || map.chunks_exact(stride).filter_map(ram);
         let highest = regions().map(|(_, end)| end).max()?;
         let words = highest.div_ceil(WORD_BITS);
-        let metadata_pages = (words * size_of::<usize>()).div_ceil(PAGE);
+        let metadata_bytes = words.checked_mul(size_of::<usize>())?
+            .checked_add(highest.checked_mul(size_of::<u16>())?)?;
+        let metadata_pages = metadata_bytes.div_ceil(PAGE);
         let (metadata, _) = regions().find(|(first, end)| end - first >= metadata_pages)?;
         let bitmap = (metadata * PAGE) as *mut usize;
+        let refs = bitmap.add(words) as *mut u16;
         for i in 0..words { ptr::write_volatile(bitmap.add(i), 0); }
+        for i in 0..highest { ptr::write(refs.add(i), 0); }
         let mut frames = Self {
-            free: slice::from_raw_parts_mut(bitmap, words), next_word: 0, available: 0,
+            free: slice::from_raw_parts_mut(bitmap, words),
+            refs: slice::from_raw_parts_mut(refs, highest),
+            next_word: 0, available: 0, kernel_root: 0,
         };
         for (first, end) in regions() {
             for i in first..end {
@@ -120,7 +138,10 @@ impl Frames<'_> {
         let bit = bits.trailing_zeros() as usize;
         *bits &= *bits - 1;
         self.available -= 1;
-        Some(Frame((self.next_word * WORD_BITS + bit) * PAGE))
+        let index = self.next_word * WORD_BITS + bit;
+        assert_eq!(self.refs[index], 0, "allocated frame retained by another owner");
+        self.refs[index] = 1;
+        Some(Frame(index * PAGE))
     }
 
     pub fn alloc_zeroed(&mut self) -> Option<Frame> {
@@ -132,11 +153,37 @@ impl Frames<'_> {
         Some(frame)
     }
 
+    /// A page is free only when its final mapping/owner releases it. Caller
+    /// must hold the SharedFrames lock and own a real reference.
     pub fn release(&mut self, frame: Frame) {
         let i = frame.0 / PAGE;
-        self.free[i / WORD_BITS] |= 1 << (i % WORD_BITS);
-        self.next_word = self.next_word.min(i / WORD_BITS);
-        self.available += 1;
+        assert!(frame.0 % PAGE == 0 && i < self.refs.len() &&
+                self.refs[i] != 0, "release of unowned physical page");
+        self.refs[i] -= 1;
+        if self.refs[i] == 0 {
+            assert_eq!(self.free[i / WORD_BITS] & (1 << (i % WORD_BITS)), 0,
+                       "frame double free");
+            self.free[i / WORD_BITS] |= 1 << (i % WORD_BITS);
+            self.next_word = self.next_word.min(i / WORD_BITS);
+            self.available += 1;
+        }
+    }
+
+    /// Retain a *currently allocated* page before installing a second PTE.
+    /// The u16 count is bounded and never silently wraps on many forks.
+    pub fn retain(&mut self, address: usize) -> Option<()> {
+        if address % PAGE != 0 { return None; }
+        let i = address / PAGE;
+        let count = self.refs.get_mut(i)?;
+        if *count == 0 || *count == u16::MAX { return None; }
+        *count += 1;
+        Some(())
+    }
+
+    pub fn references(&self, address: usize) -> Option<u16> {
+        if address % PAGE != 0 { return None; }
+        let i = address / PAGE;
+        self.refs.get(i).copied().filter(|&count| count != 0)
     }
 
     pub fn probe(&mut self) -> bool {
@@ -209,6 +256,32 @@ const SNAPSHOT_WORDS: usize = PAGE / size_of::<usize>() - 1;
 pub struct BitmapSnapshot { first: usize, pub count: usize }
 
 impl BitmapSnapshot {
+    /// Extend an earlier snapshot by one frame proven reachable from the
+    /// retained process. It must have been free at snapshot time and now have
+    /// exactly one owner. Duplicate, old, free or shared frames are rejected.
+    /// The caller establishes process ownership by walking its actual PTEs;
+    /// matches() still checks every other bit and the exact free-frame count.
+    #[allow(non_snake_case)]
+    pub fn includeAllocatedFrame(&mut self, aFrames: &Frames<'_>, aAddress: usize) -> bool {
+        if aFrames.references(aAddress) != Some(1) { return false; }
+        let pIndex = aAddress / PAGE;
+        let pWord = pIndex / WORD_BITS;
+        let pMask = 1usize << (pIndex % WORD_BITS);
+        if aFrames.free[pWord] & pMask != 0 { return false; }
+        let Some(pCount) = self.count.checked_sub(1) else { return false; };
+        let mut pPage = self.first as *mut usize;
+        for _ in 0..pWord / SNAPSHOT_WORDS {
+            if pPage.is_null() { return false; }
+            pPage = unsafe { pPage.read() as *mut usize };
+        }
+        if pPage.is_null() { return false; }
+        let pSaved = unsafe { pPage.add(1+pWord % SNAPSHOT_WORDS) };
+        if unsafe { pSaved.read() } & pMask == 0 { return false; }
+        unsafe { pSaved.write(pSaved.read() & !pMask); }
+        self.count = pCount;
+        true
+    }
+
     pub fn matches(&self, frames: &Frames<'_>) -> bool {
         let mut page = self.first as *const usize;
         for chunk in frames.free.chunks(SNAPSHOT_WORDS) {
@@ -227,5 +300,120 @@ impl BitmapSnapshot {
             frames.release(Frame(page));
             page = next;
         }
+    }
+}
+
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod snapshotTests {
+    use super::*;
+
+    #[repr(align(4096))]
+    struct SnapshotPage([usize; PAGE / size_of::<usize>()]);
+
+    // Use real bitmap/refcount and snapshot code with synthetic physical frame
+    // numbers. Only the snapshot's storage is host memory; no privileged I/O or
+    // allocation of a fictitious physical address is performed by these tests.
+    fn withSnapshot(aInitial: &[usize], aRun: impl FnOnce(&mut Frames<'_>, &mut BitmapSnapshot)) {
+        let mut pFree = aInitial.to_vec();
+        let mut pRefs = vec![0; pFree.len()*WORD_BITS];
+        let pCount = pFree.iter().map(|pWord| pWord.count_ones() as usize).sum();
+        let mut pPages: Vec<Box<SnapshotPage>> = (0..pFree.len().div_ceil(SNAPSHOT_WORDS))
+            .map(|_| Box::new(SnapshotPage([0; PAGE / size_of::<usize>()]))).collect();
+        for pIndex in 0..pPages.len() {
+            let pNext = if pIndex+1 < pPages.len() {
+                pPages[pIndex+1].0.as_ptr() as usize
+            } else { 0 };
+            pPages[pIndex].0[0] = pNext;
+        }
+        for (pPage,pWords) in pPages.iter_mut().zip(pFree.chunks(SNAPSHOT_WORDS)) {
+            pPage.0[1..1+pWords.len()].copy_from_slice(pWords);
+        }
+        let mut pSnapshot = BitmapSnapshot { first: pPages[0].0.as_ptr() as usize, count: pCount };
+        let mut pFrames = Frames { free: &mut pFree, refs: &mut pRefs, next_word: 0,
+                                  available: pCount, kernel_root: 0 };
+        aRun(&mut pFrames,&mut pSnapshot);
+    }
+
+    fn allocateNumber(aFrames: &mut Frames<'_>, aIndex: usize, aReferences: u16) {
+        let pMask = 1usize << (aIndex % WORD_BITS);
+        assert_ne!(aFrames.free[aIndex / WORD_BITS] & pMask,0);
+        aFrames.free[aIndex / WORD_BITS] &= !pMask;
+        aFrames.refs[aIndex] = aReferences;
+        aFrames.available -= 1;
+    }
+
+    #[test]
+    fn includesOnlyNewUniquelyOwnedFramesAndRejectsDuplicate() {
+        withSnapshot(&[(1<<4)|(1<<5)],|pFrames,pSnapshot| {
+            assert!(pSnapshot.matches(pFrames));
+            allocateNumber(pFrames,4,1);
+            assert!(!pSnapshot.matches(pFrames));
+            assert!(pSnapshot.includeAllocatedFrame(pFrames,4*PAGE));
+            assert_eq!(pSnapshot.count,1);
+            assert!(pSnapshot.matches(pFrames));
+            assert!(!pSnapshot.includeAllocatedFrame(pFrames,4*PAGE));
+            assert!(pSnapshot.matches(pFrames));
+        });
+    }
+
+    #[test]
+    fn rejectsOldFreeSharedUnalignedAndOutOfRangeFramesWithoutMutation() {
+        withSnapshot(&[(1<<4)|(1<<5)],|pFrames,pSnapshot| {
+            pFrames.refs[2]=1; // already owned before this snapshot
+            allocateNumber(pFrames,4,2); // new, but still shared with a child
+            let pSaved=unsafe { (pSnapshot.first as *const usize).add(1).read() };
+            for pAddress in [2*PAGE,4*PAGE,5*PAGE,6*PAGE,4*PAGE+1,WORD_BITS*PAGE,usize::MAX] {
+                assert!(!pSnapshot.includeAllocatedFrame(pFrames,pAddress));
+                assert_eq!(pSnapshot.count,2);
+                assert_eq!(unsafe { (pSnapshot.first as *const usize).add(1).read() },pSaved);
+            }
+            pFrames.refs[4]=1;
+            assert!(pSnapshot.includeAllocatedFrame(pFrames,4*PAGE));
+            assert!(pSnapshot.matches(pFrames));
+        });
+    }
+
+    #[test]
+    fn omittedLeakedFrameStillFailsExactBitmapAndCount() {
+        withSnapshot(&[(1<<4)|(1<<5)],|pFrames,pSnapshot| {
+            allocateNumber(pFrames,4,1); // reachable user page
+            allocateNumber(pFrames,5,1); // unrelated leaked frame
+            assert!(pSnapshot.includeAllocatedFrame(pFrames,4*PAGE));
+            assert!(!pSnapshot.matches(pFrames));
+            assert_eq!(pSnapshot.count,1);
+            assert_eq!(pFrames.available(),0);
+        });
+    }
+
+    #[test]
+    fn unexpectedFreeCannotHideBehindEqualAvailableCount() {
+        withSnapshot(&[(1<<4)|(1<<5)],|pFrames,pSnapshot| {
+            pFrames.refs[2]=1;
+            allocateNumber(pFrames,4,1);
+            pFrames.release(unsafe {Frame::from_owned_address(2*PAGE)});
+            assert_eq!(pFrames.available(),pSnapshot.count);
+            assert!(!pSnapshot.matches(pFrames));
+            assert!(pSnapshot.includeAllocatedFrame(pFrames,4*PAGE));
+            assert!(!pSnapshot.matches(pFrames));
+        });
+    }
+
+    #[test]
+    fn followsSnapshotChainAcrossBitmapPageBoundary() {
+        let mut pInitial=vec![0;SNAPSHOT_WORDS+1];
+        pInitial[0]=1<<4;
+        pInitial[SNAPSHOT_WORDS]=1<<5;
+        withSnapshot(&pInitial,|pFrames,pSnapshot| {
+            let pDistant=SNAPSHOT_WORDS*WORD_BITS+5;
+            allocateNumber(pFrames,4,1);
+            allocateNumber(pFrames,pDistant,1);
+            assert!(pSnapshot.includeAllocatedFrame(pFrames,pDistant*PAGE));
+            assert!(!pSnapshot.matches(pFrames));
+            assert!(pSnapshot.includeAllocatedFrame(pFrames,4*PAGE));
+            assert!(pSnapshot.matches(pFrames));
+            assert_eq!(pSnapshot.count,0);
+        });
     }
 }

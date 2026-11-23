@@ -1,10 +1,24 @@
 # AgentOS — plán implementace prvního stabilního vydání
 
-Rozsah a závazné podmínky převzetí určuje [technické zadání AgentOS](ZADANI.md). Čísla etap udávají doporučené pořadí. U každé etapy je uvedena její skutečná závislost, aby se například vývoj sítě mohl rozběhnout souběžně s úložištěm. Stav při sestavení plánu: všechny etapy čekají na implementaci a ověření.
+Rozsah a závazné podmínky převzetí určuje [technické zadání AgentOS](ZADANI.md). Čísla etap udávají doporučené pořadí. U každé etapy je uvedena její skutečná závislost, aby se například vývoj sítě mohl rozběhnout souběžně s úložištěm. Průběžný stav implementace a dostupné důkazy jsou uvedeny u jednotlivých etap. Historické výsledky platí pro uvedené obrazy; automaticky nepotvrzují pozdější změny.
+
+## Závazná pravidla implementace a předávání
+
+Tato pravidla platí pro všechny etapy, změny zdrojového kódu, testy a předání práce. Jsou závazná vedle `ZADANI.md`; technické zadání a akceptační kritéria nelze obejít zjednodušením implementace.
+
+1. **Jediný řídicí dokument.** `PLAN_IMPLEMENTACE.md` je autoritativní plán implementace. Postupovat podle jeho etap, skutečných závislostí a kritérií převzetí. Doplňkové dokumenty mohou obsahovat technické podrobnosti, ale nenahrazují stav a rozhodnutí zde.
+2. **Průběžný zápis přímo do plánu.** Každá podstatná změna se zaznamená u příslušné etapy: dotčené soubory a rozhraní, rozsah funkce, důvody rozhodnutí, provedené testy, konkrétní výsledky a odkazy na důkazy, známá omezení, rizika a další krok. Starší neplatné informace opravit nebo výslovně označit jako historické; nevytvářet rozporné paralelní přehledy.
+3. **Žádné polovičaté funkce vydávané za hotové.** Návrh musí zahrnovat běžný provoz, selhání, hraniční stavy, obnovu a uvolňování prostředků. Částečný přírůstek je přípustný pouze jako výslovně rozpracovaná součást větší funkce, s vymezením toho, co chybí; nesmí se označit za dokončenou nebo akceptovanou.
+4. **Dlouhodobě udržitelná architektura.** Před změnou zhodnotit modularitu, jasná a stabilní rozhraní, budoucí rozšiřování, kompatibilitu ABI a formátů, izolaci, bezpečnost, vlastnictví paměti a prostředků, synchronizaci, více CPU a chování v přerušeních. Nepřidávat skryté globální závislosti ani provizorní řešení bez zaznamenaného migračního plánu.
+5. **Testy jsou součástí dodávky.** Připravit automatické jednotkové, integrační a regresní testy odpovídající riziku změny, včetně chybných vstupů, limitů a souběhu. Ověřit, že se nezhoršily dříve funkční subsystémy. Pouhé napsání testu, úspěšný překlad nebo zelené CI samy neprokazují běh ve VM či na fyzickém zařízení.
+6. **Důkaz před označením „hotovo“.** Rozlišovat `navrženo`, `implementováno`, `host-test ověřeno`, `CI ověřeno`, `VM ověřeno`, `fyzicky ověřeno` a `akceptováno`. Uvést commit SHA, verzi nástrojů, konfiguraci, hash obrazu a odkazy na logy/protokoly tam, kde je to relevantní. Neprovedené kontroly uvést jako neověřené, nikoliv jako úspěšné.
+7. **Bezpečné změny a stabilní větev.** Vyvíjet na určené pracovní větvi, zachovat stabilitu `main`, neporušovat existující API a akceptované funkce. Změny ABI nebo chování vyžadují zdůvodnění, aktualizaci konzumentů, testy a explicitní evidenci v plánu.
+8. **Předatelnost.** Po každé pracovní dávce musí další vývojář pouze ze zdrojů a tohoto plánu zjistit, co je hotové, co se změnilo, jak to reprodukovat, co zůstává neověřené a jaký je následující krok. Nepředpokládat znalost předchozí konverzace.
+9. **Dokončovat ucelené funkce.** Upřednostnit dokončení a ověření jedné funkční oblasti před paralelním otevíráním dalších nedokončených částí. Pokud dostupné prostředí neumožňuje přejímku, připravit úplné testy a přesný postup ověření, ale ponechat stav otevřený.
 
 ## Jak budeme ověřovat postup
 
-Aktuální vývoj a ověřování probíhají pouze ve VirtualBoxu. Fyzické zkoušky HP v následujících etapách jsou odložené do budoucí fyzické přejímky a neblokují pokračování vývoje ve VM.
+Vývoj může pokračovat i v prostředí bez VirtualBoxu. U změn se zvlášť evidují provedené kontroly zdrojů, sestavení a hostitelské testy; běh jádra a integrační akceptace zůstávají neověřené do skutečného spuštění ve VM. Fyzické zkoušky HP v následujících etapách jsou odložené do budoucí fyzické přejímky a neblokují pokračování vývoje.
 
 - Automatické integrační běhy používají VirtualBox 7.1.12, EFI64, 2 vCPU a 256 MiB RAM. Funkční běhy jádra se opakují také s 1 vCPU. Hostitel ovládá konzoli přes COM1, kontroluje časový limit, výstupy programu a výsledný stav po restartu.
 - Fyzické zkoušky se provádějí na HP ProBook 460 G11. Podepsané USB umožní časný boot a ověření ovladačů. Pro instalaci a zápisy na interní NVMe se pracovní disk s Windows vyjme a eviduje se identita vyhrazeného disku. Výsledek z VM a výsledek z HP se zaznamenávají zvlášť.
@@ -42,21 +56,239 @@ Každý řádek odpovídá jednomu měřicímu oknu. Stopky hostitele zaznamenal
 
 **Navazuje na 1.** Zavést alokaci stránek, stránkování, ochrany paměti, ACPI/APIC, obsluhu výjimek a přerušení. Nad nimi spustit preemptivní plánovač, synchronizaci, monotónní čas a čekání bez trvalého pollingu.
 
-**Převzetí.** Test na 1 a 2 vCPU a následně na HP spustí identifikovatelnou úlohu na každém dostupném CPU. Zátěž ověří souběžnou alokaci a uvolňování stránek, preempci a probuzení časovačem. Ověří se ochranné stránky, NX a chování při vyčerpání paměti. V klidu se změří probuzení procesorů a režie jádra. Tím se uzavře celek B.
+**Převzetí.** Test na 1 a 2 vCPU a následně na HP spustí identifikovatelnou úlohu na každém dostupném CPU. Zátěž ověří souběžnou alokaci a uvolňování stránek, preempci a probuzení časovačem. Ověří se ochranné stránky, NX a chování při vyčerpání paměti. V klidu se změří probuzení procesorů a režie jádra. Tím se ověří základ celku B; obecný demand paging a řízené vyvažování SMP podle § 4.3–4.4 mají vlastní implementaci a přejímku v milníku 3.1, který potřebuje také skutečné procesy z etapy 3.
 
 ### 3. Izolované procesy, VFS, IPC a terminál
 
-**Izolace procesů a první nativní ABI ověřeny ve VM.** Podepsaný obraz se SHA-256 `237fd7d17e608b40dd1616af57455d14e0ebc41b07f1c9648bb8843130ee6e5a` načetl ze svého initramfs statický ELF `init`, který přes `spawn` spustil ELF `fault`. Oba běžely v CPL3 s vlastními tabulkami stránek. Na [1 vCPU](build/runs/AgentOS-signed-e481021595/com1.log) spadl PID 2, rodič PID 1 převzal stav 270 a skončil s kódem 0. Na [2 vCPU](build/runs/AgentOS-signed-ace69882ea/com1.log) proběhl scénář postupně na APIC ID 0 (PID 1 a 2) a APIC ID 1 (PID 3 a 4). V každé dvojici měly procesy odlišné CR3. Čtení chráněné stránky jádra vyvolalo v potomkovi výjimku 14 s chybovým kódem 5. Rodič po pádu ověřil svůj původní obsah zásobníku na stejné virtuální adrese, vypsal zprávu na COM1 a úspěšně skončil. Jádro ověřilo shodu bitmapy volných stránek a pokračovalo v běhu. Rodič také ověřil chybové návraty pro nepřístupné buffery a neznámé číslo systémového volání. Rozhraní a omezení prvního profilu popisuje [nativní ABI v1](README.md#uživatelské-procesy-a-nativní-abi-v1).
-
-**VFS, souborové popisovače a roury ověřeny ve VM.** Podepsaný EFI se SHA-256 `c1dd9800cac87ecf26d0ab0ec884c4eccf35a99d60f0cc1d1ef5b7258a49f2b7` spustil dva izolované procesy. Rodič otevřel přes VFS soubor `/data/transfer.bin` v initramfs a odeslal jej rourou. Příjemce porovnal všech 8 193 bajtů s očekávaným obsahem, ověřil EOF a ohlásil FNV-1a `1490a95f`. Na [1 vCPU](build/runs/AgentOS-signed-26567f4312/com1.log) proběhl přenos z PID 1 do PID 3. Na [2 vCPU](build/runs/AgentOS-signed-1b13556e1d/com1.log) proběhl postupně na CPU 0 z PID 1 do PID 3 a na CPU 1 z PID 4 do PID 6. Po každé dvojici jádro ověřilo návrat volných stránek do výchozího stavu.
+**Aktuální stav základního profilu k 2026-11-21: implementováno, jádro a uživatelské programy ověřeny host testy a skutečným QEMU; povinná přejímka ve VirtualBoxu zůstává otevřená.** Pracovní větev je `dev/stage3-ipc-validation`, [draft PR #1](https://github.com/filipbcz/AgentOS/pull/1). `main` se nemění. Starší průběžné zápisy byly přesunuty beze změny věcného obsahu do [historie etapy 3](docs/HISTORY_STAGE3_BEFORE_COMPLETION.md); aktuální stav určuje pouze tato část. Nově přiřazené požadavky na demand paging a vyvažování SMP jsou samostatně sledované v navazujícím milníku 3.1 a tento stav ani dosavadní důkazy je nepotvrzují.
 
 **Navazuje na 2.** Implementovat uživatelský režim, nativní syscall ABI, loader ELF, adresní prostory včetně copy-on-write, popisovače a identitu procesů. Z initramfs spustit PID 1. Přidat VFS, roury, lokální IPC s identitou volajícího, TTY, shell, PS/2 vstup a správu služeb. Textový shell pracuje přes TTY, správní operace přes služby podle § 3.
 
 **Převzetí.** Uživatelský program přečte soubor z initramfs a pošle výsledek rourou. Chybný uživatelský ukazatel a pád samostatného procesu neukončí jádro ani druhý proces. PID 1 převezme ukončeného potomka a při opakovaném pádu služby omezí restartování. Interaktivní vstup a výstup se prověří přes COM1 a klávesnici s displejem. Úplná zkouška celku C včetně odemčení, přihlášení a trvalého přesměrování proběhne v etapě 7.
 
+#### Implementovaný rozsah
+
+| Oblast | Chování a zdroj | Kontrola |
+|---|---|---|
+| Izolované procesy | CPL3, soukromé CR3, kontrola uživatelských ukazatelů, W^X/NX, omezený ELF loader; `kernel/{process,paging,scheduler,smp}.rs` | Skutečný pád potomka bez pádu rodiče/jádra, odlišná CR3, chybové ABI, návrat rámců |
+| Nativní ABI | Explicitní `AgentOS` ELF PT_NOTE, verze 1, flags 0; `kernel/native_abi.rs`, `user/{abi.h,user.ld}` | Rust parser, negativní metadata, skutečně slinkované ELF; každý z 12 programů prochází build gate |
+| COW a životní cyklus | `fork`, lazy oddělení uživatelských stránek i při kernelovém copy-out, reaping/adopce sirotků, uzavření fd | Host test skutečného paging/scheduleru, guest COW/orphan scénáře a kontrola bitmapy |
+| Kernelové zásobníky | 16 KiB + guard na obou stranách pro kernelové úlohy, syscall/trap, AP a IST; `kernel/stack.rs` | OOM rollback, nulování/reuse, supervisor/NX, sdílení mezi CR3; skutečný PF na obou guardech |
+| VFS a roury | Initramfs pouze ke čtení, 32 fd/proces, sdílená pozice, omezené buffery a blokující čekání | Přenos 8193 bajtů, FNV-1a, EOF, chybné cesty/fd/buffery a uvolnění prostředků |
+| Lokální IPC | Zprávy do 1024 B, kernelová PID/UID/GID identita, EOF/EPIPE, blokující i neblokující operace | Protilehlé identity, hraniční délky, zachování zprávy po chybě, full-mailbox EAGAIN bez změny dat |
+| Původní PID 1 | Stejný BSP `init`/CR3 po jednorázovém `boot_pause`, statický DAG služeb, READY, reaping, restart limit/backoff, transitive stop a ordered shutdown | Guest identita PARK→SESSION, tři skutečné pády workeru, host selhání závislosti/orphan/timeout/IPC a čistý konec relace |
+| Tickless běh | Jednorázový LAPIC podle nejbližšího deadline/kvanta, I/O wakeup; `kernel/timer.rs` | Host politika i scheduler, samostatný boot idle a provozní pětisekundový příkaz `idle` |
+| TTY a shell | Kanonický COM1/PS2 vstup, ASCII GOP se scrollingem, chybová obnova, `services`, `service`, `idle`; `kernel/{line,tty,ps2,keyboard,fb_console}.rs`, `user/shell.c` | Skutečné UART/klávesnicové příkazy a obrazový glyph test; host chyby vstupu, overflow, EOF, čtení a partial write |
+| Logování a důkazy | SMP/IRQ-safe omezená historie, BOOT.LOG filtr; zachovaný skutečný boot header | Pozitivní i potlačené výstupy, provenance a hash svázaný se zdroji, skutečné COM1/screenshot artefakty |
+
+#### Náprava po review a zdůvodnění změn
+
+1. **START/RESTART a obnova shellu.** Manager nyní provede spawn ještě před úspěšným ACK (`starting`, pokus 1); první příkaz nečeká na jinou událost či 60s deadline. Stav DOWN s dostupnou závislostí je okamžitá práce. Zastavená volitelná služba neblokuje obnovení již provozovaného shellu po pádu `core`. Testy pracují se skutečným C managerem a ověřují i jeho hlavní smyčku.
+2. **Omezený dohled i při chybě klienta.** Celý až 1024bajtový paket se nejprve převezme a až potom validuje; chybná délka tak nezůstane ve frontě. Odpověď používá nové `SYS_IPC_TRY_SEND=0x10019`. Plná či uzavřená schránka izoluje porouchanou relaci přes stejný bounded restart, místo zablokování PID 1. OOM při zakládání služby také spotřebuje restartovací budget.
+3. **Provozní nečinnost.** `core` po READY blokuje na celoživotním IPC, neprovádí 100ms periodickou práci. Timer používá minimum nejbližšího deadline a 10ms kvanta; při všech uspaných úlohách zůstává nejvýše 1s watchdog, bez timed waiterů je vypnutý. Nezávislý rozpočet počítá spotřebované LAPIC tick-y i při jiných IRQ. `SYS_TIMER_STATS=0x10018` kopíruje 32 B: verzi, lokální monotónní ms, runtime timer IRQ a idle timer IRQ. Čtení nenuluje počítadla; guest test ověřuje i neplatné pointery/velikost/flags.
+4. **Skutečné guardy kernelových zásobníků.** Horní supervisor/NX podstrom vzniká před kopírováním privátních user roots. Padesát tabulek je trvalých; datové rámce zásobníků se transakčně přidělují/uvolňují. CPU-local vlastnictví a invalidace při reuse odpovídají stávající architektuře bez migrace. Marker `AGENTOS KERNEL STACK GUARD OK` vzniká po skutečném page faultu dolního i horního guardu. Host testy prověřují všech 50 přípravných OOM bodů a selhání jednotlivých datových alokací.
+5. **Rozlišení ELF ABI.** Note má owner `AgentOS\0`, typ 1 a descriptor `{version=1,flags=0}`; loader ji ověří před privátními page-table alokacemi. Neoznačený ELF vrací ENOEXEC, protože je podle zadání vyhrazen budoucímu Linux ABI. Již vytvořené nativní programy je nutné znovu slinkovat přes aktualizovanou hlavičku/script. Dynamický linker ani Linux ABI se tím nepředstírají.
+6. **Testovací skripty odpovídají aktuálním producentům.** Záznam ukončení je `AGENTOS MANAGER SESSION STOP`, VBox Backspace/Enter používá vstupní PC/XT Set 1 a ověření GOP hledá přesnou novou odpověď na celém řádku. Horních 88 px uchovává skutečné bootové pixely, takže pozitivní test nezávisí na závodu s vymazáním obrazovky. TCP capture čeká i na kompletní závěrečný strukturovaný řádek. Kontrola souhrnu vyžaduje odpovídající čistý checkout, aby starší úspěch nepotvrzoval pozdější změny.
+
+Rozhraní a limity jsou popsány také v aktuálním [README](README.md). Přidané syscally nemění čísla starších operací. Nová ABI note je záměrně povinná a všechny dodávané programy jsou aktualizované současně.
+
+#### Ověření této pracovní dávky
+
+Finální ověřená implementační revize včetně přejímacích skriptů je [`64f87f8899e3d7e0cb3fff7bf55ff147bef2354c`](https://github.com/filipbcz/AgentOS/commit/64f87f8899e3d7e0cb3fff7bf55ff147bef2354c). [Host checks 44938920075](https://github.com/filipbcz/AgentOS/actions/runs/44938920075) a [QEMU Secure Boot 44938920070](https://github.com/filipbcz/AgentOS/actions/runs/44938920070) oba skončily **success**. CI checkout používá PR merge `e25f4323c979a6a803c9a756c6a0b8b423eaf802`; jeho strom `80894fb984d5dca7065134ea640a791349d27ee4` je přesně shodný se stromem uvedeného headu. Následný zápis těchto výsledků mění pouze dokumentaci, nikoli implementaci, build ani testovací scénáře.
+
+| Ověření | Skutečný výsledek |
+|---|---|
+| Host Python | 131 úspěšných testů |
+| Rust | 159 úspěšných spuštění ve 12 sadách; sdílené moduly se mohou testovat opakovaně |
+| Rizikové nové části | 30 scheduler/timer, 6 ABI parser, 4 stack allocator a 6 paging/COW testů prošlo |
+| C | Manager, worker, supervisor a orphans harness prošly |
+| Sestavení | Rust 1.75.0, GCC 13.3.0; kernel a všech 12 user ELF slinkováno; W^X, trap návraty a note ověřeny |
+| PowerShell | Parser všech skriptů prošel |
+| QEMU 1 CPU | Podepsaný boot 33,570 s; úplná UART/PS2/GOP relace 40,450 s, výsledek pass |
+| QEMU 2 CPU | Podepsaný boot 35,584 s; úplná UART/PS2/GOP relace 41,715 s, výsledek pass |
+| Provozní klid | 1 CPU: 5000 ms, 2 CPU: 5001 ms; v obou celkem 6 timer IRQ, všech 6 při všech úlohách blocked |
+| Reálné restarty a úklid | 1 CPU ukončil nová PID 19/20/21, 2 CPU PID 31/32/33 se stavem 42; původní kořen zůstal PID 1; konec obou relací stav 0 a FRAMES=OK |
+
+Podepsané obrazy mají SHA-256 `4d95f709d19e1ab15bde8d0a8b97d97ee367d9a925b7f24aaee41af2446655ce` (1 CPU) a `c2660a509ffddf533b1e43b59af5b81bc09b0f39eba940d0665203c17edbca8c` (2 CPU). Rozdíl odpovídá odděleným dočasným podpisovým klíčům jobů. **Obě nezávislá sestavení mají shodný nepodepsaný EFI hash** `aecaff94a3fae061a1a61e74a20a31b0865b1d006c7b04d1e6c8e00af03b10b1` a initramfs hash `11245c2e08a32abdaf317e09c0faac2bc9d347f8054a3fb6d708794333393fc6`.
+
+GitHub artefakty [qemu-secureboot-1cpu](https://github.com/filipbcz/AgentOS/actions/runs/44938920070/artifacts/14720892772) (ID 14720892772) a [qemu-secureboot-2cpu](https://github.com/filipbcz/AgentOS/actions/runs/44938920070/artifacts/14721225362) (ID 14721225362) obsahují skutečné COM1 logy, odeslané bajty, GOP snímky, signed EFI, build provenance a `smoke.json`; byly staženy a kontrolní součty porovnány s GitHub metadaty. Bootoval OVMF Secure Boot/QEMU TCG, 256 MiB, 1/2 CPU. Screenshot reálné PS/2 odpovědi byl také vizuálně zkontrolován. QEMU je samostatná platforma, ne potvrzení VirtualBoxu.
+
+Lokálně dále prošly čtyři C harnessy, freestanding link všech user programů s GCC 14.2 a Python kontroly. Místní prostředí nemá rustc, QEMU, PowerShell ani VirtualBox; příslušné provedené kontroly výše skutečně běžely v GitHub CI.
+
+Finální CI zahrnuje i čekání na kompletní poslední TCP řádek, kontrolu aktuálního čistého Git checkoutu, zákaz bytecode cache samotného ověřovače/QEMU harness a odstranění starého souhrnu před novým sestavením. Všech 12 regresních testů souhrnu včetně pěti testů se skutečnými dočasnými Git repozitáři prošlo. Předchozí implementační commit `6905d203f86e73feb86b29343acd139671c15ab6` měl také zelené host i QEMU běhy; pro aktuální předání jsou rozhodující finální výsledky výše.
+
+#### Jediný zbývající přejímací krok základního profilu etapy 3
+
+Na Windows s VirtualBoxem **7.1.12**, WSL `Ubuntu-24.04` a potřebným toolchainem, z čisté aktuální vývojové větve:
+
+```powershell
+.\scripts\accept-stage3.ps1
+python scripts/verify-stage3-suite.py --root . --manifest build/runs/stage3-acceptance.json
+```
+
+Matice automaticky sestaví a podepíše obraz a provede 13 profilů: na 1/2 CPU základní boot `info both`, plnou COM1 relaci `debug serial`, COM1+PS/2/GOP relaci `info serial`, `quiet none`, `debug screen`; dále tři negativní podpisové modifikace loader/kernel/initramfs na 1 CPU. Interaktivní relace zahrnuje opravu Backspace, VFS/chybové příkazy, okamžitý START, STOP, pětisekundový idle, trvání STOP, RESTART se třemi skutečnými pády bez status-pollingu, PS/2 podle profilu a konec PID 1 s `FRAMES=OK`. Idle validátor odmítá původní stovky periodických IRQ.
+
+Souhrnný úspěch je `STAGE3_VM_MATRIX_PASSED`, důkazy zůstávají v `build/runs/` včetně `stage3-acceptance.json`. `-SkipBuild` smí opakovat pouze totožný čistý commit a obraz. Selhání vyžaduje vyhodnotit konkrétní log, opravit příčinu a znovu provést dotčené testy; není dovoleno snížit kritéria nebo přijmout timeout jako úspěch. **Dokud tato matice reálně neprojde, etapa není akceptovaná a draft PR se neslučuje.**
+
+#### Hranice etapy a navazující práce
+
+Registr je konečný profil tří služeb z podepsaného initramfs: timer/IPC `core`, záměrně padající `flaky`, shell. Přihlášení, účty, LUKS2/ext4, bezpečný unmount/flush a A/B potvrzování závisí na etapách 4–10; jejich absence se nevydává za ověřenou kritickou službu. Shell `exit` dnes ukončí systémovou testovací relaci; přihlašovací služba v etapě 7 přinese opakované uživatelské relace. Úplný shell celek C včetně trvalého přesměrování zůstává v etapě 7 podle původního kritéria.
+
+Základní profil před 3.1 B měl jedno vlákno, CPU-local fd/IPC a monotónní epochu, osm task slotů na CPU, 32 fd a bootovací UID/GID 1000. Nové vlastnictví napříč CPU, společný čas a nativní ABI v2 popisuje část 3.1 B níže; historické podrobnosti ABI v1 a naměřené obrazy této části se nemění. Základní profil před milníkem 3.1 mapoval ELF segmenty a uživatelský zásobník před spuštěním; samotné COW nebylo obecným demand pagingem. Novou implementaci demand pagingu sleduje část 3.1 A níže. Migrace a nutné mezi-CPU probouzení/IPC patří do části 3.1 B. Vícevláknové POSIX ABI, dynamické service manifests a perzistentní audit nejsou v tomto základním profilu implementované. Změna těchto hranic musí rozšířit vlastnictví/TLB/protokolové testy. Fyzické HP, dlouhodobá provozní zátěž a širší platformní podpora zůstávají vlastními navazujícími zkouškami; QEMU výsledky je nenahrazují.
+
+### 3.1. Demand paging a vyvažování SMP
+
+**Stav k 2026-11-22: části A i B jsou implementované a společně ověřené host CI a QEMU na revizi `2023723`; převzetí ve VirtualBoxu zůstává otevřené.** Tento milník přiřazuje dva požadavky zadání, které původní plán nepojmenoval v žádné etapě. Níže jsou samostatné historické důkazy části A i nové společné výsledky A+B. Aktuální scénáře ověřují demand paging, skutečné migrace, vzdálené ukončení a původní regrese. Host OOM/rollback kontroly jsou provedené; samostatná guest zkouška vyčerpání paměti demand procesem ještě chybí.
+
+| Požadavek zadání | Odpovědná část milníku | Návaznost |
+|---|---|---|
+| § 4.3 — demand paging pro procesy | 3.1 A: procesová paměť a obsluha page faultu | Adresní prostory, ELF a COW z etapy 3 |
+| § 4.4 — řízený přesun úloh mezi CPU a vyvažování zátěže | 3.1 B: plánovač SMP a vlastnictví prostředků | SMP/časovače z etapy 2 a procesy, IPC a čekání z etapy 3 |
+
+**Navazuje na 2 a 3.** Doporučené pořadí je dokončit základní profil etapy 3, poté část A a následně část B včetně jejich společných regresí. Obě části patří do společných kernelových rozhraní, která později použije také Linux ABI. Nízké ovladače etapy 4 mohou vznikat souběžně; převzetí etapy 9 a stabilního vydání v etapě 12 vyžaduje dokončený milník 3.1. Dosavadní číslování etap 4–12 zůstává zachováno.
+
+#### A. Demand paging procesové paměti
+
+Oddělit evidenci rezervovaných virtuálních oblastí, jejich práv a zdroje obsahu od přidělených fyzických rámců. Platný první přístup má přidělit a vynulovat anonymní stránku nebo načíst příslušnou část ELF z initramfs, včetně správného nulování BSS. Obsluha nesmí zpřístupnit nulovou adresu, guard zásobníku ani stránky mimo povolené oblasti; zachová NX a W^X. Podporované oblasti a jejich limity musí být dokumentované.
+
+Sjednotit tuto cestu s COW a kernelovým čtením/zápisem uživatelských bufferů: platná dosud nepřítomná stránka musí fungovat i při syscallu, neplatný přístup musí skončit odpovídající chybou. `fork` musí zachovat rezervace i obsah před prvním načtením stránky i po něm. OOM, selhání částečné alokace a ukončení procesu musí mít definovaný výsledek, vrátit všechny rozpracované prostředky a zachovat ostatní procesy. První přejímka používá anonymní paměť a neměnný initramfs, takže není závislá na hotovém ext4.
+
+**Dotčená rozhraní.** Správa oblastí a PTE v `kernel/paging.rs`, životní cyklus/loader v `kernel/process.rs`, page fault a syscall copy-in/copy-out, evidence rámců a jejich referencí. Implementovaný kontrakt, chybové návraty a aditivní změnu ABI popisují následující odstavce, `user/abi.h` a README; testy používají skutečné implementace pageru i jeho konzumentů.
+
+##### Implementace části A a její hranice
+
+- `kernel/paging.rs` vlastní jednu metadata stránku s nejvýše 64 oblastmi včetně čtyřstránkového zásobníku. `UserSpace` zůstává malý kvůli osmi procesním slotům uloženým ve struktuře CPU. Rezervace nepřiděluje datové rámce ani podřízené tabulky. `kernel/process.rs` ověřuje celé ELF a uchovává pouze statický backing z initramfs; zásobníkový guard zůstává mimo rezervace. `user/user.ld` ukládá `.bss` jako `NOBITS`.
+- Page fault přijímá pouze oprávněné uživatelské první čtení/zápis/spuštění a skutečný COW zápis; jiné protection, reserved-bit, guard, NX a RO případy ukončí příslušný proces. Obsah části stránky před segmentem, BSS i padding se nuluje. Neúspěšné vytvoření jednotlivého mapování vrací celý nepublikovaný podstrom tabulek.
+- `read`/`readable`/`writable`/`write` nejprve ověří celý buffer podle oblastí, poté materializují potřebné stránky a až nakonec kopírují. `kernel/files.rs`, `kernel/ipc.rs` a syscall cesty v `kernel/smp.rs` propagují `EFAULT` (−14) a `ENOMEM` (−12) odlišně. Selhání přípravy zachová offset souboru, zprávu IPC i obsah roury. Již úspěšně připravené stránky či oddělené COW mapování mohou po více-stránkovém OOM zůstat rezidentní; nejde o potvrzený přenos dat a jejich vlastnictví zůstává procesu. UART/GOP výstup se dokončuje mimo zámek fyzického alokátoru z vlastní omezené kopie dat.
+- `fork` kopíruje i nepřítomné rezervace, sdílí pouze rezidentní stránky a ochrany rodiče mění až po úspěšném klonování. Ukončení vrací data, soukromé tabulky, metadata a všechny reference. Kontrola přetrvávajícího PID 1 normalizuje původní rezidentní snapshot pouze přes přesné PT/datové rámce dosažitelné z jeho aktuálního adresního prostoru; kontrola ostatních bitů i závěrečná bitmapa po ukončení celé relace zůstávají zachované.
+- Přibývá aditivní nativní syscall `vm_stats` (`0x1001a`, buffer 64 bajtů, flags 0). Osm little-endian u64 obsahuje verzi 1, rezervované stránky, rezidentní uživatelské stránky, soukromé tabulky včetně root, metadata stránky, počet demand alokací, COW kopií a povýšení posledního vlastníka. Cíl se připraví před snímkem. Kumulativní počty jsou od vzniku daného prostoru, v potomkovi začínají od nuly; počty mapování dědí aktuální stav. Nejde o unikátní fyzickou spotřebu celého systému. Kontrakt a nové návraty `ENOMEM` jsou v `user/abi.h` a README.
+
+##### Ověření a předání části A
+
+Ověřená funkční revize je [`9f4dde5b7a98eb847f8e82273cab7a902e6ae7e1`](https://github.com/filipbcz/AgentOS/commit/9f4dde5b7a98eb847f8e82273cab7a902e6ae7e1). [Host CI](https://github.com/filipbcz/AgentOS/actions/runs/44957373668) a [QEMU CI](https://github.com/filipbcz/AgentOS/actions/runs/44957373682) skončily `success`. Oba workflow skutečně testovaly čistý GitHub merge checkout `4a0fb41919be3fbe45a832950541674df4c0c4b7`; jeho strom `71d5d48759cea12156f50f5a2636cbee240c2c87` je shodný se stromem uvedené funkční revize. Následný zápis výsledků mění pouze README a tento plán. Toolchain: Rust 1.75.0, GCC 13.3.0 a připnutý `scripts/toolchain.lock`.
+
+| Kontrola finální revize | Výsledek |
+|---|---|
+| Python ověřovače a harness entrypointy | 141 testů v 17 sadách prošlo |
+| Rust host sady nad skutečným kódem | 191 spuštění testů ve 14 sadách prošlo; sdílené moduly se v některých sadách opakují |
+| Samostatné C harnessy | Všechny 4 prošly |
+| Nativní uživatelské programy | Všech 12 ELF se sestavilo a prošlo kontrolou ABI note |
+| Kernel a trap návrat | Link prošel; W^X 23 RX / 2 RO+NX / 1 RW+NX stránek, návratový stub 41 instrukcí |
+| PowerShell harnessy | Parsování prošlo |
+| OVMF Secure Boot / QEMU TCG, 256 MiB, 1 a 2 CPU | Na obou konfiguracích prošel běžný boot i interaktivní UART+PS/2/GOP relace |
+| Runtime idle v interaktivní relaci | V obou konfiguracích 5 001 ms, 6 timer IRQ, z toho 6 idle IRQ |
+| Ukončení interaktivní relace | Původní PID 1 skončil se stavem 0; v obou konfiguracích přesný návrat bitmapy `FRAMES=OK` |
+
+Rust testy obsahují 17 kontrol pageru, 5 kontrol přesného započítání živých rámců do snapshotu a 16 spuštění v integrační sadě loader/VFS/fd/IPC včetně 6 sdílených ABI testů. Používají vlastněnou zarovnanou host paměť a skutečný kernelový kód, řízená místa OOM, rollback a kontrolu zachování dat. První host běh odhalil chybu samostatné kompilace snapshot testů: `pub(super)` nemohlo být v kořeni testovacího crate. Finální revize přidává obalový modul zachovávající produkční viditelnost; celá sada výše byla potom znovu úspěšně provedena. Lokálně prošla syntaxe Python/Bash, Python kontroly a link všech 12 ELF s GCC 14.2; Rust a QEMU výsledky pocházejí ze skutečných běhů GitHub CI.
+
+`user/demand.c` běží v původním initu na 1/2 CPU. Rezervuje 16 MiB skutečného BSS, ověřuje lazy file/pipe/IPC buffery, fork nad rezidentními i nepřítomnými oblastmi a ukončení samostatných potomků při guard/NX/RO přístupu. Ve všech čtyřech skutečných bootech finálního QEMU běhu naměřil na každém testovaném CPU následující hodnoty pro svůj adresní prostor:
+
+| Metrika (stránka 4 KiB) | Před řídkými přístupy | Po řídkých přístupech |
+|---|---:|---:|
+| Rezervované virtuální stránky včetně obrazu a zásobníku | 4 112 | 4 112 |
+| Rezidentní uživatelské stránky | 6 (24 KiB) | 11 (44 KiB) |
+| Soukromé stránkovací tabulky včetně root | 6 (24 KiB) | 9 (36 KiB) |
+| Metadata oblastí | 1 (4 KiB) | 1 (4 KiB) |
+| Kumulativní demand materializace | 6 | 11 |
+
+Čtyři cílené vzdálené přístupy spolu s dalším přístupem běhu/reportování vytvořily celkem pět uživatelských stránek; velká nevyužitá část rezervace zůstala nepřítomná. Čísla popisují jeden adresní prostor, nikoli unikátní fyzickou spotřebu celého OS. Testy zachytily skutečné guard/NX/RO page faulty s kódy 4/20/6 a převzetí ukončených potomků. `verify-demand-paging.py` kontroluje čítače, přesnou posloupnost, identitu, adresy a chybové kódy; `qemu-smoke.py` a `test-vbox.ps1` jej v nových pozitivních sériových bězích vyžadují. **Řízené OOM a rollback jsou ověřené host testy; samostatná guest zkouška vyčerpání paměti demand procesem provedena nebyla.**
+
+Artefakty [1 CPU](https://github.com/filipbcz/AgentOS/actions/runs/44957373682/artifacts/14728262311) a [2 CPU](https://github.com/filipbcz/AgentOS/actions/runs/44957373682/artifacts/14728002770) obsahují COM1 logy, vstup relace, GOP/PS/2 snímky, podepsané i nepodepsané EFI, build provenance a výsledné `smoke.json`. Byly staženy, porovnány jejich SHA-256 a opakovány striktní kontroly skutečných logů a obrazových dat. Obě nezávislá sestavení mají shodný nepodepsaný EFI hash `1f09b2b8c9f2e8e556c54ce487b5f9d28c24422aad4ca78e977423309e9c8365` a initramfs hash `98a4a604ffb2057483cda40b1ea44f2bdbe415aefa891c09e027b5cfba82a143`. Podepsané EFI mají SHA-256 `47e3c766040a37889bf877abc4d27c9aeee207d4e2a7b1962af2cac4946abd34` (1 CPU) a `1054b906974170711cbc16f1798b7e3d2e5462757037b975844a9ad397ac5317` (2 CPU); každý job používá vlastní dočasný podpisový klíč. Délka těchto běhů zahrnuje úmyslné třicetisekundové bootové měření klidu a není měřením limitu studeného startu vydání.
+
+Automatická přejímka VirtualBoxu byla 2026-11-22 zahájena, ale první čistá VM (signed, 1 CPU) skončila po 121,419 s na `Kernel marker missing`, bez zaznamenaného COM1 artefaktu v neúspěšném záznamu. Pozdější ruční spuštění stejné VM dosáhlo `AGENTOS KERNEL OK STAGE 1`, shellu i `FRAMES=OK`; není to však validní automatická přejímka ani důkaz prvního pokusu. Pro opakování doplněn snímek `failure.png` zachycený ještě před vypnutím VM, aby bylo možné diagnostikovat obrazovku firmwaru i bez COM1. Také druhý první automatický start čerstvé VM (`AgentOS-signed-f7d390152c`) skončil na stejném markeru, přestože operátor pozoroval na obrazovce již funkční shell a zachycení `failure.png` se podařilo. Nyní všechny profily používají hostitelský TCP COM1 listener a přímo zachycený buffer místo spoléhání na VirtualBox file backend a průběžné čtení souboru. Při dalším opakování profil dosáhl kernel markeru a čekání na shell, pak Windows odmítl číst `com1.log` kvůli současnému zapisovacímu handlu z TCP capture. Skript nyní čte průběžný text z paměťového bufferu a před dávkovými Python/PowerShell kontrolami uzavírá zapisovací stream; pro interaktivní část jej znovu otevře v append režimu. Po úpravě běh `AgentOS-signed-ef529a032f` úspěšně prošel GOP, BOOT.LOG, procesy, bounded supervision, orphan reaping, COW, demand paging, migrací a správou služeb na 1 CPU. Přejímací záznam se však odmítl, protože PowerShell `Test-Path` nezařadil existující `com1.log` mezi artefakty. Jde o rezervované DOS jméno COM1 (i s příponou), a proto aktuální VirtualBox přejímka používá `serial-com1.log` v celém řetězci harness/idle/verifikátor/testovací fixtures; samostatný QEMU Linux log zůstává `com1.log`. Další běh matice prošel prvním profilem, ale druhý interaktivní profil (signed, 1 CPU, debug/serial) skončil při `service restart flaky`: po řízeném ukončení původní instance byly v COM1 zaznamenány jen dvě ukončení workerů se stavem 42. Příčina zatím není potvrzená. Při timeoutu nyní harness pošle čistě diagnostický dotaz `services` přes skutečnou UART/shell cestu a vypíše stav `flaky`, a čeká na úplné tři EXIT události po maximálně 30 sekund hostitelského času stejně jako QEMU. Neúplná posloupnost nadále bezvýjimečně selže. V následném cíleném interaktivním běhu `AgentOS-signed-b16a2217f5` se po `service start flaky` během odesílání `service stop flaky` objevil kernelový `AGENTOS USER EXIT PID=1a STATUS=42`; obě skutečné obrazovky i 14 788bajtový COM1 log končí u `agentos> serviceAGENTOS USER EXIT ...`, zbytek vstupu se nevypíše a odpověď nedorazí. To ukazuje na možnou ztrátu vstupních bajtů během souběžného diagnostického výstupu, nikoli na opožděnou odpověď shellu. VirtualBox harness proto nyní před odesláním dalšího bajtu ověří přesné echo předchozího, včetně úplného asynchronního kernelového záznamu; případný timeout přesně označí bajt. Při dalším pokusu `AgentOS-signed-9cd7344801` se první dva interaktivní příkazy podařily, ale přenos zastavil bajt 14/16 (`0x08`, Backspace) v `echo shell-ox\bk`. Soubor `com1-input.bin` skutečně končí tímto bajtem, `serial-com1.log` končí `agentos> echo shell-ox`, avšak skutečný GOP snímek ukazuje `agentos> echo shell-o` — guest Backspace zpracoval a vykreslil smazání, jeho UART echo ale do TCP zachycení nedošlo. `kernel/tty.rs` umožňuje při zaseknutém UART TX pokračovat pouze přes GOP. Harness nyní vkládá další 20ms klid po každém potvrzeném sériovém echem, nikoliv místo přísného ověření. Potvrdí-li se ztráta i po tomto odstupu, další zkoumání patří do UART TX driveru a VirtualBox serial backendu. Jde o cílenou hypotézu a ještě neověřenou úpravu testovacího harnessu, nikoli potvrzenou opravu guestu ani dokončení VM přejímky. Jde o opravy testovacího harnessu, nikoli potvrzení dokončené VM přejímky. Přejímka všech 13 profilů nadále zůstává otevřená. Aktuální `scripts/accept-stage3.ps1` sestaví nový obraz a provede 13 profilů s rozšířeným bootovým scénářem. Výsledné COM1 logy pro 1/2 CPU lze samostatně ověřit přes `python scripts/verify-demand-paging.py --log CESTA_K_COM1_LOG --cpus 1` nebo `2`; celý souhrn dál vyžaduje čistý odpovídající Git checkout. Společné výsledky A+B jsou v následující části; výše uvedená historická čísla platí pro revizi `9f4dde5`.
+
+#### B. Řízená migrace a vyvažování SMP
+
+Zachovat samostatné fronty CPU a zavést měřitelné vyvažování skutečné zátěže přesunem spustitelných úloh. Popsat pravidla výběru zdrojového/cílového CPU, bezpečný okamžik přesunu a synchronizaci front bez jednoho globálního zámku plánovače. Úloha smí mít právě jednoho vlastníka a nesmí současně běžet na dvou CPU. Připnutí zůstane jen pro zdůvodněné CPU/zařízení vázané úlohy; obecné procesy se musejí skutečně přesouvat. Vyvažování musí zachovat tickless klid bez trvalého pollingu.
+
+Odstranit vazbu identity procesu, rodičovství, fd, rour, IPC a čekacích front na původní CPU. Přesun musí zachovat PID, oprávnění a otevřené prostředky, umožnit probuzení z jiného CPU a bezpečné dokončení/ukončení potomka. Zajistit přenos kontextu, správné CR3 a kernelový zásobník, synchronizaci referencí COW a invalidaci TLB před opětovným použitím mapování či rámců. Změna nesmí uvolnit prostředek, který ještě používá jiné CPU nebo zařízení.
+
+Monotónní čas a platné lhůty nesmějí při migraci změnit význam. Nahradit dnešní CPU-local předpoklady v `kernel/scheduler.rs`, `kernel/smp.rs`, `kernel/stack.rs`, `kernel/paging.rs` a fd/IPC vrstvách a určit společnou časovou doménu nebo ekvivalentní mechanismus zachovávající lhůty. Rozhraní v `user/abi.h`, zejména `monotonic_ms`, časovaná čekání a `timer_stats`, musí dostat výslovné rozhodnutí o kompatibilitě/verzování; současné v1 nelze tiše předefinovat. Souběžná vlákna jednoho adresního prostoru, TLS a futexy se doplní a samostatně prověří v etapě 9 nad těmito kernelovými mechanismy.
+
+##### Implementace části B a její hranice
+
+- Fronty zůstávají samostatné, nejvýše osm task slotů na CPU. Balancer po událostech a návratech z kontextu vybírá méně zatížený CPU s volným slotem a zdroj s rozdílem alespoň dvou runnable úloh. Pod dvojicí zámků ve vzestupném pořadí APIC ID znovu ověří podmínky a přesune celé vlastnictví `Task`. Plný cíl nic nezmění. Kernelové bootové úlohy a root před handoffem zůstávají připnuté; běžné procesy včetně provozního PID 1 migrovat mohou. Neprobíhá periodický polling vyvažování.
+- `kernel/lifecycle.rs` drží stabilní identitu, rodiče, reaper rodinu, kill požadavek a zombie stav mimo přesouvaný `Process`, v jednom fyzickém rámci na proces. Veškerý přístup je pod společným `Frames` gate. Vzdálený `kill` pouze požádá vlastníka, vzdálený `collect` pouze spotřebuje exit status. Handles a mapování zavírá/uvolňuje vlastník. Adopce i ukončení reaper rodiny fungují nezávisle na frontě; samostatné AP bootové kořeny zůstávají oddělené.
+- `current` a právě opouštěná úloha nejsou kandidátem migrace ani reaping. `restore_context` nejprve změní RSP, poté zavolá `finish_context_switch`, až potom obnoví SIMD/GPR. Strojový kód této posloupnosti kontroluje build gate. Při každém výběru kontextu se provede CR3 flush, i při totožném root, s vypnutými PCID/PGE. Tím je definované bezpečné opětovné použití společných stack slotů při jediném aktivním CPU na adresní prostor. Vícevláknové sdílené prostory a jejich shootdown nejsou součástí tohoto milníku.
+- Pořadí synchronizace je fronta nebo dvě uspořádané fronty → frame/resource gate → TTY gate. Mutace i readiness fd, rour a IPC vyžadují frame gate; po jeho uvolnění se doručuje reschedule IPI. Cílové CPU samo znovu zkontroluje čekající procesy. Zahrnut je i self-IPI při přitažení úlohy na právě uspávaný CPU. AP po bootových zkouškách pokračují v trvalé pracovní smyčce s `STI; HLT`; při prázdné frontě bez lhůt je LAPIC timer vypnutý.
+- **Rozhodnutí o ABI:** všechny nativní programy přecházejí na explicitní ELF ABI **v2**; v1 se odmítá s `ENOEXEC` před alokací. Nové `monotonic_ms` a všechny absolutní lhůty používají společný 64bit HPET, `timer_stats` má verzi 2 a součty konzistentních per-CPU párů IRQ čítačů. `vm_stats` zůstává verzí 1 pro samotný adresní prostor. Nové `sched_stats` (`0x1001b`, 64 bajtů, flags 0) má verzi 1, APIC ID, počet CPU, počty migrací procesu/celku, vzdálené IPI notifikace, PID a PPID.
+- HPET je supervisor/NX/uncacheable MMIO, inicializovaný jednou na BSP bez comparator/legacy IRQ; frekvence pochází z deklarované periody a převod používá širokou aritmetiku. Chybějící nebo neplatný 64bit HPET způsobí explicitní boot chybu. QEMU nastavuje `hpet=on`, VirtualBox `--x86-hpet on`. Fyzická dostupnost HPET na cílovém HP zatím není ověřena a zůstává součástí hardwarové přejímky. Rozhraní zařízení popisuje [Intel HPET 1.0a](https://www.intel.com/content/dam/www/public/us/en/documents/technical-specifications/software-developers-hpet-spec-1-0a.pdf), volbu VM [Oracle VirtualBox 7.1](https://docs.oracle.com/en/virtualization/virtualbox/7.1/user/vboxmanage.html).
+
+##### Ověření a předání části B
+
+Ověřená funkční revize je [`2023723cc59bc0b7fd496d45f2acece21cb8e021`](https://github.com/filipbcz/AgentOS/commit/2023723cc59bc0b7fd496d45f2acece21cb8e021). [Host CI](https://github.com/filipbcz/AgentOS/actions/runs/44960642362) a oba joby [QEMU CI](https://github.com/filipbcz/AgentOS/actions/runs/44960642316) skončily `success`. CI testovalo čistý merge checkout `1248c90f6094e052b7fd367768db46fc9d7e3f3a`; jeho strom `c0798a8d628cd4e2a5fc616edc9f4700949d7c7b` je shodný se stromem funkční revize. Následný zápis výsledků mění pouze README a tento plán. Toolchain: Rust 1.75.0, GCC 13.3.0 a připnutý `scripts/toolchain.lock`.
+
+| Kontrola finální revize `2023723` | Výsledek |
+|---|---|
+| Python ověřovače a harness entrypointy | 167 testů v 19 sadách prošlo |
+| Rust host sady nad skutečným kódem | 218 spuštění v 17 sadách prošlo; sdílené moduly se v některých sadách opakují |
+| Scheduler a časovací politika | 22 scheduler testů a 13 timer testů prošlo |
+| Společný registr životního cyklu | 7 testů prošlo |
+| Skutečný loader / fd / IPC | 19 spuštění v integrační sadě prošlo |
+| Samostatné C harnessy | Všechny 4 prošly |
+| Nativní uživatelské programy | Všech 12 ELF se sestavilo a prošlo kontrolou ABI v2 |
+| Kernel a návraty z přerušení | Link prošel; W^X 27 RX / 3 RO+NX / 2 RW+NX stránek; GS návrat 41 instrukcí a přepnutí stacku s retirement callbackem 23 instrukcí |
+| PowerShell harnessy | Parsování prošlo |
+| OVMF Secure Boot / QEMU TCG, 256 MiB, 1 a 2 CPU | Běžný boot i interaktivní UART+PS/2/GOP relace prošly na obou konfiguracích |
+| Ukončení živého potomka a wait | Na 1 CPU ověřena místní větev; na 2 CPU prokázán jiný vlastník CPU, skutečný status 137 a nezměněný čítač migrací během ukončení |
+| Závěrečný úklid | V obou interaktivních relacích původní PID 1 skončil se stavem 0 a přesným návratem bitmapy `FRAMES=OK` |
+
+Host sady prověřují skutečný scheduler/lifecycle, zákaz přesunu právě používaného stacku, plný cíl, přesuny tam a zpět, vzdálený kill/collect/adopci a návrat rámců. Skutečné fd/pipe/IPC a TTY se testují také v souběžných host vláknech. Samostatné sady ověřují HPET a ACPI. Kontrola linkovaného assembleru požaduje potvrzení přepnutí až po změně RSP a před obnovením registrů; mutace nesprávného pořadí, cíle volání a návratových instrukcí musí selhat. Kompilátor stále vydává varování. Lokálně byly provedeny Python kontroly a sestavení uživatelských ELF s GCC 14.2; výsledky Rust/kernel/QEMU pocházejí z uvedených skutečných běhů GitHub CI.
+
+`user/migration.c` běží po obnovení původního PID 1 a před službami, vytváří čtyři potomky a nerovnoměrnou runnable zátěž. Na 2 CPU vyžaduje skutečné opakovaně pozorované změny CPU již běžících PID s růstem provedené práce; na 1 CPU stejné funkční operace proběhnou bez migrace. Dále ověřuje lazy/COW obsah, sdílený file offset, data roury, autentizované IPC, lhůty vytvořené před přesunem a skutečný exit/reaping. `verify-migration.py` vyžaduje úplný interval, konkrétní procesní identity a odpovídající exit události. Nové sériové QEMU/VBox běhy jej vyžadují; původní procesové, demand a service testy zůstávají povinné.
+
+Ze stažených COM1 logů a skutečného vstupu byly nezávisle zopakovány boot/process/supervisor/orphan/COW/demand/migration/service verifiery a u obou relací i úplný interaktivní scénář. Všechny čtyři `smoke.json` obsahují `pass`; oba PS/2 důkazy kontrolují skutečné nové glyphy odpovědi a zachovaný boot header na GOP 1280 × 800.
+
+| Konfigurace a režim | Pozorované změny CPU dětí (z toho původní zátěž) | Migrace celkem v intervalu | Vzdálené IPI notifikace | Kill: CPU rodiče → vlastníka |
+|---|---:|---:|---:|---|
+| 1 CPU, Běžný boot | 0 (0) | 0 | 0 | 0 → 0 |
+| 1 CPU, UART + PS/2 relace | 0 (0) | 0 | 0 | 0 → 0 |
+| 2 CPU, Běžný boot | 12 (11) | 23 | 209 | 0 → 1 |
+| 2 CPU, UART + PS/2 relace | 9 (9) | 21 | 197 | 0 → 1 |
+
+Globální počet zahrnuje také přesuny rodiče a přesuny mezi dvěma pozorováními; není totožný s počtem uživatelských `MOVED` záznamů. V každém běhu se ukončoval právě jeden živý potomek a skutečný `wait` vrátil 137 za 1 ms. Na 2 CPU šlo o PID 33, rodiče na CPU 0 a vlastníka na CPU 1; globální čítač zůstal během kill/collect přesně 22 → 22 v běžném bootu a 20 → 20 v interaktivní relaci. Všechny ostatní děti skončily stavem 0 a byly převzaty. Na 1 CPU byl stejný scénář místní, bez jakékoli migrace nebo vzdálené IPI.
+
+Provozní klid v interaktivní relaci naměřil **5 000 ms / 6 timer IRQ / všech 6 idle IRQ** na 1 CPU a **5 001 ms / 11 timer IRQ / všech 11 idle IRQ** na 2 CPU. V obou případech následoval skutečný PID 1 exit 0 a `FRAMES=OK`. Rozšířený init má v demand scénáři 4 124 rezervovaných stránek, rezidentní data 8 → 12, soukromé tabulky 6 → 9 a jednu metadata stránku. Tyto počty byly stejné na každém testovaném CPU ve všech čtyřech bootech; historická tabulka části A popisuje menší dřívější obraz. Bootové běhy obsahují úmyslné třicetisekundové měření klidu a neměří limit studeného startu vydání.
+
+Artefakty [1 CPU](https://github.com/filipbcz/AgentOS/actions/runs/44960642316/artifacts/14729062318) a [2 CPU](https://github.com/filipbcz/AgentOS/actions/runs/44960642316/artifacts/14729247026) obsahují COM1 logy, vstup relace, GOP/PS/2 snímky, receipts, build provenance, podepsané i nepodepsané EFI, kernel ELF a initramfs. U obou je ověřeno `source_clean: true` a výše uvedený merge checkout. Stažené soubory i odkazy v receipts prošly porovnáním SHA-256; nezávislé joby vytvořily shodné nepodepsané EFI, kernel a initramfs. Podepsané EFI se liší, protože každý job používá vlastní testovací klíč.
+
+| Obraz / součást | SHA-256 |
+|---|---|
+| `agentos.unsigned.efi`, oba joby | `c95530c8e2a15cba6476f0610021ed5886f8320f619d1683985ebda3a583c8ae` |
+| `kernel.elf`, oba joby | `9078e1d99795d4486b9cac62e0290cc5d7d0281a22f4164a18f46dfb13e9eeac` |
+| `initramfs.cpio`, oba joby | `4994ff3442e41ff98b9c054c93cb3a2eb1cf98c6e8ed50117e19ee79d99af733` |
+| Podepsané `agentos.efi`, 1 CPU | `d8e3f5696ab3fc2984f4b08a237f4f3781f1ebe79e5ba2bd83513805576451ef` |
+| Podepsané `agentos.efi`, 2 CPU | `7372d8066854253e95e58c6c72dc9afc8525c5c62c713d1663f6b35790daadc7` |
+
+První kandidát `a71689b` prošel [host kontrolami](https://github.com/filipbcz/AgentOS/actions/runs/44959340602). Jeho [QEMU běh](https://github.com/filipbcz/AgentOS/actions/runs/44959340593) dokončil migrace a čisté ukončení na obou konfiguracích, ale dvouprocesorovou interaktivní relaci odmítl ověřovač klidu: za 5 001 ms naměřil 11 timer IRQ, všech 11 při čekání, proti původnímu limitu pro jediný CPU. Příčinou byl neaktualizovaný test po přechodu na globální čítače ABI v2. Oprava `8ca96f8` zachovává původní rozpočet jednoho watchdogu za sekundu na CPU a čtyři hraniční IRQ celkem: `ceil(ms / 1000) × počet_CPU + 4`; zároveň stále požaduje `TIMERS − IDLE ≤ 2`. Počet CPU musí odpovídat konfiguraci i úplnému ověřenému migračnímu scénáři. Historické logy bez tohoto scénáře nadále mají limit pro jeden CPU. Regrese odmítají chybný či podvržený počet CPU, neúplný důkaz a návrat rychlého periodického ticku. Původní neúspěšný CI výsledek ani jeho artefakty se nepřepisují.
+
+Druhý běh `8ca96f8` odkryl skutečný závod: původní správce služeb po vzdáleném `kill` okamžitě volal `try_wait`, výsledek −11 považoval za chybu a skončil se stavem 81. Nativní ABI v2 nyní výslovně rozlišuje přijetí stop požadavku od publikace konečného statusu. `service_manager.c`, `supervisor.c` i `orphans.c` potvrzují dokončení blokujícím `wait_child_until` s novou kontrolovanou lhůtou (správce 5 s, bootové testy 1 s); při selhání se úklid neoznačí za úspěšný. Správce zachovává PID/fd do reapu, rozlišuje normální exit shellu od EOF živého procesu a navazující readiness/backoff počítá od čerstvého času. Deterministické C regrese nejprve reprodukovaly odložené potvrzení vlastníka i závod `try_wait` → exit 0 → EOF a po opravě prošly; pokrývají také timeout, selhání hodin, přetečení a přirozený exit během kill.
+
+Rozšířený migrační scénář po původní zátěži vybere živého potomka pro `kill` a vyžaduje skutečný `wait` se stavem 137. Na 2 CPU prokazuje vzdáleného vlastníka čerstvým autentizovaným ARM reportem CPU a globálního čítače migrací; čítač musí zůstat stejný až po dokončení `wait`. Kernel započte přesun ještě pod oběma frontovými zámky, takže nový vlastník nemůže vykonat úlohu před zveřejněním čítače. Ostatní tři potomci končí běžným exit 0. Nová regrese nevyužívá testovací syscalls ani afinitu a nenahrazuje původní důkaz migrace již běžících úloh.
+
+VirtualBox a fyzické HP zůstávají neprovedené. Přejímka celého milníku 3.1 vyžaduje následující společná kritéria; testy vyčerpání paměti demand procesem v guestu se stále nesmějí zaměnit za již provedené host OOM kontroly. Další implementační oblastí je etapa 4: PCI/PCIe, DMA a blokové rozhraní. Její vývoj může pokračovat během odložené hardwarové přejímky, ale otevřené testy 3.1 zůstávají podmínkou převzetí celého milníku.
+
+##### Windows checkout a spuštění přejímky
+
+Při prvním spuštění `accept-stage3.ps1` z Windows checkoutu se objevilo `set: pipefail` / `invalid option name` na řádku 5 `check-build.sh`, ještě před kompilací a spuštěním VM. Repozitář dosud neměl pravidlo pro konce řádků; CRLF mění argument Bash na `pipefail\r`. Doplněné `.gitattributes` nastavuje `* text=auto eol=lf`, včetně textových vstupů build skriptů. Starší existující soubory může být nutné převést jednorázově; README obsahuje PowerShell postup zachovávající obsahové úpravy a zahrnující všechny `.sh` i `scripts/toolchain.lock`.
+
+Ověření opravy používá izolovaný Git checkout s `core.autocrlf=true`: bez atributů reprodukuje chybu na řádku 5, s novým pravidlem uchová LF a Bash projde nastavením `pipefail`. Kontroluje se také nezměněný binární vzorek, LF v toolchain locku a zachování obsahu při jednorázové normalizaci. Jde o ověření přípravy zdrojů; nepředstavuje nový běh jádra ani uzavření přejímky ve VirtualBoxu.
+
+#### Převzetí milníku 3.1
+
+Připravit host testy algoritmů a selhání, integrační testy z uživatelského prostoru a skutečné běhy ve VirtualBoxu 7.1.12 s 256 MiB na 1 a 2 vCPU. Protokol uvede commit, hash obrazu, konfiguraci, logy a měřené hodnoty. QEMU může poskytovat průběžné regresní důkazy; fyzické ověření na HP se eviduje odděleně a zopakuje v etapě 12.
+
+1. **Skutečně odložená alokace.** Po rezervaci oblasti doložit počet rezidentních datových rámců; nevyužité stránky se nesmějí přidělit předem. První oprávněné přístupy v uživatelském režimu i přes syscall musí vytvořit jen potřebné stránky se správným obsahem ELF/BSS/anonymní paměti. Režii metadat a tabulek vykázat odděleně.
+2. **Izolace, COW a návrat prostředků.** Ověřit `fork` před prvním přístupem i po něm, soukromé zápisy rodiče/potomka, chybné adresy, ochrany a řízené OOM. Po ukončení a rollbacku se musí evidence rámců, tabulek a metadat vrátit do výchozího stavu; druhý proces a jádro pokračují.
+3. **Skutečné vyvažování.** Na 2 vCPU vytvořit nevyváženou frontu a doložit, že plánovač přesunul existující úlohu na druhé CPU a ta tam pokračovala. Počáteční rozmístění úloh na obě CPU tento požadavek nesplňuje. Ověřit zachování identity, právě jedno vykonávání každé úlohy a dokončení práce bez hladovění.
+4. **Migrace za provozu.** Při opakovaných přesunech ověřit lazy page fault/COW, syscally, roury, IPC a mezi-CPU probuzení, ukončení/reaping, monotónní čas a neztracené lhůty. Zahrnout závody přesunu s probuzením a ukončením, plnou cílovou frontu a znovupoužití zásobníků bez zastaralého TLB; nesmí vzniknout ztracená úloha, dvojí běh ani deadlock.
+5. **Regrese původního základu.** Na 1 vCPU musí systém fungovat bez potřeby druhého CPU. Na 1/2 vCPU znovu projdou dotčené testy etap 2 a 3, včetně PID 1/služeb, TTY, ochranných stránek a měření probuzení v klidu. Teprve tento protokol uzavírá oba doplněné požadavky § 4.3–4.4; původní výsledky etapy 3 je nenahrazují.
+
 ### 4. Ovladače a bloková zařízení na obou platformách
 
 **Potřebuje 2; uživatelské zkoušky využijí 3.** Zprovoznit PCI/PCIe, přerušení MSI/MSI-X, DMA mapování a blokové rozhraní s dokončením a vyprázdněním zápisů. Podle pořadí v § 5.1 připojit AHCI a NVMe, transport VirtIO-net, xHCI, USB HID, USB Mass Storage a kabelový Realtek. Síťové ovladače zde stačí dovést k odeslání a příjmu rámce.
+
+Vývoj může běžet souběžně s 3.1. Rozhraní pro dokončení I/O a probouzení musí respektovat možné přesunutí čekajícího procesu na jiné CPU. Aktivní DMA buffery mají stabilní fyzické rámce po celou dobu přístupu zařízení; demand paging ani migrace úlohy nesmějí tuto evidenci obejít. Po propojení s 3.1 se zopakují dotčené I/O a timeout testy.
 
 **Převzetí.** Na VDI, vyhrazeném USB a vyhrazeném NVMe zapsat vzorek do předem určené testovací oblasti, vynutit dokončení zápisu a po restartu porovnat obsah. Timeout či odpojení USB musí ukončit čekání, DMA buffery se smějí uvolnit až po zastavení přenosu. Na HP ověřit vestavěnou i USB klávesnici a přenos známého ethernetového rámce.
 
@@ -86,9 +318,9 @@ Každý řádek odpovídá jednomu měřicímu oknu. Stopky hostitele zaznamenal
 
 ### 9. Linux ABI pro skutečné binárky
 
-**Základ může začít po 3; převzetí potřebuje 6–8.** Od zaváděcího zásobníku ELF postupovat k souborům, procesům, signálům, vláknům, TLS vláken, futexům, socketům a epoll. Vést tabulku podporovaných syscallů, příznaků a chyb. Stejné kontroly VFS a identity použít pro obě ABI.
+**Základ může začít po 3; převzetí potřebuje 3.1 a 6–8.** Od zaváděcího zásobníku ELF postupovat k souborům, procesům, paměťovým operacím, signálům, vláknům, TLS vláken, futexům, socketům a epoll. Paměťové syscally a plánování použijí společné kernelové mechanismy z 3.1. Vést tabulku podporovaných syscallů, příznaků a chyb. Stejné kontroly VFS a identity použít pro obě ABI.
 
-**Převzetí.** Na Linuxu i AgentOS spustit totožné statické binárky s evidovaným SHA-256. Porovnat výstup a návratové kódy skriptu BusyBoxu, chybného otevření, vícevláknového programu s musl a loopback testu s timeoutem a probuzením `epoll_wait`. Zopakovat zkoušky soukromého a sdíleného souboru z etapy 7 nativní i linuxovou cestou. Výsledky uzavírají celek F.
+**Převzetí.** Na Linuxu i AgentOS spustit totožné statické binárky s evidovaným SHA-256. Porovnat výstup a návratové kódy skriptu BusyBoxu, chybného otevření, vícevláknového programu s musl a loopback testu s timeoutem a probuzením `epoll_wait`. Zopakovat zkoušky soukromého a sdíleného souboru z etapy 7 nativní i linuxovou cestou. Rozšířit regrese 3.1 o skutečně souběžná vlákna sdílející adresní prostor na 2 vCPU: lazy page faulty, změny mapování/TLB, TLS, futex probuzení a migraci při zachování lhůt. Výsledky uzavírají celek F.
 
 ### 10. Podepsané aktualizace A/B a servisní médium
 
@@ -104,7 +336,7 @@ Každý řádek odpovídá jednomu měřicímu oknu. Stopky hostitele zaznamenal
 
 ### 12. Společná přejímka vydání
 
-**Potřebuje všechny předchozí etapy.** S jediným kandidátem vydání zopakovat celky A–G podle § 11, včetně instalace, obnovy a přihlášení na fyzickém HP. Doložit shodný hash před podpisem ze dvou čistých sestavení a reprodukovatelné médium ze stejného podepsaného artefaktu. Přiložit postup sestavení, instalace, správy klíčů a obnovy, vývojářskou dokumentaci a protokol výsledků dle § 9–11.
+**Potřebuje všechny předchozí etapy včetně 3.1.** S jediným kandidátem vydání zopakovat celky A–G podle § 11, včetně demand pagingu a vyvažování SMP z 3.1, instalace, obnovy a přihlášení na fyzickém HP. Doložit shodný hash před podpisem ze dvou čistých sestavení a reprodukovatelné médium ze stejného podepsaného artefaktu. Přiložit postup sestavení, instalace, správy klíčů a obnovy, vývojářskou dokumentaci a protokol výsledků dle § 9–11.
 
 | Měření | Podmínka převzetí |
 |---|---|

@@ -3,7 +3,13 @@ set -euo pipefail
 dir=$1
 efi=$2
 level=${3:-info}
-case "$level" in quiet|info|debug) ;; *) exit 2;; esac
+case "$level" in
+  quiet|info|debug) ;;
+  "quiet serial"|"quiet screen"|"quiet both"|"quiet none"|\
+  "info serial"|"info screen"|"info both"|"info none"|\
+  "debug serial"|"debug screen"|"debug both"|"debug none") ;;
+  *) printf 'Unsupported boot logging configuration: %s\n' "$level" >&2; exit 2;;
+esac
 img="$dir/esp.raw"
 [[ -d "$dir" && ! -e "$img" && -f "$efi" ]]
 truncate -s 80M "$img"
