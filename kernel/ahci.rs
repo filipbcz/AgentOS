@@ -1,5 +1,6 @@
-//! Polling, non-NCQ READ DMA EXT on the dedicated acceptance HBA. The boot
-//! disk is on a separate controller. Only the signed DMA profile calls exercise.
+//! Polled, non-NCQ AHCI. Each issued command owns its descriptors until completion.
+mod disk;
+pub use disk::AhciDisk;
 use crate::{dma::{BusAddress, Mapping, PAGE}, frames::{Frame, Frames}, hpet, paging, pci::Console};
 use core::{fmt::Write, ptr, sync::atomic::{fence, Ordering}};
 
@@ -37,6 +38,27 @@ fn wait(mut ready: impl FnMut() -> bool, ms: u64, error: Error) -> Result<(), Er
 }
 
 pub struct Controller { pub cfg: usize, pub abar: usize }
+
+// Slot 0 carries data. Slot 1 has independent descriptors for ordered flush.
+unsafe fn command(control: &Frame, bus: BusAddress, slot: usize, opcode: u8,
+                  lba: u64, sectors: u16, to_device: bool, regions: &[(BusAddress, usize)]) {
+    let offset = 1280 + slot * 256;
+    let header = control.address() + slot * 32;
+    let table = control.address() + offset;
+    ptr::write_bytes(header as *mut u8, 0, 32);
+    ptr::write_bytes(table as *mut u8, 0, 128 + regions.len() * 16);
+    write(header, 5 | ((to_device as u32) << 6) | ((regions.len() as u32) << 16));
+    address(header + 8, bus.value() + offset as u64);
+    write(table, 0x8027 | (u32::from(opcode) << 16));
+    write(table + 4, (lba as u32 & 0xffffff) | if matches!(opcode, 0x25 | 0x35) { 1 << 30 } else { 0 });
+    write(table + 8, (lba >> 24) as u32 & 0xffffff);
+    write(table + 12, u32::from(sectors));
+    for (i, &(base, length)) in regions.iter().enumerate() {
+        let prd = table + 128 + i * 16;
+        address(prd, base.value());
+        write(prd + 12, length as u32 - 1);
+    }
+}
 
 impl Controller {
     unsafe fn bus_master(&self, enable: bool) -> Result<(), Error> {
@@ -90,14 +112,15 @@ impl Controller {
     unsafe fn drain_read(&self, control: &Frame, bus: BusAddress) -> Result<(u32, u32), Error> {
         self.reset()?;
         self.start(bus)?;
+        let result = self.flush_cache(control, bus)?;
+        self.stop()?;
+        self.bus_master(false)?;
+        Ok(result)
+    }
+
+    unsafe fn flush_cache(&self, control: &Frame, bus: BusAddress) -> Result<(u32, u32), Error> {
+        command(control, bus, 1, 0xea, 0, 0, false, &[]);
         let p = self.port();
-        let header = control.address() + 32; // slot one has its own command table
-        let table = control.address() + 1536;
-        ptr::write_bytes(header as *mut u8, 0, 32);
-        ptr::write_bytes(table as *mut u8, 0, 128);
-        write(header, 5);
-        address(header + 8, bus.value() + 1536);
-        write(table, 0x00ea_8027); // ATA FLUSH CACHE EXT, no data
         write(p + IS, u32::MAX);
         fence(Ordering::Release);
         write(p + CI, 2);
@@ -108,12 +131,10 @@ impl Controller {
         if status & 1 == 0 || status & 0x7d00_0000 != 0 || tfd & 0xa9 != 0 {
             return Err(b"AHCI drain failed");
         }
-        self.stop()?;
-        self.bus_master(false)?;
         Ok((status, tfd))
     }
 
-    pub unsafe fn exercise(self, root: usize, frames: &mut Frames<'_>) -> Result<(), Error> {
+    unsafe fn prepare(&self, root: usize, frames: &mut Frames<'_>) -> Result<u64, Error> {
         paging::claim_config(root, self.cfg).ok_or(b"AHCI config mapping" as Error)?;
         paging::map_device(root, frames, self.abar).ok_or(b"AHCI BAR mapping" as Error)?;
         // Accept only the isolated single-port HBA set up by the host profile.
@@ -121,6 +142,11 @@ impl Controller {
             read(self.port() + CI) != 0 || read(self.port() + SACT) != 0 { return Err(b"AHCI profile topology"); }
         let mask = if read(self.abar) & (1 << 31) != 0 { u64::MAX } else { u32::MAX as u64 };
         self.stop()?;
+        Ok(mask)
+    }
+
+    pub unsafe fn exercise(self, root: usize, frames: &mut Frames<'_>) -> Result<(), Error> {
+        let mask = self.prepare(root, frames)?;
         let baseline = frames.available();
         let control = frames.alloc_zeroed().ok_or(b"AHCI control allocation" as Error)?;
         let Some(bus) = BusAddress::of(&control, mask) else { frames.release(control); return Err(b"AHCI DMA mask"); };
@@ -179,20 +205,7 @@ impl Controller {
         let (mapping, spacer) = buffer(frames, mask)?;
         let pages = *mapping.pages();
         let list = control.address();
-        let table = list + 1280;
-        // Do not overwrite the live received-FIS area while FRE=1.
-        ptr::write_bytes(list as *mut u8, 0, 32);
-        ptr::write_bytes(table as *mut u8, 0, 160);
-        write(list, 5 | (2 << 16)); // five FIS dwords, read, two PRDs
-        address(list + 8, bus.value() + 1280);
-        write(table, 0x0025_8027); // Register H2D: C=1, READ DMA EXT
-        write(table + 4, 0x4000_0000 | lba);
-        write(table + 12, 16); // sixteen 512-byte logical sectors
-        for (i, page) in mapping.addresses().iter().enumerate() {
-            let prd = table + 128 + i * 16;
-            address(prd, page.value());
-            write(prd + 12, PAGE as u32 - 1);
-        }
+        command(control, bus, 0, 0x25, u64::from(lba), 16, false, &mapping.addresses().map(|a| (a, PAGE)));
         write(p + IS, u32::MAX);
         let refs = |f: &Frames<'_>| pages.map(|a| f.references(a).unwrap_or(0));
         if refs(frames) != [1, 1] {

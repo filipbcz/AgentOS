@@ -11,6 +11,9 @@ mod pci;
 mod pci_irq;
 mod dma;
 mod ahci;
+mod block;
+#[cfg(ahci_block_acceptance)]
+mod block_acceptance;
 mod smp;
 mod scheduler;
 mod stress;
@@ -159,8 +162,16 @@ pub unsafe extern "sysv64" fn kernel_main(info: &BootInfo) -> ! {
     log.event(1, b"PAGING AND IDT READY");
     if let Err(reason) = pci::inventory(windows).and_then(|devices| {
         if let Some(device) = devices.oxford { device.bind(root, &mut frames)?; }
-        if cfg!(ahci_dma_acceptance) {
+        #[cfg(ahci_dma_acceptance)]
+        {
             devices.ahci.ok_or(b"AHCI missing" as &[u8])?.exercise(root, &mut frames)?;
+        }
+        #[cfg(ahci_block_acceptance)]
+        {
+            let mut disk = ahci::AhciDisk::open(devices.ahci.ok_or(b"AHCI missing" as &[u8])?, root, &mut frames)?;
+            let result = block_acceptance::run(&mut disk);
+            disk.close(&mut frames)?;
+            result?;
         }
         Ok(())
     }) {

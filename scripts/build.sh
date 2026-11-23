@@ -7,8 +7,11 @@ rust_flags=()
 if [[ $# -eq 1 && $1 == --ahci-dma ]]; then
     profile=ahci-dma
     rust_flags=(--cfg ahci_dma_acceptance)
+elif [[ $# -eq 1 && $1 == --ahci-block ]]; then
+    profile=ahci-block
+    rust_flags=(--cfg ahci_block_acceptance)
 elif [[ $# -ne 0 ]]; then
-    echo 'Usage: build.sh [--ahci-dma]' >&2
+    echo 'Usage: build.sh [--ahci-dma|--ahci-block]' >&2
     exit 2
 fi
 while IFS='=' read -r package expected || [[ -n "$package" ]]; do

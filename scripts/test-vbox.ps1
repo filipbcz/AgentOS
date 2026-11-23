@@ -6,11 +6,13 @@ param([ValidateSet('signed','loader','kernel','initrd')][string]$Case='signed',
       [ValidateSet('serial','screen','both','none')][string]$LogOutput='both',
       [ValidateSet('piix3','ich9')][string]$PciChipset,
       [switch]$DeviceIrq,
-      [switch]$AhciDma)
+      [switch]$AhciDma,
+      [switch]$AhciBlock)
 $ErrorActionPreference='Stop'
 if ($Shell -and $Case -ne 'signed') { throw '-Shell requires the signed case' }
 if ($Keyboard -and !$Shell) { throw '-Keyboard requires -Shell' }
-if ($DeviceIrq -or $AhciDma) {
+if ($AhciBlock -and ($AhciDma -or $DeviceIrq)) { throw 'Use a separate VM for the AHCI block profile' }
+if ($DeviceIrq -or $AhciDma -or $AhciBlock) {
     if ($PciChipset -and $PciChipset -ne 'ich9') { throw 'The device profile requires ICH9' }
     $PciChipset='ich9'
 }
@@ -190,6 +192,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Signed EFI build provenance check failed; rebu
 $vboxVersion=(& $vbox --version).Trim()
 $buildProfile=(Get-Content -Raw (Join-Path $root 'build/build-provenance.json') | ConvertFrom-Json).profile
 if ([bool]$AhciDma -ne ($buildProfile -eq 'ahci-dma')) { throw 'Use build.sh --ahci-dma with -AhciDma, or build.sh for normal boots' }
+if ([bool]$AhciBlock -ne ($buildProfile -eq 'ahci-block')) { throw 'Use build.sh --ahci-block with -AhciBlock' }
 if ($LASTEXITCODE -ne 0 -or $vboxVersion -notmatch '^7\.1\.12(?:r[0-9]+)?$') {
     throw "VirtualBox 7.1.12 required for comparable acceptance: $vboxVersion"
 }
@@ -222,25 +225,34 @@ if ($DeviceIrq) {
 }
 # One local duplex pipe per VM carries the actual UART bytes in both directions.
 # Keep a read outstanding even while the harness checks an echo or screenshot.
-$serial=@{Stream=$null; Read=$null; Log=$null; Input=$null;
+function Open-Serial([string]$filename) {
+    $state=@{Stream=$null; Read=$null; Log=$null; Input=$null;
           Buffer=(New-Object byte[] 4096); Text=(New-Object Text.StringBuilder)}
-$serial.Stream=[IO.Pipes.NamedPipeServerStream]::new($vm,'InOut',1,'Byte','Asynchronous',65536,65536)
-$connection=$serial.Stream.WaitForConnectionAsync()
-$serial.Log=[IO.File]::Open("$dir\serial-com1.log",'Create','Write','ReadWrite')
-if ($Shell) {
-    $serial.Input=[IO.File]::Open("$dir\com1-input.bin",'Create','Write','ReadWrite')
+    $state.Stream=[IO.Pipes.NamedPipeServerStream]::new($vm,'InOut',1,'Byte','Asynchronous',65536,65536)
+    $state.Connection=$state.Stream.WaitForConnectionAsync()
+    $state.Log=[IO.File]::Open("$dir\$filename",'CreateNew','Write','ReadWrite')
+    if ($Shell -and $filename -eq 'serial-com1.log') {
+        $state.Input=[IO.File]::Open("$dir\com1-input.bin",'CreateNew','Write','ReadWrite')
+    }
+    return $state
 }
+$serial=if ($AhciBlock) { Open-Serial 'block-write-com1.log' } else { Open-Serial 'serial-com1.log' }
 VBox modifyvm $vm --uart-mode1 client "\\.\pipe\$vm"
-if ($AhciDma) {
-    & python scripts/ahci_dma_evidence.py --create "$dir\dma.raw"
+if ($AhciDma -or $AhciBlock) {
+    $diskName=if ($AhciBlock) { 'block' } else { 'dma' }
+    & python "scripts/ahci_${diskName}_evidence.py" --create "$dir\$diskName.raw"
     if ($LASTEXITCODE) { throw 'AHCI fixture creation failed' }
-    VBox convertfromraw "$dir\dma.raw" "$dir\dma.vdi" --format VDI
+    VBox convertfromraw "$dir\$diskName.raw" "$dir\$diskName.vdi" --format VDI
     VBox storagectl $vm --name Boot --add ide --controller PIIX4
     VBox storageattach $vm --storagectl Boot --port 0 --device 0 --type hdd --medium "$dir\esp.vdi"
     VBox modifyvm $vm --iommu none
-    VBox bandwidthctl $vm add DmaDisk --type disk --limit 32K
+    $diskOptions=@()
+    if ($AhciDma) {
+        VBox bandwidthctl $vm add DmaDisk --type disk --limit 32K
+        $diskOptions=@('--bandwidthgroup','DmaDisk')
+    }
     VBox storagectl $vm --name SATA --add sata --controller IntelAhci --portcount 1 --hostiocache off
-    VBox storageattach $vm --storagectl SATA --port 0 --device 0 --type hdd --medium "$dir\dma.vdi" --bandwidthgroup DmaDisk
+    VBox storageattach $vm --storagectl SATA --port 0 --device 0 --type hdd --medium "$dir\$diskName.vdi" @diskOptions
     VBox setextradata $vm 'VBoxInternal/Devices/ahci/0/LUN#0/Config/IgnoreFlush' 0
     VBox setextradata $vm 'VBoxInternal/Devices/ahci/0/LUN#0/Config/IgnoreFlushAsync' 0
 } else {
@@ -256,10 +268,30 @@ VBox modifynvram $vm secureboot --enable
 $runSucceeded=$false
 $shutdownSucceeded=$false
 try {
+    if ($AhciBlock) {
+        VBox startvm $vm --type headless
+        if (!$serial.Connection.Wait(30000)) { throw 'No write-boot COM1 connection' }
+        Wait-Serial $serial 'AGENTOS BLOCK READY BLOCKS=16384 SIZE=512\r\n' 0 120
+        $serial.Stream.WriteByte(87) # W, only the first boot may write
+        Wait-Serial $serial 'AGENTOS BLOCK FLUSH OK\r\n' 0 30
+        VBox controlvm $vm poweroff
+        $serial.Stream.Dispose()
+        $serial.Log.Dispose()
+        $info=@(VBox showvminfo $vm --machinereadable)
+        if ($info -notcontains 'VMState="poweroff"') { throw 'Write boot did not power off' }
+        [IO.File]::WriteAllLines("$dir\block-restart.txt",[string[]]$info)
+        Copy-Item -LiteralPath "$dir\$vm\Logs\VBox.log" -Destination "$dir\block-write-vbox.log"
+        VBox clonemedium disk "$dir\block.vdi" "$dir\block-after.raw" --format RAW
+        $serial=Open-Serial 'serial-com1.log'
+    }
     VBox startvm $vm --type headless
     $timer=[Diagnostics.Stopwatch]::StartNew()
     # Connect before examining guest output, regardless of interactive mode.
-    if (!$connection.Wait(30000)) { throw "COM1 pipe connection missing: $dir" }
+    if (!$serial.Connection.Wait(30000)) { throw "COM1 pipe connection missing: $dir" }
+    if ($AhciBlock) {
+        Wait-Serial $serial 'AGENTOS BLOCK READY BLOCKS=16384 SIZE=512\r\n' 0 120
+        $serial.Stream.WriteByte(82) # R, verify from a fresh kernel
+    }
     Receive-Serial $serial
     $idleStart=$null
     $found=$false
@@ -449,12 +481,20 @@ try {
                 VBox unregistervm $vm
             }
             $artifactHashes=@{}
+            $blockFiles=@()
+            if ($AhciBlock) {
+                $blockFiles=@('block.raw','block.vdi','block-after.raw','block-restart.txt',
+                              'block-write-com1.log','block-write-vbox.log','block-read-vbox.log')
+                if (Test-Path -LiteralPath "$dir\$vm\Logs\VBox.log") {
+                    Copy-Item -LiteralPath "$dir\$vm\Logs\VBox.log" -Destination "$dir\block-read-vbox.log"
+                }
+            }
             if ($AhciDma -and (Test-Path -LiteralPath "$dir\$vm\Logs\VBox.log")) {
                 Copy-Item -LiteralPath "$dir\$vm\Logs\VBox.log" -Destination "$dir\vbox-ahci.log"
             }
             foreach ($name in @('esp.raw','esp.vdi','changed.efi','serial-com1.log',
                                 'com1-input.bin','display.png','shell-before.png',
-                                'shell-keyboard.png','idle.csv','failure.png','vbox-pci.txt','dma.raw','dma.vdi','vbox-ahci.log')) {
+                                'shell-keyboard.png','idle.csv','failure.png','vbox-pci.txt','dma.raw','dma.vdi','vbox-ahci.log') + $blockFiles) {
                 $file=Join-Path $dir $name
                 if (Test-Path -LiteralPath $file -PathType Leaf) {
                     $artifactHashes[$name]=(Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -486,6 +526,7 @@ try {
             if ($PciChipset) { $receipt.pci_chipset=$PciChipset }
             if ($DeviceIrq) { $receipt.device_irqs=$true }
             if ($AhciDma) { $receipt.ahci_dma=$true }
+            if ($AhciBlock) { $receipt.ahci_block=$true }
             $tempReceipt="$receiptFile.tmp"
             $json=$receipt | ConvertTo-Json -Depth 6
             [IO.File]::WriteAllText($tempReceipt,$json+[Environment]::NewLine,[Text.UTF8Encoding]::new($false))
