@@ -29,26 +29,20 @@ $vbox=Join-Path $env:ProgramFiles 'Oracle\VirtualBox\VBoxManage.exe'
 function VBox { & $vbox @args; if ($LASTEXITCODE) { throw "VBoxManage failed: $($args[0])" } }
 function Receive-Serial($State) {
     if ($null -eq $State) { return }
-    if ($null -eq $State.Client) {
-        if (!$State.Listener.Pending()) { return }
-        $State.Client=$State.Listener.AcceptTcpClient()
-        $State.Client.NoDelay=$true
-        $State.Stream=$State.Client.GetStream()
-        $State.Stream.ReadTimeout=2000
-        $State.Stream.WriteTimeout=2000
-    }
     $received=0
-    while ($State.Stream.DataAvailable -and $received -lt 65536) {
-        $count=$State.Stream.Read($State.Buffer,0,$State.Buffer.Length)
-        if ($count -eq 0) { throw 'COM1 TCP connection closed' }
+    while ($received -lt 65536) {
+        if ($null -eq $State.Read) {
+            $State.Read=$State.Stream.ReadAsync($State.Buffer,0,$State.Buffer.Length)
+        }
+        if (!$State.Read.IsCompleted) { return }
+        $count=$State.Read.GetAwaiter().GetResult()
+        $State.Read=$null
+        if ($count -eq 0) { throw 'COM1 pipe closed' }
         $State.Log.Write($State.Buffer,0,$count)
         $State.Log.Flush()
         $received+=$count
         if ($State.Log.Length -gt 8MB) { throw 'COM1 capture exceeded the 8 MiB test limit' }
         [void]$State.Text.Append([Text.Encoding]::ASCII.GetString($State.Buffer,0,$count))
-    }
-    if ($State.Client.Client.Poll(0,[Net.Sockets.SelectMode]::SelectRead) -and !$State.Stream.DataAvailable) {
-        throw 'COM1 TCP connection closed'
     }
 }
 function Wait-Serial($State,[string]$Pattern,[int]$Offset=0,[int]$Seconds=10) {
@@ -205,21 +199,17 @@ VBox createvm --name $vm --basefolder $dir --ostype Other_64 --register
 $vmRegistered=$true
 VBox modifyvm $vm --memory 256 --cpus $Cpus --firmware efi64 --paravirt-provider minimal --x86-hpet on --graphicscontroller vmsvga --vram 16 --ioapic on --nic1 none --audio-enabled off --boot1 disk --boot2 none --boot3 none --boot4 none --uart1 0x3f8 4
 if ($Keyboard) { VBox modifyvm $vm --keyboard ps2 }
-# All acceptance profiles use the SAME host-owned COM1 capture. In file mode,
-# a fresh VBox EFI VM can reach the graphical shell without producing a
-# readable COM1 file; the former harness then timed out despite a working guest.
-# TCP capture also makes absent UART data distinguishable from a failed boot.
-$serial=@{Listener=$null; Client=$null; Stream=$null; Log=$null; Input=$null;
+# One local duplex pipe per VM carries the actual UART bytes in both directions.
+# Keep a read outstanding even while the harness checks an echo or screenshot.
+$serial=@{Stream=$null; Read=$null; Log=$null; Input=$null;
           Buffer=(New-Object byte[] 4096); Text=(New-Object Text.StringBuilder)}
-$serial.Listener=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0)
-$serial.Listener.Start(1)
-$port=$serial.Listener.LocalEndpoint.Port
+$serial.Stream=[IO.Pipes.NamedPipeServerStream]::new($vm,'InOut',1,'Byte','Asynchronous',65536,65536)
+$connection=$serial.Stream.WaitForConnectionAsync()
 $serial.Log=[IO.File]::Open("$dir\serial-com1.log",'Create','Write','ReadWrite')
 if ($Shell) {
     $serial.Input=[IO.File]::Open("$dir\com1-input.bin",'Create','Write','ReadWrite')
 }
-# VBox 7.1 tcpclient requires an active listener before startvm.
-VBox modifyvm $vm --uart-mode1 tcpclient "127.0.0.1:$port"
+VBox modifyvm $vm --uart-mode1 client "\\.\pipe\$vm"
 VBox storagectl $vm --name SATA --add sata --controller IntelAhci
 VBox storageattach $vm --storagectl SATA --port 0 --device 0 --type hdd --medium "$dir\esp.vdi"
 VBox modifynvram $vm inituefivarstore
@@ -234,12 +224,8 @@ try {
     VBox startvm $vm --type headless
     $timer=[Diagnostics.Stopwatch]::StartNew()
     # Connect before examining guest output, regardless of interactive mode.
-    do {
-        Receive-Serial $serial
-        if ($null -ne $serial.Client) { break }
-        Start-Sleep -Milliseconds 25
-    } while ($timer.Elapsed.TotalSeconds -lt 30)
-    if ($null -eq $serial.Client) { throw "COM1 TCP connection missing: $dir" }
+    if (!$connection.Wait(30000)) { throw "COM1 pipe connection missing: $dir" }
+    Receive-Serial $serial
     $idleStart=$null
     $found=$false
     do {
@@ -264,7 +250,7 @@ try {
     } while (($null -eq $idleStart -and $timer.Elapsed.TotalSeconds -lt 120) -or
              ($null -ne $idleStart -and ($timer.Elapsed.TotalSeconds - $idleStart) -lt 60))
     if ($Case -eq 'signed' -and !$found) {
-        throw "Kernel marker missing in COM1 TCP capture (received $($serial.Text.Length) characters): $dir"
+        throw "Kernel marker missing in COM1 capture (received $($serial.Text.Length) characters): $dir"
     }
     if ($Case -eq 'signed') {
         # The guest always enters its operational TTY. Capture its explicit
@@ -284,7 +270,7 @@ try {
     # Windows readers (ReadAllText, Select-String, Python) cannot reliably open
     # serial-com1.log while the PowerShell FileStream still has a write handle.
     # No Receive-Serial calls occur during the offline checks below; any new
-    # UART bytes remain queued by TCP until the writer is reopened.
+    # UART bytes remain in the pending read and pipe until the writer is reopened.
     $serial.Log.Flush()
     $serial.Log.Dispose()
     $serial.Log=$null
@@ -367,7 +353,7 @@ try {
             Wait-Serial $serial $sessionPlan.stop_pattern 0 15
             if ($LogLevel -in @('info','debug') -and $LogOutput -in @('serial','both')) {
                 # This structured write follows the native stop record.
-                # Drain it completely before hashing or powering off; a TCP
+                # Drain it completely before hashing or powering off; a pipe
                 # read can otherwise end halfway through the final line.
                 Wait-Serial $serial '\[INFO\] INTERACTIVE SHELL STOPPED\r\n$' 0 15
             }
@@ -383,7 +369,7 @@ try {
             if ($LASTEXITCODE -ne 0) { throw 'BOOT.LOG policy violated during interactive session' }
         }
     } elseif ($serial.Text.ToString() -notmatch 'BdsDxe: failed to load [^\r\n]*HARDDISK[^\r\n]*(Access Denied|Security Violation)') {
-        throw "Missing firmware rejection in COM1 TCP capture; timeout is inconclusive: $dir"
+        throw "Missing firmware rejection in COM1 capture; timeout is inconclusive: $dir"
     }
     $runSucceeded=$true
 } finally {
@@ -411,12 +397,11 @@ try {
     # serial-com1.log is safe for Test-Path and Get-FileHash.
     try {
         if ($null -ne $serial) {
-            foreach ($handle in @($serial.Stream,$serial.Client,$serial.Log,$serial.Input)) {
+            foreach ($handle in @($serial.Stream,$serial.Log,$serial.Input)) {
                 if ($null -ne $handle) {
                     try { $handle.Dispose() } catch { Write-Warning "COM1 cleanup failed: $_" }
                 }
             }
-            if ($null -ne $serial.Listener) { $serial.Listener.Stop() }
         }
     } finally {
         try {
