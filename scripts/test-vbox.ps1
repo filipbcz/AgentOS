@@ -241,6 +241,8 @@ if ($AhciDma) {
     VBox bandwidthctl $vm add DmaDisk --type disk --limit 32K
     VBox storagectl $vm --name SATA --add sata --controller IntelAhci --portcount 1 --hostiocache off
     VBox storageattach $vm --storagectl SATA --port 0 --device 0 --type hdd --medium "$dir\dma.vdi" --bandwidthgroup DmaDisk
+    VBox setextradata $vm 'VBoxInternal/Devices/ahci/0/LUN#0/Config/IgnoreFlush' 0
+    VBox setextradata $vm 'VBoxInternal/Devices/ahci/0/LUN#0/Config/IgnoreFlushAsync' 0
 } else {
     VBox storagectl $vm --name SATA --add sata --controller IntelAhci
     VBox storageattach $vm --storagectl SATA --port 0 --device 0 --type hdd --medium "$dir\esp.vdi"
@@ -447,9 +449,12 @@ try {
                 VBox unregistervm $vm
             }
             $artifactHashes=@{}
+            if ($AhciDma -and (Test-Path -LiteralPath "$dir\$vm\Logs\VBox.log")) {
+                Copy-Item -LiteralPath "$dir\$vm\Logs\VBox.log" -Destination "$dir\vbox-ahci.log"
+            }
             foreach ($name in @('esp.raw','esp.vdi','changed.efi','serial-com1.log',
                                 'com1-input.bin','display.png','shell-before.png',
-                                'shell-keyboard.png','idle.csv','failure.png','vbox-pci.txt','dma.raw','dma.vdi')) {
+                                'shell-keyboard.png','idle.csv','failure.png','vbox-pci.txt','dma.raw','dma.vdi','vbox-ahci.log')) {
                 $file=Join-Path $dir $name
                 if (Test-Path -LiteralPath $file -PathType Leaf) {
                     $artifactHashes[$name]=(Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()

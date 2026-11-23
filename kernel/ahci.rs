@@ -85,6 +85,34 @@ impl Controller {
         wait(|| read(p + CMD) & CR != 0, 1000, b"AHCI command start")
     }
 
+    // The VBox disk backend can retire a canceled read after HBA reset. Keep
+    // slot zero's PRDT and payload pinned across an ordered backend flush.
+    unsafe fn drain_read(&self, control: &Frame, bus: BusAddress) -> Result<(u32, u32), Error> {
+        self.reset()?;
+        self.start(bus)?;
+        let p = self.port();
+        let header = control.address() + 32; // slot one has its own command table
+        let table = control.address() + 1536;
+        ptr::write_bytes(header as *mut u8, 0, 32);
+        ptr::write_bytes(table as *mut u8, 0, 128);
+        write(header, 5);
+        address(header + 8, bus.value() + 1536);
+        write(table, 0x00ea_8027); // ATA FLUSH CACHE EXT, no data
+        write(p + IS, u32::MAX);
+        fence(Ordering::Release);
+        write(p + CI, 2);
+        wait(|| read(p + CI) == 0, 8000, b"AHCI drain timeout")?;
+        fence(Ordering::Acquire);
+        let status = read(p + IS);
+        let tfd = read(p + TFD);
+        if status & 1 == 0 || status & 0x7d00_0000 != 0 || tfd & 0xa9 != 0 {
+            return Err(b"AHCI drain failed");
+        }
+        self.stop()?;
+        self.bus_master(false)?;
+        Ok((status, tfd))
+    }
+
     pub unsafe fn exercise(self, root: usize, frames: &mut Frames<'_>) -> Result<(), Error> {
         paging::claim_config(root, self.cfg).ok_or(b"AHCI config mapping" as Error)?;
         paging::map_device(root, frames, self.abar).ok_or(b"AHCI BAR mapping" as Error)?;
@@ -133,10 +161,10 @@ impl Controller {
         // Quarantine the control frame on unconfirmed stop. Any active data
         // mapping abandoned by the error path independently retains its pins.
         self.reset()?;
+        result?;
         address(self.port() + CLB, 0);
         address(self.port() + FB, 0);
         frames.release(control);
-        result?;
         if frames.available() != baseline { return Err(b"AHCI DMA frame accounting"); }
         let _ = writeln!(Console, "AGENTOS DMA END FREE={baseline} CANARY=ok\r");
         Ok(())
@@ -204,13 +232,14 @@ impl Controller {
             } else {
                 let cmd = read(p + CMD);
                 // No console I/O between the pending snapshot and requesting stop.
-                self.reset()?;
+                let (flush_is, flush_tfd) = self.drain_read(control, bus)?;
                 let stopped = read(p + CMD);
                 let idle = read(p + CI);
                 let sact = read(p + SACT);
                 let pci = ptr::read_volatile((self.cfg + 4) as *const u16);
                 if refs(frames) != [1, 1] { return Err(b"AHCI lost pins during reset"); }
                 let _ = writeln!(Console, "AGENTOS DMA TIMEOUT TAG={tag} MS={elapsed} LIMIT={ms} CI={ci:x} CMD={cmd:x} REFS=1,1\r");
+                let _ = writeln!(Console, "AGENTOS DMA DRAIN TAG={tag} SLOT=1 IS={flush_is:x} TFD={flush_tfd:x} REFS=1,1\r");
                 let _ = writeln!(Console, "AGENTOS DMA STOP TAG={tag} CMD={stopped:x} CI={idle:x} SACT={sact:x} PCI={pci:x} REFS=1,1\r");
                 Ok(None)
             }
@@ -219,7 +248,7 @@ impl Controller {
             Ok(result) => result,
             Err(e) => {
                 frames.release(spacer);
-                if self.reset().is_ok() { active.reclaim().unmap(frames); }
+                // An unconfirmed drain must never make these pages reusable.
                 return Err(e);
             }
         };

@@ -28,7 +28,7 @@ VBox_VERSION = re.compile(r"7\.1\.12(?:r[0-9]+)?\Z")
 ARTIFACTS = frozenset({
     "esp.raw", "esp.vdi", "changed.efi", "serial-com1.log", "com1-input.bin",
     "display.png", "shell-before.png", "shell-keyboard.png", "idle.csv", "failure.png", "vbox-pci.txt",
-    "dma.raw", "dma.vdi"
+    "dma.raw", "dma.vdi", "vbox-ahci.log"
 })
 BUILD_ARTIFACTS = frozenset({
     "agentos.unsigned.efi", "agentos.efi", "db.cer", "db.esl"
@@ -128,10 +128,11 @@ def verify_run(root, run_dir, require_pass=True, *, legacy_traces=False):
     require(isinstance(artifacts, dict) and set(artifacts) <= ARTIFACTS,
             "Run contains invalid artifact names")
     expected = {"esp.raw", "esp.vdi", "serial-com1.log", "display.png"}
-    if image.get("profile") == "ahci-dma" or "ahci_dma" in data or {"dma.raw", "dma.vdi"} & set(artifacts):
+    dma_artifacts = {"dma.raw", "dma.vdi", "vbox-ahci.log"}
+    if image.get("profile") == "ahci-dma" or "ahci_dma" in data or dma_artifacts & set(artifacts):
         require(image.get("profile") == "ahci-dma" and data.get("ahci_dma") is True and
                 data.get("pci_chipset") == "ich9", "Missing or inconsistent AHCI DMA profile")
-        expected.update(("dma.raw", "dma.vdi"))
+        expected.update(dma_artifacts)
     if "device_irqs" in data:
         require(data["device_irqs"] is True and data.get("pci_chipset") == "ich9",
                 "Invalid device interrupt profile")
@@ -164,7 +165,8 @@ def verify_run(root, run_dir, require_pass=True, *, legacy_traces=False):
         if data.get("ahci_dma"):
             from ahci_dma_evidence import verify
             try:
-                verify(log.decode("ascii", errors="replace"), run_dir / "dma.raw")
+                verify(log.decode("ascii", errors="replace"), run_dir / "dma.raw",
+                       (run_dir / "vbox-ahci.log").read_text(encoding="utf-8", errors="replace"))
             except ValueError as error:
                 raise EvidenceError(f"Invalid AHCI DMA evidence: {error}") from error
         if "pci_chipset" in data:

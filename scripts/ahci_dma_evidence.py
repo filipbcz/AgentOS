@@ -17,7 +17,7 @@ def require(ok, message):
         raise ValueError(message)
 
 
-def verify(log, path):
+def verify(log, path, host_log):
     records = iter(line[12:] for line in log.splitlines() if line.startswith("AGENTOS DMA "))
 
     def take(pattern):
@@ -57,8 +57,15 @@ def verify(log, path):
                 match = re.fullmatch(rf"TIMEOUT TAG={tag} MS=(\d+) LIMIT=15 CI=1 CMD=([0-9a-f]+) REFS=1,1", line)
                 require(match and tag > 1 and not stopped_pages and int(match[1]) >= 15 and
                         int(match[2], 16) & 0xc011 == 0xc011, "No live command at the deadline")
+                flush_is, flush_tfd = take(rf"DRAIN TAG={tag} SLOT=1 IS=([0-9a-f]+) TFD=([0-9a-f]+) REFS=1,1")
+                require(int(flush_is, 16) & 1 and not int(flush_is, 16) & 0x7d000000
+                        and not int(flush_tfd, 16) & 0xa9, "Missing successful drain")
                 cmd, pci = take(rf"STOP TAG={tag} CMD=([0-9a-f]+) CI=0 SACT=0 PCI=([0-9a-f]+) REFS=1,1")
                 require(not int(cmd, 16) & 0xc011 and not int(pci, 16) & 4, "DMA still enabled")
+                offset = int(lba) * 512
+                require(re.search(rf"AHCI#\d+P0: Canceled read at offset {offset} "
+                                  r"\(8192 bytes left\) returned rc=VERR_PDM_MEDIAEX_IOREQ_CANCELED\b",
+                                  host_log), "VirtualBox did not cancel the outstanding AHCI read")
                 stopped_pages = pages
                 recovery = False
             before, after = take(rf"REUSE TAG={tag} A={a} B={b} BEFORE=(\d+) AFTER=(\d+)")
