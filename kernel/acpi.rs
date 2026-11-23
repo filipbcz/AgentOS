@@ -46,7 +46,56 @@ pub struct IoApic { pub address: usize, pub gsi: u32 }
 #[derive(Clone, Copy)]
 pub struct IsaInterrupt { pub gsi: u32, pub low: bool, pub level: bool }
 
+#[derive(Clone, Copy)]
+pub struct Ecam {
+    pub base: usize, // ACPI MCFG addresses are relative to bus zero.
+    pub segment: u16,
+    pub first: u8,
+    pub last: u8,
+}
+
+impl Ecam {
+    pub fn mapping(self) -> (usize, usize) {
+        (self.base + ((self.first as usize) << 20),
+         (usize::from(self.last) + 1 - usize::from(self.first)) << 20)
+    }
+}
+
+pub struct PciWindows {
+    entries: [Ecam; 16],
+    count: usize,
+}
+
+impl PciWindows {
+    fn new() -> Self {
+        Self { entries: [Ecam { base: 0, segment: 0, first: 0, last: 0 }; 16], count: 0 }
+    }
+    pub fn windows(&self) -> &[Ecam] { &self.entries[..self.count] }
+
+    fn parse(&mut self, table: &[u8]) -> Option<()> {
+        let rows = table.get(44..)?;
+        if self.count != 0 || rows.is_empty() || rows.len() % 16 != 0 { return None; }
+        for row in rows.chunks_exact(16) {
+            let base = usize::try_from(u64_at(row, 0)?).ok()?;
+            let window = Ecam { base, segment: u16::from_le_bytes([row[8], row[9]]),
+                                first: row[10], last: row[11] };
+            if base == 0 || base & 0xfffff != 0 || window.first > window.last ||
+                base.checked_add((usize::from(window.last) + 1) << 20)? > 1 << 39 { return None; }
+            let (start, size) = window.mapping();
+            for &other in self.windows() {
+                let (address, length) = other.mapping();
+                if (window.segment == other.segment && window.first <= other.last && other.first <= window.last)
+                    || (start < address + length && address < start + size) { return None; }
+            }
+            *self.entries.get_mut(self.count)? = window;
+            self.count += 1;
+        }
+        Some(())
+    }
+}
+
 pub struct Platform {
+    pub pci: PciWindows,
     pub lapic: usize,
     pub timer_port: u16,
     pub hpet: usize,
@@ -135,13 +184,14 @@ pub unsafe fn discover(info: &BootInfo, map: &[u8]) -> Option<Platform> {
     };
     if &root[..4] != (if width == 8 { b"XSDT" } else { b"RSDT" }) ||
         (root.len()-36) % width != 0 { return None; }
-    let mut p = Platform { lapic: 0, timer_port: 0, hpet: 0, ids: [0; 255], count: 0, legacy_pic: false,
+    let mut p = Platform { pci: PciWindows::new(), lapic: 0, timer_port: 0, hpet: 0, ids: [0; 255], count: 0, legacy_pic: false,
         io_apics: [IoApic { address: 0, gsi: 0 }; 8], io_count: 0,
         serial_irq: IsaInterrupt { gsi: 4, low: false, level: false }, serial_override: false,
         keyboard_irq: IsaInterrupt { gsi: 1, low: false, level: false }, keyboard_override: false };
     for entry in root[36..].chunks_exact(width) {
         let address = if width == 8 { u64_at(entry, 0)? } else { u32_at(entry, 0)? as u64 };
         match fw.bytes(address, 4)? {
+            b"MCFG" => p.pci.parse(fw.table(address)?)?,
             b"APIC" => p.madt(fw.table(address)?)?,
             b"HPET" => {
                 if p.hpet != 0 { return None; }

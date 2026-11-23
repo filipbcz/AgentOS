@@ -7,6 +7,7 @@ mod stack;
 mod paging;
 mod exceptions;
 mod acpi;
+mod pci;
 mod smp;
 mod scheduler;
 mod stress;
@@ -137,7 +138,8 @@ pub unsafe extern "sysv64" fn kernel_main(info: &BootInfo) -> ! {
     let Some(platform) = acpi::discover(info, map) else { log.event(0, b"ACPI DISCOVERY FAILED"); halt(); };
     log.event(2, b"ACPI TABLES READY");
     smp::copy_startup(info.ap_boot);
-    let Some(root) = paging::install(info, map, &mut frames, &platform) else {
+    let windows = platform.pci.windows();
+    let Some(root) = paging::install(info, map, &mut frames, &platform, windows.iter().map(|w| w.mapping())) else {
         log.event(0, b"PAGING INIT FAILED"); halt();
     };
     // IST stacks use the guarded pool in the newly active kernel page tables.
@@ -152,6 +154,9 @@ pub unsafe extern "sysv64" fn kernel_main(info: &BootInfo) -> ! {
     }
     serial(b"AGENTOS IDT OK: BP PF-NULL PF-GUARD PF-WP PF-NX\r\n");
     log.event(1, b"PAGING AND IDT READY");
+    if let Err(reason) = pci::inventory(windows) {
+        serial(b"AGENTOS PCI FAILED: "); serial(reason); serial(b"\r\n"); halt();
+    }
     if info.initramfs < info.image_base || info.initramfs.checked_add(info.initramfs_size)
         .zip(info.image_base.checked_add(info.image_size)).map_or(true, |(end, limit)| end > limit) { log.event(0, b"INVALID INITRAMFS"); halt(); }
     let archive = core::slice::from_raw_parts(info.initramfs as *const u8, info.initramfs_size as usize);

@@ -3,10 +3,12 @@ param([ValidateSet('signed','loader','kernel','initrd')][string]$Case='signed',
       [switch]$Shell,
       [switch]$Keyboard,
       [ValidateSet('quiet','info','debug')][string]$LogLevel='info',
-      [ValidateSet('serial','screen','both','none')][string]$LogOutput='both')
+      [ValidateSet('serial','screen','both','none')][string]$LogOutput='both',
+      [ValidateSet('piix3','ich9')][string]$PciChipset)
 $ErrorActionPreference='Stop'
 if ($Shell -and $Case -ne 'signed') { throw '-Shell requires the signed case' }
 if ($Keyboard -and !$Shell) { throw '-Keyboard requires -Shell' }
+if ($PciChipset -and $Case -ne 'signed') { throw 'PCI discovery requires a signed boot' }
 $root=Split-Path $PSScriptRoot
 Set-Location $root
 # Prevent simultaneous VirtualBox/NEM power-on from this workspace.
@@ -199,6 +201,9 @@ VBox createvm --name $vm --basefolder $dir --ostype Other_64 --register
 $vmRegistered=$true
 VBox modifyvm $vm --memory 256 --cpus $Cpus --firmware efi64 --paravirt-provider minimal --x86-hpet on --graphicscontroller vmsvga --vram 16 --ioapic on --nic1 none --audio-enabled off --boot1 disk --boot2 none --boot3 none --boot4 none --uart1 0x3f8 4
 if ($Keyboard) { VBox modifyvm $vm --keyboard ps2 }
+if ($PciChipset) {
+    VBox modifyvm $vm --chipset $PciChipset --nic1 nat --nic-type1 virtio --cable-connected1 off
+}
 # One local duplex pipe per VM carries the actual UART bytes in both directions.
 # Keep a read outstanding even while the harness checks an echo or screenshot.
 $serial=@{Stream=$null; Read=$null; Log=$null; Input=$null;
@@ -267,6 +272,10 @@ try {
         if ($readyText -notmatch 'AGENTOS SHELL READY\r\nagentos> ') { throw 'Operational shell did not become ready' }
     }
     VBox controlvm $vm screenshotpng "$dir\display.png"
+    if ($PciChipset) {
+        $pciDump=@(VBox debugvm $vm info pci verbose)
+        [IO.File]::WriteAllLines("$dir\vbox-pci.txt",[string[]]$pciDump,[Text.Encoding]::ASCII)
+    }
     # Windows readers (ReadAllText, Select-String, Python) cannot reliably open
     # serial-com1.log while the PowerShell FileStream still has a write handle.
     # No Receive-Serial calls occur during the offline checks below; any new
@@ -412,7 +421,7 @@ try {
             $artifactHashes=@{}
             foreach ($name in @('esp.raw','esp.vdi','changed.efi','serial-com1.log',
                                 'com1-input.bin','display.png','shell-before.png',
-                                'shell-keyboard.png','idle.csv','failure.png')) {
+                                'shell-keyboard.png','idle.csv','failure.png','vbox-pci.txt')) {
                 $file=Join-Path $dir $name
                 if (Test-Path -LiteralPath $file -PathType Leaf) {
                     $artifactHashes[$name]=(Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -441,6 +450,7 @@ try {
                 artifacts=$artifactHashes
             }
             $receiptFile=Join-Path $dir 'acceptance.json'
+            if ($PciChipset) { $receipt.pci_chipset=$PciChipset }
             $tempReceipt="$receiptFile.tmp"
             $json=$receipt | ConvertTo-Json -Depth 6
             [IO.File]::WriteAllText($tempReceipt,$json+[Environment]::NewLine,[Text.UTF8Encoding]::new($false))

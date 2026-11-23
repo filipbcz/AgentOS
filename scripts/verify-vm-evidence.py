@@ -27,7 +27,7 @@ VBox_VERSION = re.compile(r"7\.1\.12(?:r[0-9]+)?\Z")
 # "COM1.log" collides with reserved COM1 device name on Windows.
 ARTIFACTS = frozenset({
     "esp.raw", "esp.vdi", "changed.efi", "serial-com1.log", "com1-input.bin",
-    "display.png", "shell-before.png", "shell-keyboard.png", "idle.csv", "failure.png"
+    "display.png", "shell-before.png", "shell-keyboard.png", "idle.csv", "failure.png", "vbox-pci.txt"
 })
 BUILD_ARTIFACTS = frozenset({
     "agentos.unsigned.efi", "agentos.efi", "db.cer", "db.esl"
@@ -127,6 +127,10 @@ def verify_run(root, run_dir, require_pass=True, *, legacy_traces=False):
     require(isinstance(artifacts, dict) and set(artifacts) <= ARTIFACTS,
             "Run contains invalid artifact names")
     expected = {"esp.raw", "esp.vdi", "serial-com1.log", "display.png"}
+    if "pci_chipset" in data or "vbox-pci.txt" in artifacts:
+        require(case == "signed" and data.get("pci_chipset") in ("piix3", "ich9"),
+                "Missing or invalid VirtualBox PCI profile")
+        expected.add("vbox-pci.txt")
     if case != "signed":
         expected.add("changed.efi")
     elif shell:
@@ -149,6 +153,13 @@ def verify_run(root, run_dir, require_pass=True, *, legacy_traces=False):
         require(data.get("boot_image_sha256") == image["artifacts"]["agentos.efi"],
                 "VM boot image is not the signed build artifact")
         log = (run_dir / "serial-com1.log").read_bytes()
+        if "pci_chipset" in data:
+            from pci_evidence import verify_inventory
+            try:
+                verify_inventory(log.decode("ascii", errors="replace"),
+                                 (run_dir / "vbox-pci.txt").read_text("ascii"), data["pci_chipset"])
+            except ValueError as error:
+                raise EvidenceError(f"Invalid PCI inventory: {error}") from error
         require(b"AGENTOS KERNEL OK STAGE 1\r\n" in log,
                 "Signed VM receipt lacks final kernel boot marker")
         has_demand = b"AGENTOS DEMAND" in log

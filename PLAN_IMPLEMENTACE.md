@@ -286,6 +286,8 @@ Připravit host testy algoritmů a selhání, integrační testy z uživatelské
 
 ### 4. Ovladače a bloková zařízení na obou platformách
 
+**První část na VirtualBoxu — objevování zařízení.** Jádro před spuštěním dalších CPU čte konfigurační prostor PCI. Z ohlášených oken ACPI MCFG používá ECAM, při absenci tabulky na x86 používá CF8/CFC. Pro každou přítomnou funkci vypíše segment, sběrnici, zařízení, funkci, identifikaci, třídu, revizi, přiřazené báze BAR a pozice schopností PCIe, MSI a MSI-X. Konfiguraci zařízení při inventarizaci pouze čte. Přejímka porovnává výpis jádra přes COM1 s konfiguračními registry stejné běžící VM z debuggeru VirtualBoxu. Po podepsaném sestavení se spustí `scripts/test-vbox.ps1 -PciChipset piix3` a `scripts/test-vbox.ps1 -PciChipset ich9`, pokaždé s `-Cpus 1` i `-Cpus 2`. Každý profil obsahuje AHCI a VirtIO-net. Navazující práce zahrnuje doručení přerušení MSI/MSI-X, mapování DMA a blokové operace.
+
 **Potřebuje 2; uživatelské zkoušky využijí 3.** Zprovoznit PCI/PCIe, přerušení MSI/MSI-X, DMA mapování a blokové rozhraní s dokončením a vyprázdněním zápisů. Podle pořadí v § 5.1 připojit AHCI a NVMe, transport VirtIO-net, xHCI, USB HID, USB Mass Storage a kabelový Realtek. Síťové ovladače zde stačí dovést k odeslání a příjmu rámce.
 
 Vývoj může běžet souběžně s 3.1. Rozhraní pro dokončení I/O a probouzení musí respektovat možné přesunutí čekajícího procesu na jiné CPU. Aktivní DMA buffery mají stabilní fyzické rámce po celou dobu přístupu zařízení; demand paging ani migrace úlohy nesmějí tuto evidenci obejít. Po propojení s 3.1 se zopakují dotčené I/O a timeout testy.
