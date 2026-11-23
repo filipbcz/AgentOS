@@ -98,30 +98,35 @@ impl Controller {
         let Some(bus) = BusAddress::of(&control, mask) else { frames.release(control); return Err(b"AHCI DMA mask"); };
         // Command list, received FIS and command table occupy aligned, disjoint
         // ranges in one owned frame, held until both engines have stopped.
-        let result = (|| {
+        let result = (|| -> Result<(), Error> {
             self.start(bus)?;
             let mut digest = None;
             let mut stopped = None;
             let mut tag = 1;
             while tag <= 33 {
-                let outcome = self.transfer(frames, &control, bus, mask, tag, if tag == 1 { 8000 } else { 15 })?;
+                let outcome = self.transfer(frames, &control, bus, mask, tag, 2048 + (tag - 1) * 16,
+                                            if tag == 1 { 8000 } else { 15 })?;
                 match outcome {
                     Outcome::Done(value) => {
-                        if *digest.get_or_insert(value) != value { return Err(b"AHCI inconsistent VDI data" as Error); }
+                        if tag == 1 { digest = Some(value); }
                     }
                     Outcome::Stopped(reused) => { stopped = Some(reused); break; }
                 }
                 tag += 1;
             }
             let canary = stopped.ok_or(b"AHCI timeout scenario did not leave a command pending" as Error)?;
-            self.start(bus)?;
-            let recovered = self.transfer(frames, &control, bus, mask, tag + 1, 8000)?;
-            if !matches!(recovered, Outcome::Done(value) if Some(value) == digest) { return Err(b"AHCI recovery read"); }
-            for page in canary {
-                if (0..PAGE).any(|i| ptr::read_volatile((page.address()+i) as *const u8) != 0x5a) {
-                    return Err(b"AHCI late DMA after reclamation");
+            let recovered = self.start(bus).and_then(|()| self.transfer(frames, &control, bus, mask, tag + 1, 2048, 8000));
+            let intact = canary.iter().all(|page| (0..PAGE).all(|i|
+                ptr::read_volatile((page.address()+i) as *const u8) == 0x5a));
+            for page in canary { frames.release(page); }
+            if !intact { return Err(b"AHCI late DMA after reclamation"); }
+            match recovered? {
+                Outcome::Done(value) if Some(value) == digest => (),
+                Outcome::Stopped(pages) => {
+                    for frame in pages { frames.release(frame); }
+                    return Err(b"AHCI recovery timeout");
                 }
-                frames.release(page);
+                _ => return Err(b"AHCI recovery read"),
             }
             Ok(())
         })();
@@ -138,7 +143,7 @@ impl Controller {
     }
 
     unsafe fn transfer(&self, frames: &mut Frames<'_>, control: &Frame, bus: BusAddress,
-                       mask: u64, tag: u32, ms: u64) -> Result<Outcome, Error> {
+                       mask: u64, tag: u32, lba: u32, ms: u64) -> Result<Outcome, Error> {
         let p = self.port();
         if read(p + CI) != 0 || read(p + SACT) != 0 || read(p + CMD) & (CR | FR) != CR | FR {
             return Err(b"AHCI slot unavailable");
@@ -152,7 +157,6 @@ impl Controller {
         ptr::write_bytes(table as *mut u8, 0, 160);
         write(list, 5 | (2 << 16)); // five FIS dwords, read, two PRDs
         address(list + 8, bus.value() + 1280);
-        let lba = 2048 + (tag - 1) * 16;
         write(table, 0x0025_8027); // Register H2D: C=1, READ DMA EXT
         write(table + 4, 0x4000_0000 | lba);
         write(table + 12, 16); // sixteen 512-byte logical sectors
@@ -163,64 +167,85 @@ impl Controller {
         }
         write(p + IS, u32::MAX);
         let refs = |f: &Frames<'_>| pages.map(|a| f.references(a).unwrap_or(0));
-        if refs(frames) != [1, 1] { return Err(b"AHCI pins after owner release"); }
+        if refs(frames) != [1, 1] {
+            mapping.unmap(frames); frames.release(spacer);
+            return Err(b"AHCI pins after owner release");
+        }
         let _ = writeln!(Console, "AGENTOS DMA PIN TAG={tag} LBA={lba} A={:x} B={:x} REFS=1,1\r", pages[0], pages[1]);
-        let active = mapping.submit();
-        let start = now()?;
-        write(p + CI, 1);
-        let mut spins = 0;
-        let (done, ci, elapsed) = loop {
-            let elapsed = now()? - start;
-            let ci = read(p + CI);
-            if ci & 1 == 0 { break (true, ci, elapsed); }
-            if elapsed >= ms { break (false, ci, elapsed); }
-            spins += 1;
-            if spins == 50_000_000 { return Err(b"AHCI clock stalled"); }
-            core::hint::spin_loop();
+        let start = match now() {
+            Ok(value) => value,
+            Err(e) => { mapping.unmap(frames); frames.release(spacer); return Err(e); }
         };
-        if refs(frames) != [1, 1] { return Err(b"AHCI lost active DMA pins"); }
-        let mut hash = 2166136261u32;
-        let mapping = if done {
-            fence(Ordering::Acquire);
-            let bytes = read(list + 4);
-            let status = read(p + IS);
-            let tfd = read(p + TFD);
-            let fis = read(list + 1024 + 0x40);
-            if bytes != BYTES as u32 || status & 1 == 0 || status & 0x7d00_0000 != 0 ||
-                tfd & 0xa9 != 0 || fis as u8 != 0x34 || (fis >> 16) & 0xa9 != 0 {
-                return Err(b"AHCI unsuccessful READ DMA EXT");
+        let active = mapping.submit();
+        write(p + CI, 1);
+        let terminal = (|| -> Result<_, Error> {
+            let mut spins = 0;
+            let (done, ci, elapsed) = loop {
+                let elapsed = now()? - start;
+                let ci = read(p + CI);
+                if ci & 1 == 0 { break (true, ci, elapsed); }
+                if elapsed >= ms { break (false, ci, elapsed); }
+                spins += 1;
+                if spins == 50_000_000 { return Err(b"AHCI clock stalled"); }
+                core::hint::spin_loop();
+            };
+            if refs(frames) != [1, 1] { return Err(b"AHCI lost active DMA pins"); }
+            if done {
+                fence(Ordering::Acquire);
+                let bytes = read(list + 4);
+                let status = read(p + IS);
+                let tfd = read(p + TFD);
+                let fis = read(list + 1024 + 0x40);
+                if bytes != BYTES as u32 || status & 1 == 0 || status & 0x7d00_0000 != 0 ||
+                    tfd & 0xa9 != 0 || fis as u8 != 0x34 || (fis >> 16) & 0xa9 != 0 {
+                    return Err(b"AHCI unsuccessful READ DMA EXT");
+                }
+                Ok(Some((ci, status, tfd, fis, bytes)))
+            } else {
+                let cmd = read(p + CMD);
+                // No console I/O between the pending snapshot and requesting stop.
+                self.reset()?;
+                let stopped = read(p + CMD);
+                let idle = read(p + CI);
+                let sact = read(p + SACT);
+                let pci = ptr::read_volatile((self.cfg + 4) as *const u16);
+                if refs(frames) != [1, 1] { return Err(b"AHCI lost pins during reset"); }
+                let _ = writeln!(Console, "AGENTOS DMA TIMEOUT TAG={tag} MS={elapsed} LIMIT={ms} CI={ci:x} CMD={cmd:x} REFS=1,1\r");
+                let _ = writeln!(Console, "AGENTOS DMA STOP TAG={tag} CMD={stopped:x} CI={idle:x} SACT={sact:x} PCI={pci:x} REFS=1,1\r");
+                Ok(None)
             }
-            let map = active.reclaim();
-            for &page in map.pages() {
+        })();
+        let completion = match terminal {
+            Ok(result) => result,
+            Err(e) => {
+                frames.release(spacer);
+                if self.reset().is_ok() { active.reclaim().unmap(frames); }
+                return Err(e);
+            }
+        };
+        let mapping = active.reclaim();
+        let mut hash = 2166136261u32;
+        if let Some((ci, status, tfd, fis, bytes)) = completion {
+            for &page in mapping.pages() {
                 for i in 0..PAGE {
                     hash = (hash ^ u32::from(ptr::read_volatile((page+i) as *const u8))).wrapping_mul(16777619);
                 }
             }
             let _ = writeln!(Console, "AGENTOS DMA DONE TAG={tag} CI={ci:x} IS={status:x} TFD={tfd:x} FIS={fis:x} BYTES={bytes} FNV={hash:08x}\r");
-            map
-        } else {
-            let cmd = read(p + CMD);
-            // No console I/O between the pending snapshot and requesting stop.
-            self.reset()?;
-            let stopped = read(p + CMD);
-            let idle = read(p + CI);
-            let sact = read(p + SACT);
-            let pci = ptr::read_volatile((self.cfg + 4) as *const u16);
-            if refs(frames) != [1, 1] { return Err(b"AHCI lost pins during reset"); }
-            let _ = writeln!(Console, "AGENTOS DMA TIMEOUT TAG={tag} MS={elapsed} LIMIT={ms} CI={ci:x} CMD={cmd:x} REFS=1,1\r");
-            let _ = writeln!(Console, "AGENTOS DMA STOP TAG={tag} CMD={stopped:x} CI={idle:x} SACT={sact:x} PCI={pci:x} REFS=1,1\r");
-            active.reclaim()
-        };
+        }
         let before = frames.available();
         mapping.unmap(frames);
         let after = frames.available();
-        if after != before + 2 || refs(frames) != [0, 0] { return Err(b"AHCI unmap accounting"); }
-        let a = frames.alloc().ok_or(b"AHCI reuse first" as Error)?;
-        let b = frames.alloc().ok_or(b"AHCI reuse second" as Error)?;
-        if [a.address(), b.address()] != pages { return Err(b"AHCI exact page reuse"); }
+        if after != before + 2 || refs(frames) != [0, 0] { frames.release(spacer); return Err(b"AHCI unmap accounting"); }
+        let Some(a) = frames.alloc() else { frames.release(spacer); return Err(b"AHCI reuse first"); };
+        let Some(b) = frames.alloc() else { frames.release(a); frames.release(spacer); return Err(b"AHCI reuse second"); };
+        if [a.address(), b.address()] != pages {
+            frames.release(a); frames.release(b); frames.release(spacer);
+            return Err(b"AHCI exact page reuse");
+        }
         let _ = writeln!(Console, "AGENTOS DMA REUSE TAG={tag} A={:x} B={:x} BEFORE={before} AFTER={after}\r", a.address(), b.address());
         frames.release(spacer);
-        if done {
+        if completion.is_some() {
             frames.release(a); frames.release(b);
             Ok(Outcome::Done(hash))
         } else {

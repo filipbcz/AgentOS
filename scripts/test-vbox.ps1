@@ -238,7 +238,7 @@ if ($AhciDma) {
     VBox storagectl $vm --name Boot --add ide --controller PIIX4
     VBox storageattach $vm --storagectl Boot --port 0 --device 0 --type hdd --medium "$dir\esp.vdi"
     VBox modifyvm $vm --iommu none
-    VBox bandwidthctl $vm add DmaDisk --type disk --limit 32768
+    VBox bandwidthctl $vm add DmaDisk --type disk --limit 32K
     VBox storagectl $vm --name SATA --add sata --controller IntelAhci --portcount 1 --hostiocache off
     VBox storageattach $vm --storagectl SATA --port 0 --device 0 --type hdd --medium "$dir\dma.vdi" --bandwidthgroup DmaDisk
 } else {

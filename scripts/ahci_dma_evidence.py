@@ -6,11 +6,10 @@ import re
 
 
 def create(path):
-    sample = os.urandom(8192)
     with path.open("xb") as disk:
         disk.truncate(8 << 20)
         disk.seek(1 << 20)
-        disk.write(sample * 34)
+        disk.write(os.urandom(8192 * 33))
 
 
 def require(ok, message):
@@ -32,7 +31,8 @@ def verify(log, path):
         for tag in range(1, 35):
             lba, a, b = take(rf"PIN TAG={tag} LBA=(\d+) A=([0-9a-f]+) B=([0-9a-f]+) REFS=1,1")
             pages = {int(a, 16), int(b, 16)}
-            require(int(lba) == 2048 + 16 * (tag - 1) and len(pages) == 2 and
+            expected_lba = 2048 if stopped_pages else 2048 + 16 * (tag - 1)
+            require(int(lba) == expected_lba and len(pages) == 2 and
                     min(pages) > 0 and max(pages) - min(pages) > 4096 and
                     all(p % 4096 == 0 for p in pages) and not pages & stopped_pages,
                     "Invalid scatter/gather pages or recovery reused live canaries")
