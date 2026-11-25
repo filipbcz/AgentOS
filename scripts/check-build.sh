@@ -108,7 +108,7 @@ printf 'Testing shared cross-CPU process lifecycle and deferred reaping with %s\
 "$pOut/lifecycle-tests"
 
 printf 'Testing shared HPET time and ACPI discovery with %s\n' "$pRustc"
-"$pRustc" --edition 2021 --test "$pRoot/kernel/hpet.rs" -o "$pOut/hpet-tests"
+"$pRustc" --edition 2021 --test "$pRoot/scripts/tests/hpet-host.rs" -o "$pOut/hpet-tests"
 "$pOut/hpet-tests"
 "$pRustc" --edition 2021 --test "$pRoot/scripts/tests/acpi-host.rs" -o "$pOut/acpi-tests"
 "$pOut/acpi-tests"
@@ -116,6 +116,10 @@ printf 'Testing shared HPET time and ACPI discovery with %s\n' "$pRustc"
 printf 'Testing ACPI/HPET hardware reference selection, wrap and bounded waits with %s\n' "$pRustc"
 "$pRustc" --edition 2021 --test "$pRoot/scripts/tests/reference-clock-host.rs" -o "$pOut/reference-clock-tests"
 "$pOut/reference-clock-tests"
+
+printf 'Testing shared system epoch, wrap maintenance and source selection with %s\n' "$pRustc"
+"$pRustc" --edition 2021 --test "$pRoot/scripts/tests/system-clock-host.rs" -o "$pOut/system-clock-tests"
+"$pOut/system-clock-tests"
 
 printf 'Testing native ELF ABI declaration and malformed input rejection with %s\n' "$pRustc"
 "$pRustc" --edition 2021 --test "$pRoot/kernel/native_abi.rs" -o "$pOut/native-abi-tests"

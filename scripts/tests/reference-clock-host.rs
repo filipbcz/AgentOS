@@ -11,7 +11,7 @@ fn pm(wide: bool) -> ReferenceClock {
     ReferenceClock::Pm(PmTimer { access: PmAccess::Io(0x408), wide })
 }
 fn hpet() -> ReferenceClock {
-    ReferenceClock::Hpet { base: 0xfed0_0000, period_fs: 100_000_000 }
+    ReferenceClock::Hpet { base: 0xfed0_0000, period_fs: 100_000_000, wide: true }
 }
 
 #[test]
@@ -29,14 +29,14 @@ fn actual_counter_width_and_exact_rate() {
 #[test]
 fn fallback_uses_only_a_progressing_discovered_clock() {
     let timer = PmTimer { access: PmAccess::Io(0x408), wide: false };
-    let hp = Some((0xfed0_0000, 100_000_000));
+    let hp = Some(hpet());
     let mut visited = Vec::new();
     assert_eq!(ReferenceClock::choose(Some(timer),hp,|c| {visited.push(c); c==hpet()}),Some(hpet()));
     assert_eq!(visited, vec![pm(false),hpet()]);
     assert_eq!(ReferenceClock::choose(Some(timer),hp,|_| true),Some(pm(false)));
     assert_eq!(ReferenceClock::choose(None,hp,|_| true),Some(hpet()));
     assert_eq!(ReferenceClock::choose(Some(timer),hp,|_| false),None);
-    assert_eq!(ReferenceClock::choose(None,Some((0xfed0_0000,0)),|_| true),None);
+    assert_eq!(ReferenceClock::choose(None,Some(ReferenceClock::Hpet {base:0xfed0_0000,period_fs:0,wide:true}),|_| true),None);
     assert_eq!(ReferenceClock::choose(None,None,|_| true),None);
 }
 

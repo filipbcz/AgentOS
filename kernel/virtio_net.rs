@@ -2,7 +2,7 @@
 //! Poll split RX/TX queues, one owned DMA descriptor per queue, no offloads
 //! or IRQs. An explicit profile exercises L2 frames, then resets the device.
 mod protocol;
-use crate::{dma::BusAddress, frames::{Frame, Frames}, hpet, paging, pci::Console};
+use crate::{dma::BusAddress, frames::{Frame, Frames}, system_clock, paging, pci::Console};
 use core::{fmt::Write, ptr, sync::atomic::{fence, Ordering}};
 use protocol::{Error, Ring, PAGE, DEPTH, DESC, AVAIL, USED, HEADER, MAX_FRAME, MIN_FRAME};
 
@@ -19,10 +19,10 @@ unsafe fn write_address(addr: usize, value: u64) {
     wr(addr,value as u32); wr(addr+4,(value>>32) as u32);
 }
 fn wait(mut ready: impl FnMut() -> Result<bool,Error>, ms: u64, error: Error) -> Result<(),Error> {
-    let start = hpet::millis().ok_or(b"VirtIO clock unavailable" as Error)?;
+    let start = system_clock::millis().ok_or(b"VirtIO clock unavailable" as Error)?;
     for _ in 0..100_000_000 {
         if ready()? { return Ok(()); }
-        if hpet::millis().ok_or(b"VirtIO clock unavailable" as Error)?.saturating_sub(start) >= ms { break; }
+        if system_clock::millis().ok_or(b"VirtIO clock unavailable" as Error)?.saturating_sub(start) >= ms { break; }
         core::hint::spin_loop();
     }
     Err(error)

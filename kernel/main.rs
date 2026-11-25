@@ -27,6 +27,7 @@ mod process;
 mod lifecycle;
 mod hpet;
 mod reference_clock;
+mod system_clock;
 mod native_abi;
 mod files;
 mod ipc;
@@ -163,9 +164,16 @@ pub unsafe extern "sysv64" fn kernel_main(info: &BootInfo) -> ! {
     // IST stacks use the guarded pool in the newly active kernel page tables.
     let Some(descriptors) = exceptions::Descriptors::new(&mut frames) else { log.event(0, b"IDT INIT FAILED"); halt(); };
     descriptors.load();
-    if let Err(reason) = hpet::init(platform.hpet) {
-        serial(b"GLOBAL CLOCK FAILED: "); serial(reason); serial(b"\r\n"); halt();
+    if platform.hpet != 0 {
+        if let Err(reason) = hpet::init(platform.hpet) {
+            log.event(0, reason);
+        }
     }
+    let source = match system_clock::init(platform.pm_timer, hpet::reference()) {
+        Ok(source) => source,
+        Err(reason) => { log.event(0, reason); halt(); }
+    };
+    log.event(1, system_clock::name(source));
     serial(b"AGENTOS OWN CR3="); exceptions::hex(root as u64); serial(b"\r\n");
     if !exceptions::probe(info.stack_base) || !frames.probe() {
         log.event(0, b"EXCEPTION OR RAM PROBE FAILED"); halt();

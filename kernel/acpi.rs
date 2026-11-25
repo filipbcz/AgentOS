@@ -117,8 +117,8 @@ pub struct Platform {
 fn hpetAddress(aBytes: &[u8]) -> Option<usize> {
     if aBytes.len() < 56 || aBytes.get(..4)? != b"HPET" ||
        u32_at(aBytes, 4)? as usize != aBytes.len() || !checksum(aBytes) ||
-       aBytes[40] != 0 || !matches!(aBytes[41], 0 | 64) ||
-       aBytes[42] != 0 || !matches!(aBytes[43], 0 | 4) { return None; }
+       aBytes[40] != 0 || !matches!(aBytes[41], 0 | 32 | 64) ||
+       aBytes[42] != 0 || !matches!(aBytes[43], 0 | 3 | 4) { return None; }
     let pAddress = usize::try_from(u64_at(aBytes, 44)?).ok()?;
     // Keep hardware outside the sole user PML4 slot and canonical low half.
     (pAddress != 0 && pAddress & 4095 == 0 && pAddress < (1usize << 39))
@@ -247,14 +247,17 @@ pub unsafe fn discover(info: &BootInfo, map: &[u8]) -> Option<Platform> {
         serial_irq: IsaInterrupt { gsi: 4, low: false, level: false }, serial_override: false,
         keyboard_irq: IsaInterrupt { gsi: 1, low: false, level: false }, keyboard_override: false };
     let mut fadt_table = None;
+    let mut hpet_seen = false;
     for entry in root[36..].chunks_exact(width) {
         let address = if width == 8 { u64_at(entry, 0)? } else { u32_at(entry, 0)? as u64 };
         match fw.bytes(address, 4)? {
             b"MCFG" => p.pci.parse(fw.table(address)?)?,
             b"APIC" => p.madt(fw.table(address)?)?,
             b"HPET" => {
-                if p.hpet != 0 { return None; }
-                p.hpet = hpetAddress(fw.table(address)?)?;
+                if hpet_seen { return None; }
+                hpet_seen = true;
+                // HPET is optional. An invalid table cannot authorize MMIO.
+                p.hpet = fw.table(address).and_then(hpetAddress).unwrap_or(0);
             }
             b"FACP" => {
                 if fadt_table.is_some() { return None; }
@@ -265,8 +268,18 @@ pub unsafe fn discover(info: &BootInfo, map: &[u8]) -> Option<Platform> {
             _ => (),
         }
     }
-    if p.hpet != 0 && (p.hpet == p.lapic ||
-       p.io_apics[..p.io_count].iter().any(|pIo| pIo.address == p.hpet)) { return None; }
+    if p.hpet != 0 {
+        let fb_start = info.framebuffer as usize;
+        let fb_end = (info.stride as usize).checked_mul(info.height as usize)?
+            .checked_mul(4)?.checked_add(fb_start)?;
+        if !timer_mmio_page_ok(map, fw.stride, p.hpet) ||
+           (p.hpet < fb_end && fb_start < p.hpet + 4096) ||
+           p.hpet == p.lapic || p.io_apics[..p.io_count].iter().any(|io| io.address == p.hpet) ||
+           p.pci.windows().iter().any(|w| {
+               let (start, size) = w.mapping();
+               (start..start+size).contains(&p.hpet)
+           }) { p.hpet = 0; }
+    }
     if let Some(fadt) = fadt_table {
         p.pm_timer = fadt_pm_timer(fadt, |timer| {
             let Some(address) = timer.mmio() else { return true; };
@@ -315,6 +328,10 @@ mod tests {
     fn acceptsSystemMemoryWithDeclaredOrUnspecifiedRegisterWidth() {
         let mut pBytes = hpetTable();
         assert_eq!(hpetAddress(&pBytes), Some(0xfed0_0000));
+        pBytes[41] = 32;
+        pBytes[43] = 3;
+        fixChecksum(&mut pBytes);
+        assert_eq!(hpetAddress(&pBytes), Some(0xfed0_0000));
         pBytes[41] = 64;
         pBytes[43] = 4;
         fixChecksum(&mut pBytes);
@@ -326,7 +343,7 @@ mod tests {
         let pValid = hpetTable();
         for pLength in 0..56 { assert_eq!(hpetAddress(&pValid[..pLength]), None); }
         for (pOffset, pValue) in [(0, b'X'), (4, 55), (9, pValid[9].wrapping_add(1)),
-            (40, 1), (41, 32), (42, 1), (43, 3)] {
+            (40, 1), (41, 16), (42, 1), (43, 2)] {
             let mut pBytes = pValid.clone();
             pBytes[pOffset] = pValue;
             if pOffset != 9 { fixChecksum(&mut pBytes); }

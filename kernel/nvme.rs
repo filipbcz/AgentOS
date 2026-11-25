@@ -2,7 +2,7 @@
 //! flight, owned coherent DMA pages. Only an explicit test build activates it.
 mod protocol;
 use crate::{block::{BlockDevice, Error, Geometry}, dma::BusAddress, frames::{Frame, Frames},
-            hpet, paging, pci::Console};
+            system_clock, paging, pci::Console};
 use core::{fmt::Write, ptr, sync::atomic::{fence, Ordering}};
 use protocol::{Capabilities, QueueState, PAGE};
 
@@ -21,7 +21,7 @@ unsafe fn write16(addr: usize, value: u16) { ptr::write_volatile(addr as *mut u1
 unsafe fn address(reg: usize, bus: u64) {
     write(reg, bus as u32); write(reg + 4, (bus >> 32) as u32);
 }
-fn now() -> Result<u64, Error> { hpet::millis().ok_or(b"NVMe clock unavailable") }
+fn now() -> Result<u64, Error> { system_clock::millis().ok_or(b"NVMe clock unavailable") }
 fn wait(mut ready: impl FnMut() -> Result<bool, Error>, ms: u64, reason: Error) -> Result<(), Error> {
     let start = now()?;
     for _ in 0..50_000_000 {

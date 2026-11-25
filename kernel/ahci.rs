@@ -1,7 +1,7 @@
 //! Polled, non-NCQ AHCI. Each issued command owns its descriptors until completion.
 mod disk;
 pub use disk::AhciDisk;
-use crate::{dma::{BusAddress, Mapping, PAGE}, frames::{Frame, Frames}, hpet, paging, pci::Console};
+use crate::{dma::{BusAddress, Mapping, PAGE}, frames::{Frame, Frames}, system_clock, paging, pci::Console};
 use core::{fmt::Write, ptr, sync::atomic::{fence, Ordering}};
 
 type Error = &'static [u8];
@@ -26,7 +26,7 @@ unsafe fn address(reg: usize, bus: u64) {
     write(reg, bus as u32);
     write(reg + 4, (bus >> 32) as u32);
 }
-fn now() -> Result<u64, Error> { hpet::millis().ok_or(b"AHCI clock") }
+fn now() -> Result<u64, Error> { system_clock::millis().ok_or(b"AHCI clock") }
 fn wait(mut ready: impl FnMut() -> bool, ms: u64, error: Error) -> Result<(), Error> {
     let start = now()?;
     for _ in 0..50_000_000 {

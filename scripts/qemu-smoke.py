@@ -51,6 +51,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cpus", type=int, choices=(1, 2), required=True)
     parser.add_argument("--memory-mib", type=int, choices=(256, 512), default=256)
+    parser.add_argument("--no-hpet", action="store_true", help="Disable HPET in actual QEMU hardware")
     parser.add_argument("--session", action="store_true",
                         help="Drive UART/PS2 editing, service control, runtime idle and shutdown")
     parser.add_argument("--timeout", type=int, default=720)
@@ -272,6 +273,8 @@ def boot(args):
     profile = f"qemu-cpu{args.cpus}"
     if args.memory_mib != 256:
         profile += f"-ram{args.memory_mib}"
+    if args.no_hpet:
+        profile += "-no-hpet"
     if args.session:
         profile += "-session"
     destination = root / "build/check" / profile
@@ -339,7 +342,7 @@ def boot(args):
         serial_options = ["-serial", f"file:{serial}"]
     qemu = [
         "qemu-system-x86_64",
-        "-machine", "q35,accel=tcg,smm=on,hpet=on",
+        "-machine", "q35,accel=tcg,smm=on,hpet=" + ("off" if args.no_hpet else "on"),
         "-cpu", "max", "-smp", str(args.cpus), "-m", str(args.memory_mib),
         "-global", "driver=cfi.pflash01,property=secure,value=on",
         "-drive", f"if=pflash,format=raw,unit=0,readonly=on,file={args.ovmf_code}",
@@ -401,7 +404,7 @@ def boot(args):
             failure = {
                 "schema": 1, "result": "fail", "source_commit": commit,
                 "cpu_count": args.cpus, "memory_mib": args.memory_mib,
-                "failure": str(error),
+                "hpet_enabled": not args.no_hpet, "failure": str(error),
                 "last_com1_bytes": tail,
                 "host_elapsed_seconds": round(time.monotonic() - start, 3),
                 "signed_efi_sha256": image["artifacts"]["agentos.efi"],
@@ -469,6 +472,11 @@ def boot(args):
     image_base = int(bases[0], 16)
     if image_base < 4096 or image_base % 4096 or image_base >= 1 << 39:
         raise RuntimeError(f"Invalid runtime kernel image address: {image_base:#x}")
+    clocks = re.findall(r"(?m)^\[INFO\] SYSTEM CLOCK: (HPET64|HPET32|ACPI PM24|ACPI PM32)\r?$", text)
+    if len(clocks) != 1:
+        raise RuntimeError(f"Missing unique system clock selection: {clocks}")
+    if args.no_hpet and not clocks[0].startswith("ACPI PM"):
+        raise RuntimeError("Actual no-HPET guest did not use the ACPI PM timer")
     receipt = {
         "schema": 1,
         "result": "pass",
@@ -477,6 +485,8 @@ def boot(args):
         "cpus": args.cpus,
         "memory_mib": args.memory_mib,
         "kernel_image_base": image_base,
+        "hpet_enabled": not args.no_hpet,
+        "system_clock": clocks[0],
         "interactive_com1_manager_session": args.session,
         "ps2_keyboard_session": args.session,
         "runtime_session": session_result,

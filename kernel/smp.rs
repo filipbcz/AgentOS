@@ -194,17 +194,14 @@ impl Lapic {
             if rates.eax != 0 && quantum != 0 { return Ok((quantum, rates.eax as u64 * 1000)); }
         }
         self.write(0x380, u32::MAX);
-        let start = clock.sample();
         let tsc_start = timestamp();
         let delayed = clock.delay_ns(100_000_000);
         let tsc_delta = timestamp().checked_sub(tsc_start);
-        let elapsed = clock.elapsed_ns(start, clock.sample());
         let counted = u32::MAX - self.read(0x390);
         // Never leave the calibration timer armed on a failed reference.
         self.write(0x380, 0);
-        delayed.map_err(|_| b"timer calibration reference stopped" as Error)?;
-        let elapsed = elapsed.filter(|&ns| ns >= 100_000_000)
-            .ok_or(b"timer calibration interval" as Error)?;
+        let elapsed = delayed.map_err(|_| b"timer calibration reference stopped" as Error)?;
+        if elapsed < 100_000_000 { return Err(b"timer calibration interval"); }
         let tsc_delta = tsc_delta.ok_or(b"TSC regression" as Error)?;
         if counted == 0 || counted == u32::MAX { return Err(b"timer calibration"); }
         let per_10ms = u32::try_from(counted as u128 * 10_000_000 / elapsed as u128)
@@ -291,7 +288,8 @@ impl Cpu {
         cpu.write(Self { self_address: addr, syscall_user_rsp: UnsafeCell::new(0), syscall_stack: UnsafeCell::new(0),
                          rsp0, programs, apic, expected_id: id, interval, tsc_hz, reference,
                          clock: crate::monotonic::Clock::new(tsc_hz),
-                         timer_policy: UnsafeCell::new(crate::timer::Timer::new(interval)),
+                         timer_policy: UnsafeCell::new(crate::timer::Timer::new(interval,
+                             if descriptors.is_none() { crate::system_clock::maintenance_ms() } else { None })),
                          runtime_timer_irqs: AtomicUsize::new(0), fTimerSequence: AtomicUsize::new(0),
                          fQueueLocked: AtomicBool::new(false), fRuntimeReady: AtomicBool::new(false),
                          fWakePending: AtomicBool::new(false), fRunnable: AtomicUsize::new(0),
@@ -341,7 +339,7 @@ impl Cpu {
         // or a sparse independent-clock watchdog when every task is asleep.
         self.apic.write(0x320, MASK | TIMER);
         self.apic.write(0x380, 0);
-        let now = crate::hpet::millis();
+        let now = crate::system_clock::millis();
         (*self.timer_policy.get()).reset(now);
         self.arm_timer(true, None, now.unwrap_or(0));
         while ptr::addr_of!((*self.queue.get()).active).read_volatile() { wait_for_irq(); }
@@ -354,7 +352,7 @@ impl Cpu {
             let mut pQueue = self.lockQueue();
             pQueue.setRuntimeIdle(true);
         }
-        (*self.timer_policy.get()).reset(crate::hpet::millis());
+        (*self.timer_policy.get()).reset(crate::system_clock::millis());
         self.apic.write(0x320, MASK | TIMER);
         self.apic.write(0x380, 0);
         self.fRuntimeReady.store(true, Ordering::Release);
@@ -370,7 +368,7 @@ impl Cpu {
         }
         self.fRuntimeReady.store(true, Ordering::Release);
         gRuntimeEnabled.store(true, Ordering::Release);
-        let pNow = crate::hpet::millis();
+        let pNow = crate::system_clock::millis();
         (*self.timer_policy.get()).reset(pNow);
         self.arm_timer(true, None, pNow.unwrap_or(0));
         let mut pStatus = None;
@@ -393,7 +391,7 @@ impl Cpu {
                     pChanged |= pQueue.collectRetired(pFrames) != 0;
                     pQueue.wake_io(pFrames);
                 });
-                let pNow = crate::hpet::millis().unwrap_or(0);
+                let pNow = crate::system_clock::millis().unwrap_or(0);
                 self.arm_timer(pQueue.runnableCount() != 0, pQueue.next_deadline(), pNow);
             }
             if pChanged { notifyRemote(); }
@@ -432,7 +430,7 @@ impl Cpu {
         let mut pGuard = self.lockQueue();
         let queue = &mut *pGuard;
         let scheduled = queue.active;
-        let measured = crate::hpet::millis();
+        let measured = crate::system_clock::millis();
         let now = measured.unwrap_or(0);
         let mut pChanged = false;
         if scheduled {
@@ -545,7 +543,14 @@ impl Cpu {
         self.apic.write(0x3e0, 0xa);
         self.apic.write(0x320, TIMER);
         let start = timestamp();
-        self.apic.write(0x380, count);
+        // Bound even long idle intervals by the real short-counter service
+        // requirement on the BSP. Wide sources preserve the original long arm.
+        let max_count = if self.descriptors.is_none() {
+            crate::system_clock::maintenance_ms().map(|ms|
+                (self.interval as u64 * ms / 80).clamp(1, count as u64) as u32)
+                .unwrap_or(count)
+        } else { count };
+        self.apic.write(0x380, max_count);
         let mut waiting = 0;
         let mut wakes = 0;
         let mut timers = 0;
@@ -565,7 +570,7 @@ impl Cpu {
             // A virtual APIC may advance faster than TSC while catching up.
             // Charge every early expiration and wait for the remaining time.
             let remaining_ms = (target - elapsed) * 1000 / self.tsc_hz;
-            self.apic.write(0x380, (count as u64 * remaining_ms / 30_000).max(1) as u32);
+            self.apic.write(0x380, (count as u64 * remaining_ms / 30_000).clamp(1, max_count as u64) as u32);
         };
         if waiting >= elapsed { return Err(b"invalid idle accounting"); }
         self.apic.write(0x320, MASK | TIMER);
@@ -756,13 +761,13 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
     let result: isize = match ctx.registers[14] {
         0x10001 => pid as isize,
         // Native ABI v2 uses one HPET boot epoch on every CPU.
-        0x10010 => crate::hpet::millis().map(|v| v as isize).unwrap_or(-5),
+        0x10010 => crate::system_clock::millis().map(|v| v as isize).unwrap_or(-5),
         // Read-only, versioned global timer diagnostics. All fields are
         // captured with IF=0, and the destination is validated before writing.
         // Counts cover scheduled operation, excluding boot/idle timer probes.
         0x10018 => {
             if b != 32 || c != 0 { -22 }
-            else if let Some(now) = crate::hpet::millis() {
+            else if let Some(now) = crate::system_clock::millis() {
                 let (pTimers, pIdle) = timerSnapshot();
                 let fields = [2u64, now, pTimers, pIdle];
                 let mut bytes = [0u8; 32];
@@ -832,7 +837,7 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
             else {
                 match cpu.load.frames.with(|f| q.collect(f, pid, a)) {
                     Ok(status) => status as isize,
-                    Err(-11) => match crate::hpet::millis() {
+                    Err(-11) => match crate::system_clock::millis() {
                         None => -5,
                         Some(now) if now >= b as u64 => -110,
                         Some(now) => {
@@ -851,7 +856,7 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
             if a > isize::MAX as usize { -22 }
             else if q.take_clock_error() { -5 }
             else {
-                match crate::hpet::millis() {
+                match crate::system_clock::millis() {
                     None => -5,
                     Some(now) if now >= a as u64 => 0,
                     Some(now) => {
@@ -915,7 +920,7 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
                             if cpu.load.frames.with(|f| q.has_exited_child(f, pid)) { 1usize << 32 } else { 0 };
                         if events != 0 { events as isize }
                         else {
-                            match crate::hpet::millis() {
+                            match crate::system_clock::millis() {
                                 None => -5,
                                 Some(now) if now >= b as u64 => 0,
                                 Some(now) => {
@@ -1063,7 +1068,10 @@ unsafe fn start_ap(cpu: &Cpu, root: usize, base: usize, stack: usize, clock: &Re
     cpu.apic.send(cpu.expected_id, sipi, clock)?;
     clock.delay_ns(200_000).map_err(|_| b"AP SIPI delay reference stopped" as Error)?;
     cpu.apic.send(cpu.expected_id, sipi, clock)?;
-    clock.wait_until(2_000_000_000, || cpu.complete.load(Ordering::Acquire) != 0)
+    clock.wait_until(2_000_000_000, || {
+        let _ = crate::system_clock::millis();
+        cpu.complete.load(Ordering::Acquire) != 0
+    })
         .map_err(|error| match error {
             WaitError::Timeout => b"AP task timeout" as Error,
             WaitError::Unresponsive => b"AP task reference clock stopped" as Error,
@@ -1122,7 +1130,7 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
     boot_cpu.schedule();
     for cpu in cpus.iter().flatten() {
         if cpu.expected_id != bsp {
-            while cpu.complete.load(Ordering::Acquire) != 2 { spin_loop(); }
+            while cpu.complete.load(Ordering::Acquire) != 2 { let _ = crate::system_clock::millis(); spin_loop(); }
         }
         for slot in 0..stress::TASKS {
             let switches = (*cpu.queue.get()).preemptions(slot);
@@ -1143,7 +1151,7 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
     for cpu in cpus.iter().flatten() { cpu.phase.store(OOM_PHASE, Ordering::Release); }
     let mut rejected = boot_cpu.check_empty() as usize;
     for cpu in cpus.iter().flatten().filter(|c| c.expected_id != bsp) {
-        while cpu.complete.load(Ordering::Acquire) == 2 { spin_loop(); }
+        while cpu.complete.load(Ordering::Acquire) == 2 { let _ = crate::system_clock::millis(); spin_loop(); }
         if cpu.complete.load(Ordering::Acquire) == OOM_CHECKED { rejected += 1; }
     }
     let restored = load.frames.with(|f| held.recover(f) && baseline.matches(f) && f.probe() && baseline.matches(f));
@@ -1161,7 +1169,7 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
     boot_cpu.process_test()?;
     for cpu in cpus.iter().flatten().filter(|c| c.expected_id != bsp) {
         cpu.phase.store(PROCESS_PHASE, Ordering::Release);
-        while cpu.complete.load(Ordering::Acquire) == OOM_CHECKED { spin_loop(); }
+        while cpu.complete.load(Ordering::Acquire) == OOM_CHECKED { let _ = crate::system_clock::millis(); spin_loop(); }
         if cpu.complete.load(Ordering::Acquire) != PROCESSES_FINISHED { return Err(b"AP user processes"); }
     }
     serial(b"AGENTOS IDLE BEGIN TSC-HZ="); hex(tsc_hz); serial(b"\r\n");
@@ -1169,7 +1177,7 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
     boot_cpu.measure_idle()?;
     for cpu in cpus.iter().flatten() {
         if cpu.expected_id != bsp {
-            while cpu.complete.load(Ordering::Acquire) == PROCESSES_FINISHED { spin_loop(); }
+            while cpu.complete.load(Ordering::Acquire) == PROCESSES_FINISHED { let _ = crate::system_clock::millis(); spin_loop(); }
             if cpu.complete.load(Ordering::Acquire) != IDLE_FINISHED { return Err(b"AP idle sample"); }
         }
         let sample = &*cpu.idle.get();

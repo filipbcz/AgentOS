@@ -2,7 +2,7 @@
 //! command/event rings. USB device addressing and EP0 transfers follow in
 //! the next increment; do not present this profile as a USB HID driver.
 mod protocol;
-use crate::{dma::BusAddress,frames::{Frame,Frames},hpet,paging,pci::Console};
+use crate::{dma::BusAddress,frames::{Frame,Frames},system_clock,paging,pci::Console};
 use core::{fmt::Write,ptr,sync::atomic::{fence,Ordering}};
 use protocol::{Caps,CommandRing,Error,EventRing,PortProtocol,Trb,PAGE,COMMANDS,EVENTS};
 
@@ -18,11 +18,11 @@ unsafe fn rd16(addr:usize)->u16{ptr::read_volatile(addr as *const u16)}
 unsafe fn wr16(addr:usize,value:u16){ptr::write_volatile(addr as *mut u16,value);}
 unsafe fn address(reg:usize,value:u64){wr(reg,value as u32);wr(reg+4,(value>>32) as u32);}
 fn wait(mut ready:impl FnMut()->Result<bool,Error>,ms:u64,reason:Error)->Result<(),Error>{
-    let start=hpet::millis().ok_or(b"xHCI clock unavailable" as Error)?;
-    // A second finite budget protects even against a stalled HPET.
+    let start=system_clock::millis().ok_or(b"xHCI clock unavailable" as Error)?;
+    // A second finite budget protects even against a stalled system clock.
     for _ in 0..200_000_000u32{
         if ready()?{return Ok(());}
-        if hpet::millis().ok_or(b"xHCI clock unavailable" as Error)?.saturating_sub(start)>=ms{break;}
+        if system_clock::millis().ok_or(b"xHCI clock unavailable" as Error)?.saturating_sub(start)>=ms{break;}
         core::hint::spin_loop();
     }
     Err(reason)

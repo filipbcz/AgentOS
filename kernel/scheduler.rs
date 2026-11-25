@@ -686,7 +686,7 @@ mod timed_tests {
         let mut p = Harness::new(false);
         p.fQueues[0].block_sleep(10_000, 100);
         p.select(0, 77, false);
-        let mut pTimer = crate::timer::Timer::new(1000);
+        let mut pTimer = crate::timer::Timer::new(1000, None);
         pTimer.reset(Some(100));
         for pSecond in 1..=5 {
             assert_eq!(pTimer.plan(false, p.fQueues[0].next_deadline(), 100), crate::timer::Action::Arm(100_000));

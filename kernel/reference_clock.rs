@@ -50,11 +50,14 @@ impl PmTimer {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReferenceClock {
     Pm(PmTimer),
-    Hpet { base: usize, period_fs: u64 },
+    Hpet { base: usize, period_fs: u64, wide: bool },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WaitError { Timeout, Unresponsive }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PollOutcome { Complete, Elapsed(u64) }
 
 impl ReferenceClock {
     pub fn name(self) -> &'static [u8] {
@@ -65,10 +68,10 @@ impl ReferenceClock {
         }
     }
 
-    fn mask(self) -> u64 {
+    pub(crate) fn mask(self) -> u64 {
         match self {
             Self::Pm(timer) => if timer.wide { u32::MAX as u64 } else { 0xff_ffff },
-            Self::Hpet { .. } => u64::MAX,
+            Self::Hpet { wide, .. } => if wide { u64::MAX } else { u32::MAX as u64 },
         }
     }
 
@@ -80,13 +83,31 @@ impl ReferenceClock {
         ns.min(u64::MAX as u128) as u64
     }
 
-    fn delta(self, before: u64, after: u64) -> Option<u64> {
+    pub(crate) fn delta(self, before: u64, after: u64) -> Option<u64> {
         let mask = self.mask();
         let delta = after.wrapping_sub(before) & mask;
         // Successive samples in these short waits must be less than half
         // a wrap apart. Reject ambiguous jumps/reset rather than treating
         // a regressed clock as a completed hardware delay.
         (delta <= mask / 2).then_some(delta)
+    }
+
+    /// Exact conversion of accumulated ticks, saturating only at the signed
+    /// native ABI limit. Fractional milliseconds survive repeated reads.
+    pub(crate) fn ticks_to_ms(self, ticks: u128) -> u64 {
+        let ms = match self {
+            Self::Pm(_) => ticks.saturating_mul(1000) / PM_HZ as u128,
+            Self::Hpet { period_fs, .. } =>
+                ticks.saturating_mul(period_fs as u128) / 1_000_000_000_000u128,
+        };
+        ms.min(isize::MAX as u128) as u64
+    }
+
+    /// Sample before a quarter of a short counter's wrap, including during
+    /// idle. The scheduler supports millisecond maintenance deadlines.
+    pub(crate) fn maintenance_ms(self) -> Option<u64> {
+        if self.mask() == u64::MAX { return None; }
+        Some(self.ticks_to_ms((self.mask() as u128 + 1) / 4).min(1000))
     }
 
     pub fn elapsed_ns(self, before: u64, after: u64) -> Option<u64> {
@@ -98,7 +119,9 @@ impl ReferenceClock {
     pub unsafe fn sample(self) -> u64 {
         let value = match self {
             Self::Pm(timer) => timer.read() as u64,
-            Self::Hpet { base, .. } => ptr::read_volatile((base + 0xf0) as *const u64),
+            Self::Hpet { base, wide: true, .. } => ptr::read_volatile((base + 0xf0) as *const u64),
+            Self::Hpet { base, wide: false, .. } =>
+                ptr::read_volatile((base + 0xf0) as *const u32) as u64,
         };
         value & self.mask()
     }
@@ -106,34 +129,34 @@ impl ReferenceClock {
     /// Select a progressing ACPI reference, retaining the established PM
     /// calibration preference. An absent/frozen PM timer must not block a
     /// machine with a usable HPET. Both are already discovered and mapped.
-    pub(crate) fn choose(pm: Option<PmTimer>, hpet: Option<(usize, u64)>,
+    pub(crate) fn choose(pm: Option<PmTimer>, hpet: Option<ReferenceClock>,
                          mut progressing: impl FnMut(Self) -> bool) -> Option<Self> {
         if let Some(timer) = pm {
             let clock = Self::Pm(timer);
             if progressing(clock) { return Some(clock); }
         }
-        if let Some((base, period_fs)) = hpet {
+        if let Some(clock @ Self::Hpet { base, period_fs, .. }) = hpet {
             if base != 0 && base % 4096 == 0 &&
-               period_fs != 0 && period_fs <= 100_000_000 {
-                let clock = Self::Hpet { base, period_fs };
-                if progressing(clock) { return Some(clock); }
-            }
+               period_fs != 0 && period_fs <= 100_000_000 &&
+               progressing(clock) { return Some(clock); }
         }
         None
     }
 
-    pub unsafe fn select(pm: Option<PmTimer>, hpet: Option<(usize, u64)>) -> Option<Self> {
-        Self::choose(pm, hpet, |clock| {
-            let start = clock.sample();
-            for _ in 0..MAX_STALLED_POLLS {
-                match clock.delta(start, clock.sample()) {
-                    Some(0) => spin_loop(),
-                    Some(_) => return true,
-                    None => return false,
-                }
+    pub unsafe fn progressing(self) -> bool {
+        let start = self.sample();
+        for _ in 0..MAX_STALLED_POLLS {
+            match self.delta(start, self.sample()) {
+                Some(0) => spin_loop(),
+                Some(_) => return true,
+                None => return false,
             }
-            false
-        })
+        }
+        false
+    }
+
+    pub unsafe fn select(pm: Option<PmTimer>, hpet: Option<ReferenceClock>) -> Option<Self> {
+        Self::choose(pm, hpet, |clock| clock.progressing())
     }
 
     /// Pure polling engine with injectable hardware reads for host tests.
@@ -141,10 +164,11 @@ impl ReferenceClock {
     /// fractional ticks by converting accumulated ticks only when needed.
     /// The iteration bounds are last-resort failure guards, never a
     /// replacement for elapsed time or a source of synthetic clock time.
-    pub(crate) fn poll(self, timeout_ns: u64, max_polls: u32, max_stalled: u32,
-                       mut read: impl FnMut() -> u64,
-                       mut complete: impl FnMut() -> bool) -> Result<(), WaitError> {
-        if complete() { return Ok(()); }
+    fn poll_elapsed(self, timeout_ns: u64, max_polls: u32, max_stalled: u32,
+                    mut read: impl FnMut() -> u64,
+                    mut complete: impl FnMut() -> bool) -> Result<PollOutcome, WaitError> {
+        if complete() { return Ok(PollOutcome::Complete); }
+        if timeout_ns == 0 { return Ok(PollOutcome::Elapsed(0)); }
         let mut previous = read();
         let mut total_ticks = 0u64;
         let mut stalled = 0u32;
@@ -153,8 +177,9 @@ impl ReferenceClock {
             let delta = self.delta(previous, now).ok_or(WaitError::Unresponsive)?;
             previous = now;
             total_ticks = total_ticks.checked_add(delta).ok_or(WaitError::Unresponsive)?;
-            if self.ticks_to_ns(total_ticks) >= timeout_ns { return Err(WaitError::Timeout); }
-            if complete() { return Ok(()); }
+            let elapsed = self.ticks_to_ns(total_ticks);
+            if elapsed >= timeout_ns { return Ok(PollOutcome::Elapsed(elapsed)); }
+            if complete() { return Ok(PollOutcome::Complete); }
             if delta == 0 {
                 stalled += 1;
                 if stalled >= max_stalled { return Err(WaitError::Unresponsive); }
@@ -166,15 +191,27 @@ impl ReferenceClock {
         Err(WaitError::Unresponsive)
     }
 
+    pub(crate) fn poll(self, timeout_ns: u64, max_polls: u32, max_stalled: u32,
+                       read: impl FnMut() -> u64,
+                       complete: impl FnMut() -> bool) -> Result<(), WaitError> {
+        match self.poll_elapsed(timeout_ns, max_polls, max_stalled, read, complete)? {
+            PollOutcome::Complete => Ok(()),
+            PollOutcome::Elapsed(_) => Err(WaitError::Timeout),
+        }
+    }
+
     pub unsafe fn wait_until(self, timeout_ns: u64,
                              complete: impl FnMut() -> bool) -> Result<(), WaitError> {
         self.poll(timeout_ns, MAX_POLLS, MAX_STALLED_POLLS, || self.sample(), complete)
     }
 
-    pub unsafe fn delay_ns(self, duration_ns: u64) -> Result<(), WaitError> {
-        match self.wait_until(duration_ns, || false) {
-            Err(WaitError::Timeout) => Ok(()),
-            result => result,
+    /// Actual elapsed time, including wraps and overshoot. Calibration must
+    /// not subtract two endpoints of a short counter after a long delay.
+    pub unsafe fn delay_ns(self, duration_ns: u64) -> Result<u64, WaitError> {
+        match self.poll_elapsed(duration_ns, MAX_POLLS, MAX_STALLED_POLLS,
+                                || self.sample(), || false)? {
+            PollOutcome::Elapsed(elapsed) => Ok(elapsed),
+            PollOutcome::Complete => Err(WaitError::Unresponsive),
         }
     }
 }

@@ -1,6 +1,6 @@
 //! Boot-time owner of the Oxford PCIe UART and its PCI message interrupts.
 //! CPU startup is serialized. A route is quiesced before the next CPU owns it.
-use crate::{frames::Frames, hpet, paging, pci::Console};
+use crate::{frames::Frames, system_clock, paging, pci::Console};
 use core::{arch::asm, fmt::Write, ptr, sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering}};
 
 type Error = &'static [u8];
@@ -207,10 +207,10 @@ impl Oxford {
 }
 
 fn until(mut condition: impl FnMut() -> bool, timeout: Error) -> Result<(), Error> {
-    let start = hpet::millis().ok_or(b"missing IRQ deadline clock" as Error)?;
+    let start = system_clock::millis().ok_or(b"missing IRQ deadline clock" as Error)?;
     for _ in 0..10_000_000 {
         if condition() { return Ok(()); }
-        if hpet::millis().map_or(true, |now| now - start >= 750) { break; }
+        if system_clock::millis().map_or(true, |now| now - start >= 750) { break; }
         core::hint::spin_loop();
     }
     Err(timeout)

@@ -79,6 +79,31 @@ jobs:
               raise SystemExit("Both boots used the same physical kernel address")
           print("Actual relocated guest image bases:", hex(a["kernel_image_base"]), hex(b["kernel_image_base"]))
           PY
+      - name: Boot and exercise the identical signed image without HPET
+        env:
+          CPU_COUNT: ${{ matrix.cpus }}
+        run: |
+          set -euo pipefail
+          python3 scripts/qemu-smoke.py --cpus "$CPU_COUNT" --no-hpet --session \
+            --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd \
+            --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd --timeout 720
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          cpu = os.environ["CPU_COUNT"]
+          def read(profile):
+              return json.loads(Path("build/check", profile, "smoke.json").read_text())
+          a, b = read(f"qemu-cpu{cpu}-session"), read(f"qemu-cpu{cpu}-no-hpet-session")
+          if a["result"] != "pass" or b["result"] != "pass":
+              raise SystemExit("Missing successful interactive boot")
+          if a["source_commit"] != b["source_commit"] or a["signed_efi_sha256"] != b["signed_efi_sha256"]:
+              raise SystemExit("Different signed kernels were used")
+          if b["hpet_enabled"] or b["system_clock"] not in ("ACPI PM24", "ACPI PM32"):
+              raise SystemExit("No actual PM timer fallback")
+          if b["runtime_session"]["idle"]["milliseconds"] < 5000:
+              raise SystemExit("Missing real timed wait across a PM24 wrap interval")
+          print("Actual no-HPET interactive boot:", b["system_clock"], b["runtime_session"]["idle"])
+          PY
       - name: Preserve boot evidence even if the guest fails
         if: always()
         uses: actions/upload-artifact@v4
@@ -114,6 +139,13 @@ jobs:
             build/check/qemu-cpu${{ matrix.cpus }}-session/failed-screen.ppm
             build/check/qemu-cpu${{ matrix.cpus }}-session/shell-screen.ppm
             build/check/qemu-cpu${{ matrix.cpus }}-session/com1-input.bin
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session/com1.log
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session/qemu-stderr.log
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session/smoke.json
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session/failure.json
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session/com1-input.bin
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session/shell-screen.ppm
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session/failed-screen.ppm
             build/check/qemu-cpu${{ matrix.cpus }}-session/keyboard-before.ppm
             build/check/qemu-cpu${{ matrix.cpus }}-session/keyboard-after.ppm
             build/check/qemu-cpu${{ matrix.cpus }}-session/secureboot-vars.txt
