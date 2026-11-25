@@ -143,6 +143,14 @@ pub unsafe extern "sysv64" fn kernel_main(info: &BootInfo) -> ! {
     };
     if !frames.probe() { log.event(0, b"FRAME PROBE FAILED"); halt(); }
     log.event(1, b"PHYSICAL MEMORY READY");
+    // The linked addresses in kernel.elf are offsets. Record the real
+    // runtime base so a crash RIP can be symbolized on any machine.
+    let mut image = *b"KERNEL IMAGE BASE=0000000000000000";
+    let base = paging::image_base() as u64;
+    for (i, digit) in image[18..].iter_mut().enumerate() {
+        *digit = b"0123456789abcdef"[((base >> (60 - 4*i)) & 15) as usize];
+    }
+    log.event(1, &image);
     serial(b"AGENTOS PHYSICAL FRAMES OK\r\n");
     let Some(platform) = acpi::discover(info, map) else { log.event(0, b"ACPI DISCOVERY FAILED"); halt(); };
     log.event(2, b"ACPI TABLES READY");
