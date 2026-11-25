@@ -105,6 +105,15 @@ wsl -d Ubuntu-24.04 -- bash scripts/build.sh --nvme-block
 
 Oba běhy vyžadují vlastní platný `VM_ACCEPTANCE_JSON`. Nezávislá kontrola porovná PCI config dump obou startů, záznamy NVMe CQ dokončení zápisů a flush, UUID téže VM a VDI, dvě potvrzená vypnutí a celý export disku před a po čtecím startu. Pro etapu 3 nebo běžný boot pak znovu sestavit bez `--nvme-block`.
 
+Pro doplňkové ověření na QEMU (bez VirtualBox Extension Packu) použijte na Ubuntu připravený podepsaný `--nvme-block` build:
+
+```bash
+python3 scripts/qemu-nvme.py --cpus 1 --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd
+python3 scripts/qemu-nvme.py --cpus 2 --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd
+```
+
+Samostatná CI matice QEMU používá skutečný emulovaný NVMe řadič, QMP PCI identitu a počitadla jeho blokového backendu. Po dvou nezávislých procesech QEMU ověří všechny bajty nového RAW disku a kernelové záznamy dokončení, při druhém bootu navíc běžné jádro a procesové zkoušky. Úspěch QEMU nenahrazuje VirtualBox ani fyzickou přejímku.
+
 ## Jádro, paměť a plánování
 
 Loader předá konečnou mapu paměti, framebuffer a initramfs a korektně opustí UEFI Boot Services. Rustové `no_std` jádro vytvoří vlastní čtyřúrovňové stránkování, alokátor fyzických rámců a GDT/IDT/TSS. Kód je RX, konstanty RO/NX, data RW/NX; nulová stránka a loaderový stack guard nejsou mapované.

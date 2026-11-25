@@ -42,23 +42,60 @@ def controller_identity(log, dump):
     return bdf, cfg[:4], base
 
 
-def verify(run, cpus):
-    run = Path(run)
-    before = (run / "block.raw").read_bytes()
+def expected_disk(path):
+    before = Path(path).read_bytes()
     require(len(before) == SIZE and before[HEADER:HEADER+16] == MAGIC and
             before[-BYTES:] == bytes(BYTES), "Invalid initial disk")
     seed = before[HEADER+16:HEADER+272]
     require(len(set(seed)) > 1, "Missing random fixture")
     payload = bytes(seed[i % 256] ^ (i // 256) for i in range(BYTES))
     after = before[:-BYTES] + payload
-    require((run / "block-after.raw").read_bytes() == after,
-            "Write boot disk differs from expected sectors")
-    require((run / "block-read-after.raw").read_bytes() == after,
-            "Read boot changed the disk")
     digest = 2166136261
     for byte in payload:
         digest = ((digest ^ byte) * 16777619) & 0xffffffff
     details = f"LBA=16375 BYTES={BYTES} FNV={digest:08x}"
+    return after, details
+
+
+def verify_guest(guest, phase, details):
+    require(phase in ("write", "read"), "Invalid NVMe phase")
+    events = [line for line in guest.splitlines()
+              if line.startswith(("AGENTOS NVME ", "AGENTOS BLOCK "))]
+    require(events, "Missing NVMe records")
+    ready = re.fullmatch(r"AGENTOS NVME READY NSID=1 BLOCKS=16384 SIZE=512 DEPTH=(\d+) STRIDE=(\d+)", events[0])
+    require(ready is not None, "Missing identified NVMe namespace")
+    depth, stride = map(int, ready.groups())
+    require(2 <= depth <= 8 and 4 <= stride <= 1024 and stride & (stride-1) == 0,
+            "Invalid NVMe queue layout")
+    expected = [
+        events[0],
+        "AGENTOS NVME IO OP=02 LBA=2048 BLOCKS=1 CID=1",
+        "AGENTOS BLOCK READY BLOCKS=16384 SIZE=512",
+        "AGENTOS NVME IO OP=02 LBA=16375 BLOCKS=8 CID=2",
+        "AGENTOS NVME IO OP=02 LBA=16383 BLOCKS=1 CID=3",
+    ]
+    if phase == "write":
+        expected += [
+            "AGENTOS NVME IO OP=01 LBA=16375 BLOCKS=8 CID=4",
+            "AGENTOS NVME IO OP=01 LBA=16383 BLOCKS=1 CID=5",
+            f"AGENTOS BLOCK WRITE {details}",
+            "AGENTOS NVME IO OP=00 LBA=0 BLOCKS=0 CID=6",
+            "AGENTOS BLOCK FLUSH OK",
+        ]
+    else:
+        expected.append(f"AGENTOS BLOCK READ {details}")
+    expected.append("AGENTOS NVME CLOSED RDY=0 MASTER=0 DMA=5")
+    require(events == expected and "AGENTOS PCI FAILED" not in guest,
+            f"Incomplete or unexpected {phase} NVMe completions")
+
+
+def verify(run, cpus):
+    run = Path(run)
+    after, details = expected_disk(run / "block.raw")
+    require((run / "block-after.raw").read_bytes() == after,
+            "Write boot disk differs from expected sectors")
+    require((run / "block-read-after.raw").read_bytes() == after,
+            "Read boot changed the disk")
     with (run / "block.vdi").open("rb") as stream:
         stream.seek(392)
         medium = uuid.UUID(bytes_le=stream.read(16))
@@ -81,33 +118,6 @@ def verify(run, cpus):
                 "Missing distinct powered-off NVMe boot evidence")
         starts.append(start[1])
         controllers.append(controller_identity(guest, read_text(run / pci)))
-        events = [line for line in guest.splitlines()
-                  if line.startswith(("AGENTOS NVME ", "AGENTOS BLOCK "))]
-        require(events, "Missing NVMe records")
-        ready = re.fullmatch(r"AGENTOS NVME READY NSID=1 BLOCKS=16384 SIZE=512 DEPTH=(\d+) STRIDE=(\d+)", events[0])
-        require(ready is not None, "Missing identified NVMe namespace")
-        depth, stride = map(int, ready.groups())
-        require(2 <= depth <= 8 and 4 <= stride <= 1024 and stride & (stride-1) == 0,
-                "Invalid NVMe queue layout")
-        expected = [
-            events[0],
-            "AGENTOS NVME IO OP=02 LBA=2048 BLOCKS=1 CID=1",
-            "AGENTOS BLOCK READY BLOCKS=16384 SIZE=512",
-            "AGENTOS NVME IO OP=02 LBA=16375 BLOCKS=8 CID=2",
-            "AGENTOS NVME IO OP=02 LBA=16383 BLOCKS=1 CID=3",
-        ]
-        if phase == "write":
-            expected += [
-                "AGENTOS NVME IO OP=01 LBA=16375 BLOCKS=8 CID=4",
-                "AGENTOS NVME IO OP=01 LBA=16383 BLOCKS=1 CID=5",
-                f"AGENTOS BLOCK WRITE {details}",
-                "AGENTOS NVME IO OP=00 LBA=0 BLOCKS=0 CID=6",
-                "AGENTOS BLOCK FLUSH OK",
-            ]
-        else:
-            expected.append(f"AGENTOS BLOCK READ {details}")
-        expected.append("AGENTOS NVME CLOSED RDY=0 MASTER=0 DMA=5")
-        require(events == expected and "AGENTOS PCI FAILED" not in guest,
-                f"Incomplete or unexpected {phase} NVMe completions")
+        verify_guest(guest, phase, details)
     require(starts[0] < starts[1] and controllers[0] == controllers[1],
             "Missing distinct cold restart of the same NVMe controller")
