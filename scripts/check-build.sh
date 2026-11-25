@@ -77,6 +77,11 @@ printf 'Testing SMP/IRQ safe runtime logger with %s\n' "$pRustc"
 "$pRustc" --edition 2021 --test "$pRoot/scripts/tests/logger-host.rs" -o "$pOut/logger-tests"
 "$pOut/logger-tests"
 
+printf 'Testing UEFI GOP mode selection with %s\n' "$pCc"
+"$pCc" -std=c11 -O2 -Wall -Wextra -Werror \
+    "$pRoot/scripts/tests/gop-select-host.c" -o "$pOut/gop-select-tests"
+"$pOut/gop-select-tests"
+
 printf 'Testing GOP text console bounds, ASCII and scrolling with %s\n' "$pRustc"
 "$pRustc" --edition 2021 --test "$pRoot/scripts/tests/fb-console-host.rs" -o "$pOut/fb-console-tests"
 "$pOut/fb-console-tests"
