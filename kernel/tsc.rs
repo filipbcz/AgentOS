@@ -1,0 +1,293 @@
+//! Qualify the invariant TSC and measure startup alignment between CPUs.
+//! Invariance is a rate guarantee, not a guarantee of equal counter values.
+//! The result is a candidate for a future clocksource, not a replacement
+//! for the active shared hardware clock until long-term drift is checked.
+use crate::reference_clock::ReferenceClock;
+use core::{arch::{asm, x86_64::__cpuid}, fmt::{self, Write},
+    sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering}};
+
+const MEASURE_NS: u64 = 50_000_000;
+const MAX_MEASURE_NS: u64 = 250_000_000;
+const PPM: u128 = 1_000_000;
+const RATE_TOLERANCE_PPM: u128 = 1000;
+const MAX_READ_UNCERTAINTY_PPM: u128 = 1000;
+const ALIGNMENT_NS: u64 = 100_000;
+const EXCHANGES: u32 = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Capabilities {
+    pub available: bool,
+    pub invariant: bool,
+    pub nominal_hz: Option<u64>,
+}
+
+/// Intel CPUID.15H enumerates the crystal frequency and TSC ratio.
+/// Zero in any field means that an absolute rate was not enumerated.
+/// CPUID.16H core frequency is NOT a TSC rate.
+pub(crate) fn crystal_rate(denominator: u32, numerator: u32, crystal: u32) -> Option<u64> {
+    if denominator == 0 || numerator == 0 || crystal == 0 { return None; }
+    let hz = (crystal as u128 * numerator as u128) / denominator as u128;
+    u64::try_from(hz).ok().filter(|&rate| rate != 0)
+}
+
+pub(crate) fn capabilities(max_basic: u32, leaf1_edx: u32, max_extended: u32,
+                           invariant_edx: u32, ratio: [u32; 3]) -> Capabilities {
+    let available = max_basic >= 1 && leaf1_edx & (1 << 4) != 0;
+    let invariant = available && max_extended >= 0x8000_0007 && invariant_edx & (1 << 8) != 0;
+    let nominal_hz = if invariant && max_basic >= 0x15 {
+        crystal_rate(ratio[0], ratio[1], ratio[2])
+    } else { None };
+    Capabilities { available, invariant, nominal_hz }
+}
+
+unsafe fn detect() -> Capabilities {
+    let basic = __cpuid(0).eax;
+    let extended = __cpuid(0x8000_0000).eax;
+    let flags = if basic >= 1 { __cpuid(1).edx } else { 0 };
+    let invariant = if extended >= 0x8000_0007 { __cpuid(0x8000_0007).edx } else { 0 };
+    let ratio = if basic >= 0x15 {
+        let leaf = __cpuid(0x15);
+        [leaf.eax, leaf.ebx, leaf.ecx]
+    } else { [0; 3] };
+    capabilities(basic, flags, extended, invariant, ratio)
+}
+
+/// Ordered kernel read. Call only on a processor with architectural TSC.
+#[inline]
+pub unsafe fn read() -> u64 {
+    let (lo, hi): (u32, u32);
+    asm!("lfence", "rdtsc", "lfence", out("eax") lo, out("edx") hi, options(nostack));
+    (hi as u64) << 32 | lo as u64
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Observation {
+    pub before_start: u64,
+    pub after_start: u64,
+    pub before_end: u64,
+    pub after_end: u64,
+    pub reference_ns: u64,
+}
+
+/// Bounds account for the time taken to read both reference registers.
+/// A preempted or unusually slow bracket is unsuitable for calibration.
+pub(crate) fn measured_rate(o: Observation) -> Option<u64> {
+    if !(MEASURE_NS..=MAX_MEASURE_NS).contains(&o.reference_ns) ||
+       o.before_start > o.after_start || o.before_end > o.after_end { return None; }
+    let lower = o.before_end.checked_sub(o.after_start)? as u128;
+    let upper = o.after_end.checked_sub(o.before_start)? as u128;
+    let midpoint = (lower + upper) / 2;
+    if lower == 0 || upper < lower ||
+       (upper-lower) * PPM > midpoint * MAX_READ_UNCERTAINTY_PPM { return None; }
+    let hz = midpoint * 1_000_000_000 / o.reference_ns as u128;
+    u64::try_from(hz).ok().filter(|&rate| rate != 0)
+}
+
+fn compatible(a: u64, b: u64) -> bool {
+    a != 0 && b != 0 &&
+        a.abs_diff(b) as u128 * PPM <= a.min(b) as u128 * RATE_TOLERANCE_PPM
+}
+
+pub(crate) fn qualified_rate(caps: Capabilities, mut samples: [u64; 3]) -> Option<u64> {
+    if !caps.available || !caps.invariant { return None; }
+    if samples[0] > samples[1] { samples.swap(0, 1); }
+    if samples[1] > samples[2] { samples.swap(1, 2); }
+    if samples[0] > samples[1] { samples.swap(0, 1); }
+    if !compatible(samples[0], samples[2]) { return None; }
+    if let Some(nominal) = caps.nominal_hz {
+        if !samples.into_iter().all(|hz| compatible(hz, nominal)) { return None; }
+        Some(nominal)
+    } else { Some(samples[1]) }
+}
+
+/// Each logical CPU measures its own rate against the active independent
+/// reference. Never trust a vendor-neutral hypervisor leaf or a nominal CPU
+/// MHz value as proof of TSC invariance or synchronization.
+pub unsafe fn qualify(reference: ReferenceClock, mut maintain: impl FnMut()) -> Option<u64> {
+    let caps = detect();
+    if !caps.invariant { return None; }
+    let mut samples = [0u64; 3];
+    for sample in &mut samples {
+        let before_start = read();
+        let start = reference.sample();
+        let after_start = read();
+        let waited = reference.delay_ns_with(MEASURE_NS, &mut maintain).ok()?;
+        let before_end = read();
+        let end = reference.sample();
+        let after_end = read();
+        let reference_ns = reference.elapsed_ns(start, end)?;
+        // Both endpoints enclose the independently accumulated polling time.
+        // Reject ambiguous/missed wraps and samples outside the bound.
+        if reference_ns < waited { return None; }
+        *sample = measured_rate(Observation { before_start, after_start,
+            before_end, after_end, reference_ns })?;
+    }
+    qualified_rate(caps, samples)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Bracket {
+    pub before: u64,
+    pub remote: u64,
+    pub after: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Alignment {
+    pub offset: i64, // add to AP's TSC to estimate the BSP's TSC
+    pub uncertainty_ticks: u64,
+}
+
+impl Alignment {
+    pub(crate) fn normalize(self, raw: u64) -> Option<u64> {
+        u64::try_from(raw as i128 + self.offset as i128).ok()
+    }
+}
+
+/// A remote sample was taken after the BSP's release request and before
+/// the BSP observed the corresponding acquire response. Intersect the
+/// implied offset intervals; never equate the remote value with one end
+/// of the round trip or silently accept conflicting observations.
+pub(crate) fn align(bsp_hz: u64, ap_hz: u64,
+                    mut exchange: impl FnMut(u32) -> Option<Bracket>) -> Option<Alignment> {
+    if !compatible(bsp_hz, ap_hz) { return None; }
+    let (mut lo, mut hi) = (i128::MIN, i128::MAX);
+    for sequence in 1..=EXCHANGES {
+        let sample = exchange(sequence)?;
+        if sample.after < sample.before { return None; }
+        lo = lo.max(sample.before as i128 - sample.remote as i128);
+        hi = hi.min(sample.after as i128 - sample.remote as i128);
+        if lo > hi { return None; }
+    }
+    let width = (hi-lo) as u128;
+    let uncertainty = u64::try_from((width+1)/2).ok()?;
+    if uncertainty as u128 * 1_000_000_000 > bsp_hz as u128 * ALIGNMENT_NS as u128 {
+        return None;
+    }
+    let offset = i64::try_from(lo + (hi-lo)/2).ok()?;
+    Some(Alignment { offset, uncertainty_ticks: uncertainty })
+}
+
+/// One BSP requester and one AP responder during CPU bring-up. The two
+/// Release/Acquire edges make the timestamp bracket valid even on SMP.
+pub(crate) struct Peer {
+    ready: AtomicBool,
+    hz: AtomicU64,
+    request: AtomicU32,
+    response: AtomicU32,
+    remote: AtomicU64,
+    offset: AtomicI64,
+    uncertainty: AtomicU64,
+}
+
+impl Peer {
+    pub const fn new() -> Self {
+        Self { ready: AtomicBool::new(false), hz: AtomicU64::new(0),
+            request: AtomicU32::new(0), response: AtomicU32::new(0),
+            remote: AtomicU64::new(0), offset: AtomicI64::new(0),
+            uncertainty: AtomicU64::new(u64::MAX) }
+    }
+
+    /// Publish once, on the CPU being qualified, before answering requests.
+    pub fn publish_rate(&self, hz: Option<u64>) {
+        self.hz.store(hz.unwrap_or(0), Ordering::Relaxed);
+        self.ready.store(true, Ordering::Release);
+    }
+
+    pub fn ready(&self) -> bool { self.ready.load(Ordering::Acquire) }
+
+    pub fn rate(&self) -> Option<u64> {
+        if !self.ready() { return None; }
+        let hz = self.hz.load(Ordering::Relaxed);
+        (hz != 0).then_some(hz)
+    }
+
+    pub(crate) fn respond(&self, timestamp: impl FnOnce() -> u64) -> bool {
+        let sequence = self.request.load(Ordering::Acquire);
+        if sequence == 0 || sequence == self.response.load(Ordering::Relaxed) ||
+           self.rate().is_none() { return false; }
+        self.remote.store(timestamp(), Ordering::Relaxed);
+        self.response.store(sequence, Ordering::Release);
+        true
+    }
+
+    pub(crate) fn exchange(&self, sequence: u32, mut timestamp: impl FnMut() -> u64,
+                            wait: impl FnOnce(&Self, u32) -> bool) -> Option<Bracket> {
+        if sequence == 0 || sequence <= self.request.load(Ordering::Relaxed) ||
+           self.rate().is_none() { return None; }
+        let before = timestamp();
+        self.request.store(sequence, Ordering::Release);
+        if !wait(self, sequence) || !self.answered(sequence) { return None; }
+        let after = timestamp();
+        let remote = self.remote.load(Ordering::Relaxed);
+        Some(Bracket { before, remote, after })
+    }
+
+    pub(crate) fn answered(&self, sequence: u32) -> bool {
+        self.response.load(Ordering::Acquire) == sequence
+    }
+
+    pub fn publish_alignment(&self, alignment: Alignment) {
+        self.offset.store(alignment.offset, Ordering::Relaxed);
+        self.uncertainty.store(alignment.uncertainty_ticks, Ordering::Release);
+    }
+
+    pub fn alignment(&self) -> Option<Alignment> {
+        let uncertainty_ticks = self.uncertainty.load(Ordering::Acquire);
+        if uncertainty_ticks == u64::MAX { return None; }
+        Some(Alignment { offset: self.offset.load(Ordering::Relaxed), uncertainty_ticks })
+    }
+
+    /// The AP continues ordinary startup on failure. Do not invent an
+    /// alignment or reset a hardware TSC. This operation is optional.
+    pub unsafe fn synchronize(&self, bsp_hz: u64, reference: ReferenceClock,
+                              mut maintain: impl FnMut()) -> Option<Alignment> {
+        reference.wait_until(1_000_000_000, || {
+            maintain();
+            self.ready()
+        }).ok()?;
+        let ap_hz = self.rate()?;
+        let alignment = align(bsp_hz, ap_hz, |sequence| {
+            // Maintain the shared epoch between (not within) the measured
+            // round trips. The fast acquire path gives a tight bracket.
+            maintain();
+            self.exchange(sequence, || read(), |peer, seq| {
+                reference.wait_until(20_000_000, || peer.answered(seq)).is_ok()
+            })
+        })?;
+        self.publish_alignment(alignment);
+        Some(alignment)
+    }
+}
+
+// Bounded, allocation-free operational diagnostic, subject to BOOT.LOG.
+pub(crate) struct Diagnostic { data: [u8; 96], len: usize }
+impl Write for Diagnostic {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        let end = self.len.checked_add(value.len()).ok_or(fmt::Error)?;
+        let dst = self.data.get_mut(self.len..end).ok_or(fmt::Error)?;
+        dst.copy_from_slice(value.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+impl Diagnostic {
+    pub fn new(id: u8, peer: &Peer) -> Self {
+        let mut out = Self { data: [0; 96], len: 0 };
+        if let Some(hz) = peer.rate() {
+            if let Some(a) = peer.alignment() {
+                if write!(&mut out, "TSC APIC={} HZ={} OFFSET={} ERROR-TICKS={}",
+                          id, hz, a.offset, a.uncertainty_ticks).is_err() {
+                    out.len = 0;
+                    let _ = write!(&mut out, "TSC APIC={} QUALIFIED; DIAGNOSTIC TOO LONG", id);
+                }
+            } else {
+                let _ = write!(&mut out, "TSC APIC={} HZ={} UNSYNCHRONIZED", id, hz);
+            }
+        } else {
+            let _ = write!(&mut out, "TSC APIC={} NOT QUALIFIED", id);
+        }
+        out
+    }
+    pub fn bytes(&self) -> &[u8] { &self.data[..self.len] }
+}

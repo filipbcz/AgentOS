@@ -208,8 +208,16 @@ impl ReferenceClock {
     /// Actual elapsed time, including wraps and overshoot. Calibration must
     /// not subtract two endpoints of a short counter after a long delay.
     pub unsafe fn delay_ns(self, duration_ns: u64) -> Result<u64, WaitError> {
+        self.delay_ns_with(duration_ns, || {})
+    }
+
+    /// Maintain independent clocks or other nonblocking timekeeping state
+    /// while polling a hardware interval. The callback cannot declare the
+    /// delay finished or advance the hardware counter.
+    pub unsafe fn delay_ns_with(self, duration_ns: u64, mut maintain: impl FnMut())
+        -> Result<u64, WaitError> {
         match self.poll_elapsed(duration_ns, MAX_POLLS, MAX_STALLED_POLLS,
-                                || self.sample(), || false)? {
+                                || self.sample(), || { maintain(); false })? {
             PollOutcome::Elapsed(elapsed) => Ok(elapsed),
             PollOutcome::Complete => Err(WaitError::Unresponsive),
         }

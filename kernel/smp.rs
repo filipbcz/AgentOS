@@ -3,7 +3,7 @@ use crate::{acpi::Platform, exceptions::{hex, Descriptors}, frames::{Exhaustion,
             halt, out, process::Programs, scheduler::{Context, Queue}, serial, stress::{self, Load}};
 use crate::reference_clock::{ReferenceClock, WaitError};
 use core::{arch::{asm, x86_64::__cpuid}, cell::UnsafeCell, hint::spin_loop, ptr,
-           sync::atomic::{fence, AtomicBool, AtomicU32, AtomicUsize, Ordering}};
+           sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}};
 
 extern "C" {
     static ap_start: u8;
@@ -32,6 +32,7 @@ const RESCHEDULE: u32 = 0xe3;
 const EMPTY_CPU: AtomicUsize = AtomicUsize::new(0);
 static gCpus: [AtomicUsize; 255] = [EMPTY_CPU; 255];
 static gOnlineCount: AtomicUsize = AtomicUsize::new(0);
+static gBspQualifiedTscHz: AtomicU64 = AtomicU64::new(0);
 static gRuntimeEnabled: AtomicBool = AtomicBool::new(false);
 static gTerminal: AtomicUsize = AtomicUsize::new(0);
 static gMigrations: AtomicUsize = AtomicUsize::new(0);
@@ -151,11 +152,7 @@ unsafe fn balanceQueues() {
 }
 
 
-unsafe fn timestamp() -> u64 {
-    let (lo, hi): (u32, u32);
-    asm!("lfence", "rdtsc", "lfence", out("eax") lo, out("edx") hi, options(nostack));
-    ((hi as u64) << 32) | lo as u64
-}
+unsafe fn timestamp() -> u64 { crate::tsc::read() }
 
 #[derive(Default)]
 struct IdleSample { wakes: u64, timers: u32, elapsed: u64, active: u64 }
@@ -235,7 +232,7 @@ struct Cpu {
     interval: u32,
     tsc_hz: u64,
     reference: ReferenceClock,
-    clock: crate::monotonic::Clock,
+    tsc: crate::tsc::Peer,
     timer_policy: UnsafeCell<crate::timer::Timer>,
     runtime_timer_irqs: AtomicUsize,
     fTimerSequence: AtomicUsize,
@@ -287,7 +284,7 @@ impl Cpu {
         let cpu = addr as *mut Self;
         cpu.write(Self { self_address: addr, syscall_user_rsp: UnsafeCell::new(0), syscall_stack: UnsafeCell::new(0),
                          rsp0, programs, apic, expected_id: id, interval, tsc_hz, reference,
-                         clock: crate::monotonic::Clock::new(tsc_hz),
+                         tsc: crate::tsc::Peer::new(),
                          timer_policy: UnsafeCell::new(crate::timer::Timer::new(interval,
                              if descriptors.is_none() { crate::system_clock::maintenance_ms() } else { None })),
                          runtime_timer_irqs: AtomicUsize::new(0), fTimerSequence: AtomicUsize::new(0),
@@ -307,7 +304,6 @@ impl Cpu {
     unsafe fn run_task(&self) -> Result<(), Error> {
         let id = self.apic.id();
         if id != self.expected_id { return Err(b"wrong executing APIC ID"); }
-        if !self.clock.start(timestamp()) { return Err(b"monotonic clock initialization"); }
         asm!("wrmsr", in("ecx") 0xc0000101u32, in("eax") self.self_address as u32,
              in("edx") (self.self_address >> 32) as u32);
         self.apic.write(0x320, TIMER);    // one-shot, unmasked
@@ -1006,7 +1002,16 @@ unsafe extern "C" fn ap_main(cpu: &'static Cpu) -> ! {
     match cpu.apic.enable().and_then(|_| cpu.run_task()) {
         Ok(()) => {
             cpu.complete.store(1, Ordering::Release);
-            while !cpu.load.started.load(Ordering::Acquire) { spin_loop(); }
+            // Qualification is optional and separate from the initial
+            // CPU-ready handshake. A failed sample cannot disable the CPU.
+            let rate = if gBspQualifiedTscHz.load(Ordering::Acquire) != 0 {
+                crate::tsc::qualify(cpu.reference, || { let _ = crate::system_clock::millis(); })
+            } else { None };
+            cpu.tsc.publish_rate(rate);
+            while !cpu.load.started.load(Ordering::Acquire) {
+                cpu.tsc.respond(|| crate::tsc::read());
+                spin_loop();
+            }
             cpu.schedule();
             cpu.complete.store(2, Ordering::Release);
             while cpu.phase.load(Ordering::Acquire) < OOM_PHASE { spin_loop(); }
@@ -1108,6 +1113,13 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
     let boot_cpu = load.frames.with(|f| Cpu::create(f, apic, bsp, interval, tsc_hz, clock, None, load, programs, bsp_rsp0))?;
     gCpus[bsp as usize].store(boot_cpu.self_address, Ordering::Release);
     boot_cpu.run_task()?;
+    let bsp_rate = crate::tsc::qualify(clock, || { let _ = crate::system_clock::millis(); });
+    boot_cpu.tsc.publish_rate(bsp_rate);
+    if let Some(hz) = bsp_rate {
+        boot_cpu.tsc.publish_alignment(crate::tsc::Alignment { offset: 0, uncertainty_ticks: 0 });
+        gBspQualifiedTscHz.store(hz, Ordering::Release);
+    }
+    log.event(1, crate::tsc::Diagnostic::new(bsp, &boot_cpu.tsc).bytes());
     let mut cpus = [None; 255];
     cpus[bsp as usize] = Some(boot_cpu);
     for &id in ids {
@@ -1121,6 +1133,10 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
             .ok_or(b"AP stack" as Error)?.into_top();
         gCpus[id as usize].store(cpu.self_address, Ordering::Release);
         start_ap(cpu, root, base, stack, &clock)?;
+        if let Some(hz) = bsp_rate {
+            let _ = cpu.tsc.synchronize(hz, clock, || { let _ = crate::system_clock::millis(); });
+        }
+        log.event(1, crate::tsc::Diagnostic::new(id, &cpu.tsc).bytes());
         cpus[id as usize] = Some(cpu);
     }
     gOnlineCount.store(ids.len(), Ordering::Release);

@@ -161,6 +161,10 @@ printf 'Testing per-CPU monotonic TSC time conversion with %s\n' "$pRustc"
 "$pRustc" --edition 2021 --test "$pRoot/kernel/monotonic.rs" -o "$pOut/monotonic-tests"
 "$pOut/monotonic-tests"
 
+printf 'Testing invariant TSC capability, calibration and SMP alignment with %s\n' "$pRustc"
+"$pRustc" --edition 2021 --test "$pRoot/scripts/tests/tsc-host.rs" -o "$pOut/tsc-tests"
+"$pOut/tsc-tests"
+
 printf 'Testing NVMe wire format, geometry and queue ownership\n'
 "$pRustc" --edition 2021 --test "$pRoot/kernel/nvme/protocol.rs" -o "$pOut/nvme-tests"
 "$pOut/nvme-tests"
