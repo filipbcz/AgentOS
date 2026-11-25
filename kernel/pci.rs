@@ -44,6 +44,10 @@ pub struct Devices {
     pub nvme: Option<crate::nvme::Controller>,
     #[cfg(nvme_block_acceptance)]
     pub nvme_count: usize,
+    #[cfg(virtio_net_acceptance)]
+    pub virtio_net: Option<crate::virtio_net::Controller>,
+    #[cfg(virtio_net_acceptance)]
+    pub virtio_net_count: usize,
 }
 
 // Decode only assigned resources. Sizing by writing all ones would disrupt
@@ -147,6 +151,17 @@ unsafe fn scan(config: Config, segment: u16, first: u8, last: u8,
                                 });
                             }
                         }
+                    }
+                }
+                #[cfg(virtio_net_acceptance)]
+                if id as u16 == 0x1af4 && matches!(id >> 16, 0x1000 | 0x1041) &&
+                    class_rev >> 16 == 0x0200 && layout == 0 {
+                    devices.virtio_net_count += 1;
+                    if let Config::Ecam(w) = &config {
+                        let bdf = (u16::from(bus) << 8) | u16::from(device * 8 + function);
+                        devices.virtio_net = Some(crate::virtio_net::Controller {
+                            cfg: w.base + (usize::from(bdf) << 12), msi, msix,
+                        });
                     }
                 }
                 let _ = write!(Console, "AGENTOS PCI DEV {:04x}:{:02x}:{:02x}.{} ID={:04x}:{:04x} CLASS={:06x} REV={:02x} MSI={:02x} MSIX={:02x} PCIE={:02x}\r\n",

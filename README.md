@@ -114,6 +114,10 @@ python3 scripts/qemu-nvme.py --cpus 2 --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.s
 
 NVMe i další časné ovladače mohou použít supervisor-only `paging::map_device_window` pro 64bitové BARy nad 512 GiB bez kolize se soukromým uživatelským adresním prostorem. Samostatná CI matice QEMU používá skutečný emulovaný NVMe řadič, QMP PCI identitu, počitadla čtení/zápisu jeho blokového backendu a skutečný emulátorový trace NVMe Flush a CQ completion (QEMU 8.2.2 NVMe flush neúčtuje do QMP flush_operations). Po dvou nezávislých procesech QEMU ověří všechny bajty nového RAW disku a kernelové záznamy dokončení, při druhém bootu navíc běžné jádro a procesové zkoušky. Úspěch QEMU nenahrazuje VirtualBox ani fyzickou přejímku.
 
+### VirtIO-net (etapa 4, rozpracováno)
+
+`scripts/build.sh --virtio-net` zapíná izolovaný moderní VirtIO PCI síťový profil. Vyžaduje ECAM a jedno zařízení, vyjednává VERSION_1/MAC, používá dvě split fronty a DMA. Není to ještě runtime síťová vrstva; výchozí build kartu neaktivuje. QEMU přejímka rámců a VirtualBox přejímka jsou vedeny odděleně v plánu.
+
 ## Jádro, paměť a plánování
 
 Loader předá konečnou mapu paměti, framebuffer a initramfs a korektně opustí UEFI Boot Services. Rustové `no_std` jádro vytvoří vlastní čtyřúrovňové stránkování, alokátor fyzických rámců a GDT/IDT/TSS. Kód je RX, konstanty RO/NX, data RW/NX; nulová stránka a loaderový stack guard nejsou mapované.

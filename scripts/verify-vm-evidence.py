@@ -104,6 +104,8 @@ def verify_run(root, run_dir, require_pass=True, *, legacy_traces=False):
     if require_pass:
         require(data["result"] == "pass", "VM run did not pass acceptance checks")
     image = verify_build(root, data.get("source_commit"))
+    require(image.get("profile", "default") in ("default", "ahci-dma", "ahci-block", "nvme-block"),
+            "Unsupported VirtualBox acceptance build profile")
     require(data.get("build_provenance_sha256") ==
             sha256(root / "build/build-provenance.json"),
             "VM run references a changed build provenance receipt")

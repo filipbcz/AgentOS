@@ -14,6 +14,8 @@ mod ahci;
 mod block;
 #[cfg(nvme_block_acceptance)]
 mod nvme;
+#[cfg(virtio_net_acceptance)]
+mod virtio_net;
 #[cfg(any(ahci_block_acceptance, nvme_block_acceptance))]
 mod block_acceptance;
 mod smp;
@@ -181,6 +183,14 @@ pub unsafe extern "sysv64" fn kernel_main(info: &BootInfo) -> ! {
             let mut disk = nvme::NvmeDisk::open(devices.nvme.ok_or(b"NVMe ECAM/BAR missing" as &[u8])?, root, &mut frames)?;
             let result = block_acceptance::run(&mut disk);
             disk.close(&mut frames)?;
+            result?;
+        }
+        #[cfg(virtio_net_acceptance)]
+        {
+            if devices.virtio_net_count != 1 { return Err(b"VirtIO profile requires exactly one network controller" as &[u8]); }
+            let mut net = virtio_net::VirtioNet::open(devices.virtio_net.ok_or(b"VirtIO modern ECAM missing" as &[u8])?, root, &mut frames)?;
+            let result = virtio_net::exercise(&mut net);
+            net.close(&mut frames)?;
             result?;
         }
         Ok(())
