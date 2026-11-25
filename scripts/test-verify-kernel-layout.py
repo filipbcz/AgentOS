@@ -22,7 +22,9 @@ def image():
         return (0, kind, flags, addr, offset, size, 0, 0, 8, 0)
     return {
         "entry": begin+0x100,
-        "segment": (0x1000, begin, 0x3800, 0x4000),
+        "segments": [(0x1000, begin, 0x1800, 0x1800),
+                     (0x3000, ro, 0x400, 0x400),
+                     (0x4000, rw, 0x800, 0xb00)],
         "sections": [
             section(1, layout.SHF_ALLOC|layout.SHF_EXEC, begin, 0x1000, 0x1800),
             section(1, layout.SHF_ALLOC, ro, 0x3000, 0x400),
@@ -91,7 +93,7 @@ class KernelImageLayoutTests(unittest.TestCase):
 
     def test_segment_must_cover_all_mutable_pages(self):
         model = image()
-        model["segment"] = (0x1000, layout.KERNEL_START, 0x2800, 0x2800)
+        model["segments"][2] = (0x4000, layout.KERNEL_START+0x3000, 0x800, 0x800)
         self.rejected(model)
 
     def test_bad_alignment_or_invalid_section_file_offsets(self):
