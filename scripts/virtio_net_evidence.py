@@ -70,7 +70,9 @@ def verify_pci(guest, pci):
     matches = [d for bus in pci for d in walk(bus["devices"]) if d.get("qdev_id") == "agentos-net"]
     require(len(matches) == 1, "Missing uniquely named QEMU VirtIO NIC")
     d = matches[0]
-    require(d["id"] == {"vendor": 0x1af4, "device": 0x1041} and d["class_info"]["class"] == 0x0200,
+    # Normal PCI functions also carry optional subsystem IDs in QMP.
+    require(d["id"]["vendor"] == 0x1af4 and d["id"]["device"] == 0x1041 and
+            d["class_info"]["class"] == 0x0200,
             "Not modern VirtIO Ethernet PCI")
     bdf = f"0000:{d['bus']:02x}:{d['slot']:02x}.{d['function']}"
     require(guest.count(f"AGENTOS PCI DEV {bdf} ID=1af4:1041 CLASS=020000 ") == 1,

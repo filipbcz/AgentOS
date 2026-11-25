@@ -48,7 +48,8 @@ class EvidenceTests(unittest.TestCase):
 
     def test_pci_identity_and_high_bar(self):
         pci=[{"devices":[{"qdev_id":"agentos-net","bus":0,"slot":3,"function":0,
-                           "id":{"vendor":0x1af4,"device":0x1041},"class_info":{"class":0x0200},
+                           "id":{"vendor":0x1af4,"device":0x1041,"subsystem":0x1100,"subsystem-vendor":0x1af4},
+                           "class_info":{"class":0x0200},
                            "regions":[{"bar":4,"type":"memory","address":0xc000000000,"size":16384}]}]}]
         text=("AGENTOS PCI DEV 0000:00:03.0 ID=1af4:1041 CLASS=020000 REV=01\n"
               "AGENTOS MMIO VIRTIO BAR=4 PA=000000c000000000 VA=ffff90c000000000 PAGES=4\n")
