@@ -18,8 +18,8 @@ impl AhciDisk {
     pub unsafe fn open(hba: Controller, root: usize, frames: &mut Frames<'_>) -> Result<Self, Error> {
         let mask = hba.prepare(root, frames)?;
         if (read(hba.abar) >> 8) & 31 == 0 { return Err(b"AHCI needs two command slots"); }
-        let control = frames.alloc_zeroed().ok_or(b"AHCI command frame" as Error)?;
-        let Some(data) = frames.alloc_zeroed() else { frames.release(control); return Err(b"AHCI data frame"); };
+        let control = frames.alloc_zeroed_below(mask).ok_or(b"AHCI addressable command frame" as Error)?;
+        let Some(data) = frames.alloc_zeroed_below(mask) else { frames.release(control); return Err(b"AHCI addressable data frame"); };
         let (Some(control_bus), Some(data_bus)) = (BusAddress::of(&control, mask), BusAddress::of(&data, mask)) else {
             frames.release(data); frames.release(control); return Err(b"AHCI DMA address mask");
         };

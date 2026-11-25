@@ -10,6 +10,8 @@ Milník 3.2 začal odstraňováním závislosti na COM1: konvenční UART je vol
 
 Běžný shell podporuje `run PATH` pro nativní ELF ve VFS. Potomek dědí jen stdin/stdout/stderr; shell čeká na skutečný exit status prostřednictvím `SYS_WAIT_CHILD`, nezávisle na časovači. Argumenty a job control dosud nejsou implementovány. Toto je obecné rozhraní, nikoliv přejímací příkaz.
 
+Alokátor fyzické paměti poskytuje také alokace s adresním limitem a fyzicky souvislé zarovnané oblasti s explicitním vlastnictvím. Bootstrap CR3 využívá stránku pod 4 GiB; AHCI a xHCI volí DMA stránky podle skutečných adresních schopností řadiče. Jde o základ obecné hardwarové podpory, nikoliv potvrzení fyzické přejímky.
+
 ## Sestavení
 
 Příkazy pro Windows se spouštějí z kořene čistého Git checkoutu v PowerShellu. Potřebné prostředí:

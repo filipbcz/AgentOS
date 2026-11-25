@@ -105,15 +105,15 @@ impl Xhci{
         let (base,caps,protocols)=controller.prepare(root,frames)?;
         controller.reset(base+caps.op)?;
         if rd(base+caps.op+8)&1==0{return Err(b"xHCI 4KiB pages required");}
+        let mask=if caps.ac64{u64::MAX}else{u32::MAX as u64};
         let mut owned:[Option<Frame>;4]=core::array::from_fn(|_|None);
         for i in 0..owned.len(){
-            match frames.alloc_zeroed(){
+            match frames.alloc_zeroed_below(mask){
                 Some(page)=>owned[i]=Some(page),
                 None=>{for page in owned.into_iter().flatten(){frames.release(page);}return Err(b"xHCI DMA allocation");}
             }
         }
         let pages=owned.map(|p|p.unwrap());
-        let mask=if caps.ac64{u64::MAX}else{u32::MAX as u64};
         if pages.iter().any(|p|BusAddress::of(p,mask).is_none()){
             for p in pages{frames.release(p);}return Err(b"xHCI DMA address width");
         }

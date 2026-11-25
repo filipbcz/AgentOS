@@ -549,7 +549,10 @@ pub unsafe fn install(info: &BootInfo, map: &[u8], frames: &mut Frames<'_>, plat
     asm!("mov {}, cr4", out(reg) cr4);
     if cr4 & (1 << 12) != 0 || __cpuid(0x80000000).eax < 0x80000001 ||
        __cpuid(0x80000001).edx & (1 << 20) == 0 { return None; }
-    let root = frames.alloc_zeroed()?.into_address();
+    // APs load this shared bootstrap CR3 from a 32-bit protected-mode
+    // trampoline (MOV CR3,EAX) before entering long mode. Other page-table
+    // pages use 64-bit physical pointers and do not need this restriction.
+    let root = frames.alloc_zeroed_below(u32::MAX as u64)?.into_address();
     let mut tables = Tables { root, frames };
     for (first, end) in map.chunks_exact(info.descriptor_size as usize).filter_map(ram) {
         tables.identity(first * PAGE, (end-first) * PAGE, WRITE | NX)?;

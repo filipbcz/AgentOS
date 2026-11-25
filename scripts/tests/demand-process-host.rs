@@ -71,6 +71,16 @@ mod frames {
             unsafe { ptr::write_bytes(pFrame.0 as *mut u8, 0, gPage); }
             Some(pFrame)
         }
+        // Bootstrap paging install is not invoked by these pointer-walk
+        // host tests. Respect the real address constraint if called.
+        pub fn alloc_zeroed_below(&mut self, max_address:u64)->Option<Frame> {
+            let frame=self.alloc_zeroed()?;
+            if (frame.address() as u64).checked_add(4095).map_or(true,|end|end>max_address) {
+                self.release(frame);
+                return None;
+            }
+            Some(frame)
+        }
         fn index(&self, aAddress: usize) -> Option<usize> {
             self.fPool.iter().position(|pPage| pPage.0.as_ptr() as usize == aAddress)
         }
