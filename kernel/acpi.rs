@@ -102,6 +102,7 @@ pub struct Platform {
     pub ids: [u8; 255],
     pub count: usize,
     pub legacy_pic: bool,
+    pub ps2_controller: bool,
     pub io_apics: [IoApic; 8],
     pub io_count: usize,
     pub serial_irq: IsaInterrupt,
@@ -122,6 +123,20 @@ fn hpetAddress(aBytes: &[u8]) -> Option<usize> {
     // Keep hardware outside the sole user PML4 slot and canonical low half.
     (pAddress != 0 && pAddress & 4095 == 0 && pAddress < (1usize << 39))
         .then_some(pAddress)
+}
+
+/// FADT IA-PC Boot Architecture Flags, offset 109, bit 1 (ACPI §5.2.9).
+/// FADT revision 1/2 predates the 8042 flag; retain conventional legacy
+/// discovery there. A truncated modern FADT is invalid, not permission to
+/// probe an undeclared controller.
+pub(crate) fn fadt_8042(table: &[u8]) -> Option<bool> {
+    if table.len() < 36 || table.get(..4)? != b"FACP" ||
+       u32_at(table, 4)? as usize != table.len() || !checksum(table) {
+        return None;
+    }
+    if table[8] < 3 { return Some(true); }
+    let flags = u16::from_le_bytes(table.get(109..111)?.try_into().ok()?);
+    Some(flags & 2 != 0)
 }
 
 impl Platform {
@@ -184,7 +199,7 @@ pub unsafe fn discover(info: &BootInfo, map: &[u8]) -> Option<Platform> {
     };
     if &root[..4] != (if width == 8 { b"XSDT" } else { b"RSDT" }) ||
         (root.len()-36) % width != 0 { return None; }
-    let mut p = Platform { pci: PciWindows::new(), lapic: 0, timer_port: 0, hpet: 0, ids: [0; 255], count: 0, legacy_pic: false,
+    let mut p = Platform { pci: PciWindows::new(), lapic: 0, timer_port: 0, hpet: 0, ids: [0; 255], count: 0, legacy_pic: false, ps2_controller: true,
         io_apics: [IoApic { address: 0, gsi: 0 }; 8], io_count: 0,
         serial_irq: IsaInterrupt { gsi: 4, low: false, level: false }, serial_override: false,
         keyboard_irq: IsaInterrupt { gsi: 1, low: false, level: false }, keyboard_override: false };
@@ -199,6 +214,7 @@ pub unsafe fn discover(info: &BootInfo, map: &[u8]) -> Option<Platform> {
             }
             b"FACP" => {
                 let fadt = fw.table(address)?;
+                p.ps2_controller = fadt_8042(fadt)?;
                 let extended = u64_at(fadt, 212).unwrap_or(0);
                 let port = if extended != 0 {
                     if fadt[208] != 1 || fadt[210] != 0 { return None; }

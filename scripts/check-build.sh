@@ -53,6 +53,10 @@ printf 'Testing canonical input and the actual TTY driver with %s\n' "$pRustc"
 "$pRustc" --edition 2021 --test "$pRoot/scripts/tests/tty-host.rs" -o "$pOut/tty-tests"
 "$pOut/tty-tests"
 
+printf 'Testing optional legacy UART discovery and bounded output with %s\n' "$pRustc"
+"$pRustc" --edition 2021 --test "$pRoot/scripts/tests/legacy-uart-host.rs" -o "$pOut/legacy-uart-tests"
+"$pOut/legacy-uart-tests"
+
 printf 'Testing PS/2 scan-code decoder with %s\n' "$pRustc"
 "$pRustc" --edition 2021 --test "$pRoot/kernel/keyboard.rs" -o "$pOut/keyboard-tests"
 "$pOut/keyboard-tests"

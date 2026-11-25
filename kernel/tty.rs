@@ -19,7 +19,8 @@ unsafe impl Sync for Terminal {}
 
 struct TerminalState {
     fInput: LineInput,
-    fRoute: Route,
+    fSerialPresent: bool,
+    fRoute: Option<Route>,
     fKeyboardRoute: Option<Route>,
     fKeyboard: Keyboard,
     fKeyboardConfig: Option<ps2::Saved>,
@@ -32,9 +33,9 @@ struct TerminalState {
 const _: () = assert!(core::mem::size_of::<Terminal>() <= 4096);
 
 impl Terminal {
-    pub unsafe fn new(aPlatform: &Platform, aCpu: u8) -> Result<Self, &'static [u8]> {
-        Ok(Self { fLocked: AtomicBool::new(false),
-                  fState: UnsafeCell::new(TerminalState::new(aPlatform, aCpu)?) })
+    pub unsafe fn new(aPlatform: &Platform, aCpu: u8, aSerialPresent: bool) -> Self {
+        Self { fLocked: AtomicBool::new(false),
+               fState: UnsafeCell::new(TerminalState::new(aPlatform, aCpu, aSerialPresent)) }
     }
 
     /// Acquire after the process/queue and optional frame gate. IRQ handlers
@@ -93,37 +94,65 @@ impl Drop for TerminalGuard<'_> {
 }
 
 impl TerminalState {
-    pub unsafe fn new(aPlatform: &Platform, aCpu: u8) -> Result<Self, &'static [u8]> {
-        Ok(Self { fInput: LineInput::new(), fRoute: Route::serial(aPlatform, aCpu, VECTOR)?,
-                  fKeyboardRoute: Route::keyboard(aPlatform, aCpu, KEYBOARD_VECTOR).ok(),
-                  fKeyboard: Keyboard::new(), fKeyboardConfig: None,
-                  fScreen: None, fCpu: aCpu,
-                  fErrors: 0, fLastCr: false, fEnabled: false })
+    pub unsafe fn new(aPlatform: &Platform, aCpu: u8, aSerialPresent: bool) -> Self {
+        // An absent UART, missing GSI or unusable keyboard route must not
+        // prevent attaching an independent console/input device.
+        let pSerial = if aSerialPresent { Route::serial(aPlatform, aCpu, VECTOR).ok() } else { None };
+        let pKeyboard = if aPlatform.ps2_controller {
+            Route::keyboard(aPlatform, aCpu, KEYBOARD_VECTOR).ok()
+        } else { None };
+        if aSerialPresent && pSerial.is_none() {
+            let _ = LOGGER.record(crate::logger::ticks(), aCpu as u32, Level::Error,
+                b"UART IRQ unavailable; output only");
+        }
+        if aPlatform.ps2_controller && pKeyboard.is_none() {
+            let _ = LOGGER.record(crate::logger::ticks(), aCpu as u32, Level::Error,
+                b"PS2 IRQ unavailable");
+        }
+        Self { fInput: LineInput::new(), fSerialPresent: aSerialPresent, fRoute: pSerial,
+               fKeyboardRoute: pKeyboard, fKeyboard: Keyboard::new(), fKeyboardConfig: None,
+               fScreen: None, fCpu: aCpu, fErrors: 0, fLastCr: false, fEnabled: false }
+    }
+    fn hasInput(&self) -> bool {
+        self.fRoute.is_some() || self.fKeyboardConfig.is_some()
     }
 
     /// Sole BSP owner; attach before starting the shell's IRQ routes.
     pub fn attach_screen(&mut self, console: Console) { self.fScreen = Some(console); }
 
     pub unsafe fn enable(&mut self) {
-        out(COM + 1, 0);
-        out(COM + 2, 0x03); // FIFO on, clear RX only; do not discard boot output.
-        let _ = input(COM + 5);
-        let _ = input(COM + 6);
-        self.fErrors = 0;
-        out(COM + 4, 0x0b); // DTR, RTS, OUT2 gates the PC UART interrupt.
-        self.fEnabled = true;
-        self.fRoute.enable();
-        out(COM + 1, 0x05); // receive data and line-status errors; no TX IRQ.
+        if self.fEnabled { return; }
+        if self.fSerialPresent {
+            out(COM + 1, 0);
+            if let Some(route) = &self.fRoute {
+                out(COM + 2, 0x03); // FIFO on, clear RX only.
+                let _ = input(COM + 5);
+                let _ = input(COM + 6);
+                self.fErrors = 0;
+                out(COM + 4, 0x0b); // DTR, RTS, OUT2 gates the UART IRQ.
+                route.enable();
+                out(COM + 1, 0x05);
+            }
+        }
         if let Some(route) = &self.fKeyboardRoute {
-            // Failure to initialize PS/2 must not prevent serial recovery.
             self.fKeyboardConfig = ps2::enable();
             if self.fKeyboardConfig.is_some() { route.enable(); }
+            else {
+                let _ = LOGGER.record(crate::logger::ticks(), self.fCpu as u32, Level::Error,
+                    b"PS2 initialization failed");
+            }
+        }
+        self.fEnabled = true;
+        if !self.hasInput() {
+            let _ = LOGGER.record(crate::logger::ticks(), self.fCpu as u32, Level::Error,
+                b"TTY has no input device");
         }
     }
 
     pub unsafe fn disable(&mut self) {
-        out(COM + 1, 0);
-        self.fRoute.disable();
+        if !self.fEnabled { return; }
+        if self.fSerialPresent { out(COM + 1, 0); }
+        if let Some(route) = &self.fRoute { route.disable(); }
         if let Some(route) = &self.fKeyboardRoute { route.disable(); }
         if let Some(config) = self.fKeyboardConfig.take() {
             if !ps2::restore(config) {
@@ -140,7 +169,7 @@ impl TerminalState {
     unsafe fn status(&mut self) -> u8 {
         let pStatus = input(COM + 5);
         // Reading LSR clears RX errors, including during transmit polling.
-        self.fErrors |= pStatus & 0x1e;
+        if pStatus != 0xff && self.fRoute.is_some() { self.fErrors |= pStatus & 0x1e; }
         pStatus
     }
 
@@ -154,7 +183,9 @@ impl TerminalState {
 
     unsafe fn byte(&mut self, aByte: u8) -> bool {
         for _ in 0..100_000 {
-            if self.status() & 0x20 != 0 {
+            let status = self.status();
+            if status == 0xff { return false; }
+            if status & 0x20 != 0 {
                 out(COM, aByte);
                 self.fLastCr = aByte == b'\r';
                 return true;
@@ -170,11 +201,11 @@ impl TerminalState {
         let mut pWritten = 0;
         let mut serial_failed = false;
         for &pByte in aData {
-            let sent = if serial_failed { false } else {
+            let sent = if !self.fSerialPresent || serial_failed { false } else {
                 ( !aCooked || pByte != b'\n' || self.fLastCr || self.byte(b'\r') )
                     && self.byte(pByte)
             };
-            if !sent { serial_failed = true; }
+            if self.fSerialPresent && !sent { serial_failed = true; }
             if let Some(screen) = &mut self.fScreen {
                 screen.write(&[pByte]);
             } else if !sent {
@@ -192,13 +223,18 @@ impl TerminalState {
     pub unsafe fn write(&mut self, aData: &[u8]) -> Result<usize, isize> { self.output(aData, true) }
     pub unsafe fn diagnostic(&mut self, aData: &[u8]) { let _ = self.output(aData, false); }
 
-    pub fn ready(&self) -> bool { self.fErrors != 0 || self.fInput.ready() }
+    pub fn ready(&self) -> bool {
+        // A read that must return ENODEV/EIO is ready, not an infinite wait
+        // for an IRQ from a nonexistent device.
+        !self.fEnabled || !self.hasInput() || self.fErrors != 0 || self.fInput.ready()
+    }
 
     pub fn read<F>(&mut self, aLimit: usize, aCopy: F) -> Result<Option<usize>, isize>
         where F: FnOnce(&[u8]) -> Result<(), isize>
     {
         if aLimit == 0 { return Ok(Some(0)); }
         if !self.fEnabled { return Err(-5); }
+        if !self.hasInput() { return Err(-19); }
         self.damage();
         let pCount = match self.fInput.peek(aLimit) {
             None => return Ok(None),
@@ -211,6 +247,7 @@ impl TerminalState {
     }
 
     pub unsafe fn keyboard_interrupt(&mut self) {
+        if !self.fEnabled || self.fKeyboardConfig.is_none() { return; }
         ps2::drain(|result| match result {
             Ok(scan) => {
                 if let Some(byte) = self.fKeyboard.feed(scan) {
@@ -227,12 +264,14 @@ impl TerminalState {
     }
 
     pub unsafe fn interrupt(&mut self) {
+        if !self.fEnabled || !self.fSerialPresent || self.fRoute.is_none() { return; }
         // Force the edge source low while draining. Reenabling below produces
         // a new assertion for a byte that arrives after the last empty check.
         out(COM + 1, 0);
         let mut pDrained = false;
         for _ in 0..256 {
             let pStatus = self.status();
+            if pStatus == 0xff { break; }
             let pDamaged = self.damage();
             if pStatus & 1 == 0 { pDrained = true; break; }
             let pByte = input(COM);

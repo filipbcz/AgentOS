@@ -6,6 +6,8 @@ Vlastní operační systém pro x86-64 podle [technického zadání](ZADANI.md).
 
 Etapa 3 obsahuje izolované procesy, nativní ELF ABI, COW, VFS nad initramfs, roury, autentizované lokální IPC, původní PID 1 se správou služeb a interaktivní TTY přes COM1 i PS/2/GOP. Milník 3.1 přidává demand paging procesů a řízenou migraci mezi CPU. Vývojová větev `dev/stage3-ipc-validation` byla 23. 11. 2026 sloučena do `main` (PR #1); samotné sloučení nenahrazuje úplnou přejímku všech profilů dle plánu. Etapa 4 nyní navazuje na ověřené AHCI a rozpracovává NVMe ve větvi `dev/stage4-nvme` (PR #2).
 
+Milník 3.2 začal odstraňováním závislosti na COM1: konvenční UART je volitelný, PS/2 se řídí údaji FADT a lokální GOP/klávesnice není podmíněna sériovým IRQ. Toto dosud neznamená dokončení běžného startu bez přejímacích scénářů ani fyzickou přejímku.
+
 ## Sestavení
 
 Příkazy pro Windows se spouštějí z kořene čistého Git checkoutu v PowerShellu. Potřebné prostředí:

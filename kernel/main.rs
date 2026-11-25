@@ -33,6 +33,7 @@ mod vfs;
 mod line;
 mod ioapic;
 mod tty;
+mod legacy_uart;
 mod keyboard;
 mod ps2;
 mod log_policy;
@@ -102,18 +103,18 @@ unsafe fn input(port: u16) -> u8 {
 
 const COM: u16 = 0x3f8;
 static SERIAL_LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static SERIAL_PRESENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn serial_available() -> bool {
+    SERIAL_PRESENT.load(core::sync::atomic::Ordering::Acquire)
+}
 
 unsafe fn init_serial() {
-    out(COM + 1, 0);
-    out(COM + 3, 0x80);
-    out(COM, 1);
-    out(COM + 1, 0);
-    out(COM + 3, 3);
-    out(COM + 2, 7);
-    out(COM + 4, 3);
+    SERIAL_PRESENT.store(legacy_uart::initialize(COM), core::sync::atomic::Ordering::Release);
 }
 
 unsafe fn serial(message: &[u8]) {
+    if !serial_available() { return; }
     // Each call publishes one complete message. Mask local interrupts before
     // taking the SMP gate, so the UART IRQ cannot recursively wait on it.
     let flags: usize;
@@ -121,11 +122,7 @@ unsafe fn serial(message: &[u8]) {
     while SERIAL_LOCK.compare_exchange_weak(false, true, core::sync::atomic::Ordering::Acquire,
         core::sync::atomic::Ordering::Relaxed).is_err() { core::hint::spin_loop(); }
     for &byte in message {
-        for _ in 0..100_000 {
-            let status: u8;
-            asm!("in al, dx", in("dx") COM + 5, out("al") status, options(nomem, nostack));
-            if status & 0x20 != 0 { out(COM, byte); break; }
-        }
+        if !legacy_uart::transmit(COM, byte) { break; }
     }
     SERIAL_LOCK.store(false, core::sync::atomic::Ordering::Release);
     if flags & 0x200 != 0 { asm!("sti", options(nomem, nostack)); }
@@ -270,8 +267,13 @@ impl<'a> BootLog<'a> {
         // performs UART/MMIO while holding its nonblocking SMP/IRQ gate.
         let _ = logger::LOGGER.record(0, 0, severity, message);
         let policy = log_policy::Policy::new(self.info.log_level);
-        let serial_enabled = policy.enabled(severity, log_policy::Sink::Serial);
-        let screen_enabled = policy.enabled(severity, log_policy::Sink::Screen);
+        let serial_requested = policy.enabled(severity, log_policy::Sink::Serial);
+        let serial_enabled = serial_requested && serial_available();
+        // A serial-only configuration must not discard diagnostics simply
+        // because the optional legacy UART is absent. Explicit none still
+        // suppresses ordinary output; the history above is always recorded.
+        let screen_enabled = policy.enabled(severity, log_policy::Sink::Screen)
+            || (serial_requested && !serial_available());
         if !serial_enabled && !screen_enabled { return; }
         let prefix = log_policy::Policy::prefix(severity);
         if serial_enabled {

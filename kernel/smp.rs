@@ -1194,7 +1194,7 @@ pub unsafe fn shell(platform: &Platform, info: &crate::BootInfo) -> Result<(), E
     let terminal = storage.address() as *mut crate::tty::Terminal;
     let mut initialized = false;
     let started = (|| -> Result<usize, Error> {
-        terminal.write(crate::tty::Terminal::new(platform, cpu.expected_id)?);
+        terminal.write(crate::tty::Terminal::new(platform, cpu.expected_id, crate::serial_available()));
         initialized = true;
         // The BSP TTY owns the mapped GOP framebuffer for the entire shell
         // session; the serial path remains available if GOP validation fails.
