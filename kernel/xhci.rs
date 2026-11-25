@@ -130,6 +130,12 @@ impl Xhci{
         ptr::write_volatile(self.pages[2].address() as *mut u64,self.bus[1]);
         wr(self.pages[2].address()+8,EVENTS as u32);
         wr(self.pages[2].address()+12,0);
+        // Publish all owned DMA memory, then enable mastering while the
+        // controller is still halted. Writing ERSTBA starts event-ring
+        // initialization; an xHC may fetch ERST immediately, not only at Run
+        // (xHCI spec 4.9.4/5.5.2.3.2). Keep all pages owned until reset.
+        fence(Ordering::SeqCst);
+        self.controller.command(true,true)?;
         // Empty command ring has cycle zero; publish Link only when wrapping.
         wr(op+0x14,0);
         address(op+0x30,self.bus[3]);
@@ -139,7 +145,6 @@ impl Xhci{
         address(intr+0x18,self.bus[1]);
         address(intr+0x10,self.bus[2]);
         fence(Ordering::SeqCst);
-        self.controller.command(true,true)?;
         wr(op,1); // Run, no interrupts
         wait(||Ok(rd(op+4)&HCH==0),1000,b"xHCI run timeout")?;
         self.healthy()?;

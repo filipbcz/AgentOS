@@ -203,6 +203,8 @@ Schválení vrátí stav `granted` s přesným rozsahem. Vlastní akci agent pro
 
 Ovladače budou implementovat veřejné specifikace zařízení. Nebudou přebírány binární linuxové ovladače ani napodobováno nestabilní interní API linuxového jádra.
 
+Cílem je nativní běh na obou referenčních platformách z § 3, včetně fyzického HP, nikoliv závislost na konkrétním emulátoru. Obecné ovladače se řídí specifikacemi zařízení, skutečnou enumerací a schopnostmi hardware. Podmínky izolovaných testů (počty CPU/řadičů, typ a identita fixture, sériové/QMP řízení, velikost RAM, počet a časování operací) nesmějí omezovat běžnou implementaci. Ověření v QEMU je doplňkové; nenahrazuje VirtualBox ani fyzickou přejímku požadovaných funkcí. Hardware mimo rozsah zadání lze odmítnout s diagnostikou, nelze však bez schválení zúžit podporu referenčního HP na schopnosti emulovaného zařízení.
+
 Každý ovladač musí být oddělen na:
 
 1. hardwarově nezávislou logiku,

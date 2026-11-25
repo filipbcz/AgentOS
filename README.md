@@ -2,6 +2,8 @@
 
 Vlastní operační systém pro x86-64 podle [technického zadání](ZADANI.md). Aktuální stav, přesné ověřené revize a otevřená přejímka jsou v [plánu implementace](PLAN_IMPLEMENTACE.md). Starší výsledky se nevztahují automaticky na nový obraz.
 
+**Cílové platformy jsou VirtualBox a fyzický HP ProBook 460 G11.** QEMU slouží k průběžným integračním testům. Izolované build profily jsou testy dílčích funkcí, nikoli omezení budoucího běžného jádra. Požadavky nativního běhu a zbývající odstranění dočasných omezení jsou závazně evidovány v [etapě 4 plánu](PLAN_IMPLEMENTACE.md#4-ovladače-a-bloková-zařízení-na-obou-platformách).
+
 Etapa 3 obsahuje izolované procesy, nativní ELF ABI, COW, VFS nad initramfs, roury, autentizované lokální IPC, původní PID 1 se správou služeb a interaktivní TTY přes COM1 i PS/2/GOP. Milník 3.1 přidává demand paging procesů a řízenou migraci mezi CPU. Vývojová větev `dev/stage3-ipc-validation` byla 23. 11. 2026 sloučena do `main` (PR #1); samotné sloučení nenahrazuje úplnou přejímku všech profilů dle plánu. Etapa 4 nyní navazuje na ověřené AHCI a rozpracovává NVMe ve větvi `dev/stage4-nvme` (PR #2).
 
 ## Sestavení

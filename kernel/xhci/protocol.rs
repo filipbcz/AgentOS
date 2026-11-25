@@ -1,7 +1,7 @@
 //! xHCI register/capability bounds and the ownership state of polled TRB rings.
 pub type Error = &'static [u8];
 pub const PAGE: usize = 4096;
-pub const MAX_PORTS: usize = 32;
+pub const MAX_PORTS: usize = 255; // HCSPARAMS1.MaxPorts is eight bits
 pub const COMMANDS: usize = 16;
 pub const EVENTS: usize = 16;
 pub const NOOPS: usize = 40;
@@ -23,9 +23,14 @@ pub const PRC: u32 = 1 << 21;
 pub struct Caps {
     pub version: u16, pub op: usize, pub runtime: usize, pub doorbell: usize,
     pub slots: u8, pub ports: u8, pub ac64: bool, pub ppc: bool, pub ext: usize,
+    runtime_size: usize, doorbell_size: usize,
 }
 fn range(start: usize, size: usize, aperture: usize) -> bool {
     start.checked_add(size).map_or(false, |end| end <= aperture)
+}
+fn overlaps(a: usize, an: usize, b: usize, bn: usize) -> bool {
+    // Call only for ranges whose end was already checked against the BAR.
+    a < b + bn && b < a + an
 }
 impl Caps {
     pub fn parse(raw: [u32; 7], aperture: usize) -> Result<Self, Error> {
@@ -39,17 +44,33 @@ impl Caps {
         let doorbell = (raw[5] & !3) as usize;
         let ext = ((raw[4] >> 16) as usize) * 4;
         let operational_size = 0x400 + 16 * usize::from(ports);
+        let runtime_size = 0x20 + 32 * intrs as usize;
+        let doorbell_size = 4 * (usize::from(slots) + 1);
         if !(0x100..=0x120).contains(&version) || op < 0x20 || op % 4 != 0 ||
-           slots == 0 || ports == 0 || usize::from(ports) > MAX_PORTS || intrs == 0 ||
-           scratchpads != 0 || ext < 0x20 || ext >= op ||
-           runtime < op + operational_size || doorbell < op + operational_size ||
-           !range(op, operational_size, aperture) || !range(runtime, 0x40, aperture) ||
-           !range(doorbell, 4, aperture) ||
-           (runtime < doorbell + 4 && doorbell < runtime + 0x40) {
+           slots == 0 || ports == 0 || intrs == 0 || intrs > 1024 ||
+           scratchpads != 0 || ext < 0x20 ||
+           runtime < 0x20 || doorbell < 0x20 ||
+           !range(op, operational_size, aperture) ||
+           !range(runtime, runtime_size, aperture) ||
+           !range(doorbell, doorbell_size, aperture) ||
+           overlaps(0,op,runtime,runtime_size) || overlaps(0,op,doorbell,doorbell_size) ||
+           overlaps(op,operational_size,runtime,runtime_size) ||
+           overlaps(op,operational_size,doorbell,doorbell_size) ||
+           overlaps(runtime,runtime_size,doorbell,doorbell_size) {
             return Err(b"unsupported xHCI capability/register profile");
         }
-        Ok(Self { version, op, runtime, doorbell, slots: slots.min(8), ports,
-                  ac64: raw[4]&1 != 0, ppc: raw[4]&8 != 0, ext })
+        let caps = Self { version, op, runtime, doorbell, slots: slots.min(8), ports,
+                  ac64: raw[4]&1 != 0, ppc: raw[4]&8 != 0, ext, runtime_size, doorbell_size };
+        // xECP is relative to BAR0, not limited to the capability header.
+        // Real controllers can place extended capabilities far beyond CAPLENGTH.
+        if !caps.ext_range(ext,4,aperture) {return Err(b"xHCI invalid extended capability pointer");}
+        Ok(caps)
+    }
+    fn ext_range(self, at:usize, size:usize, aperture:usize)->bool {
+        at >= 0x20 && at%4 == 0 && range(at,size,aperture) &&
+        !overlaps(at,size,self.op,0x400+16*usize::from(self.ports)) &&
+        !overlaps(at,size,self.runtime,self.runtime_size) &&
+        !overlaps(at,size,self.doorbell,self.doorbell_size)
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,7 +86,7 @@ pub fn protocols(caps: Caps, aperture: usize, mut read: impl FnMut(usize) -> u32
     let mut table = [PortProtocol::NONE; MAX_PORTS];
     let mut at = caps.ext;
     for _ in 0..64 {
-        if at < 0x20 || at%4 != 0 || !range(at,4,aperture) {
+        if !caps.ext_range(at,4,aperture) {
             return Err(b"xHCI extended capability outside BAR");
         }
         let head = read(at);
@@ -74,7 +95,7 @@ pub fn protocols(caps: Caps, aperture: usize, mut read: impl FnMut(usize) -> u32
         if id == 0 || id == 255 { return Err(b"xHCI malformed extended capability"); }
         if id == 1 { return Err(b"xHCI legacy BIOS ownership handoff not implemented"); }
         if id == 2 {
-            if !range(at,16,aperture) || (next != 0 && next < 16) {
+            if !caps.ext_range(at,16,aperture) || (next != 0 && next < 16) {
                 return Err(b"xHCI truncated protocol capability");
             }
             let major = (head >> 24) as u8;
@@ -219,6 +240,34 @@ mod tests {
         assert!(protocols(c,0x4000,|_|0x0200ff02).is_err());
         assert!(protocols(c,0x4000,|at|match at{0x20=>0x02000402,0x24=>0x20425355,
             0x28=>0x0301,0x30=>0x03000002,0x34=>0x20425355,0x38=>0x0203,_=>0}).is_err());
+    }
+    #[test]
+    fn extendedCapabilitiesNeedNotBeInCapabilityHeader(){
+        let mut raw=cap();
+        // A non-emulator register layout: 64 ports, xECP in a separate
+        // capability area after the runtime and doorbell regions.
+        raw[1]=0x40000120;
+        raw[4]=0x0c000001; // xECP = 0x3000
+        let caps=Caps::parse(raw,0x4000).unwrap();
+        assert_eq!(caps.ports,64);
+        let table=protocols(caps,0x4000,|at|match at{
+            0x3000=>0x02000402,0x3004=>0x20425355,0x3008=>0x2001,0x300c=>0,
+            0x3010=>0x03000002,0x3014=>0x20425355,0x3018=>0x2021,0x301c=>0,_=>0
+        }).unwrap();
+        assert_eq!(table[0].major,2); assert_eq!(table[63].major,3);
+        // Reject pointers into actual registers, outside the BAR, and a
+        // capability whose body (rather than just header) crosses the limit.
+        for at in [0x40,0x1000,0x2000,0x4000] {
+            let mut bad=raw; bad[4]=((at/4)<<16)|1;
+            assert!(Caps::parse(bad,0x4000).is_err());
+        }
+        let mut last=raw;last[4]=((0x3ffc/4)<<16)|1;
+        let last=Caps::parse(last,0x4000).unwrap();
+        assert!(protocols(last,0x4000,|_|0x02000002).is_err());
+        // Extents must include all hardware interrupters/doorbells,
+        // not just the primary interrupter and doorbell zero.
+        let mut overlap=raw; overlap[1]|=128<<8;
+        assert!(Caps::parse(overlap,0x4000).is_err());
     }
     #[test]
     fn commandAndEventOwnershipWrap(){
