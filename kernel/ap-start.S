@@ -1,5 +1,6 @@
-// Copied into a SIPI page. Offsets 0..45 in the following (NX) page are
-// populated by the BSP. No code or absolute label in this page needs patching.
+// Copied into a SIPI page. Offsets 0..55 in the following (NX) page are
+// populated by the BSP, including the relocated 64-bit Rust entry address.
+// This copied code contains no absolute address into the kernel image.
 .section .rodata.ap_start,"a",@progbits
 .global ap_start, ap_end, ap_pm, ap_long, ap_gdt
 .code16
@@ -39,8 +40,7 @@ ap_long:
     mov 4096+8(%rbx), %rsp
     mov 4096+16(%rbx), %rdi
     xor %ebp, %ebp
-    movabs $ap_main, %rax
-    call *%rax
+    call *4096+48(%rbx)
     ud2
 .balign 8
 ap_gdt:
