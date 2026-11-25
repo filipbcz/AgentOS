@@ -50,6 +50,7 @@ console = load("qemu_console_image", "verify-console-image.py")
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cpus", type=int, choices=(1, 2), required=True)
+    parser.add_argument("--memory-mib", type=int, choices=(256, 512), default=256)
     parser.add_argument("--session", action="store_true",
                         help="Drive UART/PS2 editing, service control, runtime idle and shutdown")
     parser.add_argument("--timeout", type=int, default=720)
@@ -268,8 +269,12 @@ def boot(args):
     commit = subprocess.check_output(["git", "rev-parse", "--verify", "HEAD"],
                                      cwd=root, text=True).strip()
     image = evidence.verify_build(root, commit)
-    destination = root / "build/check" / (
-        f"qemu-cpu{args.cpus}-session" if args.session else f"qemu-cpu{args.cpus}")
+    profile = f"qemu-cpu{args.cpus}"
+    if args.memory_mib != 256:
+        profile += f"-ram{args.memory_mib}"
+    if args.session:
+        profile += "-session"
+    destination = root / "build/check" / profile
     destination.mkdir(parents=True, exist_ok=True)
     raw = destination / "esp.raw"
     if raw.exists():
@@ -335,7 +340,7 @@ def boot(args):
     qemu = [
         "qemu-system-x86_64",
         "-machine", "q35,accel=tcg,smm=on,hpet=on",
-        "-cpu", "max", "-smp", str(args.cpus), "-m", "256",
+        "-cpu", "max", "-smp", str(args.cpus), "-m", str(args.memory_mib),
         "-global", "driver=cfi.pflash01,property=secure,value=on",
         "-drive", f"if=pflash,format=raw,unit=0,readonly=on,file={args.ovmf_code}",
         "-drive", f"if=pflash,format=raw,unit=1,file={vm_vars}",
@@ -395,7 +400,8 @@ def boot(args):
                     if serial.exists() else "")
             failure = {
                 "schema": 1, "result": "fail", "source_commit": commit,
-                "cpu_count": args.cpus, "failure": str(error),
+                "cpu_count": args.cpus, "memory_mib": args.memory_mib,
+                "failure": str(error),
                 "last_com1_bytes": tail,
                 "host_elapsed_seconds": round(time.monotonic() - start, 3),
                 "signed_efi_sha256": image["artifacts"]["agentos.efi"],
@@ -409,14 +415,21 @@ def boot(args):
             fatal = re.search(r"FATAL VECTOR=[0-9a-f]{16} ERROR=[0-9a-f]{16} "
                               r"RIP=([0-9a-f]{16})", tail)
             kernel_elf = root / "build/kernel.elf"
-            if fatal and kernel_elf.is_file():
-                rip = int(fatal[1], 16)
-                disasm = subprocess.run(
-                    ["objdump", "-drwC", f"--start-address={max(0,rip-128)}",
-                     f"--stop-address={rip+192}", str(kernel_elf)],
-                    capture_output=True, text=True, check=False)
-                print("Kernel ELF instructions near fatal RIP:\n" + disasm.stdout,
-                      file=sys.stderr, flush=True)
+            base_match = None
+            if serial.exists():
+                with serial.open("rb") as captured:
+                    base_match = re.search(rb"\[INFO\] KERNEL IMAGE BASE=([0-9a-f]{16})\r?\n",
+                                           captured.read(65536))
+            if fatal and kernel_elf.is_file() and base_match:
+                rip, base = int(fatal[1], 16), int(base_match[1], 16)
+                if base <= rip < base + 16*1024*1024:
+                    disasm = subprocess.run(
+                        ["objdump", "-drwC", f"--adjust-vma={base}",
+                         f"--start-address={max(base,rip-128)}",
+                         f"--stop-address={rip+192}", str(kernel_elf)],
+                        capture_output=True, text=True, check=False)
+                    print("Relocated kernel ELF instructions near fatal RIP:\n" + disasm.stdout,
+                          file=sys.stderr, flush=True)
             raise
         finally:
             if qmp is not None:
@@ -450,12 +463,20 @@ def boot(args):
     if args.session:
         session_result = session.verify(serial.read_bytes(), (destination / "com1-input.bin").read_bytes(),
                                         True, args.cpus)
+    bases = re.findall(r"(?m)^\[INFO\] KERNEL IMAGE BASE=([0-9a-f]{16})\r?$", text)
+    if len(bases) != 1:
+        raise RuntimeError(f"Expected one actual runtime kernel image address: {bases}")
+    image_base = int(bases[0], 16)
+    if image_base < 4096 or image_base % 4096 or image_base >= 1 << 39:
+        raise RuntimeError(f"Invalid runtime kernel image address: {image_base:#x}")
     receipt = {
         "schema": 1,
         "result": "pass",
         "emulator": "QEMU TCG with OVMF Secure Boot",
         "source_commit": commit,
         "cpus": args.cpus,
+        "memory_mib": args.memory_mib,
+        "kernel_image_base": image_base,
         "interactive_com1_manager_session": args.session,
         "ps2_keyboard_session": args.session,
         "runtime_session": session_result,
