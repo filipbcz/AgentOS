@@ -1,7 +1,7 @@
 """Check the *linked* AgentOS kernel ELF against kernel.ld and paging.rs.
 
-The single PT_LOAD is copied by the UEFI loader. The kernel then installs
-independent page tables: .text is RX, .rodata is R/NX and .data/.bss is RW/NX.
+The static PIE has three independent PT_LOAD segments. The UEFI loader
+relocates it; the kernel installs matching RX, R/NX and RW/NX page tables.
 Fail closed on any SHF_ALLOC orphan, writable/executable overlap, misplaced
 mutable global or non-page-aligned W^X boundary. This check must be run on
 every final kernel ELF, not just on individual compiler object files.
@@ -17,7 +17,7 @@ class LayoutError(ValueError):
 
 
 PAGE = 4096
-KERNEL_START = 0x02000000
+KERNEL_START = 0
 MAX_KERNEL = 16 * 1024 * 1024
 SHF_WRITE, SHF_ALLOC, SHF_EXEC = 1, 2, 4
 
@@ -34,17 +34,37 @@ def parse_elf(blob):
         return struct.unpack_from(fmt, blob, at)
 
     require(blob[:7] == b"\x7fELF\x02\x01\x01", "Expected ELF64 little-endian")
-    require(get("<HH", 16) == (2, 62), "Expected fixed-address x86-64 ET_EXEC")
+    require(get("<HH", 16) == (3, 62), "Expected static PIE x86-64 ET_DYN")
     entry, phoff, shoff = get("<QQQ", 24)
     phsize, phnum, shsize, shnum = get("<HHHH", 54)
-    require(phnum == 1 and phsize == 56 and shsize == 64 and
-            shnum > 0 and shnum < 1024, "Expected exactly one valid PT_LOAD")
-    ptype, flags, offset, vaddr, paddr, filesz, memsz, alignment = get("<IIQQQQQQ", phoff)
-    require(ptype == 1 and flags == 5, "EFI loader requires a single RX PT_LOAD")
-    require(vaddr == KERNEL_START and paddr == vaddr and
-            alignment == PAGE and offset % PAGE == 0 and
-            0 < filesz <= memsz <= MAX_KERNEL and offset+filesz <= len(blob),
-            "Invalid or oversized fixed-address loader segment")
+    require(phnum == 4 and phsize == 56 and shsize == 64 and
+            shnum > 0 and shnum < 1024 and phoff >= 64,
+            "Expected three PT_LOAD and one PT_DYNAMIC")
+    segments = []
+    next_address, previous_file_end = KERNEL_START, phoff + phnum*phsize
+    for index, expected_flags in enumerate((5, 4, 6)):
+        ptype, flags, offset, vaddr, paddr, filesz, memsz, alignment = get(
+            "<IIQQQQQQ", phoff + index*phsize)
+        require(ptype == 1 and flags == expected_flags and
+                vaddr == next_address and paddr == vaddr and
+                alignment == PAGE and offset % PAGE == 0 and
+                offset >= previous_file_end and
+                0 < filesz <= memsz and offset+filesz <= len(blob) and
+                vaddr+memsz <= MAX_KERNEL and (index == 2 or filesz == memsz),
+                "Invalid or overlapping static PIE load segment")
+        segments.append((offset, vaddr, filesz, memsz))
+        previous_file_end = offset+filesz
+        next_address = (vaddr+memsz+PAGE-1)//PAGE*PAGE
+    ptype, flags, offset, vaddr, paddr, filesz, memsz, alignment = get(
+        "<IIQQQQQQ", phoff + 3*phsize)
+    rw_off, rw_va, rw_filesz, _ = segments[2]
+    require(ptype == 2 and flags == 6 and paddr == vaddr and
+            alignment == 8 and vaddr % 8 == 0 and 0 < filesz == memsz and
+            filesz % 16 == 0 and rw_va <= vaddr and
+            vaddr+filesz <= rw_va+rw_filesz and offset == rw_off+vaddr-rw_va,
+            "Invalid PT_DYNAMIC")
+    # The C loader's separate host test checks the real dynamic table and
+    # every relocation on every actual linked image.
     sections = [get("<IIQQQQIIQQ", shoff + i*shsize) for i in range(shnum)]
     symbols = {}
     for sec in sections:
@@ -64,7 +84,7 @@ def parse_elf(blob):
                 symbols[symbol] = (value, length, index)
     return {
         "entry": entry,
-        "segment": (offset, vaddr, filesz, memsz),
+        "segments": segments,
         "sections": sections,
         "symbols": symbols,
         "blob": blob,
@@ -96,9 +116,13 @@ def verify_kernel(path):
             end - begin <= MAX_KERNEL and
             all(addr % PAGE == 0 for addr in (begin, ro, rw, end)),
             "Invalid page-aligned kernel W^X region boundaries")
-    off, vaddr, filesz, memsz = data["segment"]
-    require(vaddr == begin and (memsz + PAGE-1)//PAGE*PAGE >= end-begin,
-            "PT_LOAD fails to cover writable kernel memory")
+    segments = data["segments"]
+    require(len(segments) == 3, "Missing distinct W^X load segments")
+    for (off, vaddr, filesz, memsz), first, limit in zip(
+            segments, (begin, ro, rw), (ro, rw, end)):
+        require(vaddr == first and 0 < filesz <= memsz and
+                (memsz+PAGE-1)//PAGE*PAGE == limit-first,
+                "PT_LOAD fails to cover its complete W^X region")
     require(begin <= data["entry"] < ro, "kernel_main is not executable")
     writable = 0
     for section in data["sections"]:
@@ -108,6 +132,10 @@ def verify_kernel(path):
         require(addr >= begin and addr+size <= end and addr+size > addr,
                 "Allocated section outside linker kernel_end")
         classify(flags, addr, addr+size, ro, rw, end)
+        index = 0 if flags & SHF_EXEC else 2 if flags & SHF_WRITE else 1
+        off, vaddr, filesz, memsz = segments[index]
+        require(vaddr <= addr and addr+size <= vaddr+memsz,
+                "Allocated section not covered by its PT_LOAD memory")
         if stype == 8:  # .bss / NOBITS; loader zeroes memsz-filesz.
             require(flags & SHF_WRITE, "Nonwritable NOBITS section")
         else:
