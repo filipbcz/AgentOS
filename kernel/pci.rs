@@ -40,6 +40,10 @@ type Error = &'static [u8];
 pub struct Devices {
     pub oxford: Option<crate::pci_irq::Oxford>,
     pub ahci: Option<crate::ahci::Controller>,
+    #[cfg(nvme_block_acceptance)]
+    pub nvme: Option<crate::nvme::Controller>,
+    #[cfg(nvme_block_acceptance)]
+    pub nvme_count: usize,
 }
 
 // Decode only assigned resources. Sizing by writing all ones would disrupt
@@ -125,6 +129,23 @@ unsafe fn scan(config: Config, segment: u16, first: u8, last: u8,
                             devices.ahci = Some(crate::ahci::Controller {
                                 cfg: w.base + (usize::from(bdf) << 12), abar: bar as usize,
                             });
+                        }
+                    }
+                }
+                #[cfg(nvme_block_acceptance)]
+                if class_rev >> 8 == 0x010802 && layout == 0 {
+                    devices.nvme_count += 1;
+                    if let Config::Ecam(w) = &config {
+                        let bdf = (u16::from(bus) << 8) | u16::from(device * 8 + function);
+                        let low = read(0x10);
+                        let wide = low & 7 == 4;
+                        if wide || low & 7 == 0 {
+                            let base = u64::from(low & !15) | if wide { u64::from(read(0x14)) << 32 } else { 0 };
+                            if base != 0 {
+                                devices.nvme = Some(crate::nvme::Controller {
+                                    cfg: w.base + (usize::from(bdf) << 12), bar: base as usize, wide, msi, msix,
+                                });
+                            }
                         }
                     }
                 }

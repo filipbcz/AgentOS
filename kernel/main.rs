@@ -12,7 +12,9 @@ mod pci_irq;
 mod dma;
 mod ahci;
 mod block;
-#[cfg(ahci_block_acceptance)]
+#[cfg(nvme_block_acceptance)]
+mod nvme;
+#[cfg(any(ahci_block_acceptance, nvme_block_acceptance))]
 mod block_acceptance;
 mod smp;
 mod scheduler;
@@ -169,6 +171,14 @@ pub unsafe extern "sysv64" fn kernel_main(info: &BootInfo) -> ! {
         #[cfg(ahci_block_acceptance)]
         {
             let mut disk = ahci::AhciDisk::open(devices.ahci.ok_or(b"AHCI missing" as &[u8])?, root, &mut frames)?;
+            let result = block_acceptance::run(&mut disk);
+            disk.close(&mut frames)?;
+            result?;
+        }
+        #[cfg(nvme_block_acceptance)]
+        {
+            if devices.nvme_count != 1 { return Err(b"NVMe profile requires exactly one controller" as &[u8]); }
+            let mut disk = nvme::NvmeDisk::open(devices.nvme.ok_or(b"NVMe ECAM/BAR missing" as &[u8])?, root, &mut frames)?;
             let result = block_acceptance::run(&mut disk);
             disk.close(&mut frames)?;
             result?;
