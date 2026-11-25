@@ -118,6 +118,15 @@ NVMe i další časné ovladače mohou použít supervisor-only `paging::map_dev
 
 `scripts/build.sh --virtio-net` zapíná izolovaný moderní VirtIO PCI síťový profil. Vyžaduje ECAM a jedno zařízení, vyjednává VERSION_1/MAC, používá dvě split fronty a DMA. Není to ještě runtime síťová vrstva; výchozí build kartu neaktivuje. QEMU přejímka rámců a VirtualBox přejímka jsou vedeny odděleně v plánu.
 
+```bash
+bash scripts/check-build.sh
+bash scripts/build.sh --virtio-net
+python3 scripts/qemu-virtio-net.py --cpus 1 --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd
+python3 scripts/qemu-virtio-net.py --cpus 2 --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd
+```
+
+Matice používá privátní socketpair a skutečný QEMU VirtIO-net NIC (bez připojení k hostitelské síti). Každý hostitelský rámec má náhodný payload, skutečný RX/TX se porovnává bajt po bajtu se samostatnou PCAP zachycenou filtrem QEMU, PCI BARy s QMP a used indexy s výstupem jádra. Po resetu NIC musí naběhnout běžný shell a projít procesové regrese. VirtualBox profil zatím není připraven.
+
 ## Jádro, paměť a plánování
 
 Loader předá konečnou mapu paměti, framebuffer a initramfs a korektně opustí UEFI Boot Services. Rustové `no_std` jádro vytvoří vlastní čtyřúrovňové stránkování, alokátor fyzických rámců a GDT/IDT/TSS. Kód je RX, konstanty RO/NX, data RW/NX; nulová stránka a loaderový stack guard nejsou mapované.
