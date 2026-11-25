@@ -1,23 +1,33 @@
-/* The loader accepts a single fixed-address PT_LOAD (PF_R|PF_X).
- * It copies filesz, zeroes memsz-filesz, then the kernel replaces firmware
- * mappings with section-specific W^X permissions. All allocated sections,
- * including mutable globals from later development, MUST precede kernel_end.
- * Page alignment prevents writable and executable aliases on one page.
+/* Static PIE, zero-based offsets. The signed ELF loader accepts exactly
+ * RX, R and RW load segments and one dynamic table. No external symbols,
+ * text relocations, executable data or runtime dynamic linker are allowed.
+ * The kernel replaces the firmware identity map with these W^X boundaries.
  */
 ENTRY(kernel_main)
-PHDRS { code PT_LOAD FLAGS(5); }
+PHDRS {
+  text PT_LOAD FLAGS(5);
+  ro PT_LOAD FLAGS(4);
+  data PT_LOAD FLAGS(6);
+  dynamic PT_DYNAMIC FLAGS(6);
+}
 SECTIONS {
-  . = 0x02000000;
+  . = 0;
   kernel_begin = .;
-  .text : { *(.text .text.*) } :code
+  .text : { *(.text .text.*) } :text
   . = ALIGN(4096);
   kernel_ro = .;
-  .rodata : { *(.rodata .rodata.*) } :code
+  .rodata : { *(.rodata .rodata.*) } :ro
+  .dynsym : { *(.dynsym) } :ro
+  .dynstr : { *(.dynstr) } :ro
+  .hash : { *(.hash) } :ro
+  .gnu.hash : { *(.gnu.hash) } :ro
+  .rela.dyn : { *(.rela.dyn) } :ro
   . = ALIGN(4096);
   kernel_rw = .;
   .data : { *(.data .data.*) *(.sdata .sdata.*)
-            *(.data.rel.ro .data.rel.ro.*) *(.got .got.*) } :code
-  .bss (NOLOAD) : { *(.bss .bss.*) *(COMMON) *(.sbss .sbss.*) } :code
+            *(.got .got.*) } :data
+  .dynamic : { *(.dynamic) } :data :dynamic
+  .bss (NOLOAD) : { *(.bss .bss.*) *(COMMON) *(.sbss .sbss.*) } :data
   . = ALIGN(4096);
   kernel_end = .;
   /DISCARD/ : { *(.eh_frame*) *(.comment) *(.note*) }
