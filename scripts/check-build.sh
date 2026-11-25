@@ -165,43 +165,56 @@ printf 'Testing xHCI capabilities, PORTSC and command/event TRB ownership\n'
 "$pRustc" --edition 2021 --test "$pRoot/kernel/xhci/protocol.rs" -o "$pOut/xhci-tests"
 "$pOut/xhci-tests"
 
+printf 'Testing checked static PIE loading and relocation with %s\n' "$pCc"
+"$pCc" -std=c11 -O2 -Wall -Wextra -Werror \
+    "$pRoot/scripts/tests/kernel-elf-host.c" -o "$pOut/kernel-elf-tests"
+"$pOut/kernel-elf-tests"
+
 printf 'Compiling and linking the kernel with %s and %s\n' "$pRustc" "$pCc"
 "$pRustc" --version
 "$pCc" --version
 "$pRustc" --edition 2021 --crate-type staticlib -C lto=fat -C opt-level=2 -C panic=abort \
-    -C relocation-model=static -C no-redzone=yes -C overflow-checks=no \
+    -C relocation-model=pic -C no-redzone=yes -C overflow-checks=no \
     --remap-path-prefix="$pRoot"=/agentos "$pRoot/kernel/main.rs" -o "$pOut/libkernel.a"
 "$pCc" -c "$pRoot/kernel/ap-start.S" -o "$pOut/ap-start.o"
-"$pLd" --no-undefined --build-id=none --gc-sections -T "$pRoot/kernel/kernel.ld" \
+"$pLd" -pie -Bsymbolic --no-dynamic-linker --no-undefined -z text -z max-page-size=4096 \
+    --build-id=none --gc-sections -T "$pRoot/kernel/kernel.ld" \
     -o "$pOut/kernel.elf" "$pOut/libkernel.a" "$pOut/ap-start.o"
 "$pPython" "$pRoot/scripts/verify-kernel-layout.py" "$pOut/kernel.elf"
+"$pOut/kernel-elf-tests" "$pOut/kernel.elf"
 "$pPython" "$pRoot/scripts/verify-trap-return.py" "$pOut/kernel.elf"
 
 # Also link the actual NVMe opt-in profile.
 "$pRustc" --edition 2021 --crate-type staticlib -C lto=fat -C opt-level=2 -C panic=abort \
-    -C relocation-model=static -C no-redzone=yes -C overflow-checks=no \
+    -C relocation-model=pic -C no-redzone=yes -C overflow-checks=no \
     --cfg nvme_block_acceptance --remap-path-prefix="$pRoot"=/agentos "$pRoot/kernel/main.rs" -o "$pOut/libkernel-nvme.a"
-"$pLd" --no-undefined --build-id=none --gc-sections -T "$pRoot/kernel/kernel.ld" \
+"$pLd" -pie -Bsymbolic --no-dynamic-linker --no-undefined -z text -z max-page-size=4096 \
+    --build-id=none --gc-sections -T "$pRoot/kernel/kernel.ld" \
     -o "$pOut/kernel-nvme.elf" "$pOut/libkernel-nvme.a" "$pOut/ap-start.o"
 "$pPython" "$pRoot/scripts/verify-kernel-layout.py" "$pOut/kernel-nvme.elf"
+"$pOut/kernel-elf-tests" "$pOut/kernel-nvme.elf"
 "$pPython" "$pRoot/scripts/verify-trap-return.py" "$pOut/kernel-nvme.elf"
 
 # Link the real isolated VirtIO-net profile as well.
 "$pRustc" --edition 2021 --crate-type staticlib -C lto=fat -C opt-level=2 -C panic=abort \
-    -C relocation-model=static -C no-redzone=yes -C overflow-checks=no \
+    -C relocation-model=pic -C no-redzone=yes -C overflow-checks=no \
     --cfg virtio_net_acceptance --remap-path-prefix="$pRoot"=/agentos "$pRoot/kernel/main.rs" -o "$pOut/libkernel-virtio-net.a"
-"$pLd" --no-undefined --build-id=none --gc-sections -T "$pRoot/kernel/kernel.ld" \
+"$pLd" -pie -Bsymbolic --no-dynamic-linker --no-undefined -z text -z max-page-size=4096 \
+    --build-id=none --gc-sections -T "$pRoot/kernel/kernel.ld" \
     -o "$pOut/kernel-virtio-net.elf" "$pOut/libkernel-virtio-net.a" "$pOut/ap-start.o"
 "$pPython" "$pRoot/scripts/verify-kernel-layout.py" "$pOut/kernel-virtio-net.elf"
+"$pOut/kernel-elf-tests" "$pOut/kernel-virtio-net.elf"
 "$pPython" "$pRoot/scripts/verify-trap-return.py" "$pOut/kernel-virtio-net.elf"
 
 # Compile and link the isolated xHCI guest profile.
 "$pRustc" --edition 2021 --crate-type staticlib -C lto=fat -C opt-level=2 -C panic=abort \
-    -C relocation-model=static -C no-redzone=yes -C overflow-checks=no \
+    -C relocation-model=pic -C no-redzone=yes -C overflow-checks=no \
     --cfg xhci_acceptance --remap-path-prefix="$pRoot"=/agentos "$pRoot/kernel/main.rs" -o "$pOut/libkernel-xhci.a"
-"$pLd" --no-undefined --build-id=none --gc-sections -T "$pRoot/kernel/kernel.ld" \
+"$pLd" -pie -Bsymbolic --no-dynamic-linker --no-undefined -z text -z max-page-size=4096 \
+    --build-id=none --gc-sections -T "$pRoot/kernel/kernel.ld" \
     -o "$pOut/kernel-xhci.elf" "$pOut/libkernel-xhci.a" "$pOut/ap-start.o"
 "$pPython" "$pRoot/scripts/verify-kernel-layout.py" "$pOut/kernel-xhci.elf"
+"$pOut/kernel-elf-tests" "$pOut/kernel-xhci.elf"
 "$pPython" "$pRoot/scripts/verify-trap-return.py" "$pOut/kernel-xhci.elf"
 
 for pApp in init fault receiver service shell svc_ok svc_fail svc_hang orphan_parent manager svc_alive svc_flaky; do
