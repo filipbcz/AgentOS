@@ -15,6 +15,7 @@ pSpec.loader.exec_module(v)
 
 HELP = ("help       List commands\r\npid        Show process ID\r\n"
         "echo TEXT  Print text\r\ncat PATH   Read an initramfs file\r\n"
+        "run PATH   Run a native program\r\n"
         "services   Show service registry\r\n"
         "service start|stop|restart core|flaky\r\n"
         "idle       Measure timer wakeups over 5 seconds\r\n"
@@ -37,6 +38,7 @@ def transcript(aKeyboard=False):
         ("echo shell-ox\b \bk", "shell-ok\r\n"),
         ("cat /stage", "AgentOS stage 1\r\n"),
         ("cat /missing", "cat: open failed (-2)\r\n"),
+        ("run /missing","run: spawn failed (-2)\r\n"),
         ("no-such-command", "error: unknown command or arguments; use help\r\n"),
         ("services", registry("failed", 3)),
         ("service start flaky", registry("starting", 1)),

@@ -719,3 +719,34 @@ fn ipcAcrossMovedOwnersKeepsAuthenticatedIdentityAndPeerCloseReadiness() {
     });
     finishMovedProcesses(pFrames.into_inner().unwrap(), pHarness.fKernelRoot);
 }
+
+#[test]
+fn stdioOnlySpawnInheritanceDoesNotRetainPrivateHandlesOrInventClosedStdio() {
+    let mut pHarness = Harness::new(programImage());
+    let mut pParent = pHarness.load().unwrap();
+    let mut pChild = pHarness.load().unwrap();
+    let (pRead, pWrite) = pair(&mut pParent, &mut pHarness.fFrames, false);
+    assert_eq!((pRead,pWrite),(0,2));
+    pParent.files.close(&mut pHarness.fFrames, 1).unwrap();
+    let pPrivate = pParent.files.open(&mut pHarness.fFrames, gFileData).unwrap();
+    assert_eq!(pPrivate, 1);
+    pParent.files.dup2(&mut pHarness.fFrames, pPrivate, 9).unwrap();
+    pParent.files.close(&mut pHarness.fFrames, 1).unwrap();
+    let pPrivateFrames = pHarness.fFrames.used();
+    pChild.files.inherit_stdio(&mut pHarness.fFrames, &pParent.files);
+    assert_eq!(pHarness.fFrames.used(), pPrivateFrames);
+    pChild.space.write(&mut pHarness.fFrames, gData, b"ABC").unwrap();
+    assert_eq!(count(pChild.files.write(&mut pHarness.fFrames, &pChild.space, 2, gData, 3)), Ok(3));
+    assert_eq!(count(pParent.files.read(&mut pHarness.fFrames, &pParent.space, 0, gData, 3)), Ok(3));
+    let mut bytes=[0u8;3];
+    pParent.space.read(&mut pHarness.fFrames,gData,&mut bytes).unwrap();
+    assert_eq!(&bytes,b"ABC");
+    assert_eq!(count(pChild.files.write(&mut pHarness.fFrames, &pChild.space, 1, gData, 3)), Err(-9));
+    assert_eq!(count(pChild.files.read(&mut pHarness.fFrames, &pChild.space, 9, gData, 3)), Err(-9));
+    let before = pHarness.fFrames.used();
+    assert_eq!(pParent.files.close(&mut pHarness.fFrames,9),Ok(0));
+    assert_eq!(pHarness.fFrames.used()+1,before,"private file retained by child");
+    releaseProcess(&mut pHarness.fFrames,pChild);
+    releaseProcess(&mut pHarness.fFrames,pParent);
+    pHarness.finish();
+}

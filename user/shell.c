@@ -3,7 +3,7 @@
 int manager_connect(void);
 int manager_command(unsigned op,unsigned service);
 
-enum { commandCapacity = 256, inputChunk = 64, outputChunk = 256 };
+enum { commandCapacity = 256, outputChunk = 256 };
 
 static unsigned textLength(const char *aText) {
     unsigned pLength = 0;
@@ -98,6 +98,22 @@ static int measureIdle(void) {
     return writeAll(pLine,sizeof(pLine)-1);
 }
 
+// Foreground native programs use the ordinary process interface. Only
+// stdio is inherited: the parent's service-manager authority stays private.
+static int runProgram(const char *aPath) {
+    long pPid = os_call(SYS_SPAWN, (long)aPath, textLength(aPath), SPAWN_STDIO_ONLY);
+    if (pPid <= 0) return writeError("run: spawn failed", pPid < 0 ? pPid : -5) ? 1 : -1;
+    long pStatus = os_call(SYS_WAIT_CHILD, pPid, 0, 0);
+    if (pStatus < 0) {
+        // The child's lifetime is uncertain. Do not read the same terminal
+        // while the foreground child may own its input; PID1 reaps orphans.
+        (void)writeError("run: wait failed", pStatus);
+        return -1;
+    }
+    return writeText("exit status ") && writeNumber((unsigned long)pStatus) &&
+           writeText("\r\n") ? 1 : -1;
+}
+
 // Returns 1 to continue, 0 for an explicit exit and -1 after an output failure.
 static int executeLine(char *aLine) {
     char *pCommand = skipSpaces(aLine);
@@ -115,6 +131,13 @@ static int executeLine(char *aLine) {
         char *pRest = pEnd;
         if (*pEnd) { *pEnd = 0; pRest = skipSpaces(pEnd + 1); }
         pOk = !*pArgs || *pRest ? writeText("usage: cat PATH\r\n") : catFile(pArgs);
+    } else if (equals(pCommand, "run")) {
+        char *pEnd = pArgs;
+        while (*pEnd && !isSpace(*pEnd)) pEnd++;
+        char *pRest = pEnd;
+        if (*pEnd) { *pEnd = 0; pRest = skipSpaces(pEnd + 1); }
+        if (!*pArgs || *pRest) return writeText("usage: run PATH\r\n") ? 1 : -1;
+        return runProgram(pArgs);
     } else if (equals(pCommand, "services") && !*pArgs) {
         pOk = manager_command(SVC_OP_STATUS,0xffff);
     } else if (equals(pCommand, "idle") && !*pArgs) {
@@ -139,6 +162,7 @@ static int executeLine(char *aLine) {
     } else if (equals(pCommand, "help") && !*pArgs) {
         pOk = writeText("help       List commands\r\npid        Show process ID\r\n"
                        "echo TEXT  Print text\r\ncat PATH   Read an initramfs file\r\n"
+                       "run PATH   Run a native program\r\n"
                        "services   Show service registry\r\n"
                        "service start|stop|restart core|flaky\r\n"
                        "idle       Measure timer wakeups over 5 seconds\r\n"
@@ -164,11 +188,11 @@ static int finishLine(char *aLine, unsigned aLength, int aRejected) {
     return executeLine(aLine);
 }
 
-// TTY supplies canonical LF-terminated input. The extra framing here handles
-// short reads and preserves command boundaries if stdin later becomes a pipe.
+// Read exactly up to the command boundary, also for redirected stdin.
+// Never read ahead bytes intended for a foreground program.
 int runShell(void) {
     char pLine[commandCapacity];
-    char pInput[inputChunk];
+    char pInput[1];
     unsigned pUsed = 0;
     int pRejected = 0;
     if (!manager_connect()) return 2;

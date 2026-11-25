@@ -106,7 +106,20 @@ impl Descriptors {
 
     // Called once on a newly created child's table, before it becomes runnable.
     pub fn inherit(&mut self, aFrames: &mut Frames<'_>, parent: &Self) {
-        for (slot, &h) in self.slots_mut().iter_mut().zip(parent.slots()) { *slot = unsafe { h.retain(aFrames) }; }
+        self.inherit_prefix(aFrames, parent, SLOTS);
+    }
+
+    /// Child receives only descriptors 0, 1 and 2, including closed
+    /// descriptors. No private parent control socket, file or pipe escapes.
+    pub fn inherit_stdio(&mut self, aFrames: &mut Frames<'_>, parent: &Self) {
+        self.inherit_prefix(aFrames, parent, 3);
+    }
+
+    fn inherit_prefix(&mut self, aFrames: &mut Frames<'_>, parent: &Self, count: usize) {
+        for (index, (slot, &source)) in self.slots_mut().iter_mut().zip(parent.slots()).enumerate() {
+            let inherited = if index < count { unsafe { source.retain(aFrames) } } else { Handle::Empty };
+            unsafe { mem::replace(slot, inherited).release(aFrames); }
+        }
     }
 
     // Attach only to the fresh shell, preserving the acceptance programs' fd0.

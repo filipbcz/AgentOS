@@ -23,12 +23,30 @@ static unsigned gReadChunk, gWriteChunk;
 static const char *gMode, *gFilePath;
 static FILE *gFile;
 static unsigned gOpens, gCloses, gInputCalls, gWriteCalls;
-static unsigned gStatsCalls;
+static unsigned gStatsCalls, gSpawns, gWaits;
+static long gForeground;
 static unsigned long gClockMs=1000;
 
 static int modeIs(const char *aMode) { return strcmp(gMode, aMode) == 0; }
 static long mockCall(long aOp, long aFirst, long aSecond, long aThird) {
     if (aOp == SYS_GETPID) return modeIs("pid-error") ? -5 : 4242;
+    if (aOp == SYS_SPAWN) {
+        if (aThird != SPAWN_STDIO_ONLY || gForeground) abort();
+        gSpawns++;
+        if (aSecond<=0 || aSecond>128) return -36;
+        if (modeIs("spawn-oom")) return -12;
+        if (aSecond!=8 || memcmp((const void*)aFirst,"/program",8)) return -2;
+        gForeground=4310;
+        return gForeground;
+    }
+    if (aOp == SYS_WAIT_CHILD) {
+        if (aFirst != gForeground || !gForeground || aSecond || aThird) abort();
+        gWaits++;
+        if (modeIs("wait-error")) return -10;
+        if (modeIs("child-stdin") && fgetc(stdin)!='X') abort();
+        gForeground=0;
+        return modeIs("child-fault") ? 270 : modeIs("child-exit") ? 42 : 0;
+    }
     if (aOp == SYS_TIMER_STATS) {
         if (!aFirst || aSecond!=32 || aThird) abort();
         if (modeIs("idle-stats-error")) return -14;
@@ -56,10 +74,11 @@ static long mockCall(long aOp, long aFirst, long aSecond, long aThird) {
         return (long)fwrite((const void *)aSecond, 1, pLength, stdout);
     }
     if (aOp == SYS_READ && aFirst == 0) {
+        if (gForeground) abort();
         gInputCalls++;
         if (modeIs("input-error")) return -5;
         if ((modeIs("input-overflow") && gInputCalls == 1) ||
-            (modeIs("input-overflow-after-prefix") && gInputCalls == 2)) return -75;
+            (modeIs("input-overflow-after-prefix") && gInputCalls == 5)) return -75;
         unsigned pLength = (unsigned)aThird < gReadChunk ? (unsigned)aThird : gReadChunk;
         return (long)fread((void *)aSecond, 1, pLength, stdin);
     }
@@ -94,7 +113,7 @@ int main(int aCount, char **aArgs) {
     gMode = aArgs[3];
     gFilePath = aArgs[4];
     int pStatus = runShell();
-    fprintf(stderr, "{\"opens\":%u,\"closes\":%u,\"inputCalls\":%u,\"writeCalls\":%u}\n",
-            gOpens, gCloses, gInputCalls, gWriteCalls);
+    fprintf(stderr, "{\"opens\":%u,\"closes\":%u,\"inputCalls\":%u,\"writeCalls\":%u,\"spawns\":%u,\"waits\":%u}\n",
+            gOpens, gCloses, gInputCalls, gWriteCalls,gSpawns,gWaits);
     return pStatus;
 }

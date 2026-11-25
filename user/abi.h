@@ -28,6 +28,20 @@
 #define SYS_IPC_TRY_SEND      0x10019
 #define SYS_VM_STATS          0x1001a
 #define SYS_SCHED_STATS       0x1001b
+#define SYS_WAIT_CHILD        0x1001c
+#define SPAWN_STDIO_ONLY      1
+
+/* SYS_SPAWN(path, length, flags): start a native executable from the VFS.
+ * A non-NUL-terminated path of 1..128 bytes is accepted. Flags=0 preserves
+ * inherited descriptors; SPAWN_STDIO_ONLY inherits exactly fd 0, 1, 2
+ * (including closed descriptors), never unrelated private handles.
+ * Credentials are always inherited. Unknown flags return -22; too long a
+ * path returns -36. Returns the new PID or a negative kernel error.
+ * SYS_WAIT_CHILD(pid, 0, 0) waits and collects an owned child's actual
+ * exit status without a clock or deadline. Already exited children are
+ * collected immediately. An absent/unowned/already collected child is -10;
+ * nonzero reserved arguments are -22. No polling and no artificial timeout.
+ */
 
 /* Native ELF ABI v2 replaces the former CPU-local time contract. The loader
  * rejects v1 ELF notes with -8 (ENOEXEC) before allocating a process; rebuild

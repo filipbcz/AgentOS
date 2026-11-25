@@ -8,6 +8,8 @@ Etapa 3 obsahuje izolované procesy, nativní ELF ABI, COW, VFS nad initramfs, r
 
 Milník 3.2 začal odstraňováním závislosti na COM1: konvenční UART je volitelný, PS/2 se řídí údaji FADT a lokální GOP/klávesnice není podmíněna sériovým IRQ. Samostatný hostitelský test `scripts/qemu-console-no-uart.py` používá stejný podepsaný výchozí obraz a skutečné PS/2/GOP bez UARTu. Toto dosud neznamená dokončení běžného startu bez přejímacích scénářů ani fyzickou přejímku.
 
+Běžný shell podporuje `run PATH` pro nativní ELF ve VFS. Potomek dědí jen stdin/stdout/stderr; shell čeká na skutečný exit status prostřednictvím `SYS_WAIT_CHILD`, nezávisle na časovači. Argumenty a job control dosud nejsou implementovány. Toto je obecné rozhraní, nikoliv přejímací příkaz.
+
 ## Sestavení
 
 Příkazy pro Windows se spouštějí z kořene čistého Git checkoutu v PowerShellu. Potřebné prostředí:

@@ -504,7 +504,7 @@ impl Cpu {
         // the boot tests; AP tests still use independent finite sessions.
         let bsp_root = self.descriptors.is_none();
         let baseline = self.load.frames.with(|f| f.snapshot()).ok_or(b"process snapshot" as Error)?;
-        let pid = self.load.frames.with(|f| (*self.queue.get()).spawn_process(f, self.programs, b"init", 0))
+        let pid = self.load.frames.with(|f| (*self.queue.get()).spawn_process(f, self.programs, b"init", 0, 0))
             .map_err(|_| b"user init ELF" as Error)?;
         let resident = if bsp_root {
             Some(self.load.frames.with(|f| f.snapshot()).ok_or(b"PID1 test snapshot" as Error)?)
@@ -818,6 +818,22 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
                 }).map_or_else(|e| e, |_| 0)
             }
         }
+        // SYS_WAIT_CHILD(child_pid, 0, 0): pure lifecycle wait, independent
+        // of the availability and progression of the monotonic clock.
+        0x1001c => {
+            if b != 0 || c != 0 { -22 }
+            else {
+                match cpu.load.frames.with(|f| q.collect(f, pid, a)) {
+                    Ok(status) => status as isize,
+                    Err(-11) => {
+                        q.block_child_exit(a);
+                        ctx.rip -= 2;
+                        switchNow!(ctx as *mut Context as usize);
+                    }
+                    Err(error) => error,
+                }
+            }
+        }
         // SYS_WAIT_CHILD_UNTIL(child_pid, absolute_deadline_ms):
         // nonblocking if already reaped/finished, otherwise sleep until child
         // termination or the shared monotonic deadline. Reaps on success.
@@ -932,10 +948,11 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
             switchNow!(0);
         }
         0x10004 => {
-            let mut name = [0; 64];
-            if b == 0 || b > name.len() { -22 }
+            let mut name = [0; crate::vfs::PATH_MAX];
+            if b == 0 || c & !1 != 0 { -22 }
+            else if b > name.len() { -36 }
             else if let Err(error) = cpu.load.frames.with(|f| p.space.read(f, a, &mut name[..b])) { error }
-            else { cpu.load.frames.with(|f| q.spawn_process(f, cpu.programs, &name[..b], pid))
+            else { cpu.load.frames.with(|f| q.spawn_process(f, cpu.programs, &name[..b], pid, c))
                        .map(|v| v as isize).unwrap_or_else(|e| e) }
         }
         0x10005 => cpu.load.frames.with(|f| q.collect(f, pid, a)).map(|v| v as isize).unwrap_or_else(|e| e),

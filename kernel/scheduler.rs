@@ -51,12 +51,17 @@ pub struct MigrationInfo {
 enum TimedWait {
     Sleep(u64),
     Child { pid: usize, deadline: u64 },
+    /// Untimed wait for a direct child: only the lifecycle event wakes it.
+    ChildExit { pid: usize },
     /// Wait for any watched local IPC message, a direct-child exit, or timeout.
     Events { mask: u32, deadline: u64 },
 }
 impl TimedWait {
-    fn deadline(self) -> u64 {
-        match self { Self::Sleep(ms) | Self::Child { deadline: ms, .. } | Self::Events { deadline: ms, .. } => ms }
+    fn deadline(self) -> Option<u64> {
+        match self {
+            Self::Sleep(ms) | Self::Child { deadline: ms, .. } | Self::Events { deadline: ms, .. } => Some(ms),
+            Self::ChildExit { .. } => None,
+        }
     }
 }
 
@@ -107,7 +112,10 @@ impl Queue {
     }
 
     pub unsafe fn spawn_process(&mut self, frames: &mut Frames<'_>, programs: &Programs, name: &[u8],
-                                parent: usize) -> Result<usize, isize> {
+                                parent: usize, flags: usize) -> Result<usize, isize> {
+        // Validate before allocating any frame or consuming a PID.
+        const SPAWN_STDIO_ONLY: usize = 1;
+        if flags & !SPAWN_STDIO_ONLY != 0 { return Err(-22); }
         if !self.fPrograms.is_null() && self.fPrograms != programs as *const Programs { return Err(-22); }
         let slot = self.tasks.iter().position(Option::is_none).ok_or(-11isize)?;
         let stack = KernelStack::allocate(frames).ok_or(-12isize)?;
@@ -116,7 +124,10 @@ impl Queue {
             Ok(process) => process,
             Err(e) => { stack.release(frames); return Err(e); }
         };
-        if let Some(caller) = self.process() { process.files.inherit(frames, &caller.files); }
+        if let Some(caller) = self.process() {
+            if flags & SPAWN_STDIO_ONLY != 0 { process.files.inherit_stdio(frames, &caller.files); }
+            else { process.files.inherit(frames, &caller.files); }
+        }
         let context = (stack.top() - size_of::<Context>()) as *mut Context;
         ptr::write_unaligned((*context).fx.as_mut_ptr() as *mut u16, 0x037f);
         ptr::write_unaligned((*context).fx.as_mut_ptr().add(24) as *mut u32, 0x1f80);
@@ -250,6 +261,10 @@ impl Queue {
         self.block_timed(TimedWait::Child { pid, deadline }, now);
     }
 
+    pub fn block_child_exit(&mut self, pid: usize) {
+        self.block_timed(TimedWait::ChildExit { pid }, 0);
+    }
+
     pub fn block_events(&mut self, mask: u32, deadline: u64, now: u64) {
         self.block_timed(TimedWait::Events { mask, deadline }, now);
     }
@@ -285,16 +300,17 @@ impl Queue {
             let Some(pWait) = pTask.timed else { continue; };
             let pParent = pTask.process.as_ref().map(|pProcess| pProcess.pid);
             let pFinished = match (pWait, pPrograms, pParent) {
-                (TimedWait::Child { pid, .. }, Some(pPrograms), Some(pParent)) =>
+                (TimedWait::Child { pid, .. } | TimedWait::ChildExit { pid }, Some(pPrograms), Some(pParent)) =>
                     !pPrograms.fRegistry.childRunning(aFrames, pParent, pid),
                 (TimedWait::Events { .. }, Some(pPrograms), Some(pParent)) =>
                     pPrograms.fRegistry.hasExitedChild(aFrames, pParent),
                 _ => false,
             };
-            if pFinished || (!aClockError && aNow >= pWait.deadline()) {
+            let pDeadline = pWait.deadline();
+            if pFinished || (!aClockError && pDeadline.is_some_and(|ms| aNow >= ms)) {
                 pTask.timed = None;
                 pTask.runnable = true;
-            } else if aClockError {
+            } else if aClockError && pDeadline.is_some() {
                 pTask.timed = None;
                 pTask.clock_error = true;
                 pTask.runnable = true;
@@ -303,13 +319,13 @@ impl Queue {
     }
 
     pub fn has_timed_waiters(&self) -> bool {
-        self.tasks.iter().flatten().any(|task| task.timed.is_some())
+        self.tasks.iter().flatten().any(|task| task.timed.and_then(TimedWait::deadline).is_some())
     }
 
     /// Earliest scheduler-owned timeout, independent of task slot order.
     /// The CPU uses this only after selecting work, with local IRQs masked.
     pub fn next_deadline(&self) -> Option<u64> {
-        self.tasks.iter().flatten().filter_map(|task| task.timed.map(TimedWait::deadline)).min()
+        self.tasks.iter().flatten().filter_map(|task| task.timed.and_then(TimedWait::deadline)).min()
     }
 
     /// The caller holds the local queue lock and Frames. Remote I/O/exit
@@ -323,7 +339,7 @@ impl Queue {
             }
             let Some(pProcess) = pTask.process.as_ref() else { continue; };
             let pReady = match pTask.timed {
-                Some(TimedWait::Child { pid, .. }) => pPrograms.map_or(false, |pPrograms|
+                Some(TimedWait::Child { pid, .. } | TimedWait::ChildExit { pid }) => pPrograms.map_or(false, |pPrograms|
                     !pPrograms.fRegistry.childRunning(aFrames, pProcess.pid, pid)),
                 Some(TimedWait::Events { mask, .. }) =>
                     pProcess.files.ipc_ready_mask(aFrames, mask).unwrap_or(0) != 0 ||
@@ -639,6 +655,30 @@ mod timed_tests {
         p.select(1, 0, false);
         assert_eq!(p.fQueues[1].collectRetired(&mut p.fFrames), 1);
         assert_eq!(p.fFrames.used(), 1);
+    }
+
+    #[test]
+    fn untimedWaitForMigratedChildNeedsNoClockOrTimer() {
+        let mut p = Harness::new(true);
+        assert_eq!(p.moveTask(0).unwrap().fPid, 2);
+        p.fQueues[0].block_child_exit(2);
+        assert_eq!(p.select(0, 99, false), 10);
+        assert_eq!(p.fQueues[0].next_deadline(), None);
+        assert!(!p.fQueues[0].has_timed_waiters());
+        assert!(p.fQueues[0].active && !p.fQueues[0].running());
+        p.fQueues[0].wake_timed(&mut p.fFrames, u64::MAX, true);
+        p.fQueues[0].wake_io(&mut p.fFrames);
+        assert!(!p.fQueues[0].tasks[0].as_ref().unwrap().runnable);
+        assert_eq!(p.fQueues[0].collect(&mut p.fFrames, 1, 2), Err(-11));
+        assert_eq!(p.select(1, 200, false), 8192);
+        p.fQueues[1].terminate(42, &mut p.fFrames);
+        p.fQueues[0].wake_io(&mut p.fFrames);
+        assert_eq!(p.select(0, 11, false), 99);
+        assert!(!p.fQueues[0].take_clock_error());
+        assert_eq!(p.fQueues[0].collect(&mut p.fFrames, 1, 2), Ok(42));
+        assert_eq!(p.fQueues[0].collect(&mut p.fFrames, 1, 2), Err(-10));
+        p.select(1, 0, false);
+        assert_eq!(p.fQueues[1].collectRetired(&mut p.fFrames), 1);
     }
 
     #[test]
