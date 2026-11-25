@@ -101,7 +101,7 @@ static int measureIdle(void) {
 // Foreground native programs use the ordinary process interface. Only
 // stdio is inherited: the parent's service-manager authority stays private.
 static int runProgram(const char *aPath) {
-    long pPid = os_call(SYS_SPAWN, (long)aPath, textLength(aPath), SPAWN_STDIO_ONLY);
+    long pPid = os_call(SYS_SPAWN_FLAGS, (long)aPath, textLength(aPath), SPAWN_STDIO_ONLY);
     if (pPid <= 0) return writeError("run: spawn failed", pPid < 0 ? pPid : -5) ? 1 : -1;
     long pStatus = os_call(SYS_WAIT_CHILD, pPid, 0, 0);
     if (pStatus < 0) {

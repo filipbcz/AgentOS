@@ -30,7 +30,7 @@ static unsigned long gClockMs=1000;
 static int modeIs(const char *aMode) { return strcmp(gMode, aMode) == 0; }
 static long mockCall(long aOp, long aFirst, long aSecond, long aThird) {
     if (aOp == SYS_GETPID) return modeIs("pid-error") ? -5 : 4242;
-    if (aOp == SYS_SPAWN) {
+    if (aOp == SYS_SPAWN_FLAGS) {
         if (aThird != SPAWN_STDIO_ONLY || gForeground) abort();
         gSpawns++;
         if (aSecond<=0 || aSecond>128) return -36;

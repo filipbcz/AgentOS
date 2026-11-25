@@ -185,7 +185,7 @@ Instrukce `syscall` přijímá číslo v RAX a tři argumenty v RDI/RSI/RDX. RAX
 | `0x10001` | `getpid` | Identita volajícího |
 | `0x10002` | `write` | COM1, TTY nebo roura; možné dílčí zápisy |
 | `0x10003` | `exit` | Ukončení a uzavření všech fd |
-| `0x10004` | `spawn` | Nový ELF proces se zděděnými fd |
+| `0x10004` | `spawn` | Původní dvouargumentové ABI, zděděné všechny fd; RDX ignorován |
 | `0x10005` | `try_wait` | Převzetí vlastního potomka; běžící vrací −11 |
 | `0x10006` | `yield` | Dobrovolné předání CPU |
 | `0x10007` | `open` | Soubor initramfs pouze ke čtení |
@@ -209,6 +209,8 @@ Instrukce `syscall` přijímá číslo v RAX a tři argumenty v RDI/RSI/RDX. RAX
 | `0x10019` | `ipc_try_send` | Plná schránka vrací −11 bez uspání a bez odeslání |
 | `0x1001a` | `vm_stats` | Osm u64: verze 1, rezervované/rezidentní stránky, tabulky, metadata, demand/COW čítače |
 | `0x1001b` | `sched_stats` | Osm u64: verze 1, APIC ID, počet CPU, migrace procesu/celku, vzdálené IPI notifikace, PID, PPID |
+| `0x1001c` | `wait_child` | Blokující převzetí potomka bez časovače |
+| `0x1001d` | `spawn_flags` | ELF z VFS, volitelně zdědí pouze fd 0–2; cesta do 128 B |
 
 `timer_stats(buffer,32,0)` je pouze čtecí diagnostika verze 2; čítače se čtením nenulují. Čas i absolutní lhůty jsou srovnatelné mezi CPU a při migraci se nemění; nejde o UTC. IRQ/idle čítače jsou součtem konzistentních párů z každého CPU, čtených pomocí sekvenčního čítače. `sched_stats(buffer,64,0)` zachytí identitu a stav aktuálního procesu; špatná velikost/flags vrací −22, neplatný buffer −14 a OOM −12. Počet vzdálených probouzení znamená odeslané IPI notifikace, nikoli počet probuzených procesů nebo self-IPI.
 

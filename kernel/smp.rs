@@ -947,13 +947,16 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
             cpu.load.frames.with(|f| q.terminate(a & 255, f));
             switchNow!(0);
         }
-        0x10004 => {
+        op @ (crate::native_abi::SYS_SPAWN | crate::native_abi::SYS_SPAWN_FLAGS) => {
             let mut name = [0; crate::vfs::PATH_MAX];
-            if b == 0 || c & !1 != 0 { -22 }
-            else if b > name.len() { -36 }
-            else if let Err(error) = cpu.load.frames.with(|f| p.space.read(f, a, &mut name[..b])) { error }
-            else { cpu.load.frames.with(|f| q.spawn_process(f, cpu.programs, &name[..b], pid, c))
-                       .map(|v| v as isize).unwrap_or_else(|e| e) }
+            match crate::native_abi::spawn_flags(op, b, c, name.len()) {
+                Err(error) => error,
+                Ok(flags) => {
+                    if let Err(error) = cpu.load.frames.with(|f| p.space.read(f, a, &mut name[..b])) { error }
+                    else { cpu.load.frames.with(|f| q.spawn_process(f, cpu.programs, &name[..b], pid, flags))
+                               .map(|v| v as isize).unwrap_or_else(|e| e) }
+                }
+            }
         }
         0x10005 => cpu.load.frames.with(|f| q.collect(f, pid, a)).map(|v| v as isize).unwrap_or_else(|e| e),
         // Parent gets the new PID. The child resumes at the same return RIP
