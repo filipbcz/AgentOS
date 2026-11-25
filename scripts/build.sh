@@ -44,11 +44,15 @@ mkdir data
 rust_version=$(/usr/bin/rustc --version)
 [[ "$rust_version" == "rustc 1.75.0 "* ]] || { printf 'Pinned Rust compiler mismatch: %s\n' "$rust_version" >&2; exit 1; }
 /usr/bin/rustc --edition 2021 --crate-type staticlib -C lto=fat -C opt-level=2 -C panic=abort \
-    -C relocation-model=static -C no-redzone=yes -C overflow-checks=no \
+    -C relocation-model=pic -C no-redzone=yes -C overflow-checks=no \
     "${rust_flags[@]}" --remap-path-prefix="$root"=/agentos "$root/kernel/main.rs" -o libkernel.a
 gcc-13 -c -o ap-start.o "$root/kernel/ap-start.S"
-ld --build-id=none --gc-sections -T "$root/kernel/kernel.ld" -o kernel.elf libkernel.a ap-start.o
+ld -pie -Bsymbolic --no-dynamic-linker --no-undefined -z text -z max-page-size=4096 \
+    --build-id=none --gc-sections -T "$root/kernel/kernel.ld" -o kernel.elf libkernel.a ap-start.o
 python3 "$root/scripts/verify-kernel-layout.py" kernel.elf
+# Validate the same ELF contract used by the EFI loader before signing.
+gcc-13 -std=c11 -O2 -Wall -Wextra -Werror "$root/scripts/tests/kernel-elf-host.c" -o kernel-elf-tests
+./kernel-elf-tests kernel.elf
 python3 "$root/scripts/verify-trap-return.py" kernel.elf
 # Preserve the exact linked ELF for symbolization of a real guest fault.
 cp kernel.elf "$out/kernel.elf"
