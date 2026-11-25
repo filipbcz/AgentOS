@@ -296,6 +296,15 @@ Připravit host testy algoritmů a selhání, integrační testy z uživatelské
 
 **Blokové operace AHCI a trvalost zápisu.** Rozhraní jádra poskytuje geometrii z ATA IDENTIFY, čtení a zápis celých logických sektorů a explicitní flush. Pro přejímku sestavit `bash scripts/build.sh --ahci-block` a spustit `scripts/test-vbox.ps1 -AhciBlock -Cpus 1` a potom stejný příkaz s `-Cpus 2`. První start zapíše devět sektorů od LBA 16375 na samostatný 8MiB VDI a počká na FLUSH CACHE EXT. Host VM vypne, exportuje celý datový disk a znovu spustí tutéž VM se stejným VDI. Druhý start jen čte a porovná každý bajt. Offline přejímka ověří oba protokoly, počitadla AHCI, studený restart a všechny bajty exportu včetně sektorů mimo zápis.
 
+**Výsledek přejímky.** Blokové rozhraní AHCI prošlo ve VirtualBoxu 7.1.12 na podepsaném sestavení `af9ceca`. Po vypnutí test znovu otevřel uloženou definici téže VM, zaznamenal UUID připojeného VDI a před druhým startem ověřil obsah databáze klíčů Secure Boot. Offline ověřovač porovnal UUID s hlavičkou VDI. V obou profilech se všech 4 608 bajtů přečtených po restartu shodovalo s očekávanými daty. Porovnání celého exportovaného disku ověřilo také sektory mimo cílový rozsah.
+
+| vCPU | Zápisy AHCI / dokončené flush | Zápisy po restartu | FNV-1a přečtených dat | Protokol v `build/runs` |
+| ---: | ---: | ---: | --- | --- |
+| 1 | 2 / 1 | 0 | `5a0ea3dd` | `AgentOS-signed-974d98fd0c/acceptance.json` |
+| 2 | 2 / 1 | 0 | `89177ec5` | `AgentOS-signed-200dad6c3e/acceptance.json` |
+
+Hostitelská sada `scripts/check-build.sh` prošla. Offline ověřovač přijal oba protokoly. U každého odmítl všech pět poškozených kopií pokrývajících chybějící potvrzení flush z jádra či řadiče, záměnu čtení za zápis při druhém startu, chybějící potvrzení vypnutí VM a změnu jediného bajtu v exportu disku.
+
 Vývoj může běžet souběžně s 3.1. Rozhraní pro dokončení I/O a probouzení musí respektovat možné přesunutí čekajícího procesu na jiné CPU. Aktivní DMA buffery mají stabilní fyzické rámce po celou dobu přístupu zařízení; demand paging ani migrace úlohy nesmějí tuto evidenci obejít. Po propojení s 3.1 se zopakují dotčené I/O a timeout testy.
 
 **Převzetí.** Na VDI, vyhrazeném USB a vyhrazeném NVMe zapsat vzorek do předem určené testovací oblasti, vynutit dokončení zápisu a po restartu porovnat obsah. Timeout či odpojení USB musí ukončit čekání, DMA buffery se smějí uvolnit až po zastavení přenosu. Na HP ověřit vestavěnou i USB klávesnici a přenos známého ethernetového rámce.
