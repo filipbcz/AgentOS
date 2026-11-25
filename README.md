@@ -92,6 +92,19 @@ Pozitivní profil čeká na skutečný prompt shellu. Kontrola obrazovky porovn�
 
 AHCI čtení/zápis/flush a studený restart jsou ověřeny na revizi `af9ceca`; podrobnosti viz [plán etapy 4](PLAN_IMPLEMENTACE.md#4-ovladače-a-bloková-zařízení-na-obou-platformách). NVMe se vyvíjí ve větvi `dev/stage4-nvme`. Volitelný `bash scripts/build.sh --nvme-block` sestavuje izolovanou zkoušku NVMe; běžný obraz NVMe řadič neaktivuje. NVMe zatím není akceptováno, nepoužívat k zápisu na fyzické disky.
 
+Pro izolovanou zkoušku je nutný **Oracle VirtualBox Extension Pack 7.1.12** (ověřit `VBoxManage list extpacks`). VDI se vytvoří v novém adresáři běhu; nepředává se existující disk ani fyzické zařízení.
+
+```powershell
+git switch dev/stage4-nvme
+git pull --ff-only
+wsl -d Ubuntu-24.04 -- bash scripts/check-build.sh
+wsl -d Ubuntu-24.04 -- bash scripts/build.sh --nvme-block
+.\scripts\test-vbox.ps1 -NvmeBlock -Cpus 1
+.\scripts\test-vbox.ps1 -NvmeBlock -Cpus 2
+```
+
+Oba běhy vyžadují vlastní platný `VM_ACCEPTANCE_JSON`. Nezávislá kontrola porovná PCI config dump obou startů, záznamy NVMe CQ dokončení zápisů a flush, UUID téže VM a VDI, dvě potvrzená vypnutí a celý export disku před a po čtecím startu. Pro etapu 3 nebo běžný boot pak znovu sestavit bez `--nvme-block`.
+
 ## Jádro, paměť a plánování
 
 Loader předá konečnou mapu paměti, framebuffer a initramfs a korektně opustí UEFI Boot Services. Rustové `no_std` jádro vytvoří vlastní čtyřúrovňové stránkování, alokátor fyzických rámců a GDT/IDT/TSS. Kód je RX, konstanty RO/NX, data RW/NX; nulová stránka a loaderový stack guard nejsou mapované.

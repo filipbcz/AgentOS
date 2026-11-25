@@ -120,6 +120,16 @@ class VmEvidenceTests(unittest.TestCase):
         self.save_manifest()
         self.rejected()
 
+    def test_nvme_receipt_cannot_use_default_image_or_missing_cold_artifacts(self):
+        self.manifest.update({"nvme_block": True, "pci_chipset": "ich9"})
+        self.save_manifest()
+        self.rejected()
+        self.provenance["profile"] = "nvme-block"
+        self.save_provenance()
+        self.manifest["build_provenance_sha256"] = evidence.sha256(self.build / "build-provenance.json")
+        self.save_manifest()
+        self.rejected()
+
     def test_valid_mutation_rejected_by_firmware(self):
         self.manifest.update({"case": "loader", "shell": False, "keyboard": False})
         self.write(self.run / "changed.efi", b"altered signed EFI")

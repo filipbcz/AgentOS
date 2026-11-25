@@ -28,11 +28,13 @@ VBox_VERSION = re.compile(r"7\.1\.12(?:r[0-9]+)?\Z")
 BLOCK_ARTIFACTS = frozenset({"block.raw", "block-after.raw", "block.vdi", "block-restart.txt", "block-db.esl",
                              "block-write-com1.log", "block-write-vbox.log", "block-read-vbox.log"})
 
+NVME_ARTIFACTS = frozenset({"block-write-pci.txt", "block-read-poweroff.txt", "block-read-after.raw"})
+
 ARTIFACTS = frozenset({
     "esp.raw", "esp.vdi", "changed.efi", "serial-com1.log", "com1-input.bin",
     "display.png", "shell-before.png", "shell-keyboard.png", "idle.csv", "failure.png", "vbox-pci.txt",
     "dma.raw", "dma.vdi", "vbox-ahci.log"
-}) | BLOCK_ARTIFACTS
+}) | BLOCK_ARTIFACTS | NVME_ARTIFACTS
 BUILD_ARTIFACTS = frozenset({
     "agentos.unsigned.efi", "agentos.efi", "db.cer", "db.esl"
 })
@@ -131,10 +133,18 @@ def verify_run(root, run_dir, require_pass=True, *, legacy_traces=False):
     require(isinstance(artifacts, dict) and set(artifacts) <= ARTIFACTS,
             "Run contains invalid artifact names")
     expected = {"esp.raw", "esp.vdi", "serial-com1.log", "display.png"}
-    if image.get("profile") == "ahci-block" or "ahci_block" in data or BLOCK_ARTIFACTS & set(artifacts):
-        require(image.get("profile") == "ahci-block" and data.get("ahci_block") is True and
-                data.get("pci_chipset") == "ich9", "Missing or inconsistent AHCI block profile")
+    block_profile = image.get("profile") in ("ahci-block", "nvme-block")
+    if (block_profile or "ahci_block" in data or "nvme_block" in data or
+            (BLOCK_ARTIFACTS | NVME_ARTIFACTS) & set(artifacts)):
+        ahci = image.get("profile") == "ahci-block" and data.get("ahci_block") is True and "nvme_block" not in data
+        nvme = image.get("profile") == "nvme-block" and data.get("nvme_block") is True and "ahci_block" not in data
+        require((ahci or nvme) and data.get("pci_chipset") == "ich9" and case == "signed" and
+                "ahci_dma" not in data and "device_irqs" not in data, "Missing or inconsistent block profile")
         expected.update(BLOCK_ARTIFACTS)
+        if nvme:
+            expected.update(NVME_ARTIFACTS)
+        else:
+            require(not (NVME_ARTIFACTS & set(artifacts)), "NVMe artifacts in AHCI run")
         require(artifacts.get("block-db.esl") == image["artifacts"]["db.esl"], "Cold boot trust database changed")
     dma_artifacts = {"dma.raw", "dma.vdi", "vbox-ahci.log"}
     if image.get("profile") == "ahci-dma" or "ahci_dma" in data or dma_artifacts & set(artifacts):
@@ -176,6 +186,12 @@ def verify_run(root, run_dir, require_pass=True, *, legacy_traces=False):
                 verify_block(run_dir, cpus)
             except ValueError as error:
                 raise EvidenceError(f"Invalid AHCI block evidence: {error}") from error
+        if data.get("nvme_block"):
+            from nvme_block_evidence import verify as verify_nvme
+            try:
+                verify_nvme(run_dir, cpus)
+            except ValueError as error:
+                raise EvidenceError(f"Invalid NVMe block evidence: {error}") from error
         if data.get("ahci_dma"):
             from ahci_dma_evidence import verify
             try:

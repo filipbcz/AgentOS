@@ -69,6 +69,8 @@ def verify(root, manifest_path):
                     "Invalid suite commit")
     verify_current_checkout(root, source)
     build = receipt.verify_build(root, source)
+    receipt.require(build.get("profile", "default") == "default",
+                    "Stage-3 matrix requires the default signed build, not a storage fixture")
     receipt.require(data.get("signed_efi_sha256") ==
                     build["artifacts"]["agentos.efi"],
                     "Suite signed image differs from its original build")

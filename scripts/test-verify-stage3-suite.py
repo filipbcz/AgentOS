@@ -72,6 +72,12 @@ class SuiteTests(unittest.TestCase):
         self.assertEqual(self.verify(), 13)
         self.checkout.assert_called_once_with(self.root, SHA)
 
+    def test_storage_build_cannot_count_as_stage3_matrix(self):
+        with mock.patch.object(suite.receipt, "verify_build",
+                               return_value={"profile": "nvme-block", "artifacts": {"agentos.efi": IMAGE}}):
+            with self.assertRaises(suite.receipt.EvidenceError):
+                suite.verify(self.root, self.summary_file)
+
     def test_missing_run_or_duplicate_run_fails(self):
         original = self.summary["runs"].pop()
         self.save()

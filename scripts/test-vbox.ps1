@@ -7,12 +7,16 @@ param([ValidateSet('signed','loader','kernel','initrd')][string]$Case='signed',
       [ValidateSet('piix3','ich9')][string]$PciChipset,
       [switch]$DeviceIrq,
       [switch]$AhciDma,
-      [switch]$AhciBlock)
+      [switch]$AhciBlock,
+      [switch]$NvmeBlock)
 $ErrorActionPreference='Stop'
 if ($Shell -and $Case -ne 'signed') { throw '-Shell requires the signed case' }
 if ($Keyboard -and !$Shell) { throw '-Keyboard requires -Shell' }
-if ($AhciBlock -and ($AhciDma -or $DeviceIrq)) { throw 'Use a separate VM for the AHCI block profile' }
-if ($DeviceIrq -or $AhciDma -or $AhciBlock) {
+$blockProfile=$AhciBlock -or $NvmeBlock
+if (($AhciBlock -and $NvmeBlock) -or ($blockProfile -and ($AhciDma -or $DeviceIrq))) {
+    throw 'Use a separate VM for each block profile'
+}
+if ($DeviceIrq -or $AhciDma -or $blockProfile) {
     if ($PciChipset -and $PciChipset -ne 'ich9') { throw 'The device profile requires ICH9' }
     $PciChipset='ich9'
 }
@@ -193,6 +197,14 @@ $vboxVersion=(& $vbox --version).Trim()
 $buildProfile=(Get-Content -Raw (Join-Path $root 'build/build-provenance.json') | ConvertFrom-Json).profile
 if ([bool]$AhciDma -ne ($buildProfile -eq 'ahci-dma')) { throw 'Use build.sh --ahci-dma with -AhciDma, or build.sh for normal boots' }
 if ([bool]$AhciBlock -ne ($buildProfile -eq 'ahci-block')) { throw 'Use build.sh --ahci-block with -AhciBlock' }
+if ([bool]$NvmeBlock -ne ($buildProfile -eq 'nvme-block')) { throw 'Use build.sh --nvme-block with -NvmeBlock' }
+if ($NvmeBlock) {
+    $packs=(& $vbox list extpacks | Out-String)
+    if ($LASTEXITCODE -ne 0 -or $packs -notmatch '(?im)^\s*Pack no\.\s*\d+:\s*Oracle (?:VM )?VirtualBox Extension Pack\s*$' -or
+        $packs -notmatch '(?im)^\s*Version:\s*7\.1\.12\s*$' -or $packs -notmatch '(?im)^\s*Usable:\s*true\s*$') {
+        throw 'NVMe VM profile requires the usable Oracle VirtualBox Extension Pack 7.1.12'
+    }
+}
 if ($LASTEXITCODE -ne 0 -or $vboxVersion -notmatch '^7\.1\.12(?:r[0-9]+)?$') {
     throw "VirtualBox 7.1.12 required for comparable acceptance: $vboxVersion"
 }
@@ -236,25 +248,33 @@ function Open-Serial([string]$filename) {
     }
     return $state
 }
-$serial=if ($AhciBlock) { Open-Serial 'block-write-com1.log' } else { Open-Serial 'serial-com1.log' }
+$serial=if ($blockProfile) { Open-Serial 'block-write-com1.log' } else { Open-Serial 'serial-com1.log' }
 VBox modifyvm $vm --uart-mode1 client "\\.\pipe\$vm"
-if ($AhciDma -or $AhciBlock) {
-    $diskName=if ($AhciBlock) { 'block' } else { 'dma' }
+if ($AhciDma -or $blockProfile) {
+    $diskName=if ($blockProfile) { 'block' } else { 'dma' }
     & python "scripts/ahci_${diskName}_evidence.py" --create "$dir\$diskName.raw"
-    if ($LASTEXITCODE) { throw 'AHCI fixture creation failed' }
+    if ($LASTEXITCODE) { throw 'Block/DMA fixture creation failed' }
     VBox convertfromraw "$dir\$diskName.raw" "$dir\$diskName.vdi" --format VDI
-    VBox storagectl $vm --name Boot --add ide --controller PIIX4
-    VBox storageattach $vm --storagectl Boot --port 0 --device 0 --type hdd --medium "$dir\esp.vdi"
     VBox modifyvm $vm --iommu none
-    $diskOptions=@()
-    if ($AhciDma) {
-        VBox bandwidthctl $vm add DmaDisk --type disk --limit 32K
-        $diskOptions=@('--bandwidthgroup','DmaDisk')
+    if ($NvmeBlock) {
+        # Fresh, dedicated file-backed NVMe namespace; boot stays on AHCI.
+        VBox storagectl $vm --name SATA --add sata --controller IntelAhci --portcount 1
+        VBox storageattach $vm --storagectl SATA --port 0 --device 0 --type hdd --medium "$dir\esp.vdi"
+        VBox storagectl $vm --name NVMe --add pcie --controller NVMe --portcount 1 --hostiocache off --bootable off
+        VBox storageattach $vm --storagectl NVMe --port 0 --device 0 --type hdd --medium "$dir\block.vdi"
+    } else {
+        VBox storagectl $vm --name Boot --add ide --controller PIIX4
+        VBox storageattach $vm --storagectl Boot --port 0 --device 0 --type hdd --medium "$dir\esp.vdi"
+        $diskOptions=@()
+        if ($AhciDma) {
+            VBox bandwidthctl $vm add DmaDisk --type disk --limit 32K
+            $diskOptions=@('--bandwidthgroup','DmaDisk')
+        }
+        VBox storagectl $vm --name SATA --add sata --controller IntelAhci --portcount 1 --hostiocache off
+        VBox storageattach $vm --storagectl SATA --port 0 --device 0 --type hdd --medium "$dir\$diskName.vdi" @diskOptions
+        VBox setextradata $vm 'VBoxInternal/Devices/ahci/0/LUN#0/Config/IgnoreFlush' 0
+        VBox setextradata $vm 'VBoxInternal/Devices/ahci/0/LUN#0/Config/IgnoreFlushAsync' 0
     }
-    VBox storagectl $vm --name SATA --add sata --controller IntelAhci --portcount 1 --hostiocache off
-    VBox storageattach $vm --storagectl SATA --port 0 --device 0 --type hdd --medium "$dir\$diskName.vdi" @diskOptions
-    VBox setextradata $vm 'VBoxInternal/Devices/ahci/0/LUN#0/Config/IgnoreFlush' 0
-    VBox setextradata $vm 'VBoxInternal/Devices/ahci/0/LUN#0/Config/IgnoreFlushAsync' 0
 } else {
     VBox storagectl $vm --name SATA --add sata --controller IntelAhci
     VBox storageattach $vm --storagectl SATA --port 0 --device 0 --type hdd --medium "$dir\esp.vdi"
@@ -268,12 +288,17 @@ VBox modifynvram $vm secureboot --enable
 $runSucceeded=$false
 $shutdownSucceeded=$false
 try {
-    if ($AhciBlock) {
+    if ($blockProfile) {
         VBox startvm $vm --type headless
         if (!$serial.Connection.Wait(30000)) { throw 'No write-boot COM1 connection' }
         Wait-Serial $serial 'AGENTOS BLOCK READY BLOCKS=16384 SIZE=512\r\n' 0 120
         $serial.Stream.WriteByte(87) # W, only the first boot may write
         Wait-Serial $serial 'AGENTOS BLOCK FLUSH OK\r\n' 0 30
+        if ($NvmeBlock) {
+            Wait-Serial $serial 'AGENTOS NVME CLOSED RDY=0 MASTER=0 DMA=5\r\n' 0 30
+            $firstPci=@(VBox debugvm $vm info pci verbose)
+            [IO.File]::WriteAllLines("$dir\block-write-pci.txt",[string[]]$firstPci,[Text.Encoding]::ASCII)
+        }
         VBox controlvm $vm poweroff
         $serial.Stream.Dispose()
         $serial.Log.Dispose()
@@ -299,7 +324,7 @@ try {
     $timer=[Diagnostics.Stopwatch]::StartNew()
     # Connect before examining guest output, regardless of interactive mode.
     if (!$serial.Connection.Wait(30000)) { throw "COM1 pipe connection missing: $dir" }
-    if ($AhciBlock) {
+    if ($blockProfile) {
         Wait-Serial $serial 'AGENTOS BLOCK READY BLOCKS=16384 SIZE=512\r\n' 0 120
         $serial.Stream.WriteByte(82) # R, verify from a fresh kernel
     }
@@ -469,6 +494,18 @@ try {
         if ($runSucceeded) { throw }
         Write-Warning "VM power-off after a failed run also failed: $_"
     }
+    if ($NvmeBlock -and $runSucceeded -and $shutdownSucceeded) {
+        try {
+            $info=@(VBox showvminfo $vm --machinereadable)
+            if ($info -notcontains 'VMState="poweroff"') { throw 'Read boot did not power off' }
+            [IO.File]::WriteAllLines("$dir\block-read-poweroff.txt",[string[]]$info)
+            VBox clonemedium disk "$dir\block.vdi" "$dir\block-read-after.raw" --format RAW
+            VBox closemedium disk "$dir\block-read-after.raw"
+        } catch {
+            $runSucceeded=$false
+            throw
+        }
+    }
 }
 } catch {
     $runError=$_.Exception.Message
@@ -493,12 +530,15 @@ try {
             }
             $artifactHashes=@{}
             $blockFiles=@()
-            if ($AhciBlock) {
+            if ($blockProfile) {
                 $blockFiles=@('block.raw','block.vdi','block-after.raw','block-restart.txt','block-db.esl',
                               'block-write-com1.log','block-write-vbox.log','block-read-vbox.log')
                 if (Test-Path -LiteralPath "$dir\$vm\Logs\VBox.log") {
                     Copy-Item -LiteralPath "$dir\$vm\Logs\VBox.log" -Destination "$dir\block-read-vbox.log"
                 }
+            }
+            if ($NvmeBlock) {
+                $blockFiles+=@('block-write-pci.txt','block-read-poweroff.txt','block-read-after.raw')
             }
             if ($AhciDma -and (Test-Path -LiteralPath "$dir\$vm\Logs\VBox.log")) {
                 Copy-Item -LiteralPath "$dir\$vm\Logs\VBox.log" -Destination "$dir\vbox-ahci.log"
@@ -538,6 +578,7 @@ try {
             if ($DeviceIrq) { $receipt.device_irqs=$true }
             if ($AhciDma) { $receipt.ahci_dma=$true }
             if ($AhciBlock) { $receipt.ahci_block=$true }
+            if ($NvmeBlock) { $receipt.nvme_block=$true }
             $tempReceipt="$receiptFile.tmp"
             $json=$receipt | ConvertTo-Json -Depth 6
             [IO.File]::WriteAllText($tempReceipt,$json+[Environment]::NewLine,[Text.UTF8Encoding]::new($false))
