@@ -1,6 +1,7 @@
 #include <efi.h>
 #include <efilib.h>
 #include <elf.h>
+#include "gop-select.h"
 
 extern UINT8 elf_start[], elf_end[], archive_start[], archive_end[];
 typedef struct {
@@ -80,6 +81,41 @@ static UINT64 boot_log_level(EFI_HANDLE device) {
     return 1 | LOG_SERIAL | LOG_SCREEN;
 }
 
+static GopMode gop_mode(const EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *mode) {
+    return (GopMode){mode->HorizontalResolution, mode->VerticalResolution,
+        mode->PixelsPerScanLine, mode->PixelFormat, mode->PixelInformation.RedMask,
+        mode->PixelInformation.GreenMask, mode->PixelInformation.BlueMask,
+        mode->PixelInformation.ReservedMask};
+}
+
+static int gop_current(void *context, GopFramebuffer *out) {
+    EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = context;
+    if (!gop->Mode || !gop->Mode->Info ||
+        gop->Mode->SizeOfInfo < sizeof(EFI_GRAPHICS_OUTPUT_MODE_INFORMATION) ||
+        gop->Mode->Mode >= gop->Mode->MaxMode) return 0;
+    *out = (GopFramebuffer){gop_mode(gop->Mode->Info),
+        gop->Mode->FrameBufferBase, gop->Mode->FrameBufferSize};
+    return 1;
+}
+
+static int gop_query(void *context, uint32_t index, GopMode *out) {
+    EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = context;
+    EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *mode = NULL;
+    UINTN size = 0;
+    EFI_STATUS status = gop->QueryMode(gop, index, &size, &mode);
+    if (EFI_ERROR(status)) return status == EFI_NOT_STARTED ?
+        GOP_QUERY_NOT_STARTED : GOP_QUERY_FAILED;
+    int valid = mode && size >= sizeof(*mode);
+    if (valid) *out = gop_mode(mode);
+    if (mode) BS->FreePool(mode);
+    return valid ? GOP_QUERY_OK : GOP_QUERY_FAILED;
+}
+
+static int gop_activate(void *context, uint32_t index) {
+    EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = context;
+    return !EFI_ERROR(gop->SetMode(gop, index));
+}
+
 static BootInfo info = {.version = 3};
 
 EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *table) {
@@ -88,15 +124,15 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *table) {
     EFI_GRAPHICS_OUTPUT_PROTOCOL *gop;
     EFI_STATUS s = BS->LocateProtocol(&GraphicsOutputProtocol, NULL, (void **)&gop);
     if (EFI_ERROR(s)) return s;
-    EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *mode = gop->Mode->Info;
-    info.fb = gop->Mode->FrameBufferBase;
-    info.width = mode->HorizontalResolution;
-    info.height = mode->VerticalResolution;
-    info.stride = mode->PixelsPerScanLine;
-    info.format = mode->PixelFormat;
-    if (!info.fb || info.width < 200 || info.height < 64 || info.format > 1 ||
-        info.stride < info.width || (UINT64)info.stride*info.height > gop->Mode->FrameBufferSize/4)
-        return EFI_UNSUPPORTED;
+    if (!gop || !gop->Mode || !gop->QueryMode || !gop->SetMode) return EFI_UNSUPPORTED;
+    GopAccess access = {gop, gop->Mode->MaxMode, gop_current, gop_query, gop_activate};
+    GopFramebuffer framebuffer;
+    if (!gop_select(&access, &framebuffer)) return EFI_UNSUPPORTED;
+    info.fb = framebuffer.base;
+    info.width = framebuffer.mode.width;
+    info.height = framebuffer.mode.height;
+    info.stride = framebuffer.mode.stride;
+    info.format = framebuffer.mode.format;
     EFI_LOADED_IMAGE *loaded;
     s = BS->HandleProtocol(image, &LoadedImageProtocol, (void **)&loaded);
     if (EFI_ERROR(s)) return s;
