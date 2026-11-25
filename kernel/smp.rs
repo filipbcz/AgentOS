@@ -1066,6 +1066,7 @@ unsafe fn start_ap(cpu: &Cpu, root: usize, base: usize, stack: usize, clock: &Pm
     ((mailbox+36) as *mut u16).write(8);
     ((mailbox+40) as *mut u32).write(dest(ptr::addr_of!(ap_long)));
     ((mailbox+44) as *mut u16).write(24);
+    ((mailbox+48) as *mut usize).write(ap_main as *const () as usize);
     fence(Ordering::SeqCst);
     cpu.apic.send(cpu.expected_id, 0xc500, clock)?; // level-triggered INIT, assert
     clock.delay(PM_HZ / 100 + 1);
