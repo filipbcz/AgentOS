@@ -19,6 +19,11 @@ const ENOEXEC: isize = -8;
 pub const USER_BASE: usize = 1 << 39;
 pub const USER_END: usize = 2 << 39;
 pub const MAX_REGIONS: usize = 64;
+// Permanent supervisor-only PCI MMIO window, disjoint from slot 1 (users)
+// and slot 256 (guarded stacks). Map only explicitly claimed device pages.
+const DEVICE_BASE: usize = 0xffff_9000_0000_0000;
+const DEVICE_PHYS_LIMIT: usize = 1 << 44; // first 16 TiB of device physical space
+const MAX_DEVICE_PAGES: usize = 16;
 
 #[derive(Clone, Copy)]
 struct Region {
@@ -432,6 +437,93 @@ pub unsafe fn map_device(root: usize, frames: &mut Frames<'_>, address: usize) -
     Tables { root, frames }.identity(address, PAGE, MMIO)?;
     asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
     Some(())
+}
+
+// Inspect a supervisor leaf without creating a mapping. Reject huge pages,
+// malformed ancestors and user-owned branches rather than treating them as free.
+unsafe fn device_leaf(root: usize, va: usize) -> Option<u64> {
+    let mut node = root;
+    for shift in [39, 30, 21] {
+        let value = *((node as *const u64).add((va >> shift) & 511));
+        if value == 0 { return Some(0); }
+        if value & (PRESENT | WRITE | USER | (1 << 7)) != PRESENT | WRITE {
+            return None;
+        }
+        node = (value & ADDRESS) as usize;
+        if node == 0 { return None; }
+    }
+    Some(*((node as *const u64).add((va >> 12) & 511)))
+}
+
+// Must be called by the BSP before publishing any process root or starting APs.
+// For low device addresses retain the existing uncached identity convention;
+// high BARs may occupy the *physical* range reserved for user virtual memory.
+// Give those pages a separate supervisor-only canonical VA instead. Never
+// create a conflicting cached alias of an existing identity mapping.
+pub unsafe fn map_device_window(root: usize, frames: &mut Frames<'_>,
+                                physical: usize, pages: usize) -> Option<usize> {
+    // Host tests use synthetic physical addresses independently of host CPUID.
+    #[cfg(test)]
+    let bits = 52u32;
+    #[cfg(not(test))]
+    let bits = if __cpuid(0x80000000).eax >= 0x80000008 {
+        __cpuid(0x80000008).eax & 0xff
+    } else { return None; };
+    if !(32..=52).contains(&bits) || physical < PAGE || physical % PAGE != 0 ||
+       pages == 0 || pages > MAX_DEVICE_PAGES || root == 0 || root % PAGE != 0 {
+        return None;
+    }
+    let end = physical.checked_add(pages.checked_mul(PAGE)?)?;
+    if end > (1usize << bits) || end > DEVICE_PHYS_LIMIT ||
+       (physical < USER_BASE && end > USER_BASE) { return None; }
+    let high = physical >= USER_BASE;
+    let base = if high { DEVICE_BASE.checked_add(physical)? } else { physical };
+    let ad = (1 << 5) | (1 << 6);
+    for i in 0..pages {
+        let pa = physical + i * PAGE;
+        if high && device_leaf(root, pa)? != 0 { return None; }
+        let old = device_leaf(root, base + i * PAGE)?;
+        if old != 0 && old & !ad != pa as u64 | PRESENT | MMIO { return None; }
+    }
+
+    // Publish new branches only while this root is exclusive. Roll back every
+    // newly allocated page table on OOM. Do not modify any leaf until all
+    // branches are ready, so existing mappings remain intact on failure.
+    let mut allocated = [(ptr::null_mut::<u64>(), 0usize); MAX_DEVICE_PAGES * 3];
+    let mut count = 0;
+    let mut leaves = [ptr::null_mut::<u64>(); MAX_DEVICE_PAGES];
+    let result = (|| {
+        for (i, leaf) in leaves[..pages].iter_mut().enumerate() {
+            let va = base + i * PAGE;
+            let mut node = root;
+            for shift in [39, 30, 21] {
+                let entry = (node as *mut u64).add((va >> shift) & 511);
+                if *entry == 0 {
+                    let address = frames.alloc_zeroed()?.into_address();
+                    allocated[count] = (entry, address);
+                    count += 1;
+                    *entry = address as u64 | PRESENT | WRITE | NX;
+                }
+                // Preflight inspected old branches; new branches are ours.
+                node = (*entry & ADDRESS) as usize;
+            }
+            *leaf = (node as *mut u64).add((va >> 12) & 511);
+        }
+        Some(())
+    })();
+    if result.is_none() {
+        for &(entry, address) in allocated[..count].iter().rev() {
+            *entry = 0;
+            frames.release(Frame::from_owned_address(address));
+        }
+        return None;
+    }
+    for (i, &leaf) in leaves[..pages].iter().enumerate() {
+        if *leaf == 0 { *leaf = (physical + i * PAGE) as u64 | PRESENT | MMIO; }
+        #[cfg(not(test))]
+        asm!("invlpg [{}]", in(reg) (base + i * PAGE), options(nostack, preserves_flags));
+    }
+    Some(base)
 }
 
 // Grant write access only to the driver's previously mapped ECAM function.

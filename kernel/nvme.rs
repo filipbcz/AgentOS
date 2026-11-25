@@ -43,7 +43,7 @@ impl Controller {
     }
     // Size only the selected controller with memory and bus mastering off,
     // never change BARs while doing general read-only PCI inventory.
-    unsafe fn prepare(&self, root: usize, frames: &mut Frames<'_>) -> Result<Capabilities, Error> {
+    unsafe fn prepare(&mut self, root: usize, frames: &mut Frames<'_>) -> Result<Capabilities, Error> {
         paging::claim_config(root, self.cfg).ok_or(b"NVMe ECAM mapping" as Error)?;
         let cmd = self.cfg + 4;
         write16(cmd, (read16(cmd) | (1 << 10)) & !7);
@@ -74,8 +74,12 @@ impl Controller {
             self.bar as u64 & (size - 1) != 0 || self.bar.checked_add(8192).is_none() {
             return Err(b"unsupported NVMe BAR aperture");
         }
-        paging::map_device(root, frames, self.bar).ok_or(b"NVMe register mapping" as Error)?;
-        paging::map_device(root, frames, self.bar + PAGE).ok_or(b"NVMe doorbell mapping" as Error)?;
+        // BAR0 is a physical bus resource, not necessarily a usable CPU VA.
+        // Preserve the firmware assignment and map a supervisor-only window.
+        let physical = self.bar;
+        self.bar = paging::map_device_window(root, frames, physical, 2)
+            .ok_or(b"NVMe register/doorbell mapping" as Error)?;
+        let _ = writeln!(Console, "AGENTOS MMIO NVME PA={physical:016x} VA={:016x} PAGES=2\r", self.bar);
         self.bus_master(false)?;
         let cap = u64::from(read(self.bar)) | (u64::from(read(self.bar + 4)) << 32);
         let caps = Capabilities::parse(cap, size)?;
@@ -102,7 +106,7 @@ pub struct NvmeDisk {
     admin: Queue, io: Queue, geometry: Geometry, failed: bool, uncertain: bool,
 }
 impl NvmeDisk {
-    pub unsafe fn open(controller: Controller, root: usize, frames: &mut Frames<'_>) -> Result<Self, Error> {
+    pub unsafe fn open(mut controller: Controller, root: usize, frames: &mut Frames<'_>) -> Result<Self, Error> {
         let caps = controller.prepare(root, frames)?;
         let mut owned: [Option<Frame>; 5] = core::array::from_fn(|_| None);
         for i in 0..owned.len() {

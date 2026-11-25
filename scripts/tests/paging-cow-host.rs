@@ -516,3 +516,97 @@ fn residentVisitorEnumeratesOnlyPrivateTablesAndDataAndStopsOnFailure() {
     unsafe {pSpace.release(&mut pFrames);}
     assert_eq!(pFrames.used(),1);
 }
+
+#[test]
+fn highPciBarIsNotIdentityMappedIntoPrivateUserSpace() {
+    const physical: usize = 0x0000_00c0_0000_0000;
+    const addressMask: u64 = 0x000f_ffff_ffff_f000;
+    const flags: u64 = (1 << 63) | 0x1b; // NX, supervisor, writable, UC
+    let mut frames = frames::Frames::new(32);
+    let root = frames.alloc_zeroed().unwrap().into_address();
+    let va = unsafe { paging::map_device_window(root, &mut frames, physical, 2).unwrap() };
+    assert_eq!(va, 0xffff_9000_0000_0000 + physical);
+    assert_eq!(unsafe { (root as *const u64).add(1).read() }, 0);
+    let count = frames.used();
+    assert_eq!(unsafe { paging::map_device_window(root, &mut frames, physical, 2) }, Some(va));
+    assert_eq!(frames.used(), count);
+    let user = unsafe { UserSpace::new(&mut frames, root).unwrap() };
+    let leaf = |mut table: usize, va: usize| unsafe {
+        for shift in [39, 30, 21] {
+            let entry = (table as *const u64).add((va >> shift) & 511).read();
+            assert_eq!(entry & 7, 3);
+            table = (entry & addressMask) as usize;
+        }
+        (table as *mut u64).add((va >> 12) & 511)
+    };
+    for i in 0..2 {
+        let address = va + i * 4096;
+        let entry = unsafe { leaf(root, address).read() };
+        assert_eq!(entry, (physical + i * 4096) as u64 | flags);
+        assert_eq!(unsafe { leaf(user.root, address).read() }, entry);
+    }
+    // The same numeric address remains usable as an ordinary private user VA.
+    let frame = unsafe { user.map(&mut frames, physical, true, false).unwrap() };
+    assert_ne!(frame, physical);
+    assert!(user.read(&mut frames, va, &mut [0u8; 1]).is_err());
+    unsafe { user.release(&mut frames); }
+    assert_eq!(frames.used(), count);
+    // Existing A/D bits don't create a false conflict. A cached or user leaf
+    // is a real conflict and may never be silently widened/retyped.
+    unsafe {
+        *leaf(root, va) |= (1 << 5) | (1 << 6);
+        assert_eq!(paging::map_device_window(root, &mut frames, physical, 2), Some(va));
+        *leaf(root, va + 4096) &= !(1 << 4);
+        assert!(paging::map_device_window(root, &mut frames, physical, 2).is_none());
+    }
+    assert_eq!(frames.used(), count);
+}
+
+#[test]
+fn deviceWindowRollsBackAllocationAndRejectsInvalidRanges() {
+    // Cross a PT boundary so the second page requires another table.
+    let physical = USER_BASE + 0x1ff000;
+    for budget in 0..4 {
+        let mut frames = frames::Frames::new(16);
+        let root = frames.alloc_zeroed().unwrap().into_address();
+        frames.allow(budget);
+        assert!(unsafe { paging::map_device_window(root, &mut frames, physical, 2) }.is_none());
+        assert_eq!(frames.used(), 1);
+        assert!(unsafe { core::slice::from_raw_parts(root as *const u64, 512) }
+                .iter().all(|&value| value == 0));
+    }
+    let mut frames = frames::Frames::new(16);
+    let root = frames.alloc_zeroed().unwrap().into_address();
+    for (pa, pages) in [(0, 1), (physical + 1, 1), (physical, 0), (physical, 17),
+                        (USER_BASE - 4096, 2), (1usize << 44, 1), (usize::MAX - 4095, 2)] {
+        assert!(unsafe { paging::map_device_window(root, &mut frames, pa, pages) }.is_none());
+        assert_eq!(frames.used(), 1);
+    }
+    // An existing identity-mapped high physical page must not receive an
+    // uncached alias: even a cached mapping with a different VA is unsafe.
+    let pdpt = frames.alloc_zeroed().unwrap().into_address();
+    let pd = frames.alloc_zeroed().unwrap().into_address();
+    let pt = frames.alloc_zeroed().unwrap().into_address();
+    unsafe {
+        (root as *mut u64).add(1).write(pdpt as u64 | 3);
+        (pdpt as *mut u64).write(pd as u64 | 3);
+        (pd as *mut u64).write(pt as u64 | 3);
+        (pt as *mut u64).write(USER_BASE as u64 | 3);
+        assert!(paging::map_device_window(root, &mut frames, USER_BASE, 1).is_none());
+    }
+    assert_eq!(frames.used(), 4);
+    assert_eq!(unsafe { (root as *const u64).add(288).read() }, 0);
+}
+
+#[test]
+fn lowDeviceWindowKeepsExistingIdentityConvention() {
+    let mut frames = frames::Frames::new(16);
+    let root = frames.alloc_zeroed().unwrap().into_address();
+    assert_eq!(unsafe { paging::map_device_window(root, &mut frames, 0xf0000000, 2) },
+               Some(0xf0000000));
+    let count = frames.used();
+    assert_eq!(unsafe { paging::map_device_window(root, &mut frames, 0xf0000000, 2) },
+               Some(0xf0000000));
+    assert_eq!(frames.used(), count);
+    assert_eq!(unsafe { (root as *const u64).add(1).read() }, 0);
+}
