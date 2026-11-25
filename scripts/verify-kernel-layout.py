@@ -139,7 +139,7 @@ def verify_kernel(path):
         if stype == 8:  # .bss / NOBITS; loader zeroes memsz-filesz.
             require(flags & SHF_WRITE, "Nonwritable NOBITS section")
         else:
-            require(fileoff == off + (addr-begin) and
+            require(fileoff == off + (addr-vaddr) and
                     fileoff + size <= off + filesz,
                     "Allocated ELF section not included in loader file bytes")
         if flags & SHF_WRITE:
