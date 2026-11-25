@@ -77,6 +77,11 @@ printf 'Testing SMP/IRQ safe runtime logger with %s\n' "$pRustc"
 "$pRustc" --edition 2021 --test "$pRoot/scripts/tests/logger-host.rs" -o "$pOut/logger-tests"
 "$pOut/logger-tests"
 
+printf 'Testing UEFI memory map capture and ExitBootServices retry with %s\n' "$pCc"
+"$pCc" -std=c11 -O2 -Wall -Wextra -Werror \
+    "$pRoot/scripts/tests/boot-map-host.c" -o "$pOut/boot-map-tests"
+"$pOut/boot-map-tests"
+
 printf 'Testing UEFI GOP mode selection with %s\n' "$pCc"
 "$pCc" -std=c11 -O2 -Wall -Wextra -Werror \
     "$pRoot/scripts/tests/gop-select-host.c" -o "$pOut/gop-select-tests"
