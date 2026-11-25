@@ -16,6 +16,7 @@ mod acpi {
     pub struct Platform {
         pub lapic: usize, pub hpet: usize, pub io_apics: [Io; 1], pub io_count: usize,
     }
+    impl Platform { pub fn pm_timer_mmio(&self) -> Option<usize> { None } }
 }
 mod frames {
     use super::*;

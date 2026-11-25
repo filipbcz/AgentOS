@@ -1,6 +1,7 @@
 #![allow(non_snake_case, non_upper_case_globals)]
 use crate::{acpi::Platform, exceptions::{hex, Descriptors}, frames::{Exhaustion, Frames, SharedFrames},
             halt, out, process::Programs, scheduler::{Context, Queue}, serial, stress::{self, Load}};
+use crate::reference_clock::{ReferenceClock, WaitError};
 use core::{arch::{asm, x86_64::__cpuid}, cell::UnsafeCell, hint::spin_loop, ptr,
            sync::atomic::{fence, AtomicBool, AtomicU32, AtomicUsize, Ordering}};
 
@@ -19,7 +20,6 @@ type Error = &'static [u8];
 const PAGE: usize = 4096;
 const TIMER: u32 = 0xe0;
 const MASK: u32 = 1 << 16;
-const PM_HZ: u32 = 3_579_545;
 const WAKEUPS: u32 = 3;
 const OOM_PHASE: u32 = 1;
 const PROCESS_PHASE: u32 = 2;
@@ -33,7 +33,6 @@ const EMPTY_CPU: AtomicUsize = AtomicUsize::new(0);
 static gCpus: [AtomicUsize; 255] = [EMPTY_CPU; 255];
 static gOnlineCount: AtomicUsize = AtomicUsize::new(0);
 static gRuntimeEnabled: AtomicBool = AtomicBool::new(false);
-static gPmPort: AtomicUsize = AtomicUsize::new(0);
 static gTerminal: AtomicUsize = AtomicUsize::new(0);
 static gMigrations: AtomicUsize = AtomicUsize::new(0);
 static gRemoteWakeups: AtomicUsize = AtomicUsize::new(0);
@@ -161,23 +160,6 @@ unsafe fn timestamp() -> u64 {
 #[derive(Default)]
 struct IdleSample { wakes: u64, timers: u32, elapsed: u64, active: u64 }
 
-struct PmClock(u16);
-impl PmClock {
-    unsafe fn now(&self) -> u32 {
-        let value: u32;
-        asm!("in eax, dx", in("dx") self.0, out("eax") value, options(nomem, nostack));
-        value
-    }
-    unsafe fn elapsed(&self, start: u32) -> u32 {
-        // Intervals here are shorter than one wrap of the 24-bit ACPI timer.
-        self.now().wrapping_sub(start) & 0xff_ffff
-    }
-    unsafe fn delay(&self, ticks: u32) {
-        let start = self.now();
-        while self.elapsed(start) < ticks { spin_loop(); }
-    }
-}
-
 #[derive(Clone, Copy)]
 struct Lapic(usize);
 impl Lapic {
@@ -202,7 +184,7 @@ impl Lapic {
         Ok(())
     }
 
-    unsafe fn calibrate(self, clock: &PmClock) -> Result<(u32, u64), Error> {
+    unsafe fn calibrate(self, clock: &ReferenceClock) -> Result<(u32, u64), Error> {
         // VirtualBox Minimal advertises TSC and undivided APIC kHz. Use the
         // guest clocks' nominal rates rather than assuming a short PM-timer
         // calibration remains representative during virtual-clock catch-up.
@@ -212,29 +194,35 @@ impl Lapic {
             if rates.eax != 0 && quantum != 0 { return Ok((quantum, rates.eax as u64 * 1000)); }
         }
         self.write(0x380, u32::MAX);
-        let start = clock.now();
+        let start = clock.sample();
         let tsc_start = timestamp();
-        clock.delay(PM_HZ / 10);
-        let tsc_delta = timestamp() - tsc_start;
-        let elapsed = clock.elapsed(start);
+        let delayed = clock.delay_ns(100_000_000);
+        let tsc_delta = timestamp().checked_sub(tsc_start);
+        let elapsed = clock.elapsed_ns(start, clock.sample());
         let counted = u32::MAX - self.read(0x390);
+        // Never leave the calibration timer armed on a failed reference.
         self.write(0x380, 0);
-        if elapsed == 0 || counted == 0 || counted == u32::MAX { return Err(b"timer calibration"); }
-        let per_10ms = (counted as u64 * PM_HZ as u64 / (100 * elapsed as u64)) as u32;
-        let tsc_hz = tsc_delta * PM_HZ as u64 / elapsed as u64;
+        delayed.map_err(|_| b"timer calibration reference stopped" as Error)?;
+        let elapsed = elapsed.filter(|&ns| ns >= 100_000_000)
+            .ok_or(b"timer calibration interval" as Error)?;
+        let tsc_delta = tsc_delta.ok_or(b"TSC regression" as Error)?;
+        if counted == 0 || counted == u32::MAX { return Err(b"timer calibration"); }
+        let per_10ms = u32::try_from(counted as u128 * 10_000_000 / elapsed as u128)
+            .map_err(|_| b"LAPIC calibration overflow" as Error)?;
+        let tsc_hz = u64::try_from(tsc_delta as u128 * 1_000_000_000 / elapsed as u128)
+            .map_err(|_| b"TSC calibration overflow" as Error)?;
         if per_10ms == 0 || tsc_hz == 0 { return Err(b"zero timer interval"); }
         Ok((per_10ms, tsc_hz))
     }
 
-    unsafe fn send(self, id: u8, command: u32, clock: &PmClock) -> Result<(), Error> {
+    unsafe fn send(self, id: u8, command: u32, clock: &ReferenceClock) -> Result<(), Error> {
         self.write(0x310, (id as u32) << 24);
         self.write(0x300, command);
-        let start = clock.now();
-        while self.read(0x300) & (1 << 12) != 0 {
-            if clock.elapsed(start) > PM_HZ { return Err(b"IPI delivery timeout"); }
-            spin_loop();
-        }
-        Ok(())
+        clock.wait_until(1_000_000_000, || self.read(0x300) & (1 << 12) == 0)
+            .map_err(|error| match error {
+                WaitError::Timeout => b"IPI delivery timeout" as Error,
+                WaitError::Unresponsive => b"IPI reference clock stopped" as Error,
+            })
     }
 }
 
@@ -249,6 +237,7 @@ struct Cpu {
     expected_id: u8,
     interval: u32,
     tsc_hz: u64,
+    reference: ReferenceClock,
     clock: crate::monotonic::Clock,
     timer_policy: UnsafeCell<crate::timer::Timer>,
     runtime_timer_irqs: AtomicUsize,
@@ -288,19 +277,19 @@ impl Cpu {
     }
     unsafe fn requestReschedule(&self, aTarget: &Cpu) {
         if aTarget.fWakePending.swap(true, Ordering::AcqRel) { return; }
-        let pClock = PmClock(gPmPort.load(Ordering::Relaxed) as u16);
-        if self.apic.send(aTarget.expected_id, RESCHEDULE, &pClock).is_err() {
+        if self.apic.send(aTarget.expected_id, RESCHEDULE, &self.reference).is_err() {
             serial(b"SMP FAILED: reschedule IPI delivery\r\n"); halt();
         }
         if aTarget.expected_id != self.expected_id { gRemoteWakeups.fetch_add(1, Ordering::Relaxed); }
     }
     unsafe fn create(frames: &mut Frames<'_>, apic: Lapic, id: u8, interval: u32, tsc_hz: u64,
+                     reference: ReferenceClock,
                      descriptors: Option<Descriptors>, load: &'static Load, programs: &'static Programs,
                      rsp0: usize) -> Result<&'static Self, Error> {
         let addr = frames.alloc().ok_or(b"CPU allocation" as Error)?.into_address();
         let cpu = addr as *mut Self;
         cpu.write(Self { self_address: addr, syscall_user_rsp: UnsafeCell::new(0), syscall_stack: UnsafeCell::new(0),
-                         rsp0, programs, apic, expected_id: id, interval, tsc_hz,
+                         rsp0, programs, apic, expected_id: id, interval, tsc_hz, reference,
                          clock: crate::monotonic::Clock::new(tsc_hz),
                          timer_policy: UnsafeCell::new(crate::timer::Timer::new(interval)),
                          runtime_timer_irqs: AtomicUsize::new(0), fTimerSequence: AtomicUsize::new(0),
@@ -1054,7 +1043,7 @@ pub unsafe fn copy_startup(base: usize) {
     }
 }
 
-unsafe fn start_ap(cpu: &Cpu, root: usize, base: usize, stack: usize, clock: &PmClock) -> Result<(), Error> {
+unsafe fn start_ap(cpu: &Cpu, root: usize, base: usize, stack: usize, clock: &ReferenceClock) -> Result<(), Error> {
     let mailbox = base + PAGE;
     let dest = |label: *const u8| (base + (label as usize - ptr::addr_of!(ap_start) as usize)) as u32;
     (mailbox as *mut u32).write(u32::try_from(root).map_err(|_| b"AP bootstrap CR3 above 4 GiB" as Error)?);
@@ -1069,16 +1058,16 @@ unsafe fn start_ap(cpu: &Cpu, root: usize, base: usize, stack: usize, clock: &Pm
     ((mailbox+48) as *mut usize).write(ap_main as *const () as usize);
     fence(Ordering::SeqCst);
     cpu.apic.send(cpu.expected_id, 0xc500, clock)?; // level-triggered INIT, assert
-    clock.delay(PM_HZ / 100 + 1);
+    clock.delay_ns(10_000_000).map_err(|_| b"AP INIT delay reference stopped" as Error)?;
     let sipi = 0x4600 | (base >> 12) as u32;
     cpu.apic.send(cpu.expected_id, sipi, clock)?;
-    clock.delay(PM_HZ / 5000 + 1);
+    clock.delay_ns(200_000).map_err(|_| b"AP SIPI delay reference stopped" as Error)?;
     cpu.apic.send(cpu.expected_id, sipi, clock)?;
-    let start = clock.now();
-    while cpu.complete.load(Ordering::Acquire) == 0 {
-        if clock.elapsed(start) > 2 * PM_HZ { return Err(b"AP task timeout"); }
-        spin_loop();
-    }
+    clock.wait_until(2_000_000_000, || cpu.complete.load(Ordering::Acquire) != 0)
+        .map_err(|error| match error {
+            WaitError::Timeout => b"AP task timeout" as Error,
+            WaitError::Unresponsive => b"AP task reference clock stopped" as Error,
+        })?;
     if cpu.complete.load(Ordering::Acquire) != 1 { return Err(b"AP task failed"); }
     Ok(())
 }
@@ -1094,8 +1083,9 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
     if platform.legacy_pic { out(0x21, 0xff); out(0xa1, 0xff); }
     let apic = Lapic(platform.lapic);
     apic.enable()?;
-    let clock = PmClock(platform.timer_port);
-    gPmPort.store(platform.timer_port as usize, Ordering::Relaxed);
+    let clock = ReferenceClock::select(platform.pm_timer, crate::hpet::reference())
+        .ok_or(b"no progressing hardware reference clock" as Error)?;
+    log.event(1, clock.name());
     let (interval, tsc_hz) = apic.calibrate(&clock)?;
     log.event(2, b"APIC TIMER READY");
     let bsp = apic.id();
@@ -1107,7 +1097,7 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
     let programs = &*programs;
     storage.write(Load::new(SharedFrames::new(frames), ids.len()));
     let load = &*storage;
-    let boot_cpu = load.frames.with(|f| Cpu::create(f, apic, bsp, interval, tsc_hz, None, load, programs, bsp_rsp0))?;
+    let boot_cpu = load.frames.with(|f| Cpu::create(f, apic, bsp, interval, tsc_hz, clock, None, load, programs, bsp_rsp0))?;
     gCpus[bsp as usize].store(boot_cpu.self_address, Ordering::Release);
     boot_cpu.run_task()?;
     let mut cpus = [None; 255];
@@ -1117,7 +1107,7 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
         let cpu = load.frames.with(|f| {
             let descriptors = Descriptors::new(f).ok_or(b"AP descriptors" as Error)?;
             let rsp0 = descriptors.rsp0_slot();
-            Cpu::create(f, apic, id, interval, tsc_hz, Some(descriptors), load, programs, rsp0)
+            Cpu::create(f, apic, id, interval, tsc_hz, clock, Some(descriptors), load, programs, rsp0)
         })?;
         let stack = load.frames.with(crate::stack::KernelStack::allocate)
             .ok_or(b"AP stack" as Error)?.into_top();
@@ -1192,13 +1182,13 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
     for pCpu in cpus.iter().flatten().filter(|pCpu| pCpu.expected_id != bsp) {
         pCpu.phase.store(RUNTIME_PHASE, Ordering::Release);
     }
-    let pStart = clock.now();
-    for pCpu in cpus.iter().flatten().filter(|pCpu| pCpu.expected_id != bsp) {
-        while !pCpu.fRuntimeReady.load(Ordering::Acquire) {
-            if clock.elapsed(pStart) > 2 * PM_HZ { return Err(b"runtime CPU startup timeout"); }
-            spin_loop();
-        }
-    }
+    clock.wait_until(2_000_000_000, || cpus.iter().flatten()
+        .filter(|cpu| cpu.expected_id != bsp)
+        .all(|cpu| cpu.fRuntimeReady.load(Ordering::Acquire)))
+        .map_err(|error| match error {
+            WaitError::Timeout => b"runtime CPU startup timeout" as Error,
+            WaitError::Unresponsive => b"runtime CPU startup reference clock stopped" as Error,
+        })?;
 
     Ok(())
 }

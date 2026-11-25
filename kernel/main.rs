@@ -26,6 +26,7 @@ mod stress;
 mod process;
 mod lifecycle;
 mod hpet;
+mod reference_clock;
 mod native_abi;
 mod files;
 mod ipc;

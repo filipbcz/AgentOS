@@ -97,6 +97,13 @@ pub unsafe fn init(aAddress: usize) -> Result<(), Error> { gHpet.initialize(aAdd
 /// A stalled counter stays stalled; the LAPIC policy detects clock failure.
 pub fn millis() -> Option<u64> { gHpet.millis() }
 
+/// A read-only short-interval reference sharing the initialized HPET
+/// counter. No second reset or ownership transfer is permitted.
+pub fn reference() -> Option<(usize, u64)> {
+    if gHpet.fState.load(Ordering::Acquire) != 2 { return None; }
+    Some((gHpet.fBase.load(Ordering::Relaxed), gHpet.fPeriodFs.load(Ordering::Relaxed)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
