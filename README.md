@@ -127,6 +127,10 @@ python3 scripts/qemu-virtio-net.py --cpus 2 --ovmf-code /usr/share/OVMF/OVMF_COD
 
 Matice používá privátní socketpair a skutečný QEMU VirtIO-net NIC (bez připojení k hostitelské síti). Každý hostitelský rámec má náhodný payload, skutečný RX/TX se porovnává bajt po bajtu se samostatnou PCAP zachycenou filtrem QEMU, PCI BARy s QMP a used indexy s výstupem jádra. Po resetu NIC musí naběhnout běžný shell a projít procesové regrese. VirtualBox profil zatím není připraven.
 
+### xHCI (etapa 4, první přírůstek)
+
+`bash scripts/build.sh --xhci` sestaví samostatný profil pro inicializaci řadiče, DMA command/event ring a port/slot lifecycle. Tento profil očekává řízené připojení a odpojení jednoho USB2 zařízení; nepoužívat na fyzickém HP. Nejde dosud o adresování zařízení, enumeraci, USB HID ani Mass Storage. Běžný build xHCI neaktivuje.
+
 ## Jádro, paměť a plánování
 
 Loader předá konečnou mapu paměti, framebuffer a initramfs a korektně opustí UEFI Boot Services. Rustové `no_std` jádro vytvoří vlastní čtyřúrovňové stránkování, alokátor fyzických rámců a GDT/IDT/TSS. Kód je RX, konstanty RO/NX, data RW/NX; nulová stránka a loaderový stack guard nejsou mapované.

@@ -198,7 +198,7 @@ $buildProfile=(Get-Content -Raw (Join-Path $root 'build/build-provenance.json') 
 if ([bool]$AhciDma -ne ($buildProfile -eq 'ahci-dma')) { throw 'Use build.sh --ahci-dma with -AhciDma, or build.sh for normal boots' }
 if ([bool]$AhciBlock -ne ($buildProfile -eq 'ahci-block')) { throw 'Use build.sh --ahci-block with -AhciBlock' }
 if ([bool]$NvmeBlock -ne ($buildProfile -eq 'nvme-block')) { throw 'Use build.sh --nvme-block with -NvmeBlock' }
-if ($buildProfile -eq 'virtio-net') { throw 'VirtIO-net isolated QEMU profile has no VirtualBox acceptance yet; rebuild the default image' }
+if ($buildProfile -in @('virtio-net','xhci')) { throw 'Isolated QEMU device profile has no VirtualBox acceptance yet; rebuild the default image' }
 if ($NvmeBlock) {
     $packs=(& $vbox list extpacks | Out-String)
     if ($LASTEXITCODE -ne 0 -or $packs -notmatch '(?im)^\s*Pack no\.\s*\d+:\s*Oracle (?:VM )?VirtualBox Extension Pack\s*$' -or

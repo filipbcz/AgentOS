@@ -16,6 +16,8 @@ mod block;
 mod nvme;
 #[cfg(virtio_net_acceptance)]
 mod virtio_net;
+#[cfg(xhci_acceptance)]
+mod xhci;
 #[cfg(any(ahci_block_acceptance, nvme_block_acceptance))]
 mod block_acceptance;
 mod smp;
@@ -191,6 +193,14 @@ pub unsafe extern "sysv64" fn kernel_main(info: &BootInfo) -> ! {
             let mut net = virtio_net::VirtioNet::open(devices.virtio_net.ok_or(b"VirtIO modern ECAM missing" as &[u8])?, root, &mut frames)?;
             let result = virtio_net::exercise(&mut net);
             net.close(&mut frames)?;
+            result?;
+        }
+        #[cfg(xhci_acceptance)]
+        {
+            if devices.xhci_count != 1 { return Err(b"xHCI profile requires exactly one controller" as &[u8]); }
+            let mut hc = xhci::Xhci::open(devices.xhci.ok_or(b"xHCI ECAM/BAR missing" as &[u8])?, root, &mut frames)?;
+            let result = hc.exercise();
+            hc.close(&mut frames)?;
             result?;
         }
         Ok(())

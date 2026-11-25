@@ -147,6 +147,10 @@ printf 'Testing VirtIO PCI capabilities, feature subset and split ring ownership
 "$pRustc" --edition 2021 --test "$pRoot/kernel/virtio_net/protocol.rs" -o "$pOut/virtio-net-tests"
 "$pOut/virtio-net-tests"
 
+printf 'Testing xHCI capabilities, PORTSC and command/event TRB ownership\n'
+"$pRustc" --edition 2021 --test "$pRoot/kernel/xhci/protocol.rs" -o "$pOut/xhci-tests"
+"$pOut/xhci-tests"
+
 printf 'Compiling and linking the kernel with %s and %s\n' "$pRustc" "$pCc"
 "$pRustc" --version
 "$pCc" --version
@@ -176,6 +180,15 @@ printf 'Compiling and linking the kernel with %s and %s\n' "$pRustc" "$pCc"
     -o "$pOut/kernel-virtio-net.elf" "$pOut/libkernel-virtio-net.a" "$pOut/ap-start.o"
 "$pPython" "$pRoot/scripts/verify-kernel-layout.py" "$pOut/kernel-virtio-net.elf"
 "$pPython" "$pRoot/scripts/verify-trap-return.py" "$pOut/kernel-virtio-net.elf"
+
+# Compile and link the isolated xHCI guest profile.
+"$pRustc" --edition 2021 --crate-type staticlib -C lto=fat -C opt-level=2 -C panic=abort \
+    -C relocation-model=static -C no-redzone=yes -C overflow-checks=no \
+    --cfg xhci_acceptance --remap-path-prefix="$pRoot"=/agentos "$pRoot/kernel/main.rs" -o "$pOut/libkernel-xhci.a"
+"$pLd" --no-undefined --build-id=none --gc-sections -T "$pRoot/kernel/kernel.ld" \
+    -o "$pOut/kernel-xhci.elf" "$pOut/libkernel-xhci.a" "$pOut/ap-start.o"
+"$pPython" "$pRoot/scripts/verify-kernel-layout.py" "$pOut/kernel-xhci.elf"
+"$pPython" "$pRoot/scripts/verify-trap-return.py" "$pOut/kernel-xhci.elf"
 
 for pApp in init fault receiver service shell svc_ok svc_fail svc_hang orphan_parent manager svc_alive svc_flaky; do
     printf 'Compiling and linking user program %s\n' "$pApp"

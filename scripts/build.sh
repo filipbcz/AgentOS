@@ -16,8 +16,11 @@ elif [[ $# -eq 1 && $1 == --nvme-block ]]; then
 elif [[ $# -eq 1 && $1 == --virtio-net ]]; then
     profile=virtio-net
     rust_flags=(--cfg virtio_net_acceptance)
+elif [[ $# -eq 1 && $1 == --xhci ]]; then
+    profile=xhci
+    rust_flags=(--cfg xhci_acceptance)
 elif [[ $# -ne 0 ]]; then
-    echo 'Usage: build.sh [--ahci-dma|--ahci-block|--nvme-block|--virtio-net]' >&2
+    echo 'Usage: build.sh [--ahci-dma|--ahci-block|--nvme-block|--virtio-net|--xhci]' >&2
     exit 2
 fi
 while IFS='=' read -r package expected || [[ -n "$package" ]]; do

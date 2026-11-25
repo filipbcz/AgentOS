@@ -48,6 +48,10 @@ pub struct Devices {
     pub virtio_net: Option<crate::virtio_net::Controller>,
     #[cfg(virtio_net_acceptance)]
     pub virtio_net_count: usize,
+    #[cfg(xhci_acceptance)]
+    pub xhci: Option<crate::xhci::Controller>,
+    #[cfg(xhci_acceptance)]
+    pub xhci_count: usize,
 }
 
 // Decode only assigned resources. Sizing by writing all ones would disrupt
@@ -162,6 +166,23 @@ unsafe fn scan(config: Config, segment: u16, first: u8, last: u8,
                         devices.virtio_net = Some(crate::virtio_net::Controller {
                             cfg: w.base + (usize::from(bdf) << 12), msi, msix,
                         });
+                    }
+                }
+                #[cfg(xhci_acceptance)]
+                if class_rev >> 8 == 0x0c0330 && layout == 0 {
+                    devices.xhci_count += 1;
+                    if let Config::Ecam(w) = &config {
+                        let bdf = (u16::from(bus) << 8) | u16::from(device * 8 + function);
+                        let low = read(0x10);
+                        let wide = low & 7 == 4;
+                        if wide || low & 7 == 0 {
+                            let base = u64::from(low & !15) | if wide {u64::from(read(0x14)) << 32} else {0};
+                            if base != 0 {
+                                devices.xhci = Some(crate::xhci::Controller {
+                                    cfg: w.base + (usize::from(bdf) << 12), bar: base as usize, wide, msi, msix,
+                                });
+                            }
+                        }
                     }
                 }
                 let _ = write!(Console, "AGENTOS PCI DEV {:04x}:{:02x}:{:02x}.{} ID={:04x}:{:04x} CLASS={:06x} REV={:02x} MSI={:02x} MSIX={:02x} PCIE={:02x}\r\n",
