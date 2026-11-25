@@ -3,6 +3,7 @@
 #include <elf.h>
 #include "gop-select.h"
 #include "boot-map.h"
+#include "kernel-elf.h"
 
 extern UINT8 elf_start[], elf_end[], archive_start[], archive_end[];
 typedef struct {
@@ -21,29 +22,24 @@ static BOOLEAN flag(CHAR16 *name, UINT8 expected) {
            n == 1 && value == expected;
 }
 
-// Stage 1 link script produces exactly one aligned, executable load segment.
+// Load the signed, self-contained static PIE into any suitable available
+// identity-mapped memory below the user PML4 slot. No preferred physical
+// address, external dynamic linker or writable executable segment in ELF.
 static EFI_STATUS load_kernel(UINT64 *entry, EFI_PHYSICAL_ADDRESS *base, UINTN *pages) {
-    UINTN n = elf_end - elf_start;
-    Elf64_Ehdr *e = (void *)elf_start;
-    if (n < sizeof(*e) || CompareMem(e->e_ident, ELFMAG, SELFMAG) ||
-        e->e_ident[EI_CLASS] != ELFCLASS64 || e->e_ident[EI_DATA] != ELFDATA2LSB ||
-        e->e_machine != EM_X86_64 || e->e_type != ET_EXEC || e->e_phnum != 1 ||
-        e->e_phentsize != sizeof(Elf64_Phdr) || e->e_phoff > n - sizeof(Elf64_Phdr))
+    size_t length = elf_end - elf_start;
+    KernelElf elf;
+    if (!kernel_elf_parse(elf_start, length, &elf)) return EFI_LOAD_ERROR;
+    UINTN count = elf.size / KERNEL_PAGE;
+    EFI_PHYSICAL_ADDRESS address = KERNEL_LIMIT - 1;
+    EFI_STATUS status = BS->AllocatePages(AllocateMaxAddress, EfiLoaderCode, count, &address);
+    if (EFI_ERROR(status)) return status;
+    uint64_t relocated_entry;
+    if (!kernel_elf_load(elf_start, length, (void *)(UINTN)address, address,
+                         elf.size, &relocated_entry)) {
+        BS->FreePages(address, count);
         return EFI_LOAD_ERROR;
-    Elf64_Phdr *p = (void *)(elf_start + e->e_phoff);
-    if (p->p_type != PT_LOAD || p->p_flags != (PF_R|PF_X) ||
-        p->p_paddr != 0x02000000 || p->p_paddr != p->p_vaddr ||
-        p->p_offset > n || p->p_filesz > n-p->p_offset ||
-        p->p_filesz > p->p_memsz || p->p_memsz > 16*1024*1024 ||
-        e->e_entry < p->p_vaddr || e->e_entry-p->p_vaddr >= p->p_filesz)
-        return EFI_LOAD_ERROR;
-    EFI_PHYSICAL_ADDRESS address = p->p_paddr;
-    UINTN count = EFI_SIZE_TO_PAGES(p->p_memsz);
-    EFI_STATUS s = BS->AllocatePages(AllocateAddress, EfiLoaderCode, count, &address);
-    if (EFI_ERROR(s)) return s;
-    SetMem((void *)address, p->p_memsz, 0);
-    CopyMem((void *)address, elf_start+p->p_offset, p->p_filesz);
-    *entry = e->e_entry;
+    }
+    *entry = relocated_entry;
     *base = address;
     *pages = count;
     return EFI_SUCCESS;
