@@ -2,7 +2,7 @@
 
 Vlastní operační systém pro x86-64 podle [technického zadání](ZADANI.md). Aktuální stav, přesné ověřené revize a otevřená přejímka jsou v [plánu implementace](PLAN_IMPLEMENTACE.md). Starší výsledky se nevztahují automaticky na nový obraz.
 
-Etapa 3 obsahuje izolované procesy, nativní ELF ABI, COW, VFS nad initramfs, roury, autentizované lokální IPC, původní PID 1 se správou služeb a interaktivní TTY přes COM1 i PS/2/GOP. Milník 3.1 přidává demand paging procesů a řízenou migraci mezi CPU. Vývoj probíhá ve větvi `dev/stage3-ipc-validation`. Povinné převzetí této verze ve VirtualBoxu zůstává otevřené; QEMU poskytuje samostatný integrační důkaz konkrétní ověřené revize.
+Etapa 3 obsahuje izolované procesy, nativní ELF ABI, COW, VFS nad initramfs, roury, autentizované lokální IPC, původní PID 1 se správou služeb a interaktivní TTY přes COM1 i PS/2/GOP. Milník 3.1 přidává demand paging procesů a řízenou migraci mezi CPU. Vývojová větev `dev/stage3-ipc-validation` byla 23. 11. 2026 sloučena do `main` (PR #1); samotné sloučení nenahrazuje úplnou přejímku všech profilů dle plánu. Etapa 4 nyní navazuje na ověřené AHCI a rozpracovává NVMe ve větvi `dev/stage4-nvme` (PR #2).
 
 ## Sestavení
 
@@ -46,10 +46,10 @@ Při prvním sestavení vznikne místní testovací podpisový klíč v `~/.loca
 
 ## Dokončení přejímky etapy 3 ve VirtualBoxu
 
-Po aktualizaci vývojové větve stačí spustit připravenou matici:
+Pro přejímku aktuálního stabilního základu použijte výchozí build na `main` (historická větev je zachována pro reprodukci starších důkazů):
 
 ```powershell
-git switch dev/stage3-ipc-validation
+git switch main
 git pull --ff-only
 .\scripts\accept-stage3.ps1
 ```
