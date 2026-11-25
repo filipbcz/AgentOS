@@ -112,7 +112,7 @@ python3 scripts/qemu-nvme.py --cpus 1 --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.s
 python3 scripts/qemu-nvme.py --cpus 2 --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd
 ```
 
-NVMe i další časné ovladače mohou použít supervisor-only `paging::map_device_window` pro 64bitové BARy nad 512 GiB bez kolize se soukromým uživatelským adresním prostorem. Samostatná CI matice QEMU používá skutečný emulovaný NVMe řadič, QMP PCI identitu a počitadla jeho blokového backendu. Po dvou nezávislých procesech QEMU ověří všechny bajty nového RAW disku a kernelové záznamy dokončení, při druhém bootu navíc běžné jádro a procesové zkoušky. Úspěch QEMU nenahrazuje VirtualBox ani fyzickou přejímku.
+NVMe i další časné ovladače mohou použít supervisor-only `paging::map_device_window` pro 64bitové BARy nad 512 GiB bez kolize se soukromým uživatelským adresním prostorem. Samostatná CI matice QEMU používá skutečný emulovaný NVMe řadič, QMP PCI identitu, počitadla čtení/zápisu jeho blokového backendu a skutečný emulátorový trace NVMe Flush a CQ completion (QEMU 8.2.2 NVMe flush neúčtuje do QMP flush_operations). Po dvou nezávislých procesech QEMU ověří všechny bajty nového RAW disku a kernelové záznamy dokončení, při druhém bootu navíc běžné jádro a procesové zkoušky. Úspěch QEMU nenahrazuje VirtualBox ani fyzickou přejímku.
 
 ## Jádro, paměť a plánování
 

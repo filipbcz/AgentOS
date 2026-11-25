@@ -42,21 +42,72 @@ def backend_stats(records):
 
 
 def verify_stats(before, after, phase):
+    # QEMU 8.2.2 hw/nvme/ctrl.c:nvme_flush_ns_cb calls blk_aio_flush
+    # without block_acct_start(BLOCK_ACCT_FLUSH). Its QMP flush counter is
+    # therefore insufficient. verify_trace independently requires the actual
+    # namespace flush and successful completion in the emulator itself.
     start, stop = backend_stats(before), backend_stats(after)
     delta = {key: stop[key] - start[key] for key in start}
     require(all(value >= 0 for value in delta.values()), "QMP block counters regressed")
     require(delta["rd_bytes"] == BYTES and delta["rd_operations"] == 2,
             "QEMU backend did not complete the two expected reads")
     if phase == "write":
-        require(delta["wr_bytes"] == BYTES and delta["wr_operations"] == 2 and
-                delta["flush_operations"] >= 1,
-                "QEMU backend did not complete the two writes and flush")
+        require(delta["wr_bytes"] == BYTES and delta["wr_operations"] == 2,
+                f"QEMU backend did not complete the two writes: {delta}")
     else:
         require(phase == "read" and delta["wr_bytes"] == delta["wr_operations"] == 0 and
                 delta["flush_operations"] == 0, "Read boot issued unexpected writes or flush")
     require(start["wr_bytes"] == start["wr_operations"] == 0,
             "Unexpected backend write before explicit phase command")
     return delta
+
+
+TRACE_EVENTS = (
+    "pci_nvme_io_cmd",
+    "pci_nvme_flush_ns",
+    "pci_nvme_enqueue_req_completion",
+)
+TRACE_PREFIX = r"^(?:\d+@\d+\.\d+:)?"
+TRACE_IO = re.compile(TRACE_PREFIX +
+    r"pci_nvme_io_cmd cid (\d+) nsid 0x([0-9a-f]+) sqid (\d+) opc 0x([0-9a-f]+) opname '[^']*'$")
+TRACE_FLUSH = re.compile(TRACE_PREFIX + r"pci_nvme_flush_ns nsid 0x([0-9a-f]+)$")
+TRACE_CQ = re.compile(TRACE_PREFIX +
+    r"pci_nvme_enqueue_req_completion cid (\d+) cqid (\d+) dw0 0x[0-9a-f]+ dw1 0x[0-9a-f]+ status 0x([0-9a-f]+)$")
+
+
+def verify_trace(text, phase):
+    """Match actual controller-side commands and CQ success before power-off.
+
+    QEMU's admin queues (qid 0), including firmware traffic, are not I/O
+    evidence. Reject missing/malformed records, unrelated namespace/queue
+    traffic, premature completions, failed statuses and read-phase writes.
+    Never synthesize a trace from the guest transcript or QMP counters.
+    """
+    events = []
+    for line in text.splitlines():
+        if m := TRACE_IO.fullmatch(line):
+            cid, nsid, sqid, opcode = m.groups()
+            events.append(("io", int(cid), int(nsid, 16), int(sqid), int(opcode, 16)))
+        elif m := TRACE_FLUSH.fullmatch(line):
+            events.append(("flush", int(m[1], 16)))
+        elif m := TRACE_CQ.fullmatch(line):
+            cid, cqid, status = m.groups()
+            if int(cqid) != 0:
+                events.append(("cq", int(cid), int(cqid), int(status, 16)))
+        elif any(name + " " in line for name in TRACE_EVENTS):
+            raise ValueError(f"Unrecognized QEMU NVMe trace line: {line!r}")
+    require(phase in ("write", "read"), "Invalid NVMe trace phase")
+    expected = []
+    ops = (2, 2, 2, 1, 1, 0) if phase == "write" else (2, 2, 2)
+    for cid, opcode in enumerate(ops, 1):
+        expected.append(("io", cid, 1, 1, opcode))
+        if opcode == 0:
+            expected.append(("flush", 1))
+        expected.append(("cq", cid, 1, 0))
+    require(events == expected,
+            f"Independent NVMe controller trace mismatch: expected {expected!r}, observed {events!r}")
+    return {"io_commands": len(ops), "flush_commands": ops.count(0),
+            "successful_completions": len(ops)}
 
 
 def check_attachment(qmp, raw, guest):
@@ -115,8 +166,11 @@ def phase(args, out, raw, vars_file, esp, mode, expected_details):
         uart_path = Path(sock_dir) / "uart"
         qmp_path = Path(sock_dir) / "qmp"
         hmp_path = Path(sock_dir) / "hmp"
+        trace_events = folder / "trace-events.txt"
+        trace_events.write_text("\n".join(TRACE_EVENTS) + "\n", encoding="ascii")
+        trace = folder / "nvme-trace.log"
         cmd = [
-            "qemu-system-x86_64", "-machine", "q35,accel=tcg,smm=on,hpet=on",
+            "qemu-system-x86_64", "-trace", f"events={trace_events}", "-D", str(trace), "-machine", "q35,accel=tcg,smm=on,hpet=on",
             "-cpu", "max", "-smp", str(args.cpus), "-m", "256",
             "-global", "driver=cfi.pflash01,property=secure,value=on",
             "-drive", f"if=pflash,format=raw,unit=0,readonly=on,file={args.ovmf_code}",
@@ -154,7 +208,14 @@ def phase(args, out, raw, vars_file, esp, mode, expected_details):
                 verify_guest(data.decode("ascii", errors="replace"), name, expected_details)
                 after = monitor.execute("query-blockstats")
                 write_json(folder / "stats-after.json", after)
+                print(f"QEMU NVMe {name} QMP stats: {backend_stats(before)} -> {backend_stats(after)}",
+                      flush=True)
                 delta = verify_stats(before, after, name)
+                # Capture the controller trace before quit, so a teardown
+                # flush cannot be mistaken for an acknowledged guest command.
+                trace_before_quit = trace.read_text("utf-8", errors="strict")
+                trace_result = verify_trace(trace_before_quit, name)
+                (folder / "nvme-trace-before-quit.log").write_text(trace_before_quit, encoding="utf-8")
                 if name == "read":
                     # Demonstrate that the fresh kernel can proceed beyond the
                     # controller teardown and actually bring up all configured CPUs.
@@ -181,7 +242,7 @@ def phase(args, out, raw, vars_file, esp, mode, expected_details):
                 require(process.wait(timeout=15) == 0, "QEMU did not exit cleanly")
                 result = {"phase": name, "qemu_pid": process.pid,
                           "exit_code": process.returncode, "backend_delta": delta,
-                          "bdf": attachment["bdf"], "seconds": round(time.monotonic()-started, 3)}
+                          "controller_trace": trace_result, "bdf": attachment["bdf"], "seconds": round(time.monotonic()-started, 3)}
                 write_json(folder / "phase.json", result)
                 print(f"QEMU NVMe {name}: {json.dumps(result)}", flush=True)
                 return result
@@ -247,7 +308,10 @@ def run(args):
                  "write/com1.log", "read/com1.log", "write/stats-before.json",
                  "write/stats-after.json", "read/stats-before.json", "read/stats-after.json",
                  "write/attachment.json", "read/attachment.json", "write/com1-input.bin",
-                 "read/com1-input.bin", "read/shell-screen.ppm", "write/command.json", "read/command.json")
+                 "read/com1-input.bin", "read/shell-screen.ppm", "write/command.json", "read/command.json",
+                 "write/nvme-trace-before-quit.log", "read/nvme-trace-before-quit.log",
+                 "write/nvme-trace.log", "read/nvme-trace.log",
+                 "write/trace-events.txt", "read/trace-events.txt")
         result = {"schema": 1, "result": "pass", "source_commit": commit, "cpus": args.cpus,
                   "emulator": subprocess.check_output(["qemu-system-x86_64", "--version"], text=True).splitlines()[0],
                   "signed_efi_sha256": build["artifacts"]["agentos.efi"], "details": details,
