@@ -400,6 +400,9 @@ impl UserSpace {
 
 extern "C" { static kernel_begin: u8; static kernel_ro: u8; static kernel_rw: u8; static kernel_end: u8; }
 
+/// Actual runtime image base, used for crash symbolization and diagnostics.
+pub fn image_base() -> usize { unsafe { ptr::addr_of!(kernel_begin) as usize } }
+
 struct Tables<'a, 'b> {
     root: usize,
     frames: &'a mut Frames<'b>,
