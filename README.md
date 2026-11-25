@@ -131,6 +131,15 @@ Matice používá privátní socketpair a skutečný QEMU VirtIO-net NIC (bez p�
 
 `bash scripts/build.sh --xhci` sestaví samostatný profil pro inicializaci řadiče, DMA command/event ring a port/slot lifecycle. Tento profil očekává řízené připojení a odpojení jednoho USB2 zařízení; nepoužívat na fyzickém HP. Nejde dosud o adresování zařízení, enumeraci, USB HID ani Mass Storage. Běžný build xHCI neaktivuje.
 
+```bash
+bash scripts/check-build.sh
+bash scripts/build.sh --xhci
+python3 scripts/qemu-xhci.py --cpus 1 --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd
+python3 scripts/qemu-xhci.py --cpus 2 --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd
+```
+
+QEMU za běhu připojí a odpojí emulovanou USB klávesnici přes QMP, porovná skutečný trace řadiče (fetch TRB, command/event cycle, reset portu, slot, zastavení/reset) se sériovými záznamy a po uvolnění DMA ověří běžný start jádra. Dosud nejde o test přenosu klávesnice. Úspěch nového profilu zatím nepotvrzen.
+
 ## Jádro, paměť a plánování
 
 Loader předá konečnou mapu paměti, framebuffer a initramfs a korektně opustí UEFI Boot Services. Rustové `no_std` jádro vytvoří vlastní čtyřúrovňové stránkování, alokátor fyzických rámců a GDT/IDT/TSS. Kód je RX, konstanty RO/NX, data RW/NX; nulová stránka a loaderový stack guard nejsou mapované.

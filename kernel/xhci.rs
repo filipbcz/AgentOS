@@ -73,7 +73,7 @@ impl Controller{
     unsafe fn reset(&self,op:usize)->Result<(),Error>{
         // Stop first; HCRST is only legal while halted. Always turn off bus
         // mastering on teardown, including a failed halt/reset handshake.
-        let stopped=(||{
+        let stopped:Result<(),Error>=(||{
             wait(||Ok(rd(op+4)&CNR==0),1000,b"xHCI controller not ready")?;
             wr(op,0);
             wait(||Ok(rd(op+4)&HCH!=0),1000,b"xHCI halt timeout")?;

@@ -173,3 +173,44 @@ jobs:
             build/agentos.unsigned.efi
             build/db.esl
             build/check/qemu-virtio-net-cpu${{ matrix.cpus }}/run-*/**
+
+  xhci:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        cpus: [1, 2]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install pinned EFI build and QEMU dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            binutils cpio gcc-13 gnu-efi rustc python3 openssl \
+            sbsigntool efitools gdisk mtools qemu-system-x86 ovmf \
+            python3-virt-firmware
+      - name: Build signed xHCI test image
+        run: bash scripts/build.sh --xhci
+      - name: Real xHCI TRBs, USB hotplug, reset and slot lifecycle
+        env:
+          CPU_COUNT: ${{ matrix.cpus }}
+        run: |
+          python3 scripts/qemu-xhci.py --cpus "$CPU_COUNT" \
+            --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd \
+            --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd --timeout 300
+      - name: Preserve actual xHCI and USB evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-xhci-${{ matrix.cpus }}cpu
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            build/build-provenance.json
+            build/agentos.efi
+            build/agentos.unsigned.efi
+            build/db.esl
+            build/check/qemu-xhci-cpu${{ matrix.cpus }}/run-*/**

@@ -230,13 +230,12 @@ mod tests {
             assert_eq!(link.is_some(),i%15==14);
             if let Some(l)=link{assert_eq!(l,Trb::link(base,t.cycle));}
             assert!(cmd.submit(NOOP,0,0).is_err());
-            let mut e=Trb{parameter:t.pointer,status:1<<24,control:(33<<10)|(i/16%2==0) as u32};
+            let e=Trb{parameter:t.pointer,status:1<<24,control:(33<<10)|(i/16%2==0) as u32};
             assert!(event.ready(e.control));
             assert!(cmd.complete(Trb{parameter:t.pointer+16,..e},8).is_err());
             assert!(cmd.complete(Trb{status:5<<24,..e},8).is_err());
             assert!(cmd.pending());
             assert_eq!(cmd.complete(e,8),Ok(0));event.consume(e).unwrap();
-            e.control^=1; // only stale cycle is rejected
             assert_eq!(event.index(),(i+1)%16);
             assert_eq!(cmd.count(),i+1);
         }
