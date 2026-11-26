@@ -170,6 +170,10 @@ const COUNT_STATUS2: u8 = 0xc8; // latch count and status for channel 2
 const LOAD_POLLS: u32 = 4096;
 pub(crate) const MONITOR_MAINTENANCE_MS: u64 = 10;
 pub(crate) const REARM_COUNT: u16 = MONITOR_DIVISOR / 2;
+// Leave at least two milliseconds on the old finite count. A bounded
+// register reset must not race the terminal edge we are trying to
+// detect; a late observation cannot authorize a new window.
+pub(crate) const MIN_REARM_COUNT: u16 = 2387;
 
 pub(crate) fn count_elapsed_ns(from: u16, to: u16) -> Option<u128> {
     if to == 0 { return None; }
