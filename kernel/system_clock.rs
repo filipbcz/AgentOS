@@ -1,6 +1,7 @@
 //! A shared monotonic epoch with a continuously qualified hardware standby.
 //! Physical counter reads, modulo extension and source transitions are
-//! serialized by one IRQ-safe SMP gate. No CPU-local TSC is authoritative.
+//! serialized by one IRQ-safe SMP gate. Qualified normalized TSC can
+//! preserve time during bounded holdover, never certify its own rate.
 use crate::{clock_quorum::{self, Span, TscBracket, Verdict, Witness},
     reference_clock::{PmTimer, ReferenceClock}};
 use core::{arch::asm, cell::UnsafeCell, hint::spin_loop,
@@ -56,7 +57,7 @@ const STALL_NS: u128 = 100_000_000;
 #[repr(u8)]
 pub(crate) enum ClockEvent {
     StandbyRetired = 1, PromotedPm = 2, PromotedHpet = 3,
-    Unavailable = 4, StandbyRebased = 5, TscRejected = 6,
+    Unavailable = 4, StandbyRebased = 5, TscRejected = 6, PromotedTsc = 7,
 }
 
 impl ClockEvent {
@@ -68,6 +69,7 @@ impl ClockEvent {
             Self::Unavailable => b"SYSTEM CLOCK: no trustworthy elapsed time; epoch unavailable",
             Self::StandbyRebased => b"SYSTEM CLOCK: standby wrap ambiguous; requalifying",
             Self::TscRejected => b"SYSTEM CLOCK: two physical references disagree with TSC; witness retired",
+            Self::PromotedTsc => b"SYSTEM CLOCK: physical references invalid; qualified TSC holdover",
         }
     }
     pub fn error(self) -> bool { self == Self::Unavailable }
@@ -84,6 +86,31 @@ struct TripleAnchor {
     pair: Pair,
     tsc: TscBracket,
     global: u128,
+}
+
+#[derive(Clone, Copy)]
+struct SingleAnchor { physical: Span, tsc: TscBracket, global: u128 }
+
+/// Keep the original independently verified anchor for the entire
+/// holdover. Never accumulate uncertain per-read deltas or rebase the
+/// origin from TSC-derived time. The provider must independently grant
+/// a fresh fleet lease on every read.
+struct Holdover {
+    origin: TscBracket,
+    latest: TscBracket,
+    global: u128,
+}
+
+impl Holdover {
+    fn advance(&mut self, current: TscBracket) -> Option<u128> {
+        let span = self.origin.elapsed(current)?;
+        if span.high > MAX_ANCHOR_AGE_NS { return None; }
+        self.latest = self.latest.advance(current)?;
+        // Lower elapsed bound avoids charging uncertain read latency to
+        // an existing absolute deadline. Publish clamps overlapping
+        // cross-CPU samples to the prior global high-water mark.
+        self.global.checked_add(span.low)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -106,6 +133,9 @@ pub(crate) struct ClockSet {
     failed: bool,
     event: Option<ClockEvent>,
     triple: Option<TripleAnchor>,
+    single: Option<SingleAnchor>,
+    single_qualified: bool,
+    holdover: Option<Holdover>,
     witness_rejected: bool,
     witness_hooks: Option<WitnessHooks>,
 }
@@ -118,18 +148,21 @@ impl ClockSet {
         Self { primary: Epoch::new(primary.0, primary.1), standby,
             base_ns: 0, published_ns: 0, baseline: None, good_windows: 0,
             anchor: None, stall_samples: 0, failed: false, event: None,
-            triple: None, witness_rejected: false, witness_hooks: None }
+            triple: None, single: None, single_qualified: false,
+            holdover: None, witness_rejected: false, witness_hooks: None }
     }
 
     pub(crate) fn source(&self) -> Option<ReferenceClock> {
-        (!self.failed).then_some(self.primary.source)
+        (!self.failed && self.holdover.is_none()).then_some(self.primary.source)
     }
 
+    pub(crate) fn using_tsc(&self) -> bool { !self.failed && self.holdover.is_some() }
     pub(crate) fn qualified(&self) -> bool { self.anchor.is_some() && !self.failed }
     pub(crate) fn take_event(&mut self) -> Option<ClockEvent> { self.event.take() }
 
     pub(crate) fn maintenance_ms(&self) -> Option<u64> {
         if self.failed { return None; }
+        if self.using_tsc() { return Some(1000); }
         let active = self.primary.source.maintenance_ms();
         let standby = self.standby.as_ref().and_then(|s| s.source.maintenance_ms());
         match (active, standby) {
@@ -165,6 +198,9 @@ impl ClockSet {
     fn unavailable(&mut self) -> Option<u128> {
         self.failed = true;
         self.triple = None;
+        self.single = None;
+        self.single_qualified = false;
+        self.holdover = None;
         self.clear_qualification();
         self.event = Some(ClockEvent::Unavailable);
         None
@@ -198,6 +234,78 @@ impl ClockSet {
             ReferenceClock::Pm(_) => ClockEvent::PromotedPm,
             ReferenceClock::Hpet { .. } => ClockEvent::PromotedHpet,
         });
+        self.publish(time)
+    }
+
+    fn enter_holdover(&mut self, origin: TscBracket, current: TscBracket,
+                      global: u128) -> Option<u128> {
+        let Some(span) = origin.elapsed(current) else { return self.unavailable(); };
+        if self.witness_rejected || span.high > MAX_GAP_NS { return self.unavailable(); }
+        let mut holdover = Holdover { origin, latest: origin, global };
+        let Some(time) = holdover.advance(current) else { return self.unavailable(); };
+        self.standby = None;
+        self.triple = None;
+        self.single = None;
+        self.single_qualified = false;
+        self.clear_qualification();
+        self.holdover = Some(holdover);
+        self.event = Some(ClockEvent::PromotedTsc);
+        self.publish(time.max(self.published_ns))
+    }
+
+    fn continue_holdover(&mut self, witness: Option<Witness>) -> Option<u128> {
+        let Some(current) = witness.and_then(|w| TscBracket::new(w, w))
+            else { return self.unavailable(); };
+        let Some(time) = self.holdover.as_mut().and_then(|h| h.advance(current))
+            else { return self.unavailable(); };
+        self.publish(time.max(self.published_ns))
+    }
+
+    /// Called by the scheduler's independent LAPIC stalled-clock guard.
+    /// A stopped TSC cannot measure the end of its own lease.
+    pub(crate) fn invalidate_holdover(&mut self) {
+        if self.using_tsc() { let _ = self.unavailable(); }
+    }
+
+    /// One remaining physical reference cannot arbitrate an arbitrary
+    /// disagreement against TSC. It can still establish a trusted
+    /// anchor for explicit invalidation of that reference (regression).
+    /// Require another independent interval after fleet qualification.
+    fn sample_single(&mut self, first: Option<u128>, last: Option<u128>,
+                     tsc: Option<TscBracket>) -> Option<u128> {
+        let (Some(low), Some(high)) = (first, last) else {
+            if let (true, Some(old), Some(current)) = (self.single_qualified, self.single, tsc) {
+                return self.enter_holdover(old.tsc, current, old.global);
+            }
+            return self.unavailable();
+        };
+        let time = self.base_ns.saturating_add(high);
+        if let Some(current) = tsc.filter(|_| high-low <= BRACKET_NS) {
+            let next = SingleAnchor { physical: Span { low, high }, tsc: current,
+                                      global: self.base_ns.saturating_add(low) };
+            if let Some(old) = self.single {
+                let physical = Span::elapsed(old.physical, next.physical);
+                let elapsed = old.tsc.elapsed(current);
+                match (physical, elapsed) {
+                    (Some(p), Some(t)) if t.high <= MAX_GAP_NS && p.agrees(t) => {
+                        if t.low >= WINDOW_NS && p.low != 0 {
+                            self.single_qualified = true;
+                            self.single = Some(next);
+                        }
+                    }
+                    _ => {
+                        self.single_qualified = false;
+                        self.single = Some(next);
+                    }
+                }
+            } else {
+                self.single = Some(next);
+                self.single_qualified = false;
+            }
+        } else {
+            self.single = None;
+            self.single_qualified = false;
+        }
         self.publish(time)
     }
 
@@ -244,18 +352,21 @@ impl ClockSet {
     }
 
     /// The provider only grants a bracket while all enabled CPUs have
-    /// fresh independent qualification. TSC never provides the published
-    /// epoch: it decides which of the two physical references is credible.
+    /// fresh independent qualification. TSC arbitrates physical source
+    /// disputes and, only on explicit loss, provides bounded holdover.
     pub(crate) fn sample_with_witness(&mut self, mut read: impl FnMut(ReferenceClock) -> u64,
         mut witness: impl FnMut() -> Option<Witness>) -> Option<u128> {
         if self.failed { return None; }
-        let before = if self.standby.is_some() && !self.witness_rejected { witness() } else { None };
+        if self.using_tsc() { return self.continue_holdover(witness()); }
+        let before = if !self.witness_rejected { witness() } else { None };
         let active = self.primary.source;
         let prior = self.primary.ns();
         let first = self.primary.advance(read(active));
         let Some(standby) = self.standby.as_mut() else {
-            let Some(ns) = first else { return self.unavailable(); };
-            return self.publish(self.base_ns.saturating_add(ns));
+            // Retain the cheap single-read path if no witness is granted.
+            let last = if before.is_some() { self.primary.advance(read(active)) } else { first };
+            let bracket = before.and_then(|b| witness().and_then(|a| TscBracket::new(b, a)));
+            return self.sample_single(first, last, bracket);
         };
         let shadow_source = standby.source;
         let shadow_prior = standby.ns();
@@ -282,6 +393,13 @@ impl ClockSet {
                                   Span { low, high })
                 });
                 let b = shadow.and_then(|ns| ns.checked_sub(old.pair.shadow)).map(Span::exact);
+                // Both physical epochs explicitly failed validation.
+                // This is not the ambiguous case of three valid but
+                // disagreeing observations. Only here can the last
+                // independently corroborated TSC bridge the loss.
+                if last.is_none() && shadow.is_none() {
+                    return self.enter_holdover(old.tsc, current, old.global);
+                }
                 match clock_quorum::decide(a, b, tsc) {
                     Verdict::AllAgree => {
                         // Retain a sufficiently long common baseline so
@@ -459,17 +577,25 @@ pub unsafe fn init(pm: Option<PmTimer>, hp: Option<ReferenceClock>)
 pub(crate) fn attach_witness(read: fn() -> Option<Witness>, reject: fn()) -> bool {
     CLOCK.with(|clocks| {
         let Some(clocks) = clocks.as_mut() else { return false; };
-        if clocks.failed || clocks.standby.is_none() || clocks.witness_rejected ||
+        if clocks.failed || clocks.witness_rejected ||
            clocks.witness_hooks.is_some() { return false; }
         clocks.witness_hooks = Some(WitnessHooks { read, reject });
         true
     })
 }
 
-pub fn millis() -> Option<u64> { snapshot().map(|(ms, _)| ms) }
+pub fn millis() -> Option<u64> { snapshot().map(|s| s.millis) }
 
-/// Both views refer to the same observation and shared absolute epoch.
-pub(crate) fn snapshot() -> Option<(u64, Option<u64>)> {
+/// The physical reference for the watchdog is deliberately absent
+/// during TSC holdover. Consumers still receive the shared ABI time,
+/// but must never use that time as independent TSC rate evidence.
+pub(crate) struct ClockSnapshot {
+    pub millis: u64,
+    pub independent_ns: Option<u64>,
+    pub holdover: bool,
+}
+
+pub(crate) fn snapshot() -> Option<ClockSnapshot> {
     CLOCK.with(|clocks| {
         let clocks = clocks.as_mut()?;
         let read = clocks.witness_hooks.map(|hooks| hooks.read);
@@ -483,8 +609,29 @@ pub(crate) fn snapshot() -> Option<(u64, Option<u64>)> {
             CLOCK.event.store(event as u8, Ordering::Release);
         }
         let ns = result?;
-        Some(((ns / 1_000_000).min(isize::MAX as u128) as u64, u64::try_from(ns).ok()))
+        let holdover = clocks.using_tsc();
+        Some(ClockSnapshot {
+            millis: (ns / 1_000_000).min(isize::MAX as u128) as u64,
+            independent_ns: if holdover { None } else { u64::try_from(ns).ok() },
+            holdover,
+        })
     })
+}
+
+/// Independent LAPIC progress can diagnose a frozen holdover even when
+/// TSC itself never advances far enough to age out its qualification.
+pub(crate) fn expire_stalled_holdover() {
+    CLOCK.with(|clocks| {
+        if let Some(clocks) = clocks.as_mut() {
+            if clocks.using_tsc() {
+                clocks.invalidate_holdover();
+                CLOCK.maintenance.store(0, Ordering::Release);
+                if let Some(event) = clocks.take_event() {
+                    CLOCK.event.store(event as u8, Ordering::Release);
+                }
+            }
+        }
+    });
 }
 
 pub(crate) fn take_event() -> Option<ClockEvent> {
@@ -495,6 +642,7 @@ pub(crate) fn take_event() -> Option<ClockEvent> {
         4 => Some(ClockEvent::Unavailable),
         5 => Some(ClockEvent::StandbyRebased),
         6 => Some(ClockEvent::TscRejected),
+        7 => Some(ClockEvent::PromotedTsc),
         _ => None,
     }
 }
