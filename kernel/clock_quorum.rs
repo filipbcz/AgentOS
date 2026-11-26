@@ -94,6 +94,9 @@ pub(crate) fn decide(active: Option<Span>, standby: Option<Span>,
     let agrees = |a: Option<Span>, b: Option<Span>| {
         match (a, b) { (Some(a), Some(b)) => a.agrees(b), _ => false }
     };
+    if tsc.is_none() {
+        return if agrees(active, standby) { Verdict::PhysicalAgree } else { Verdict::Ambiguous };
+    }
     match (agrees(active, standby), agrees(active, tsc), agrees(standby, tsc)) {
         (true, true, true) => Verdict::AllAgree,
         (true, false, false) => Verdict::TscRejected,
