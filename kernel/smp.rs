@@ -96,7 +96,7 @@ unsafe fn pit_diagnostic(cpu:u8,mandatory:bool,level:crate::log_policy::Level,li
 unsafe fn report_pit_failure(cpu: u8, phase: &str, mandatory: bool, fault: crate::pit::QualificationFailure) {
     fault.report(cpu,phase,|line|pit_diagnostic(cpu,mandatory,crate::log_policy::Level::Error,line));
 }
-unsafe fn report_pit_discarded(cpu:u8,phase:&str,mandatory:bool,discarded:&crate::pit::DiscardedWindows) {
+unsafe fn report_pit_acquisition(cpu:u8,phase:&str,mandatory:bool,discarded:&crate::pit::AcquisitionEvidence) {
     discarded.report(cpu,phase,|line|pit_diagnostic(cpu,mandatory,crate::log_policy::Level::Info,line));
 }
 
@@ -359,9 +359,9 @@ impl Cpu {
                 Err(_)=>return None,
             }
         }
-        let mut discarded=crate::pit::DiscardedWindows::new();
+        let mut discarded=crate::pit::AcquisitionEvidence::new();
         let result=crate::pit::qualify(self.legacy_pit_probe,&mut maintain,&mut discarded);
-        report_pit_discarded(self.expected_id,phase,mandatory,&discarded);
+        report_pit_acquisition(self.expected_id,phase,mandatory,&discarded);
         match result {
             Ok(rate)=>Some(rate),
             Err(fault)=>{
@@ -1282,9 +1282,9 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
     } else {
         // An enumerated crystal ratio is useful for diagnosing the
         // platform, but cannot authorize a public epoch by itself.
-        let mut discarded=crate::pit::DiscardedWindows::new();
+        let mut discarded=crate::pit::AcquisitionEvidence::new();
         let result=crate::pit::qualify(platform.legacy_pit_probe,||{},&mut discarded);
-        report_pit_discarded(apic.id(),"bsp-start",true,&discarded);
+        report_pit_acquisition(apic.id(),"bsp-start",true,&discarded);
         let rate=result.map_err(|fault| {
                 report_pit_failure(apic.id(),"bsp-start",true,fault);
                 if crate::tsc::detect().nominal_hz.is_some() {

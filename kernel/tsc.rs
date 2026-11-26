@@ -144,19 +144,29 @@ impl Calibration {
         self.observe_checked(observation).ok().map(|_| ())
     }
     pub(crate) fn observe_checked(&mut self, observation: Observation) -> Result<u64, CalibrationFault> {
+        self.observe_checked_span(observation,observation.before_start,observation.after_end)
+    }
+
+    /// The rate bracket may be inside a larger raw span (e.g. gate
+    /// programming and terminal-state validation surrounding latched count
+    /// reads). Retain that span for continuity, without charging the
+    /// unrelated work to the measured reference interval.
+    pub(crate) fn observe_checked_span(&mut self, observation: Observation, first:u64, last:u64)
+        -> Result<u64, CalibrationFault> {
         use CalibrationFault::*;
         let result = if self.failed { Err(PreviousFailure) }
             else if self.len == self.samples.len() { Err(ExcessSamples) }
-            else if self.last.map_or(false, |last| observation.before_start < last) { Err(BetweenSamples) }
+            else if first>observation.before_start || last<observation.after_end { Err(RawOrder) }
+            else if self.last.map_or(false, |previous| first < previous) { Err(BetweenSamples) }
             else { measured_rate_checked(observation) };
         let rate = match result {
             Ok(rate) => rate,
             Err(reason) => { self.failed = true; return Err(reason); }
         };
-        if self.last.is_none() { self.first=observation.before_start; }
+        if self.last.is_none() { self.first=first; }
         self.samples[self.len] = rate;
         self.len += 1;
-        self.last = Some(observation.after_end);
+        self.last = Some(last);
         Ok(rate)
     }
     /// A physical measurement with insufficient precision has no rate

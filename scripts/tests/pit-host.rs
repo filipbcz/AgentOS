@@ -12,7 +12,8 @@ use core::cell::Cell;
 use pit::{Ports, Error};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Fault { None, Stopped, InitialHigh, ImmediateHigh, WrongStatus, TerminalNull, GateStuck, CleanupStuck }
+enum Fault { None, Stopped, InitialHigh, ImmediateHigh, WrongStatus, TerminalNull, GateStuck, CleanupStuck,
+    LatchFrozen, LatchIncreasing, LatchNull, LatchTerminal, LatchWrongStatus }
 
 struct Model<'a> {
     ticks: &'a Cell<u64>,
@@ -20,6 +21,10 @@ struct Model<'a> {
     control: u8,
     programmed: bool,
     status_latched: bool,
+    latched_status:u8,
+    latched_count:Option<[u8;2]>,
+    latch_index:usize,
+    latch_reads:u32,
     count: [u8; 2],
     count_bytes: usize,
     gate_start: Option<u64>,
@@ -29,15 +34,18 @@ struct Model<'a> {
     started: bool,
     start_delay:u64,
     terminal_delay:u64,
+    latch_delay:u64,
+    data_delay:u64,
     attempts:Option<&'a Cell<u32>>,
 }
 
 impl<'a> Model<'a> {
     fn new(ticks: &'a Cell<u64>, hz: u64, fault: Fault) -> Self {
         Self { ticks, hz, control: 0x0f, programmed: false, status_latched: false,
+            latched_status:0,latched_count:None,latch_index:0,latch_reads:0,
             count: [0;2], count_bytes: 0, gate_start: None, fault,
             writes: Vec::new(), reads: 0, started: false,
-            start_delay:0,terminal_delay:0,attempts:None }
+            start_delay:0,terminal_delay:0,latch_delay:0,data_delay:0,attempts:None }
     }
 
     fn out_high(&self) -> bool {
@@ -57,6 +65,9 @@ impl Ports for Model<'_> {
     fn read(&mut self, port:u16)->u8 {
         self.reads+=1;
         self.io_delay();
+        if port==0x42 && self.latched_count.is_some() {
+            self.ticks.set(self.ticks.get()+self.data_delay);
+        }
         if port==0x61 && self.gate_start.is_some() && self.out_high() && self.terminal_delay!=0 {
             self.ticks.set(self.ticks.get()+self.terminal_delay);
             self.terminal_delay=0;
@@ -64,12 +75,14 @@ impl Ports for Model<'_> {
         match port {
             0x61 => self.control | 0xd0 | if self.out_high(){0x20}else{0},
             0x42 => {
-                assert!(self.status_latched);
-                self.status_latched=false;
-                if self.fault==Fault::WrongStatus { return 0xff; }
-                let high=self.out_high();
-                0x30 | if high{0x80}else{0} |
-                    if !high || self.fault==Fault::TerminalNull {0x40}else{0}
+                if self.status_latched {
+                    self.status_latched=false;
+                    return self.latched_status;
+                }
+                let value=self.latched_count.expect("no latched status or count")[self.latch_index];
+                self.latch_index+=1;
+                if self.latch_index==2 {self.latched_count=None;self.latch_index=0;}
+                value
             }
             _=>panic!("unexpected read {port:#x}"),
         }
@@ -95,13 +108,48 @@ impl Ports for Model<'_> {
                 assert_eq!(self.control&3,0);
                 self.programmed=true;
                 if let Some(attempts)=self.attempts {attempts.set(attempts.get()+1);}
+                self.status_latched=false;
+                self.latched_count=None;
+                self.latch_index=0;
+                self.latch_reads=0;
                 self.count_bytes=0;
                 self.gate_start=None;
             }
             0x43 if value==0xe8 => {
                 assert!(self.programmed);
                 assert_eq!(self.count_bytes,2);
+                assert!(self.latched_count.is_none());
                 self.status_latched=true;
+                let high=self.out_high();
+                self.latched_status=if self.fault==Fault::WrongStatus {0xff} else {
+                    0x30 | if high{0x80}else{0} |
+                        if !high || self.fault==Fault::TerminalNull {0x40}else{0}
+                };
+            }
+            0x43 if value==0xc8 => {
+                assert!(self.programmed);
+                assert_eq!(self.count_bytes,2);
+                assert!(self.latched_count.is_none()&&!self.status_latched);
+                self.ticks.set(self.ticks.get()+self.latch_delay);
+                let start=self.gate_start.expect("count latch before enabling gate");
+                let divisor=u16::from_le_bytes(self.count);
+                let elapsed=((self.ticks.get()-start) as u128*1_193_182/self.hz as u128) as u64;
+                let count=divisor.saturating_sub(elapsed.min(u16::MAX as u64) as u16);
+                self.latch_reads+=1;
+                let count=match self.fault {
+                    Fault::LatchFrozen=>divisor-100,
+                    Fault::LatchIncreasing=>if self.latch_reads==1{divisor-100}else{divisor-1},
+                    _=>count,
+                };
+                self.latched_status=match self.fault {
+                    Fault::LatchWrongStatus=>0xff,
+                    Fault::LatchNull if self.latch_reads>1=>0x70,
+                    Fault::LatchTerminal=>0xb0,
+                    _=>if self.out_high(){0xb0}else{0x30},
+                };
+                self.status_latched=true;
+                self.latched_count=Some(count.to_le_bytes());
+                self.latch_index=0;
             }
             0x42 => {
                 assert!(self.programmed);
@@ -263,9 +311,11 @@ fn rejected_physical_measurements_preserve_the_actual_operation_and_operands() {
     let ticks=Cell::new(1_000_000);
     let mut model=Model::new(&ticks,hz,Fault::None);
     let caps=tsc::Capabilities{available:true,invariant:true,nominal_hz:Some(hz)};
-    let mut discarded=pit::DiscardedWindows::new();
-    let rejection=pit::qualify_samples(caps,&mut model,100,||ticks.get(),
-        ||ticks.set(ticks.get()+30_000_000),&mut discarded).unwrap_err();
+    let mut discarded=pit::AcquisitionEvidence::new();
+    model.start_delay=300_000;
+    model.latch_delay=300_000;
+    let rejection=pit::qualify_samples(caps,&mut model,30_000,||ticks.get(),
+        ||ticks.set(ticks.get()+12_000),&mut discarded).unwrap_err();
     assert_eq!(rejection.reason,pit::QualificationReason::PrecisionBudget);
     assert_eq!(discarded.len(),6);
     assert_eq!(rejection.window,1);
@@ -289,7 +339,7 @@ fn rejected_calibration_preserves_prior_rates_and_disagrees_with_nominal() {
     let hz=3_000_000_000;
     let mut model=Model::new(&ticks,hz,Fault::None);
     let caps=tsc::Capabilities{available:true,invariant:true,nominal_hz:Some(hz*2)};
-    let mut discarded=pit::DiscardedWindows::new();
+    let mut discarded=pit::AcquisitionEvidence::new();
     let fault=pit::qualify_samples(caps,&mut model,30_000,||ticks.get(),
         ||ticks.set(ticks.get()+12_000),&mut discarded).unwrap_err();
     assert_eq!(discarded.len(),0);
@@ -311,7 +361,7 @@ fn actual_rejected_bsp_and_ap_brackets_require_fresh_precise_windows() {
         let [a,b,c,d]=values;
         let lo=c-b;let hi=d-a;
         assert!((hi-lo) as u128*1_000_000>((hi+lo)/2) as u128*960);
-        let raw=pit::DiscardedWindow{window:1,attempt:1,values};
+        let raw=pit::DiscardedWindow{window:1,attempt:1,values,reference_ticks:59_660,stage:pit::Stage::EdgeUncertain};
         assert!(raw.compatible_with(hz));
         assert!(!raw.compatible_with(2_500_000_000));
         let ticks=Cell::new(1_000_000);
@@ -321,11 +371,12 @@ fn actual_rejected_bsp_and_ap_brackets_require_fresh_precise_windows() {
         model.start_delay=b-a;
         model.terminal_delay=d-c;
         let caps=tsc::Capabilities{available:true,invariant:true,nominal_hz:Some(hz)};
-        let mut discarded=pit::DiscardedWindows::new();
+        let mut discarded=pit::AcquisitionEvidence::new();
         let rate=pit::qualify_samples(caps,&mut model,30_000,||ticks.get(),
             ||ticks.set(ticks.get()+hz/250_000),&mut discarded).unwrap();
         assert_eq!(rate.hz(),hz);
         assert_eq!(discarded.len(),1);
+        assert_eq!(discarded.count_len(),3);
         let entry=discarded.iter().next().unwrap();
         assert_eq!((entry.window,entry.attempt),(1,1));
         let [a,b,c,d]=entry.values;
@@ -334,8 +385,9 @@ fn actual_rejected_bsp_and_ap_brackets_require_fresh_precise_windows() {
         assert_eq!(model.control&3,0);
         let mut messages=Vec::new();
         discarded.report(1,"ap-start",|line|messages.push(line.to_vec()));
-        assert_eq!(messages.len(),2);
-        assert!(messages[0].ends_with(b"ATTEMPT=1 RETRY=EdgeUncertain"));
+        assert_eq!(messages.len(),8);
+        assert!(messages[0].ends_with(b"TICKS=59660 RETRY=EdgeUncertain"));
+        assert!(messages[2].windows(b"COUNT ".len()).any(|w|w==b"COUNT "));
         assert!(messages.iter().all(|m|m.len()<=96));
     }
 }
@@ -351,7 +403,7 @@ fn imprecise_but_contradictory_interval_cannot_be_hidden_by_good_later_rate() {
     model.terminal_delay=100_000;
     let prior=Cell::new(ticks.get());
     let raw=Cell::new(ticks.get());
-    let mut discarded=pit::DiscardedWindows::new();
+    let mut discarded=pit::AcquisitionEvidence::new();
     let caps=tsc::Capabilities{available:true,invariant:true,nominal_hz:None};
     let fault=pit::qualify_samples(caps,&mut model,30_000,||{
         let now=ticks.get();
@@ -376,7 +428,7 @@ fn missing_edge_and_gate_failure_are_never_retried() {
         let attempts=Cell::new(0);
         let mut model=Model::new(&ticks,hz,fault);
         model.attempts=Some(&attempts);
-        let mut discarded=pit::DiscardedWindows::new();
+        let mut discarded=pit::AcquisitionEvidence::new();
         let caps=tsc::Capabilities{available:true,invariant:true,nominal_hz:None};
         let result=pit::qualify_samples(caps,&mut model,30_000,||ticks.get(),
             ||ticks.set(ticks.get()+hz/250_000),&mut discarded);
@@ -384,4 +436,55 @@ fn missing_edge_and_gate_failure_are_never_retried() {
         assert_eq!(attempts.get(),1);
         assert_eq!(discarded.len(),0);
     }
+}
+
+#[test]
+fn latched_count_brackets_exclude_data_read_and_poll_latency() {
+    let hz=2_700_000_000;
+    let ticks=Cell::new(1_000_000);
+    let mut model=Model::new(&ticks,hz,Fault::None);
+    // 19us latch-command cost on BOTH endpoints, as opposed to a
+    // gate-start and two successive slow OUT polling operations.
+    model.latch_delay=51_300;
+    // Delay each of the three read-back bytes by another 20us.
+    // The reference count must remain frozen at the latch instant.
+    model.data_delay=54_000;
+    let m=pit::measure_latched(true,&mut model,30_000,||ticks.get(),
+        ||ticks.set(ticks.get()+hz/250_000)).unwrap();
+    assert!(m.start_count>m.end_count && m.start_count-m.end_count>=59_660);
+    assert_eq!(m.observation.reference_ns,(m.start_count-m.end_count) as u64*1_000_000_000/1_193_182);
+    assert!(tsc::measured_rate(m.observation).unwrap().abs_diff(hz)<hz/1000);
+    assert!(m.span_start<=m.observation.before_start && m.span_end>=m.observation.after_end);
+    assert!(model.latched_count.is_none()&&!model.status_latched);
+    assert_eq!(model.control&3,0);
+    assert!(model.writes.iter().filter(|&&(p,v)|p==0x43&&v==0xc8).count()>2);
+    assert!(model.writes.iter().all(|&(p,v)|p!=0x43||matches!(v,0xb0|0xe8|0xc8)));
+    assert_eq!(model.count,u16::MAX.to_le_bytes());
+}
+
+#[test]
+fn count_latch_never_qualifies_stale_wrapped_increasing_or_unloaded_values() {
+    let hz=2_700_000_000;
+    for (fault,stage) in [
+        (Fault::LatchIncreasing,pit::Stage::LatchCount),
+        (Fault::LatchNull,pit::Stage::LatchStatus),
+        (Fault::LatchTerminal,pit::Stage::LatchTerminal),
+        (Fault::LatchWrongStatus,pit::Stage::LatchStatus),
+        (Fault::LatchFrozen,pit::Stage::LatchTerminal),
+        (Fault::CleanupStuck,pit::Stage::CleanupGate),
+    ] {
+        let ticks=Cell::new(1_000_000);
+        let mut model=Model::new(&ticks,hz,fault);
+        let error=pit::measure_latched(true,&mut model,30_000,||ticks.get(),
+            ||ticks.set(ticks.get()+hz/250_000)).unwrap_err();
+        assert_eq!(error.stage,stage);
+        assert!(model.latched_count.is_none()&&!model.status_latched);
+        if fault!=Fault::CleanupStuck {assert_eq!(model.control&3,0);}
+    }
+    let ticks=Cell::new(1_000_000);
+    let mut model=Model::new(&ticks,hz,Fault::None);
+    let error=pit::measure_latched(true,&mut model,100,||ticks.get(),
+        ||ticks.set(ticks.get()+hz/100)).unwrap_err();
+    assert_eq!(error.stage,pit::Stage::LatchStartLate);
+    assert_eq!(model.control&3,0);
 }

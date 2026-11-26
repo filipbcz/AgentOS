@@ -269,3 +269,17 @@ fn discarded_spans_never_qualify_and_cannot_hide_raw_discontinuity() {
     peer.publish_rate(Some(prior.finish_checked().unwrap()));
     assert!(!peer.confirm_rate(rate));
 }
+
+#[test]
+fn count_rate_bracket_inside_raw_validation_span_cannot_hide_regression() {
+    use tsc::CalibrationFault::*;
+    let caps=Capabilities{available:true,invariant:true,nominal_hz:Some(3_000_000_000)};
+    let o=Observation{before_start:100,after_start:100,before_end:150_000_100,
+        after_end:150_000_100,reference_ns:50_000_000};
+    let mut c=tsc::Calibration::new(caps);
+    c.observe_checked_span(o,10,160_000_000).unwrap();
+    let next=Observation{before_start:170_000_000,after_start:170_000_000,
+        before_end:320_000_000,after_end:320_000_000,..o};
+    assert_eq!(c.observe_checked_span(next,159_999_999,320_000_000),Err(BetweenSamples));
+    assert_eq!(c.finish_checked(),Err(PreviousFailure));
+}
