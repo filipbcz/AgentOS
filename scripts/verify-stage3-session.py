@@ -29,6 +29,9 @@ READY = b"AGENTOS SHELL READY\r\nagentos> "
 # Only the separate test harness sends these ordinary shell commands.
 # These ELF fixtures already exist in the historical signed initramfs.
 RUNTIME_PROGRAMS = (("run /svc_ok",0),("run /svc_fail",42),("run /fault",270))
+SUPERVISOR_COMMAND = "run /supervisor-runner"
+SUPERVISOR_INPUT = (SUPERVISOR_COMMAND+"\r").encode("ascii")
+SUPERVISOR_MISSING = b"run: spawn failed (-2)\r\nagentos> "
 
 def runtime_input():
     return b"".join((command+"\r").encode("ascii") for command,_ in RUNTIME_PROGRAMS)
@@ -67,6 +70,76 @@ def runtime_process_prefix(data, shell, shell_cr3, prior_pids):
         offset+=len(reply)
         records.append({"pid":pid,"cr3":cr3,"status":status})
     return offset,records
+
+
+def supervisor_prefix(data, shell, shell_cr3, prior_pids, variant):
+    """Consume only a verified foreground workload (or real ENOENT)."""
+    require(variant in ("control", "test"), "Invalid supervisor image variant")
+    echo = (SUPERVISOR_COMMAND+"\r\n").encode("ascii")
+    require(data.startswith(echo), "Missing supervisor command echo")
+    offset = len(echo)
+    if variant == "control":
+        require(data.startswith(SUPERVISOR_MISSING, offset),
+                "Distribution did not reject the absent test runner")
+        return offset+len(SUPERVISOR_MISSING), {"absent": True}, set()
+
+    spec = importlib.util.spec_from_file_location(
+        "runtime_supervisor", Path(__file__).with_name("verify-supervisor.py"))
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+
+    def read_line():
+        nonlocal offset
+        end = data.find(b"\r\n", offset)
+        require(end >= offset, "Truncated supervisor interval")
+        line = data[offset:end]
+        require(line.isascii(), "Non-ASCII supervisor record")
+        offset = end+2
+        return line.decode("ascii")
+
+    identity = re.fullmatch(r"AGENTOS TEST RUNNER PID=("+verifier.HEX16+
+                            r") PARENT=("+verifier.HEX16+r")", read_line())
+    require(identity is not None, "Missing runner scheduler identity")
+    runner, parent = (int(v,16) for v in identity.groups())
+    require(parent==shell and runner>shell and runner not in prior_pids,
+            "Foreign parent or reused supervisor PID")
+    begin = verifier.BEGIN.fullmatch(read_line())
+    require(begin is not None and int(begin[1],16)==runner,
+            "Supervisor begin identity mismatch")
+    seen = set(prior_pids) | {runner}
+    records, child_roots = [], []
+    try:
+        for _ in verifier.EXPECTED_ORDER:
+            line = read_line()
+            item = verifier.event(line)
+            require(item is not None, "Unexpected supervisor record")
+            records.append(item)
+            match = verifier.EXIT.fullmatch(line)
+            if match:
+                child_roots.append(int(match[2],16))
+        end = verifier.END.fullmatch(read_line())
+        require(end is not None and int(end[1],16)==runner,
+                "Supervisor end identity mismatch")
+        outcome = verifier.verify_interval(runner, records, seen)
+    except verifier.VerificationError as error:
+        raise VerificationError("Foreground supervisor: "+str(error)) from error
+
+    actual = EXIT.match(data, offset)
+    require(actual is not None, "Missing actual supervisor exit")
+    pid, cr3, status = (int(v,16) for v in actual.groups())
+    require(pid==runner and status==0 and cr3>0 and cr3%4096==0 and cr3!=shell_cr3,
+            "Supervisor did not exit normally in its private address space")
+    require(all(root != cr3 and root != shell_cr3 for root in child_roots),
+            "Supervisor child reused a live parent or shell address space")
+    children = [outcome["healthy_pid"], *outcome["failed_pids"], outcome["killed_pid"]]
+    require(all(child > runner for child in children) and children == sorted(children),
+            "Unexpected child PID allocation order")
+    reply = b"exit status 0\r\nagentos> "
+    require(data.startswith(reply, actual.end()), "Shell did not collect real runner exit")
+    outcome.update({"absent":False,"runner_pid":runner,"shell_pid":parent,
+                    "runner_cr3":cr3,"runner_status":status,
+                    "child_statuses":[records[i][3] for i in (0,2,4,6,9)]})
+    return actual.end()+len(reply), outcome, {runner,*children}
 
 
 class VerificationError(ValueError):
@@ -188,7 +261,12 @@ def verify_idle(aBytes, aCpus=1, aClockMaintenanceMs=1000):
 
 
 def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceMs=1000,
-           aRuntimeProcess=False):
+           aRuntimeProcess=False, aSupervisorImage=None):
+    require(aSupervisorImage is None or (aRuntimeProcess and aSupervisorImage in ("control","test")),
+            "Supervisor image scenario requires the existing foreground regression")
+    if aSupervisorImage is not None:
+        require(aLog.count(b"AGENTOS TEST RUNNER ")==int(aSupervisorImage=="test"),
+                "Unexpected runner invocation outside its foreground interval")
     pTimerCpus = timerCpuCount(aLog,aCpus)
     pRoots,pChildren,pEnds = (list(pPattern.finditer(aLog)) for pPattern in
                               (ROOT_START,SHELL_START,SESSION_STOP))
@@ -211,6 +289,8 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
     require(pInteractive.startswith(READY),"Missing real initial shell prompt")
     pInteractive=pInteractive[len(READY):]
     pRuntimeRecords=[]
+    pSupervisor=None
+    pPrefixPids=set()
     if aRuntimeProcess:
         # Account for every earlier actual PID, not just the current shell.
         pPrior={int(m[1],16) for m in re.finditer(
@@ -220,6 +300,13 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
         pConsumed,pRuntimeRecords=runtime_process_prefix(
             pInteractive,pShell,int(pShellExits[0][2],16),pPrior)
         pInteractive=pInteractive[pConsumed:]
+        pPrefixPids={r["pid"] for r in pRuntimeRecords}
+        if aSupervisorImage is not None:
+            pConsumed,pSupervisor,pNewPids=supervisor_prefix(
+                pInteractive,pShell,int(pShellExits[0][2],16),
+                pPrior | pPrefixPids,aSupervisorImage)
+            pPrefixPids.update(pNewPids)
+            pInteractive=pInteractive[pConsumed:]
     pClean = without_kernel_events(pInteractive)
     pExpected = b"".join(
         pStep["pattern"].encode("ascii") for pStep in steps(pShell,aKeyboard))
@@ -230,13 +317,15 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
         require(aInput is not None,"Separate process regression requires actual transmitted bytes")
     if aInput is not None:
         pPrefix=runtime_input() if aRuntimeProcess else b""
+        if aSupervisorImage is not None:
+            pPrefix+=SUPERVISOR_INPUT
         require(aInput==pPrefix+transmitted_input(pShell,aKeyboard),"Captured transmitted UART bytes differ from scenario")
     pRestart = pInteractive.find(b"service restart flaky\r\n")
     require(pRestart>=0,"No explicit service RESTART command")
     pAfterRestart = pInteractive[pRestart:]
     pExits = list(EXIT.finditer(pAfterRestart))
     require(len(pExits)==3,"Restart did not produce exactly three real worker exits")
-    pSeen = {r["pid"] for r in pRuntimeRecords}
+    pSeen = set(pPrefixPids)
     for pMatch in EXIT.finditer(pInteractive):
         pPid,pCr3,pStatus = (int(pValue,16) for pValue in pMatch.groups())
         require(pPid>pShell and pPid not in pSeen and pCr3>0 and pCr3%4096==0 and pStatus==42,
@@ -248,7 +337,7 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
         require(pPid>pShell and pParent==pRoot and pPid not in pSeen and pPid not in pKilled,
                 "Service STOP killed a foreign or already-reaped process")
         pKilled.add(pPid)
-    require(pKilled or len(pSeen)-len(pRuntimeRecords)>3,
+    require(pKilled or len(pSeen)-len(pPrefixPids)>3,
             "Initial START/STOP has no actual worker termination evidence")
     pTail = pPhase[pShellExits[0].end():]
     pShutdown = (f"AGENTOS MANAGER SHUTD ROOT={pRoot:016x} COUNT=00000003\r\n"
@@ -264,6 +353,8 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
             "restarted_pids":sorted(int(pMatch[1],16) for pMatch in pExits),"idle":pIdle}
     if aRuntimeProcess:
         result["runtime_process_regression"]=pRuntimeRecords
+    if aSupervisorImage is not None:
+        result["runtime_supervisor"]=pSupervisor
     return result
 
 
@@ -275,9 +366,10 @@ def main():
     pParser.add_argument("--cpus",type=int,choices=(1,2))
     pParser.add_argument("--plan-pid",type=int)
     pParser.add_argument("--runtime-process-regression",action="store_true")
+    pParser.add_argument("--supervisor-image",choices=("control","test"))
     pArgs = pParser.parse_args()
     if pArgs.plan_pid is not None:
-        require(not pArgs.runtime_process_regression,"Separate process regression uses the QEMU test driver")
+        require(not pArgs.runtime_process_regression and pArgs.supervisor_image is None,"Separate process regression uses the QEMU test driver")
         require(pArgs.plan_pid>1,"Invalid shell PID for input plan")
         print(json.dumps({"steps":steps(pArgs.plan_pid,pArgs.keyboard),
                           "kernel_event_pattern":KERNEL_EVENT.pattern.decode(),
@@ -288,7 +380,8 @@ def main():
         pParser.error("--log or --plan-pid is required")
     try:
         pResult = verify(pArgs.log.read_bytes(),pArgs.input.read_bytes() if pArgs.input else None,
-                         pArgs.keyboard,pArgs.cpus,aRuntimeProcess=pArgs.runtime_process_regression)
+                         pArgs.keyboard,pArgs.cpus,aRuntimeProcess=pArgs.runtime_process_regression,
+                         aSupervisorImage=pArgs.supervisor_image)
     except (OSError,VerificationError) as pError:
         print(f"Stage-3 interactive verification failed: {pError}",file=sys.stderr)
         return 1

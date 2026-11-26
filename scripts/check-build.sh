@@ -271,5 +271,12 @@ for pApp in init fault receiver service shell svc_ok svc_fail svc_hang orphan_pa
         -o "$pOut/$pApp" "${pObjects[@]}"
     "$pPython" "$pRoot/scripts/verify-user-abi.py" "$pOut/$pApp"
 done
+"$pCc" -c "$pRoot/scripts/tests/supervisor-runner.S" -o "$pOut/supervisor-runner-entry.o"
+"$pCc" -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
+    -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large \
+    -c "$pRoot/scripts/tests/supervisor-runner.c" -o "$pOut/supervisor-runner.o"
+"$pLd" --no-undefined --build-id=none -z noexecstack -s -T "$pRoot/user/user.ld" \
+    -o "$pOut/supervisor-runner" "$pOut/supervisor-runner-entry.o" "$pOut/supervisor-runner.o" "$pOut/supervisor.o"
+"$pPython" "$pRoot/scripts/verify-user-abi.py" "$pOut/supervisor-runner"
 printf 'Host tests and kernel/user ELF links passed: %s\n' "$pOut"
 printf 'EFI assembly/signing, pinned-toolchain reproducibility and VM execution remain separate checks.\n'

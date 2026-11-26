@@ -101,36 +101,43 @@ def verify(text, cpus):
     require([p for _, p in checks[:cpus]] == parents, "Supervisor parent/process check mismatch")
     all_pids = set(parents)
     for parent, records in sections:
-        require(len(records) == len(EXPECTED_ORDER),
-                f"Wrong service evidence count for parent {parent}")
-        require(tuple(item[0] for item in records) == EXPECTED_ORDER,
-                f"Wrong service evidence order for parent {parent}")
-        healthy, done = records[0:2]
-        require(healthy[1] > 0 and healthy[3] == 0 and
-                done == ("DONE", healthy[1], parent, 0, 1),
-                f"Healthy child not collected by parent {parent}")
-        failed = []
-        for attempt in range(1, 4):
-            ex = records[attempt * 2]
-            note = records[attempt * 2 + 1]
-            require(ex[1] > 0 and ex[3] == 42 and
-                    note == ("REAP", ex[1], parent, 42, attempt),
-                    f"Uncollected crash / incorrect attempt {attempt} for parent {parent}")
-            failed.append(ex[1])
-        require(records[8] == ("STOP", failed[-1], parent, 42, 3),
-                f"Failure restart cap not enforced for parent {parent}")
-        killed, duration, time, stop = records[9:]
-        require(killed[1] > 0 and killed[2] == parent and killed[3] == 137 and
-                duration[1] == killed[1] and duration[2] == parent and
-                250 <= duration[3] < (1 << 63) and
-                time == ("TIME", killed[1], parent, 137, 1) and
-                stop == ("STOP", killed[1], parent, 137, 1),
-                f"Stalled child not killed and collected by parent {parent}")
-        children = [healthy[1], *failed, killed[1]]
-        require(len(set(children)) == 5 and not (set(children) & all_pids),
-                f"Duplicate service child PID for parent {parent}")
-        all_pids.update(children)
+        verify_interval(parent, records, all_pids)
     return len(sections)
+
+
+def verify_interval(parent, records, all_pids):
+    """The original strict interval checks, also used for the foreground runner."""
+    require(len(records) == len(EXPECTED_ORDER),
+            f"Wrong service evidence count for parent {parent}")
+    require(tuple(item[0] for item in records) == EXPECTED_ORDER,
+            f"Wrong service evidence order for parent {parent}")
+    healthy, done = records[0:2]
+    require(healthy[1] > 0 and healthy[3] == 0 and
+            done == ("DONE", healthy[1], parent, 0, 1),
+            f"Healthy child not collected by parent {parent}")
+    failed = []
+    for attempt in range(1, 4):
+        ex = records[attempt * 2]
+        note = records[attempt * 2 + 1]
+        require(ex[1] > 0 and ex[3] == 42 and
+                note == ("REAP", ex[1], parent, 42, attempt),
+                f"Uncollected crash / incorrect attempt {attempt} for parent {parent}")
+        failed.append(ex[1])
+    require(records[8] == ("STOP", failed[-1], parent, 42, 3),
+            f"Failure restart cap not enforced for parent {parent}")
+    killed, duration, time, stop = records[9:]
+    require(killed[1] > 0 and killed[2] == parent and killed[3] == 137 and
+            duration[1] == killed[1] and duration[2] == parent and
+            250 <= duration[3] < (1 << 63) and
+            time == ("TIME", killed[1], parent, 137, 1) and
+            stop == ("STOP", killed[1], parent, 137, 1),
+            f"Stalled child not killed and collected by parent {parent}")
+    children = [healthy[1], *failed, killed[1]]
+    require(len(set(children)) == 5 and not (set(children) & all_pids),
+            f"Duplicate service child PID for parent {parent}")
+    all_pids.update(children)
+    return {"healthy_pid": healthy[1], "failed_pids": failed,
+            "killed_pid": killed[1], "duration_ms": duration[3]}
 
 
 def main():

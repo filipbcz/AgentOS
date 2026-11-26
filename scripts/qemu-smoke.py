@@ -58,12 +58,16 @@ def main():
                         help="Drive UART/PS2 editing, service control, runtime idle and shutdown")
     parser.add_argument("--runtime-process-regression", action="store_true",
                         help="Separate foreground ELF/fault regression through the ordinary shell")
+    parser.add_argument("--supervisor-image", choices=("control","test"),
+                        help="Host-only paired signed image regression")
     parser.add_argument("--timeout", type=int, default=720)
     parser.add_argument("--ovmf-code", type=Path, required=True)
     parser.add_argument("--ovmf-vars", type=Path, required=True)
     args = parser.parse_args()
     if args.runtime_process_regression and not args.session:
         parser.error("--runtime-process-regression requires --session")
+    if args.supervisor_image and not args.runtime_process_regression:
+        parser.error("--supervisor-image requires --session --runtime-process-regression")
     try:
         return boot(args)
     except Exception as error:
@@ -236,7 +240,8 @@ def wait_session(process, capture, serial, predicate, description, seconds=30):
     raise TimeoutError(f"Interactive guest did not complete {description}")
 
 
-def run_session(process, capture, qmp, destination, runtime_process_regression=False):
+def run_session(process, capture, qmp, destination, runtime_process_regression=False,
+                supervisor_image=None):
     serial = destination / "com1.log"
     children = list(session.SHELL_START.finditer(serial.read_bytes()))
     if len(children) != 1:
@@ -250,6 +255,14 @@ def run_session(process, capture, qmp, destination, runtime_process_regression=F
             reply = f"exit status {status}\r\nagentos> ".encode("ascii")
             wait_session(process, capture, serial,
                          lambda data: reply in data[offset:], command, 30)
+    if supervisor_image is not None:
+        offset = serial.stat().st_size
+        print(f"QEMU {supervisor_image} signed image: {session.SUPERVISOR_COMMAND!r}", flush=True)
+        capture.send(session.SUPERVISOR_INPUT)
+        reply = (session.SUPERVISOR_MISSING if supervisor_image=="control"
+                 else b"exit status 0\r\nagentos> ")
+        wait_session(process, capture, serial,
+                     lambda data: reply in data[offset:], session.SUPERVISOR_COMMAND, 30)
     for step in session.steps(shell, True):
         if step["screenshot"]:
             qmp.screenshot(destination / "keyboard-before.ppm")
@@ -284,6 +297,17 @@ def boot(args):
     commit = subprocess.check_output(["git", "rev-parse", "--verify", "HEAD"],
                                      cwd=root, text=True).strip()
     image = evidence.verify_build(root, commit)
+    image_path = "build/agentos.efi"
+    image_sha = image["artifacts"]["agentos.efi"]
+    supervisor_image = getattr(args, "supervisor_image", None)
+    if supervisor_image is not None:
+        if not args.session or not getattr(args, "runtime_process_regression", False):
+            raise ValueError("Supervisor pair requires the full foreground and shell regressions")
+        paired = load("supervisor_image_evidence", "verify-supervisor-image.py")
+        identity = paired.verify_identity(root)
+        if supervisor_image=="test":
+            image_path = "build/supervisor-staging/test.efi"
+            image_sha = identity["test"]["signed_sha256"]
     profile = f"qemu-cpu{args.cpus}"
     if args.memory_mib != 256:
         profile += f"-ram{args.memory_mib}"
@@ -293,15 +317,20 @@ def boot(args):
         profile += "-"+args.accel
     if args.session:
         profile += "-session"
-    if getattr(args, "runtime_process_regression", False):
+    if supervisor_image is not None:
+        profile += "-sv-"+supervisor_image
+    elif getattr(args, "runtime_process_regression", False):
         profile += "-runtime-process-regression"
     destination = root / "build/check" / profile
     destination.mkdir(parents=True, exist_ok=True)
+    if supervisor_image is not None:
+        for name in ("smoke.json", "failure.json"):
+            (destination/name).unlink(missing_ok=True)
     raw = destination / "esp.raw"
     if raw.exists():
         raw.unlink()
     subprocess.run(["bash", "scripts/disk.sh", str(destination),
-                    "build/agentos.efi", "info both"], cwd=root, check=True)
+                    image_path, "info both"], cwd=root, check=True)
     # Independently re-read the exact signed EFI from the ESP. A GPT image
     # that merely exists is not evidence its fallback boot file was copied.
     copied = destination / "esp-bootx64.efi"
@@ -309,7 +338,7 @@ def boot(args):
         copied.unlink()
     subprocess.run(["mcopy", "-i", f"{raw}@@1048576",
                     "::EFI/BOOT/BOOTX64.EFI", str(copied)], check=True)
-    if evidence.sha256(copied) != image["artifacts"]["agentos.efi"]:
+    if evidence.sha256(copied) != image_sha:
         raise RuntimeError("EFI on QEMU ESP differs from the signed build output")
     vm_vars = destination / "OVMF_VARS.secboot.fd"
     if vm_vars.exists():
@@ -409,7 +438,7 @@ def boot(args):
                     console.verify(destination / "shell-screen.ppm", aLevel="info", aOutput="both")
                     if args.session:
                         run_session(process, serial_capture, qmp, destination,
-                                    getattr(args, "runtime_process_regression", False))
+                                    getattr(args, "runtime_process_regression", False), supervisor_image)
                     run_succeeded = True
                     break
                 if process.poll() is not None:
@@ -433,7 +462,7 @@ def boot(args):
                 "failure": str(error),
                 "last_com1_bytes": tail,
                 "host_elapsed_seconds": round(time.monotonic() - start, 3),
-                "signed_efi_sha256": image["artifacts"]["agentos.efi"],
+                "signed_efi_sha256": image_sha,
             }
             (destination / "failure.json").write_text(
                 json.dumps(failure, indent=2, sort_keys=True) + "\n",
@@ -492,7 +521,8 @@ def boot(args):
     if args.session:
         session_result = session.verify(serial.read_bytes(), (destination / "com1-input.bin").read_bytes(),
                                         True, args.cpus,
-                                        aRuntimeProcess=getattr(args,"runtime_process_regression",False))
+                                        aRuntimeProcess=getattr(args,"runtime_process_regression",False),
+                                        aSupervisorImage=supervisor_image)
     bases = re.findall(r"(?m)^\[INFO\] KERNEL IMAGE BASE=([0-9a-f]{16})\r?$", text)
     if len(bases) != 1:
         raise RuntimeError(f"Expected one actual runtime kernel image address: {bases}")
@@ -522,13 +552,15 @@ def boot(args):
         "migration": migration_result,
         "gop_sha256": evidence.sha256(destination / "shell-screen.ppm"),
         "host_elapsed_seconds": round(time.monotonic()-start, 3),
-        "signed_efi_sha256": image["artifacts"]["agentos.efi"],
+        "signed_efi_sha256": image_sha,
         "ovmf_code_sha256": evidence.sha256(args.ovmf_code),
         "esp_sha256": evidence.sha256(raw),
         "esp_boot_efi_sha256": evidence.sha256(copied),
         "com1_sha256": evidence.sha256(serial),
         "firmware_vars_sha256_after_boot": evidence.sha256(vm_vars),
     }
+    if supervisor_image is not None:
+        receipt["supervisor_image"] = supervisor_image
     if args.session:
         receipt["com1_input_sha256"] = evidence.sha256(destination / "com1-input.bin")
         receipt["ps2_before_sha256"] = evidence.sha256(destination / "keyboard-before.ppm")

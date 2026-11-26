@@ -3,8 +3,11 @@ set -euo pipefail
 export LC_ALL=C SOURCE_DATE_EPOCH=0
 root=$(cd "$(dirname "$0")/.." && pwd)
 profile=default
+staging=0
 rust_flags=()
-if [[ $# -eq 1 && $1 == --ahci-dma ]]; then
+if [[ $# -eq 1 && $1 == --supervisor-staging ]]; then
+    staging=1 # Host packaging only; production compiler flags are unchanged.
+elif [[ $# -eq 1 && $1 == --ahci-dma ]]; then
     profile=ahci-dma
     rust_flags=(--cfg ahci_dma_acceptance)
 elif [[ $# -eq 1 && $1 == --ahci-block ]]; then
@@ -20,7 +23,7 @@ elif [[ $# -eq 1 && $1 == --xhci ]]; then
     profile=xhci
     rust_flags=(--cfg xhci_acceptance)
 elif [[ $# -ne 0 ]]; then
-    echo 'Usage: build.sh [--ahci-dma|--ahci-block|--nvme-block|--virtio-net|--xhci]' >&2
+    echo 'Usage: build.sh [--supervisor-staging|--ahci-dma|--ahci-block|--nvme-block|--virtio-net|--xhci]' >&2
     exit 2
 fi
 while IFS='=' read -r package expected || [[ -n "$package" ]]; do
@@ -35,6 +38,7 @@ out="$root/build"
 mkdir -p "$out"
 # Never leave a success receipt from a previous build if the new build fails.
 rm -f "$out/build-provenance.json"
+rm -rf -- "$out/supervisor-staging"
 work=$(mktemp -d)
 # Work directory was exclusively created by mktemp. New ELF programs and C
 # objects must never make a successful, signed build fail in the EXIT trap.
@@ -74,8 +78,9 @@ for app in init fault receiver service shell svc_ok svc_fail svc_hang orphan_par
     python3 "$root/scripts/verify-user-abi.py" "$app"
 done
 awk 'BEGIN {for (i=0;i<8193;i++) printf "%c",(i*73+int(i/251)*19)%256}' > data/transfer.bin
-touch -d @0 stage init fault receiver service shell svc_ok svc_fail svc_hang orphan_parent manager svc_alive svc_flaky data/transfer.bin data
-printf '%s\n' stage init fault receiver service shell svc_ok svc_fail svc_hang orphan_parent manager svc_alive svc_flaky data data/transfer.bin | cpio --quiet --reproducible --owner=0:0 -o -H newc > initramfs.cpio
+files=(stage init fault receiver service shell svc_ok svc_fail svc_hang orphan_parent manager svc_alive svc_flaky data data/transfer.bin)
+touch -d @0 "${files[@]}"
+printf '%s\n' "${files[@]}" | cpio --quiet --reproducible --owner=0:0 -o -H newc > initramfs.cpio
 cp initramfs.cpio "$out/initramfs.cpio"
 gcc-13 -I/usr/include/efi -I/usr/include/efi/x86_64 -DGNU_EFI_USE_MS_ABI \
     -O2 -Wall -Wextra -Werror -fpic -ffreestanding -fno-stack-protector -fshort-wchar \
@@ -137,3 +142,30 @@ temporary.replace(path)
 print(f"Build provenance: {path} (commit {receipt['source_commit']}, clean={receipt['source_clean']})")
 PY
 sha256sum "$out/"*.efi
+
+# Both images reuse the same actual loader, kernel and customer binaries.
+# Only the optional host packaging step adds the standalone test client.
+if ((staging)); then
+    stage_out="$out/supervisor-staging"
+    mkdir "$stage_out"
+    cp loader.o supervisor.o layout.ld "$stage_out/"
+    gcc-13 -c "$root/scripts/tests/supervisor-runner.S" -o runner-entry.o
+    gcc-13 -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
+        -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large \
+        -c "$root/scripts/tests/supervisor-runner.c" -o runner.o
+    ld --no-undefined --build-id=none -z noexecstack -s -T "$root/user/user.ld" \
+        -o supervisor-runner runner-entry.o runner.o supervisor.o
+    python3 "$root/scripts/verify-user-abi.py" supervisor-runner
+    cp supervisor-runner "$stage_out/"
+    touch -d @0 supervisor-runner
+    printf '%s\n' "${files[@]}" supervisor-runner | cpio --quiet --reproducible --owner=0:0 -o -H newc > initramfs.cpio
+    cp initramfs.cpio "$stage_out/test.cpio"
+    gcc-13 -c "$root/boot/payload.S" -o payload.o
+    ld -nostdlib --build-id=none -znocombreloc -T layout.ld -shared -Bsymbolic \
+       /usr/lib/crt0-efi-x86_64.o loader.o payload.o -L/usr/lib -lefi -lgnuefi -o loader.so
+    objcopy --strip-all -j .text -j .sdata -j .data -j .dynamic -j .dynsym -j .rela -j .reloc \
+        -j .kernel -j .initrd --target=efi-app-x86_64 loader.so "$stage_out/test.unsigned.efi"
+    sbsign --key "$keys/db.key" --cert "$keys/db.crt" --output "$stage_out/test.efi" "$stage_out/test.unsigned.efi"
+    sbverify --cert "$keys/db.crt" "$stage_out/test.efi"
+    python3 "$root/scripts/verify-supervisor-image.py" --write-identity
+fi

@@ -342,3 +342,69 @@ jobs:
             build/agentos.unsigned.efi
             build/db.esl
             build/check/qemu-no-uart-cpu${{ matrix.cpus }}/run-*/**
+
+  supervisor-staging:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        cpus: [1, 2]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install pinned EFI and QEMU dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            binutils cpio gcc-13 gnu-efi rustc python3 openssl \
+            sbsigntool efitools gdisk mtools qemu-system-x86 ovmf python3-virt-firmware
+      - name: Build ordinary distribution and separately signed runner image
+        run: bash scripts/build.sh --supervisor-staging
+      - name: Boot both signed images and drive the same full session
+        env:
+          CPU_COUNT: ${{ matrix.cpus }}
+        run: |
+          set -euo pipefail
+          status=0
+          for variant in control test; do
+            python3 scripts/qemu-smoke.py --cpus "$CPU_COUNT" --session \
+              --runtime-process-regression --supervisor-image "$variant" \
+              --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd \
+              --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd --timeout 720 || status=1
+          done
+          test "$status" -eq 0
+          python3 scripts/verify-supervisor-image.py --cpus "$CPU_COUNT"
+      - name: Preserve paired signed images and independent evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-supervisor-staging-${{ matrix.cpus }}cpu
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            build/build-provenance.json
+            build/agentos.efi
+            build/agentos.unsigned.efi
+            build/kernel.elf
+            build/initramfs.cpio
+            build/db.cer
+            build/db.esl
+            build/supervisor-staging/
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-control/*.log
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-control/*.json
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-control/*.bin
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-control/*.ppm
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-control/esp-bootx64.efi
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-control/secureboot-vars.txt
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-control/OVMF_VARS.secboot.fd
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-control/esp.raw
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-test/*.log
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-test/*.json
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-test/*.bin
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-test/*.ppm
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-test/esp-bootx64.efi
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-test/secureboot-vars.txt
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-test/OVMF_VARS.secboot.fd
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-test/esp.raw
