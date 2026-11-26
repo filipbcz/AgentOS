@@ -165,6 +165,10 @@ printf 'Testing invariant TSC capability, calibration and SMP alignment with %s\
 "$pRustc" --edition 2021 --test "$pRoot/scripts/tests/tsc-host.rs" -o "$pOut/tsc-tests"
 "$pOut/tsc-tests"
 
+printf 'Testing independent legacy PIT one-shot calibration and bounded register faults with %s\n' "$pRustc"
+"$pRustc" --edition 2021 --test "$pRoot/scripts/tests/pit-host.rs" -o "$pOut/pit-tests"
+"$pOut/pit-tests"
+
 printf 'Testing independent TSC watchdog, CPU skew and maintenance deadlines with %s\n' "$pRustc"
 "$pRustc" --edition 2021 --test "$pRoot/scripts/tests/tsc-watchdog-host.rs" -o "$pOut/tsc-watchdog-tests"
 "$pOut/tsc-watchdog-tests"
