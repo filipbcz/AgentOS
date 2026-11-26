@@ -2,7 +2,7 @@
 //! clock. Never substitutes TSC for that clock on disagreement: two
 //! disagreeing counters alone cannot identify which counter failed.
 //! Samples include actual readout uncertainty and the measured CPU offset.
-use crate::tsc::Alignment;
+use crate::{clock_quorum::Witness, tsc::Alignment};
 use core::{cell::UnsafeCell, hint::spin_loop,
     sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering}};
 
@@ -150,80 +150,208 @@ impl Watchdog {
     }
 }
 
-/// Shared BSP anchor. Each AP uses its startup offset to compare its current
-/// normalized TSC with a recent independent observation from the BSP.
-/// A gap is not evidence of success; a clear mismatch revokes this candidate
-/// for the entire machine until a future explicit requalification lifecycle.
+// A fleet lease is expressed in normalized TSC ticks, not the currently
+// selected physical epoch: a stopped physical clock cannot indefinitely
+// extend a previously verified lease. Account conservatively for cross-CPU
+// alignment, readout and the full comparison-window rate error.
+const FLEET_GUARD_NS: u128 = 6_000_000;
+
+#[derive(Clone, Copy)]
+struct Member {
+    alignment: Option<Alignment>,
+    last_raw: Option<u64>,
+    verified: Option<Point>,
+}
+impl Member {
+    const fn new() -> Self { Self { alignment: None, last_raw: None, verified: None } }
+}
+
+struct Fleet {
+    expected: [u64; 4],
+    members: [Member; 256],
+}
+impl Fleet {
+    const fn new() -> Self {
+        Self { expected: [0; 4], members: [Member::new(); 256] }
+    }
+
+    fn register(&mut self, bsp: u32, ids: impl IntoIterator<Item = u8>) -> bool {
+        // The current APIC topology uses xAPIC IDs, not a dense CPU index.
+        // Publish only a complete, nonduplicated enabled CPU roster.
+        let mut mask = [0u64; 4];
+        for id in ids {
+            let index = id as usize;
+            let bit = 1u64 << (index % 64);
+            if mask[index/64] & bit != 0 { return false; }
+            mask[index/64] |= bit;
+        }
+        if bsp >= 256 || mask[bsp as usize / 64] & (1u64 << (bsp % 64)) == 0 {
+            return false;
+        }
+        self.expected = mask;
+        true
+    }
+
+    fn contains(&self, cpu: u32) -> bool {
+        cpu < 256 && self.expected[cpu as usize / 64] & (1u64 << (cpu % 64)) != 0
+    }
+
+    fn revoke(&mut self, cpu: u32) {
+        if self.contains(cpu) { self.members[cpu as usize].verified = None; }
+    }
+
+    fn observe(&mut self, cpu: u32, alignment: Alignment, sample: Sample,
+               point: Option<Point>, health: Health, completed_window: bool) {
+        let member = &mut self.members[cpu as usize];
+        member.alignment = Some(alignment);
+        member.last_raw = Some(sample.after);
+        // Refresh only from a newly completed independent window. Merely
+        // reading the candidate repeatedly never renews its own lease.
+        if health != Health::Verified {
+            member.verified = None;
+        } else if completed_window {
+            member.verified = point;
+        }
+    }
+
+    fn witness(&self, cpu: u8, alignment: Alignment, raw: u64, hz: u64) -> Option<Witness> {
+        if hz == 0 || !self.contains(cpu as u32) { return None; }
+        let local = &self.members[cpu as usize];
+        if local.alignment != Some(alignment) || raw < local.last_raw? { return None; }
+        let ticks = alignment.normalize(raw)?;
+        let guard = u64::try_from((hz as u128 * FLEET_GUARD_NS + 999_999_999)
+            / 1_000_000_000).ok()?;
+        let uncertainty = guard.checked_add(alignment.uncertainty_ticks)?;
+        let now_high = ticks.checked_add(uncertainty)?;
+        let max_age = hz as u128 * MAX_GAP_NS as u128 / 1_000_000_000;
+        // Use only registered CPU IDs, including sparse APIC IDs. All
+        // verified observations must still be fresh on the common scale.
+        for (word, mut pending) in self.expected.into_iter().enumerate() {
+            while pending != 0 {
+                let index = word*64 + pending.trailing_zeros() as usize;
+                pending &= pending-1;
+                let point = self.members[index].verified?;
+                let low = u64::try_from(point.low).ok()?;
+                if low > now_high || (now_high-low) as u128 > max_age {
+                    return None;
+                }
+            }
+        }
+        Some(Witness { cpu, ticks, hz, uncertainty_ticks: uncertainty })
+    }
+}
+
+struct MonitorData {
+    anchor: Option<Point>,
+    fleet: Fleet,
+}
+
+/// Shared BSP anchor and machine-wide, time-bounded TSC qualification.
+/// A gap is not evidence of success; a clear mismatch revokes the entire
+/// candidate until a future explicit requalification lifecycle.
 pub(crate) struct RuntimeMonitor {
     state: AtomicU8, // 0 disabled, 1 active, 2 rejected
     bsp: AtomicU32,
     hz: AtomicU64,
     gate: AtomicBool,
-    anchor: UnsafeCell<Option<Point>>,
+    data: UnsafeCell<MonitorData>,
 }
 
-// SAFETY: anchor access is serialized by gate. Initialization precedes
-// publication to APs. Every caller of observe is a kernel CPU with IRQs
-// masked; no hardware read or other lock acquisition occurs inside gate.
+// SAFETY: data access is serialized by gate. Initialization precedes
+// publication to APs. Every runtime caller masks local IRQs. No hardware
+// reads or other kernel lock acquisitions occur inside gate.
 unsafe impl Sync for RuntimeMonitor {}
 
 impl RuntimeMonitor {
     pub const fn new() -> Self {
         Self { state: AtomicU8::new(0), bsp: AtomicU32::new(0), hz: AtomicU64::new(0),
-               gate: AtomicBool::new(false), anchor: UnsafeCell::new(None) }
+               gate: AtomicBool::new(false),
+               data: UnsafeCell::new(MonitorData { anchor: None, fleet: Fleet::new() }) }
     }
 
     /// Once, on the BSP before runtime publication, only if every enabled
     /// CPU has an independently qualified rate and bounded startup offset.
-    pub fn start(&self, bsp: u32, hz: u64) {
-        if hz == 0 || self.state.load(Ordering::Relaxed) != 0 { return; }
-        self.bsp.store(bsp, Ordering::Relaxed);
-        self.hz.store(hz, Ordering::Relaxed);
-        self.state.store(1, Ordering::Release);
+    pub fn start(&self, bsp: u32, hz: u64, ids: impl IntoIterator<Item = u8>) -> bool {
+        self.with_data(|data| {
+            if hz == 0 || self.state.load(Ordering::Relaxed) != 0 ||
+               !data.fleet.register(bsp, ids) { return false; }
+            self.bsp.store(bsp, Ordering::Relaxed);
+            self.hz.store(hz, Ordering::Relaxed);
+            self.state.store(1, Ordering::Release);
+            true
+        })
     }
 
     pub fn active(&self) -> bool { self.state.load(Ordering::Acquire) == 1 }
 
-    fn with_anchor<R>(&self, f: impl FnOnce(&mut Option<Point>) -> R) -> R {
+    fn with_data<R>(&self, f: impl FnOnce(&mut MonitorData) -> R) -> R {
         while self.gate.swap(true, Ordering::Acquire) {
             while self.gate.load(Ordering::Relaxed) { spin_loop(); }
         }
-        let result = f(unsafe { &mut *self.anchor.get() });
+        let result = f(unsafe { &mut *self.data.get() });
         self.gate.store(false, Ordering::Release);
         result
     }
 
-    /// IRQs must be masked; the caller owns its Watchdog. Measurements have
-    /// already been acquired, so lock ordering cannot involve MMIO or time.
+    /// IRQs must be masked. The caller owns its per-CPU Watchdog.
     pub fn observe(&self, cpu: u32, rate: u64, alignment: Alignment,
                    watchdog: &mut Watchdog, sample: Option<Sample>) -> Health {
-        if !self.active() { return watchdog.health(); }
-        let Some(sample) = sample else { return watchdog.unverified(); };
-        let hz = self.hz.load(Ordering::Relaxed);
-        let bsp = cpu == self.bsp.load(Ordering::Relaxed);
-        let normalized = sample.point(rate, alignment);
-        let cross = if bsp {
-            Comparison::Match
-        } else if let Some(point) = normalized {
-            self.with_anchor(|anchor| match *anchor {
-                Some(origin) => compare(origin, point, hz),
-                None => Comparison::Stale,
-            })
-        } else {
-            Comparison::Stale
-        };
-        let health = watchdog.observe(sample, rate, cross);
-        if health == Health::Rejected {
-            self.state.store(2, Ordering::Release);
-        } else if bsp && normalized.is_some() {
-            self.with_anchor(|anchor| {
-                // A wide or invalid sample must not replace a usable anchor.
-                if anchor.map_or(true, |old| sample.reference_ns >= old.ns) {
-                    *anchor = normalized;
+        self.with_data(|data| {
+            if !self.active() { return watchdog.health(); }
+            if !data.fleet.contains(cpu) { return watchdog.unverified(); }
+            let Some(sample) = sample else {
+                data.fleet.revoke(cpu);
+                return watchdog.unverified();
+            };
+            let hz = self.hz.load(Ordering::Relaxed);
+            let bsp = cpu == self.bsp.load(Ordering::Relaxed);
+            let normalized = sample.point(rate, alignment);
+            let old_alignment = data.fleet.members[cpu as usize].alignment;
+            let cross = if rate == 0 || rate.abs_diff(hz) as u128 * 1000 > rate.min(hz) as u128 ||
+                           old_alignment.map_or(false, |old| old != alignment) {
+                Comparison::Disagree
+            } else if bsp {
+                Comparison::Match
+            } else if let Some(point) = normalized {
+                match data.anchor {
+                    Some(origin) => compare(origin, point, hz),
+                    None => Comparison::Stale,
                 }
-            });
-        }
-        health
+            } else {
+                Comparison::Stale
+            };
+            let previous = watchdog.baseline.map(|p| p.ns);
+            let health = watchdog.observe(sample, rate, cross);
+            let completed_window = watchdog.baseline.map(|p| p.ns) != previous;
+            data.fleet.observe(cpu, alignment, sample, normalized, health, completed_window);
+            if health == Health::Rejected {
+                self.state.store(2, Ordering::Release);
+            } else if bsp && normalized.is_some() &&
+                      data.anchor.map_or(true, |old| sample.reference_ns >= old.ns) {
+                data.anchor = normalized;
+            }
+            health
+        })
+    }
+
+    /// This reads only evidence already published by independent watchdog
+    /// observations. The caller samples the local TSC outside this lock,
+    /// with IRQs masked; witness acquisition never calls the system clock.
+    pub fn witness(&self, cpu: u8, alignment: Alignment, raw: u64) -> Option<Witness> {
+        if !self.active() { return None; }
+        self.with_data(|data| {
+            if !self.active() { return None; }
+            data.fleet.witness(cpu, alignment, raw, self.hz.load(Ordering::Relaxed))
+        })
+    }
+
+    /// Two independent physical clocks contradicted the candidate. Stop
+    /// granting leases and remove its maintenance requirement. This never
+    /// changes the system clock or reads any hardware under the gate.
+    pub fn reject(&self) {
+        self.with_data(|_| {
+            if self.active() { self.state.store(2, Ordering::Release); }
+        });
     }
 }
 
