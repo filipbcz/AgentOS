@@ -1,9 +1,9 @@
-//! Single system-wide monotonic epoch shared by syscalls and drivers.
-//! A source is selected before SMP and is never reset by another CPU.
-//! Read + wrap extension are serialized with local interrupts masked.
+//! A shared monotonic epoch with a continuously qualified hardware standby.
+//! Physical counter reads, modulo extension and source transitions are
+//! serialized by one IRQ-safe SMP gate. No CPU-local TSC is authoritative.
 use crate::reference_clock::{PmTimer, ReferenceClock};
 use core::{arch::asm, cell::UnsafeCell, hint::spin_loop,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering}};
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering}};
 
 pub(crate) struct Epoch {
     source: ReferenceClock,
@@ -17,57 +17,303 @@ impl Epoch {
         Self { source, last: first & source.mask(), ticks: 0, valid: true }
     }
 
-    pub(crate) fn observe(&mut self, raw: u64) -> Option<u64> {
+    fn ns(&self) -> u128 { self.source.wide_ns(self.ticks) }
+
+    fn advance(&mut self, raw: u64) -> Option<u128> {
         if !self.valid { return None; }
         let raw = raw & self.source.mask();
         let Some(delta) = self.source.delta(self.last, raw) else {
-            // An ambiguous jump/reset cannot be interpreted as elapsed time.
-            // The epoch is no longer trustworthy; never restart it silently.
             self.valid = false;
             return None;
         };
         self.last = raw;
         self.ticks = self.ticks.saturating_add(delta as u128);
+        Some(self.ns())
+    }
+
+    pub(crate) fn observe(&mut self, raw: u64) -> Option<u64> {
+        self.advance(raw)?;
         Some(self.source.ticks_to_ms(self.ticks))
     }
 }
 
 pub(crate) fn choose(pm: Option<PmTimer>, hp: Option<ReferenceClock>,
                      mut progressing: impl FnMut(ReferenceClock) -> bool) -> Option<ReferenceClock> {
-    // Prefer HPET, including a 32-bit device when maintenance is feasible.
-    // The ACPI PM timer is an independent standard fallback, not a TSC
-    // approximation; all CPUs see the same physical counter and epoch.
-    for source in [hp, pm.map(ReferenceClock::Pm)].into_iter().flatten() {
-        if source.maintenance_ms() != Some(0) && progressing(source) {
-            return Some(source);
+    [hp, pm.map(ReferenceClock::Pm)].into_iter().flatten()
+        .find(|&source| source.maintenance_ms() != Some(0) && progressing(source))
+}
+
+const WINDOW_NS: u128 = 100_000_000;
+const QUALIFY_WINDOWS: u8 = 3;
+const BRACKET_NS: u128 = 200_000;
+const JITTER_NS: u128 = 100_000;
+const MAX_GAP_NS: u128 = 2_000_000_000;
+const MAX_ANCHOR_AGE_NS: u128 = 2_500_000_000;
+const STALL_NS: u128 = 100_000_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum ClockEvent {
+    StandbyRetired = 1, PromotedPm = 2, PromotedHpet = 3,
+    Unavailable = 4, StandbyRebased = 5,
+}
+
+impl ClockEvent {
+    pub fn message(self) -> &'static [u8] {
+        match self {
+            Self::StandbyRetired => b"SYSTEM CLOCK: standby counter invalid; retaining active source",
+            Self::PromotedPm => b"SYSTEM CLOCK: switched to qualified ACPI PM timer",
+            Self::PromotedHpet => b"SYSTEM CLOCK: switched to qualified HPET",
+            Self::Unavailable => b"SYSTEM CLOCK: no trustworthy elapsed time; epoch unavailable",
+            Self::StandbyRebased => b"SYSTEM CLOCK: standby wrap ambiguous; requalifying",
         }
     }
-    None
+    pub fn error(self) -> bool { self == Self::Unavailable }
+}
+
+#[derive(Clone, Copy)]
+struct Pair { low: u128, high: u128, shadow: u128 }
+
+#[derive(Clone, Copy)]
+struct Anchor { global: u128, shadow: u128 }
+
+/// The pure transition logic receives actual register observations through
+/// one read operation. Host fixtures exercise the identical implementation.
+pub(crate) struct ClockSet {
+    primary: Epoch,
+    standby: Option<Epoch>,
+    base_ns: u128,
+    published_ns: u128,
+    baseline: Option<Pair>,
+    good_windows: u8,
+    anchor: Option<Anchor>,
+    stall_samples: u8,
+    failed: bool,
+    event: Option<ClockEvent>,
+}
+
+impl ClockSet {
+    pub(crate) fn new(primary: (ReferenceClock, u64),
+                      standby: Option<(ReferenceClock, u64)>) -> Self {
+        let standby = standby.filter(|(source, _)| *source != primary.0)
+            .map(|(source, first)| Epoch::new(source, first));
+        Self { primary: Epoch::new(primary.0, primary.1), standby,
+            base_ns: 0, published_ns: 0, baseline: None, good_windows: 0,
+            anchor: None, stall_samples: 0, failed: false, event: None }
+    }
+
+    pub(crate) fn source(&self) -> Option<ReferenceClock> {
+        (!self.failed).then_some(self.primary.source)
+    }
+
+    pub(crate) fn qualified(&self) -> bool { self.anchor.is_some() && !self.failed }
+    pub(crate) fn take_event(&mut self) -> Option<ClockEvent> { self.event.take() }
+
+    pub(crate) fn maintenance_ms(&self) -> Option<u64> {
+        if self.failed { return None; }
+        let active = self.primary.source.maintenance_ms();
+        let standby = self.standby.as_ref().and_then(|s| s.source.maintenance_ms());
+        match (active, standby) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            _ => None,
+        }
+    }
+
+    fn clear_qualification(&mut self) {
+        self.baseline = None;
+        self.good_windows = 0;
+        self.anchor = None;
+        self.stall_samples = 0;
+    }
+
+    fn retire_standby(&mut self) {
+        self.standby = None;
+        self.clear_qualification();
+        self.event = Some(ClockEvent::StandbyRetired);
+    }
+
+    fn rebase_standby(&mut self, source: ReferenceClock, raw: u64) {
+        // Unknown elapsed history invalidates only the standby epoch.
+        // Re-observe agreement before it may preserve absolute time.
+        self.standby = Some(Epoch::new(source, raw));
+        self.clear_qualification();
+        self.event = Some(ClockEvent::StandbyRebased);
+    }
+
+    fn unavailable(&mut self) -> Option<u128> {
+        self.failed = true;
+        self.clear_qualification();
+        self.event = Some(ClockEvent::Unavailable);
+        None
+    }
+
+    fn publish(&mut self, time: u128) -> Option<u128> {
+        if time < self.published_ns { return self.unavailable(); }
+        self.published_ns = time;
+        Some(time)
+    }
+
+    /// Preserve the last published epoch and every existing absolute
+    /// deadline. Do not reset time to the standby's power-on value.
+    /// The anchor is the lower end of the bounded primary read bracket.
+    fn promote(&mut self, shadow_ns: u128, step: u128) -> Option<u128> {
+        let Some(anchor) = self.anchor else { return self.unavailable(); };
+        let Some(elapsed) = shadow_ns.checked_sub(anchor.shadow) else {
+            return self.unavailable();
+        };
+        if step > MAX_GAP_NS || elapsed == 0 || elapsed > MAX_ANCHOR_AGE_NS {
+            return self.unavailable();
+        }
+        let Some(time) = anchor.global.checked_add(elapsed) else { return self.unavailable(); };
+        let Some(standby) = self.standby.take() else { return self.unavailable(); };
+        let time = time.max(self.published_ns);
+        self.base_ns = time;
+        self.primary = Epoch::new(standby.source, standby.last);
+        self.clear_qualification();
+        self.event = Some(match self.primary.source {
+            ReferenceClock::Pm(_) => ClockEvent::PromotedPm,
+            ReferenceClock::Hpet { .. } => ClockEvent::PromotedHpet,
+        });
+        self.publish(time)
+    }
+
+    /// A shadow read is enclosed by two primary reads. Compare elapsed
+    /// intervals, including read uncertainty and a 1% rate / 100us budget.
+    /// A new anchor must agree even between complete 100ms windows.
+    fn qualify_pair(&mut self, pair: Pair) -> bool {
+        if pair.high-pair.low > BRACKET_NS {
+            self.clear_qualification();
+            return false;
+        }
+        let Some(base) = self.baseline else {
+            self.baseline = Some(pair);
+            return false;
+        };
+        let Some(shadow_elapsed) = pair.shadow.checked_sub(base.shadow) else {
+            self.clear_qualification();
+            return false;
+        };
+        let Some(high) = pair.high.checked_sub(base.low) else {
+            self.clear_qualification();
+            return false;
+        };
+        let low = pair.low.saturating_sub(base.high);
+        let error = shadow_elapsed / 100 + JITTER_NS;
+        let window = high.max(shadow_elapsed) >= WINDOW_NS;
+        if high.max(shadow_elapsed) > MAX_GAP_NS ||
+           low > shadow_elapsed.saturating_add(error) ||
+           high.saturating_add(error) < shadow_elapsed ||
+           (window && (shadow_elapsed == 0 || low == 0)) {
+            self.clear_qualification();
+            self.baseline = Some(pair);
+            return false;
+        }
+        if window {
+            self.baseline = Some(pair);
+            self.good_windows = self.good_windows.saturating_add(1);
+        }
+        true
+    }
+
+    pub(crate) fn sample(&mut self, mut read: impl FnMut(ReferenceClock) -> u64) -> Option<u128> {
+        if self.failed { return None; }
+        let active = self.primary.source;
+        let prior = self.primary.ns();
+        let first = self.primary.advance(read(active));
+        let Some(standby) = self.standby.as_mut() else {
+            let Some(ns) = first else { return self.unavailable(); };
+            return self.publish(self.base_ns.saturating_add(ns));
+        };
+        let shadow_source = standby.source;
+        let shadow_prior = standby.ns();
+        let shadow_raw = read(shadow_source);
+        let shadow = standby.advance(shadow_raw);
+        let last = self.primary.advance(read(active));
+
+        // The known elapsed interval can exceed the standby's modulo
+        // ambiguity bound even when its raw residue appears plausible.
+        if let Some(high) = last {
+            if high-prior > shadow_source.half_span_ns() {
+                self.rebase_standby(shadow_source, shadow_raw);
+                return self.publish(self.base_ns.saturating_add(high));
+            }
+        }
+        let Some(shadow_ns) = shadow else {
+            self.retire_standby();
+            let Some(ns) = last else { return self.unavailable(); };
+            return self.publish(self.base_ns.saturating_add(ns));
+        };
+        let step = shadow_ns-shadow_prior;
+        let (Some(low), Some(high)) = (first, last) else {
+            // A detected active regression can only use a recent,
+            // previously qualified standby.
+            return self.promote(shadow_ns, step);
+        };
+
+        if step > active.half_span_ns() {
+            // Two disagreeing sources cannot prove a missing wrap. Only
+            // a previously qualified witness can invalidate this epoch;
+            // an unqualified optional device cannot disable the OS.
+            if self.qualified() { return self.unavailable(); }
+            self.rebase_standby(shadow_source, shadow_raw);
+            return self.publish(self.base_ns.saturating_add(high));
+        }
+        if step > MAX_GAP_NS || high-prior > MAX_GAP_NS {
+            self.clear_qualification();
+        }
+
+        let time = self.base_ns.saturating_add(high);
+        if high == prior {
+            if let Some(anchor) = self.anchor {
+                let Some(elapsed) = shadow_ns.checked_sub(anchor.shadow) else {
+                    return self.unavailable();
+                };
+                if elapsed > MAX_ANCHOR_AGE_NS {
+                    self.clear_qualification();
+                } else {
+                    // Do not mistake one large standby jump or repeated
+                    // identical reads for evidence of a stalled primary.
+                    if step != 0 { self.stall_samples = self.stall_samples.saturating_add(1); }
+                    if elapsed >= STALL_NS && self.stall_samples >= 2 {
+                        return self.promote(shadow_ns, step);
+                    }
+                    return self.publish(time);
+                }
+            }
+        }
+        self.stall_samples = 0;
+        let consistent = self.qualify_pair(Pair { low, high, shadow: shadow_ns });
+        if consistent && self.good_windows >= QUALIFY_WINDOWS && high > prior {
+            self.anchor = Some(Anchor { global: self.base_ns.saturating_add(low), shadow: shadow_ns });
+        }
+        self.publish(time)
+    }
 }
 
 struct SharedClock {
     gate: AtomicBool,
-    epoch: UnsafeCell<Option<Epoch>>,
-    maintenance: AtomicU64, // 0 = no short-counter maintenance needed
+    clocks: UnsafeCell<Option<ClockSet>>,
+    maintenance: AtomicU64,
+    event: AtomicU8,
 }
-
 unsafe impl Sync for SharedClock {}
 
 impl SharedClock {
     const fn new() -> Self {
-        Self { gate: AtomicBool::new(false), epoch: UnsafeCell::new(None),
-               maintenance: AtomicU64::new(0) }
+        Self { gate: AtomicBool::new(false), clocks: UnsafeCell::new(None),
+            maintenance: AtomicU64::new(0), event: AtomicU8::new(0) }
     }
 
-    // No MMIO or other kernel locks may call back into this gate. Interrupt
-    // masking prevents a local timer/syscall from deadlocking its owner.
-    fn with<R>(&self, operation: impl FnOnce(&mut Option<Epoch>) -> R) -> R {
+    // No other kernel lock or logging operation is acquired under this
+    // gate. Local IRQ masking prevents recursion on the owning CPU.
+    fn with<R>(&self, operation: impl FnOnce(&mut Option<ClockSet>) -> R) -> R {
         let flags: usize;
         unsafe { asm!("pushfq", "pop {}", "cli", out(reg) flags); }
         while self.gate.swap(true, Ordering::Acquire) {
             while self.gate.load(Ordering::Relaxed) { spin_loop(); }
         }
-        let result = operation(unsafe { &mut *self.epoch.get() });
+        let result = operation(unsafe { &mut *self.clocks.get() });
         self.gate.store(false, Ordering::Release);
         if flags & (1 << 9) != 0 { unsafe { asm!("sti", options(nostack)); } }
         result
@@ -78,38 +324,53 @@ static CLOCK: SharedClock = SharedClock::new();
 
 pub unsafe fn init(pm: Option<PmTimer>, hp: Option<ReferenceClock>)
     -> Result<ReferenceClock, &'static [u8]> {
-    CLOCK.with(|epoch| {
-        if epoch.is_some() { return Err(b"system clock already initialized" as &[u8]); }
+    CLOCK.with(|clocks| {
+        if clocks.is_some() { return Err(b"system clock already initialized" as &[u8]); }
         let source = choose(pm, hp, |s| s.progressing())
             .ok_or(b"no progressing system clock with maintainable wrap interval" as &[u8])?;
-        *epoch = Some(Epoch::new(source, source.sample()));
-        CLOCK.maintenance.store(source.maintenance_ms().unwrap_or(0), Ordering::Release);
+        let standby = [hp, pm.map(ReferenceClock::Pm)].into_iter().flatten()
+            .find(|&s| s != source && s.maintenance_ms() != Some(0) && s.progressing());
+        let first = source.sample();
+        let standby = standby.map(|s| (s, s.sample()));
+        let set = ClockSet::new((source, first), standby);
+        CLOCK.maintenance.store(set.maintenance_ms().unwrap_or(0), Ordering::Release);
+        *clocks = Some(set);
         Ok(source)
     })
 }
 
-pub fn millis() -> Option<u64> {
-    CLOCK.with(|epoch| {
-        let epoch = epoch.as_mut()?;
-        let raw = unsafe { epoch.source.sample() };
-        epoch.observe(raw)
-    })
-}
+pub fn millis() -> Option<u64> { snapshot().map(|(ms, _)| ms) }
 
-/// Read the same shared epoch once, returning the normal ABI value and
-/// precise time for independent clock comparison. A nanosecond overflow
-/// does not truncate the much larger signed-millisecond ABI range.
+/// Both views refer to the same observation and shared absolute epoch.
 pub(crate) fn snapshot() -> Option<(u64, Option<u64>)> {
-    CLOCK.with(|epoch| {
-        let epoch = epoch.as_mut()?;
-        let raw = unsafe { epoch.source.sample() };
-        let ms = epoch.observe(raw)?;
-        Some((ms, epoch.source.total_ns(epoch.ticks)))
+    CLOCK.with(|clocks| {
+        let clocks = clocks.as_mut()?;
+        let result = clocks.sample(|source| unsafe { source.sample() });
+        let maintenance = clocks.maintenance_ms().unwrap_or(0);
+        if CLOCK.maintenance.load(Ordering::Relaxed) != maintenance {
+            CLOCK.maintenance.store(maintenance, Ordering::Release);
+        }
+        if let Some(event) = clocks.take_event() {
+            CLOCK.event.store(event as u8, Ordering::Release);
+        }
+        let ns = result?;
+        Some(((ns / 1_000_000).min(isize::MAX as u128) as u64, u64::try_from(ns).ok()))
     })
 }
 
-/// Only one online CPU is required to sample a shared short counter when
-/// there are no runnable tasks or timed waiters. Other CPUs stay tickless.
+pub(crate) fn take_event() -> Option<ClockEvent> {
+    match CLOCK.event.swap(0, Ordering::AcqRel) {
+        1 => Some(ClockEvent::StandbyRetired),
+        2 => Some(ClockEvent::PromotedPm),
+        3 => Some(ClockEvent::PromotedHpet),
+        4 => Some(ClockEvent::Unavailable),
+        5 => Some(ClockEvent::StandbyRebased),
+        _ => None,
+    }
+}
+
+/// The BSP maintains the shortest active or standby wrap interval.
+/// All other idle CPUs retain their ordinary timer policy.
 pub fn maintenance_ms() -> Option<u64> {
     let interval = CLOCK.maintenance.load(Ordering::Acquire);
     (interval != 0).then_some(interval)
