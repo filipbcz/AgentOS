@@ -9,6 +9,10 @@ mod clock_quorum;
 mod tsc;
 #[path = "../../kernel/tsc_watchdog.rs"]
 mod tsc_watchdog;
+#[path = "../../kernel/pit.rs"]
+mod pit;
+#[path = "../../kernel/tsc_epoch.rs"]
+mod tsc_epoch;
 #[path = "../../kernel/system_clock.rs"]
 mod system_clock;
 #[path = "../../kernel/timer.rs"]
