@@ -30,6 +30,7 @@ mod reference_clock;
 mod clock_quorum;
 mod system_clock;
 mod tsc;
+mod pit;
 mod tsc_watchdog;
 mod native_abi;
 mod files;
