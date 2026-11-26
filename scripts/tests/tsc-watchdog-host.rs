@@ -155,6 +155,11 @@ fn complete_sparse_fleet_must_be_verified_before_witness_is_available() {
     assert_eq!(monitor.witness(20,ZERO,local),None);
     assert_eq!(monitor.witness(19,ZERO,ap_raw),None);
     assert_eq!(monitor.witness(7,ZERO,1),None);
+    // Regression after a granted witness must also be rejected, even
+    // if it is still later than the last independent watchdog sample.
+    assert!(monitor.witness(7,ZERO,local+300_000).is_some());
+    assert_eq!(monitor.witness(7,ZERO,local+299_999),None);
+    assert!(monitor.witness(7,ZERO,local+300_001).is_some());
 }
 
 #[test]
