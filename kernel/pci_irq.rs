@@ -1,6 +1,6 @@
 //! Boot-time owner of the Oxford PCIe UART and its PCI message interrupts.
 //! CPU startup is serialized. A route is quiesced before the next CPU owns it.
-use crate::{frames::Frames, system_clock, paging, pci::Console};
+use crate::{bringup_clock::BringupClock, frames::Frames, system_clock, paging, pci::Console};
 use core::{arch::asm, fmt::Write, ptr, sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering}};
 
 type Error = &'static [u8];
@@ -124,12 +124,12 @@ impl Oxford {
         Ok(())
     }
 
-    unsafe fn exchange(&self, vector: u8, cpu: u8, byte: u8) -> Result<(), Error> {
+    unsafe fn exchange(&self, vector: u8, cpu: u8, byte: u8, clock: BringupClock) -> Result<(), Error> {
         let uart = self.base + 4096;
         let before = RECEIVED.load(Ordering::Acquire);
         // Wait for the previous transmit shift register to drain with the
         // receiver's loopback disconnected. Only the ISR can consume RX.
-        until(|| rd::<u8>(uart + 5) & 0x40 != 0, b"Oxford transmitter busy")?;
+        until(clock, || rd::<u8>(uart + 5) & 0x40 != 0, b"Oxford transmitter busy")?;
         if rd::<u32>(self.base + 8) & 1 != 0 { return Err(b"Oxford RX already asserted"); }
         let msix = vector == MSIX;
         if msix {
@@ -144,11 +144,11 @@ impl Oxford {
         asm!("sti", options(nostack));
         let result = (|| {
             if msix {
-                until(|| rd::<u32>(self.messages.pending) & 1 != 0, b"MSI-X masked message timeout")?;
+                until(clock, || rd::<u32>(self.messages.pending) & 1 != 0, b"MSI-X masked message timeout")?;
                 if RECEIVED.load(Ordering::Acquire) != before { return Err(b"masked MSI-X delivered" as Error); }
                 wr(self.messages.entry + 12, 0u32);
             }
-            until(|| RECEIVED.load(Ordering::Acquire) != before, b"Oxford message delivery timeout")
+            until(clock, || RECEIVED.load(Ordering::Acquire) != before, b"Oxford message delivery timeout")
         })();
         asm!("cli", options(nostack));
         result?;
@@ -171,7 +171,7 @@ impl Oxford {
         Ok(())
     }
 
-    unsafe fn run(&self, cpu: u8) -> Result<(), Error> {
+    unsafe fn run(&self, cpu: u8, clock: BringupClock) -> Result<(), Error> {
         let cmd = rd::<u16>(self.cfg + 4);
         let m = &self.messages;
         if (m.msi != 0 && rd::<u16>(m.msi + 2) & 1 != 0) ||
@@ -192,7 +192,7 @@ impl Oxford {
                 if cap == 0 { continue; }
                 m.route(vector, cpu)?;
                 wr(uart + 1, 1u8); // received-data interrupts only
-                for payload in [0x53, 0xa6] { self.exchange(vector, cpu, payload ^ cpu ^ vector)?; }
+                for payload in [0x53, 0xa6] { self.exchange(vector, cpu, payload ^ cpu ^ vector, clock)?; }
                 wr(uart + 1, 0u8);
             }
             Ok(())
@@ -206,18 +206,18 @@ impl Oxford {
     }
 }
 
-fn until(mut condition: impl FnMut() -> bool, timeout: Error) -> Result<(), Error> {
-    let start = system_clock::millis().ok_or(b"missing IRQ deadline clock" as Error)?;
-    for _ in 0..10_000_000 {
-        if condition() { return Ok(()); }
-        if system_clock::millis().map_or(true, |now| now - start >= 750) { break; }
-        core::hint::spin_loop();
-    }
-    Err(timeout)
+// The IRQ owner runs on one boot CPU at a time, before user timers
+// need a global epoch. Its local deadline must not depend on a public
+// clock which may still be waiting for the full SMP roster.
+unsafe fn until(clock: BringupClock, mut condition: impl FnMut() -> bool, timeout: Error) -> Result<(), Error> {
+    clock.wait_until(750_000_000, || {
+        let _ = system_clock::millis();
+        condition()
+    }).map_err(|_| timeout)
 }
 
-pub unsafe fn exercise(cpu: u8) -> Result<(), Error> {
-    match PORT.load(Ordering::Acquire).as_ref() { Some(port) => port.run(cpu), None => Ok(()) }
+pub unsafe fn exercise(cpu: u8, clock: BringupClock) -> Result<(), Error> {
+    match PORT.load(Ordering::Acquire).as_ref() { Some(port) => port.run(cpu, clock), None => Ok(()) }
 }
 
 // Called exclusively from the two device IDT gates. Reading RBR consumes
