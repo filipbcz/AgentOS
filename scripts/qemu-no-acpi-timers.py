@@ -189,6 +189,57 @@ def verify_pm_read(io, port, disabled=True):
     return value
 
 
+def kernel_postmortem(qmp, dest, ram):
+    """Read existing kernel-owned state after a terminal test outcome.
+
+    Exact relocated symbol ranges from the ELF built in this job; no guessed
+    Rust struct offsets or calls into the guest. Absence of a symbol or
+    overwritten log history is inconclusive, never evidence of clock health.
+    """
+    data=(dest/"com1.log").read_bytes()
+    bases=re.findall(rb"(?m)^\[INFO\] KERNEL IMAGE BASE=([0-9a-f]{16})\r?$",data)
+    if len(bases)!=1:
+        return {"result":"unavailable","reason":"No unique kernel relocation evidence"}
+    base=int(bases[0],16)
+    symbols=subprocess.check_output(["nm","-S","-C","--defined-only",str(ROOT/"build/kernel.elf")],text=True)
+    result={"result":"diagnostic","kernel_base":base}
+    for wanted,tag,maximum in [
+        ("::logger::LOGGER","kernel-logger",4096),
+        ("::pit::MONITOR_ACTIVE","pit-monitor-active",1),
+        ("::system_clock::CLOCK","system-clock",65536),
+    ]:
+        matches=[]
+        for line in symbols.splitlines():
+            match=re.fullmatch(r"([0-9a-f]+)\s+([0-9a-f]+)\s+([bBdD])\s+(.+)",line.strip())
+            if match and re.search(re.escape(wanted)+r"(?:::h[0-9a-f]+)?$",match[4]):
+                matches.append((int(match[1],16),int(match[2],16),match[4]))
+        if len(matches)!=1:
+            result[tag]={"available":False,"symbol_matches":matches}
+            continue
+        offset,size,symbol=matches[0]
+        address=base+offset
+        if not (0<size<=maximum and 4096<=address and address+size<=ram):
+            result[tag]={"available":False,"reason":"unexpected symbol range","size":size}
+            continue
+        path=dest/(tag+".bin")
+        qmp.execute("pmemsave",{"val":address,"size":size,"filename":str(path)})
+        raw=path.read_bytes()
+        require(len(raw)==size,"Truncated kernel postmortem")
+        record={"available":True,"symbol":symbol,"address":address,"size":size,
+                "sha256":smoke.evidence.sha256(path)}
+        if tag=="kernel-logger":
+            # The actual bounded log owns inline copies of message bytes.
+            # Search only this precise mutable object, not ELF string data.
+            record["unavailable_event_in_ring"]=(
+                b"SYSTEM CLOCK: no trustworthy elapsed time; epoch unavailable" in raw)
+            record["clock_messages"]=[m.decode("ascii") for m in
+                re.findall(rb"SYSTEM CLOCK: [\x20-\x7e]{1,82}",raw)]
+        if tag=="pit-monitor-active":
+            record["active"]=bool(raw[0]) if raw in (b"\0",b"\1") else None
+        result[tag]=record
+    return result
+
+
 def capture_platform(qmp, dest, cpus, accel, ram, profile="disabled"):
     # Do not pause a live finite-PIT epoch during the session. This is
     # called only after session completion or a recorded boot failure.
@@ -197,12 +248,21 @@ def capture_platform(qmp, dest, cpus, accel, ram, profile="disabled"):
     require(not state["running"], "QEMU did not pause for final read-only inspection")
     disabled=profile=="disabled"
     hidden=profile!="chain"
+    try:
+        diagnostic=kernel_postmortem(qmp,dest,ram)
+        write_json(dest/"kernel-postmortem.json",diagnostic)
+        print("Stopped kernel postmortem:",json.dumps(diagnostic,sort_keys=True),flush=True)
+    except Exception as exc:
+        print("Kernel postmortem unavailable:",exc,flush=True)
     # Capture stopped architectural state before any validation can fail.
     # No guest instruction, clock counter or RAM is changed.
     for command,name in [("info registers -a","registers-all.txt"),
                          ("info lapic","lapic.txt"),("info pic","pic.txt")]:
         try:
-            (dest/name).write_text(hmp(qmp,command))
+            output=hmp(qmp,command)
+            (dest/name).write_text(output)
+            if name=="registers-all.txt":
+                print("Stopped CPU registers:",output,flush=True)
         except Exception as exc:
             print("Diagnostic unavailable:",command,exc,flush=True)
     for index in range(cpus):
