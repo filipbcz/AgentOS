@@ -1,7 +1,7 @@
 #![allow(non_snake_case, non_upper_case_globals)]
 use crate::{acpi::Platform, exceptions::{hex, Descriptors}, frames::{Exhaustion, Frames, SharedFrames},
             halt, out, process::Programs, scheduler::{Context, Queue}, serial, stress::{self, Load}};
-use crate::reference_clock::{ReferenceClock, WaitError};
+use crate::{bringup_clock::BringupClock, reference_clock::{ReferenceClock, WaitError}};
 use core::{arch::{asm, x86_64::__cpuid}, cell::UnsafeCell, hint::spin_loop, ptr,
            sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}};
 
@@ -181,11 +181,11 @@ impl Lapic {
         Ok(())
     }
 
-    unsafe fn calibrate(self, clock: &ReferenceClock) -> Result<(u32, u64), Error> {
+    unsafe fn calibrate(self, clock: &BringupClock) -> Result<(u32, u64), Error> {
         // VirtualBox Minimal advertises TSC and undivided APIC kHz. Use the
         // guest clocks' nominal rates rather than assuming a short PM-timer
         // calibration remains representative during virtual-clock catch-up.
-        if __cpuid(1).ecx & (1 << 31) != 0 && __cpuid(0x40000000).eax >= 0x40000010 {
+        if clock.tsc_hz().is_none() && __cpuid(1).ecx & (1 << 31) != 0 && __cpuid(0x40000000).eax >= 0x40000010 {
             let rates = __cpuid(0x40000010);
             let quantum = (rates.ebx as u64 * 1000 / (16 * 100)) as u32;
             if rates.eax != 0 && quantum != 0 { return Ok((quantum, rates.eax as u64 * 1000)); }
@@ -206,7 +206,7 @@ impl Lapic {
         let tsc_hz = u64::try_from(tsc_delta as u128 * 1_000_000_000 / elapsed as u128)
             .map_err(|_| b"TSC calibration overflow" as Error)?;
         if per_10ms == 0 || tsc_hz == 0 { return Err(b"zero timer interval"); }
-        Ok((per_10ms, tsc_hz))
+        Ok((per_10ms, clock.tsc_hz().unwrap_or(tsc_hz)))
     }
 
     unsafe fn send_runtime(self, id: u8, command: u32) -> Result<(), Error> {
@@ -226,7 +226,7 @@ impl Lapic {
         Err(b"IPI delivery polling limit")
     }
 
-    unsafe fn send(self, id: u8, command: u32, clock: &ReferenceClock) -> Result<(), Error> {
+    unsafe fn send(self, id: u8, command: u32, clock: &BringupClock) -> Result<(), Error> {
         self.write(0x310, (id as u32) << 24);
         self.write(0x300, command);
         clock.wait_until(1_000_000_000, || self.read(0x300) & (1 << 12) == 0)
@@ -248,7 +248,7 @@ struct Cpu {
     expected_id: u8,
     interval: u32,
     tsc_hz: u64,
-    reference: ReferenceClock,
+    reference: BringupClock,
     legacy_pit_probe: bool,
     tsc: crate::tsc::Peer,
     tsc_watchdog: UnsafeCell<crate::tsc_watchdog::Watchdog>,
@@ -294,14 +294,15 @@ impl Cpu {
         // all other deadlines. Never retry the ICR command after timeout.
         let delivery = if gRuntimeEnabled.load(Ordering::Acquire) {
             self.apic.send_runtime(aTarget.expected_id, RESCHEDULE)
-        } else { self.apic.send(aTarget.expected_id, RESCHEDULE, &self.reference) };
+        } else { self.local_reference().ok_or(b"unqualified local TSC" as Error)
+            .and_then(|clock| self.apic.send(aTarget.expected_id, RESCHEDULE, &clock)) };
         if delivery.is_err() {
             serial(b"SMP FAILED: reschedule IPI delivery\r\n"); halt();
         }
         if aTarget.expected_id != self.expected_id { gRemoteWakeups.fetch_add(1, Ordering::Relaxed); }
     }
     unsafe fn create(frames: &mut Frames<'_>, apic: Lapic, id: u8, interval: u32, tsc_hz: u64,
-                     reference: ReferenceClock, legacy_pit_probe: bool,
+                     reference: BringupClock, legacy_pit_probe: bool,
                      descriptors: Option<Descriptors>, load: &'static Load, programs: &'static Programs,
                      rsp0: usize) -> Result<&'static Self, Error> {
         let addr = frames.alloc().ok_or(b"CPU allocation" as Error)?.into_address();
@@ -331,12 +332,29 @@ impl Cpu {
     /// that actually measured inconsistent rates must not be bypassed.
     unsafe fn qualify_tsc(&self) -> Option<u64> {
         let mut maintain = || { let _ = crate::system_clock::millis(); };
-        match crate::tsc::qualify_reference(self.reference, &mut maintain) {
-            Ok(hz) => Some(hz),
-            Err(crate::tsc::QualificationError::ReferenceUnavailable) =>
+        match self.reference {
+            BringupClock::Physical(reference) => match crate::tsc::qualify_reference(reference, &mut maintain) {
+                Ok(hz) => Some(hz),
+                Err(crate::tsc::QualificationError::ReferenceUnavailable) =>
+                    crate::pit::qualify(self.legacy_pit_probe, &mut maintain),
+                Err(_) => None,
+            },
+            BringupClock::LocalTsc { .. } =>
                 crate::pit::qualify(self.legacy_pit_probe, &mut maintain),
-            Err(_) => None,
         }
+    }
+
+    fn local_reference(&self) -> Option<BringupClock> {
+        match self.reference {
+            BringupClock::Physical(_) => Some(self.reference),
+            BringupClock::LocalTsc { .. } =>
+                Some(BringupClock::LocalTsc { hz: self.tsc.rate()? }),
+        }
+    }
+
+    fn tsc_member(&self) -> Option<crate::tsc_epoch::Member> {
+        Some(crate::tsc_epoch::Member { id:self.expected_id, hz:self.tsc.rate()?,
+            alignment:self.tsc.alignment()? })
     }
 
     unsafe fn run_task(&self) -> Result<(), Error> {
@@ -363,7 +381,7 @@ impl Cpu {
         serial(b" APIC="); hex(id as u64);
         serial(b" TIMER-WAKES="); hex(wakes as u64);
         serial(b"\r\n");
-        crate::pci_irq::exercise(id)
+        crate::pci_irq::exercise(id,self.local_reference().ok_or(b"unqualified local TSC" as Error)?)
     }
 
     unsafe fn schedule(&self) {
@@ -686,6 +704,14 @@ fn clock_witness(generation: u64) -> Option<crate::clock_quorum::Witness> {
     if !cpu.fRuntimeReady.load(Ordering::Acquire) { return None; }
     let alignment = cpu.tsc.alignment()?;
     MONITOR.witness_at(generation, cpu.expected_id, alignment, unsafe { crate::tsc::read() })
+}
+
+// Installed only after GS, rate and alignment are available on every
+// enabled CPU. No scheduler, global clock or watchdog lock recursion.
+fn local_tsc_sample() -> Option<crate::tsc_epoch::Sample> {
+    let cpu=unsafe { current_cpu() };
+    Some(crate::tsc_epoch::Sample { member:cpu.tsc_member()?,
+        raw:unsafe { crate::tsc::read() } })
 }
 
 fn reject_clock_witness() {
@@ -1109,15 +1135,28 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
 #[no_mangle]
 unsafe extern "C" fn ap_main(cpu: &'static Cpu) -> ! {
     cpu.descriptors.as_ref().unwrap().load();
-    match cpu.apic.enable().and_then(|_| cpu.run_task()) {
+    match cpu.apic.enable().and_then(|_| {
+        // On the TSC-only bring-up path each AP must first measure its
+        // own rate against PIT. Do not use the BSP's raw TSC as its clock.
+        if let Some(bsp_hz)=cpu.reference.tsc_hz() {
+            let rate=cpu.qualify_tsc().ok_or(b"AP independent TSC calibration failed" as Error)?;
+            if rate.abs_diff(bsp_hz) as u128*1000>rate.min(bsp_hz) as u128 {
+                return Err(b"AP TSC rate mismatch" as Error);
+            }
+            cpu.tsc.publish_rate(Some(rate));
+        }
+        cpu.run_task()
+    }) {
         Ok(()) => {
             cpu.complete.store(1, Ordering::Release);
-            // Qualification is optional and separate from the initial
-            // CPU-ready handshake. A failed sample cannot disable the CPU.
-            let rate = if gBspQualifiedTscHz.load(Ordering::Acquire) != 0 {
-                cpu.qualify_tsc()
-            } else { None };
-            cpu.tsc.publish_rate(rate);
+            // With an independent ACPI epoch, TSC is optional. With
+            // TSC-only bring-up its local rate was qualified above.
+            if cpu.reference.tsc_hz().is_none() {
+                let rate = if gBspQualifiedTscHz.load(Ordering::Acquire) != 0 {
+                    cpu.qualify_tsc()
+                } else { None };
+                cpu.tsc.publish_rate(rate);
+            }
             while !cpu.load.started.load(Ordering::Acquire) {
                 cpu.tsc.respond(|| crate::tsc::read());
                 spin_loop();
@@ -1163,7 +1202,7 @@ pub unsafe fn copy_startup(base: usize) {
     }
 }
 
-unsafe fn start_ap(cpu: &Cpu, root: usize, base: usize, stack: usize, clock: &ReferenceClock) -> Result<(), Error> {
+unsafe fn start_ap(cpu: &Cpu, root: usize, base: usize, stack: usize, clock: &BringupClock) -> Result<(), Error> {
     let mailbox = base + PAGE;
     let dest = |label: *const u8| (base + (label as usize - ptr::addr_of!(ap_start) as usize)) as u32;
     (mailbox as *mut u32).write(u32::try_from(root).map_err(|_| b"AP bootstrap CR3 above 4 GiB" as Error)?);
@@ -1196,7 +1235,9 @@ unsafe fn start_ap(cpu: &Cpu, root: usize, base: usize, stack: usize, clock: &Re
 }
 
 pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Frames<'static>,
-                  bsp_rsp0: usize, archive: &'static [u8], log: &mut crate::BootLog<'_>) -> Result<(), Error> {
+                  bsp_rsp0: usize, archive: &'static [u8], log: &mut crate::BootLog<'_>,
+                  physical_ready: bool,
+                  initialize_timed_devices: impl FnOnce(&mut Frames<'static>) -> Result<(),Error>) -> Result<(), Error> {
     let guard_probe = crate::stack::KernelStack::allocate(&mut frames).ok_or(b"kernel guard stack" as Error)?;
     let guarded = crate::exceptions::probe_guard(guard_probe.guard()) &&
         crate::exceptions::probe_guard(guard_probe.top());
@@ -1206,8 +1247,18 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
     if platform.legacy_pic { out(0x21, 0xff); out(0xa1, 0xff); }
     let apic = Lapic(platform.lapic);
     apic.enable()?;
-    let clock = ReferenceClock::select(platform.pm_timer, crate::hpet::reference())
-        .ok_or(b"no progressing hardware reference clock" as Error)?;
+    let clock = if physical_ready {
+        BringupClock::Physical(ReferenceClock::select(platform.pm_timer,crate::hpet::reference())
+            .ok_or(b"no progressing hardware reference clock" as Error)?)
+    } else {
+        // An enumerated crystal ratio is useful for diagnosing the
+        // platform, but cannot authorize a public epoch by itself.
+        let rate=crate::pit::qualify(platform.legacy_pit_probe,||{})
+            .ok_or(if crate::tsc::detect().nominal_hz.is_some() {
+                b"enumerated TSC rate but no independent bootstrap reference" as Error
+            } else { b"no independent TSC bootstrap calibration" as Error })?;
+        BringupClock::LocalTsc { hz:rate }
+    };
     log.event(1, clock.name());
     let (interval, tsc_hz) = apic.calibrate(&clock)?;
     log.event(2, b"APIC TIMER READY");
@@ -1222,9 +1273,13 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
     let load = &*storage;
     let boot_cpu = load.frames.with(|f| Cpu::create(f, apic, bsp, interval, tsc_hz, clock, platform.legacy_pit_probe, None, load, programs, bsp_rsp0))?;
     gCpus[bsp as usize].store(boot_cpu.self_address, Ordering::Release);
+    if let Some(hz)=clock.tsc_hz() { boot_cpu.tsc.publish_rate(Some(hz)); }
     boot_cpu.run_task()?;
-    let bsp_rate = boot_cpu.qualify_tsc();
-    boot_cpu.tsc.publish_rate(bsp_rate);
+    let bsp_rate = if let Some(hz)=clock.tsc_hz() { Some(hz) } else {
+        let rate=boot_cpu.qualify_tsc();
+        boot_cpu.tsc.publish_rate(rate);
+        rate
+    };
     if let Some(hz) = bsp_rate {
         boot_cpu.tsc.publish_alignment(crate::tsc::Alignment { offset: 0, uncertainty_ticks: 0 });
         gBspQualifiedTscHz.store(hz, Ordering::Release);
@@ -1244,13 +1299,27 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
         gCpus[id as usize].store(cpu.self_address, Ordering::Release);
         start_ap(cpu, root, base, stack, &clock)?;
         if let Some(hz) = bsp_rate {
-            let _ = cpu.tsc.synchronize(hz, clock, || { let _ = crate::system_clock::millis(); });
+            let alignment=clock.synchronize(&cpu.tsc,hz,||{ let _=crate::system_clock::millis(); });
+            if !physical_ready && alignment.is_none() { return Err(b"AP TSC alignment failed"); }
         }
         log.event(1, crate::tsc::Diagnostic::new(id, &cpu.tsc).bytes());
         cpus[id as usize] = Some(cpu);
     }
     gOnlineCount.store(ids.len(), Ordering::Release);
     log.event(1, b"PROCESSORS ONLINE");
+    if !physical_ready {
+        let hz=bsp_rate.ok_or(b"unqualified BSP TSC" as Error)?;
+        let roster=crate::tsc_epoch::Roster::qualify(bsp,hz,ids,
+            cpus.iter().flatten().filter_map(|cpu|cpu.tsc_member()))
+            .ok_or(b"incomplete qualified TSC roster" as Error)?;
+        crate::system_clock::publish_tsc(roster,platform.legacy_pit_probe,local_tsc_sample)?;
+        log.event(1,b"SYSTEM CLOCK: TSC (independent finite PIT watchdog)");
+    }
+    // APs are initialized and still behind the ordinary startup barrier.
+    // Timed device operations run only after a real epoch exists, and
+    // before releasing the scheduler and user tasks.
+    load.frames.with(initialize_timed_devices)?;
+    if crate::system_clock::millis().is_none() { return Err(b"system clock unavailable before scheduler"); }
     let baseline = load.frames.with(|f| f.snapshot()).ok_or(b"bitmap snapshot" as Error)?;
     load.started.store(true, Ordering::Release);
     boot_cpu.schedule();
@@ -1316,7 +1385,7 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
     // An invariant TSC cannot be a system-wide candidate unless every
     // enabled CPU has a qualified rate and bounded alignment. Monitor
     // continuously from ordinary runtime startup, including idle CPUs.
-    if let Some(hz) = bsp_rate {
+    if let Some(hz) = bsp_rate.filter(|_| physical_ready) {
         if cpus.iter().flatten().all(|cpu| cpu.tsc.rate().is_some() && cpu.tsc.alignment().is_some()) {
             if crate::tsc_watchdog::MONITOR.start(bsp as u32, hz,
                 cpus.iter().flatten().map(|cpu| cpu.expected_id)) {
