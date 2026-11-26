@@ -269,12 +269,18 @@ impl ClockSet {
         if bracket.is_none() { self.triple = None; }
         if let (Some(old), Some(current)) = (self.triple, bracket) {
             let tsc = old.tsc.elapsed(current);
-            if tsc.map_or(false, |span| span.high > clock_quorum::MAX_GAP_NS) {
-                // Long gaps and stale qualification cannot authorize a vote.
+            if tsc.map_or(true, |span| span.high > clock_quorum::MAX_GAP_NS) {
+                // Missing, regressed or stale evidence cannot authorize a vote.
                 self.triple = None;
             } else {
-                let a = first.zip(last).and_then(|(low, high)| Span::elapsed(
-                    Span { low: old.pair.low, high: old.pair.high }, Span { low, high }));
+                let a = first.zip(last).and_then(|(low, high)| {
+                    // A jump inside the primary read bracket must not
+                    // become a huge interval which agrees with everything.
+                    // The independent TSC has bounded the real read time.
+                    if high.checked_sub(low)? > BRACKET_NS { return None; }
+                    Span::elapsed(Span { low: old.pair.low, high: old.pair.high },
+                                  Span { low, high })
+                });
                 let b = shadow.and_then(|ns| ns.checked_sub(old.pair.shadow)).map(Span::exact);
                 match clock_quorum::decide(a, b, tsc) {
                     Verdict::AllAgree => {
@@ -319,7 +325,9 @@ impl ClockSet {
                     Verdict::Inconclusive => {
                         // TSC's uncertainty overlaps both conflicting
                         // physical readings. It cannot justify promotion.
-                        self.triple = None;
+                        // Keep the last common triple anchor, not the
+                        // disputed pair. Subsequent accumulated evidence
+                        // may disambiguate this bounded overlap.
                         self.clear_qualification();
                         let Some(high) = last else { return self.unavailable(); };
                         return self.publish(self.base_ns.saturating_add(high));
