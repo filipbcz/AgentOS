@@ -102,6 +102,7 @@ pub struct Platform {
     pub ids: [u8; 255],
     pub count: usize,
     pub legacy_pic: bool,
+    pub legacy_pit_probe: bool,
     pub ps2_controller: bool,
     pub io_apics: [IoApic; 8],
     pub io_count: usize,
@@ -137,6 +138,19 @@ pub(crate) fn fadt_8042(table: &[u8]) -> Option<bool> {
     if table[8] < 3 { return Some(true); }
     let flags = u16::from_le_bytes(table.get(109..111)?.try_into().ok()?);
     Some(flags & 2 != 0)
+}
+
+/// MADT PCAT_COMPAT declares the legacy dual 8259 interrupt model,
+/// not proof of an 8254. Permit only a bounded, validated legacy PIT
+/// probe on that compatibility path, with a valid non-reduced FADT.
+/// IA-PC LEGACY_DEVICES alone describes user-visible ISA/LPC devices,
+/// and is not a PIT presence flag. Never probe on reduced platforms.
+pub(crate) fn legacy_pit_probe(legacy_pic: bool, fadt: Option<&[u8]>) -> bool {
+    if !legacy_pic { return false; }
+    let Some(table) = fadt else { return false; };
+    table.len() >= 116 && table.get(..4) == Some(b"FACP") &&
+        u32_at(table, 4) == Some(table.len() as u32) && checksum(table) &&
+        u32_at(table, 112).map_or(false, |flags| flags & (1 << 20) == 0)
 }
 
 /// ACPI 6.6 FADT §5.2.9 and PM_TMR §4.8.3.3. Prefer a usable
@@ -242,7 +256,7 @@ pub unsafe fn discover(info: &BootInfo, map: &[u8]) -> Option<Platform> {
     };
     if &root[..4] != (if width == 8 { b"XSDT" } else { b"RSDT" }) ||
         (root.len()-36) % width != 0 { return None; }
-    let mut p = Platform { pci: PciWindows::new(), lapic: 0, pm_timer: None, hpet: 0, ids: [0; 255], count: 0, legacy_pic: false, ps2_controller: true,
+    let mut p = Platform { pci: PciWindows::new(), lapic: 0, pm_timer: None, hpet: 0, ids: [0; 255], count: 0, legacy_pic: false, legacy_pit_probe: false, ps2_controller: true,
         io_apics: [IoApic { address: 0, gsi: 0 }; 8], io_count: 0,
         serial_irq: IsaInterrupt { gsi: 4, low: false, level: false }, serial_override: false,
         keyboard_irq: IsaInterrupt { gsi: 1, low: false, level: false }, keyboard_override: false };
@@ -280,6 +294,7 @@ pub unsafe fn discover(info: &BootInfo, map: &[u8]) -> Option<Platform> {
                (start..start+size).contains(&p.hpet)
            }) { p.hpet = 0; }
     }
+    p.legacy_pit_probe = legacy_pit_probe(p.legacy_pic, fadt_table);
     if let Some(fadt) = fadt_table {
         p.pm_timer = fadt_pm_timer(fadt, |timer| {
             let Some(address) = timer.mmio() else { return true; };
