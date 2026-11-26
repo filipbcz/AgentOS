@@ -1,7 +1,8 @@
 //! A shared monotonic epoch with a continuously qualified hardware standby.
 //! Physical counter reads, modulo extension and source transitions are
 //! serialized by one IRQ-safe SMP gate. No CPU-local TSC is authoritative.
-use crate::reference_clock::{PmTimer, ReferenceClock};
+use crate::{clock_quorum::{self, Span, TscBracket, Verdict, Witness},
+    reference_clock::{PmTimer, ReferenceClock}};
 use core::{arch::asm, cell::UnsafeCell, hint::spin_loop,
     sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering}};
 
@@ -55,7 +56,7 @@ const STALL_NS: u128 = 100_000_000;
 #[repr(u8)]
 pub(crate) enum ClockEvent {
     StandbyRetired = 1, PromotedPm = 2, PromotedHpet = 3,
-    Unavailable = 4, StandbyRebased = 5,
+    Unavailable = 4, StandbyRebased = 5, TscRejected = 6,
 }
 
 impl ClockEvent {
@@ -66,6 +67,7 @@ impl ClockEvent {
             Self::PromotedHpet => b"SYSTEM CLOCK: switched to qualified HPET",
             Self::Unavailable => b"SYSTEM CLOCK: no trustworthy elapsed time; epoch unavailable",
             Self::StandbyRebased => b"SYSTEM CLOCK: standby wrap ambiguous; requalifying",
+            Self::TscRejected => b"SYSTEM CLOCK: two physical references disagree with TSC; witness retired",
         }
     }
     pub fn error(self) -> bool { self == Self::Unavailable }
@@ -76,6 +78,19 @@ struct Pair { low: u128, high: u128, shadow: u128 }
 
 #[derive(Clone, Copy)]
 struct Anchor { global: u128, shadow: u128 }
+
+#[derive(Clone, Copy)]
+struct TripleAnchor {
+    pair: Pair,
+    tsc: TscBracket,
+    global: u128,
+}
+
+#[derive(Clone, Copy)]
+struct WitnessHooks {
+    read: fn() -> Option<Witness>,
+    reject: fn(),
+}
 
 /// The pure transition logic receives actual register observations through
 /// one read operation. Host fixtures exercise the identical implementation.
@@ -90,6 +105,9 @@ pub(crate) struct ClockSet {
     stall_samples: u8,
     failed: bool,
     event: Option<ClockEvent>,
+    triple: Option<TripleAnchor>,
+    witness_rejected: bool,
+    witness_hooks: Option<WitnessHooks>,
 }
 
 impl ClockSet {
@@ -99,7 +117,8 @@ impl ClockSet {
             .map(|(source, first)| Epoch::new(source, first));
         Self { primary: Epoch::new(primary.0, primary.1), standby,
             base_ns: 0, published_ns: 0, baseline: None, good_windows: 0,
-            anchor: None, stall_samples: 0, failed: false, event: None }
+            anchor: None, stall_samples: 0, failed: false, event: None,
+            triple: None, witness_rejected: false, witness_hooks: None }
     }
 
     pub(crate) fn source(&self) -> Option<ReferenceClock> {
@@ -128,6 +147,7 @@ impl ClockSet {
     }
 
     fn retire_standby(&mut self) {
+        self.triple = None;
         self.standby = None;
         self.clear_qualification();
         self.event = Some(ClockEvent::StandbyRetired);
@@ -136,6 +156,7 @@ impl ClockSet {
     fn rebase_standby(&mut self, source: ReferenceClock, raw: u64) {
         // Unknown elapsed history invalidates only the standby epoch.
         // Re-observe agreement before it may preserve absolute time.
+        self.triple = None;
         self.standby = Some(Epoch::new(source, raw));
         self.clear_qualification();
         self.event = Some(ClockEvent::StandbyRebased);
@@ -143,6 +164,7 @@ impl ClockSet {
 
     fn unavailable(&mut self) -> Option<u128> {
         self.failed = true;
+        self.triple = None;
         self.clear_qualification();
         self.event = Some(ClockEvent::Unavailable);
         None
@@ -170,6 +192,7 @@ impl ClockSet {
         let time = time.max(self.published_ns);
         self.base_ns = time;
         self.primary = Epoch::new(standby.source, standby.last);
+        self.triple = None;
         self.clear_qualification();
         self.event = Some(match self.primary.source {
             ReferenceClock::Pm(_) => ClockEvent::PromotedPm,
@@ -216,8 +239,17 @@ impl ClockSet {
         true
     }
 
-    pub(crate) fn sample(&mut self, mut read: impl FnMut(ReferenceClock) -> u64) -> Option<u128> {
+    pub(crate) fn sample(&mut self, read: impl FnMut(ReferenceClock) -> u64) -> Option<u128> {
+        self.sample_with_witness(read, || None)
+    }
+
+    /// The provider only grants a bracket while all enabled CPUs have
+    /// fresh independent qualification. TSC never provides the published
+    /// epoch: it decides which of the two physical references is credible.
+    pub(crate) fn sample_with_witness(&mut self, mut read: impl FnMut(ReferenceClock) -> u64,
+        mut witness: impl FnMut() -> Option<Witness>) -> Option<u128> {
         if self.failed { return None; }
+        let before = if self.standby.is_some() && !self.witness_rejected { witness() } else { None };
         let active = self.primary.source;
         let prior = self.primary.ns();
         let first = self.primary.advance(read(active));
@@ -230,6 +262,72 @@ impl ClockSet {
         let shadow_raw = read(shadow_source);
         let shadow = standby.advance(shadow_raw);
         let last = self.primary.advance(read(active));
+
+        // Bracket the *same* physical register reads with normalized TSC
+        // observations. The provider does not read the system clock.
+        let bracket = before.and_then(|b| witness().and_then(|a| TscBracket::new(b, a)));
+        if bracket.is_none() { self.triple = None; }
+        if let (Some(old), Some(current)) = (self.triple, bracket) {
+            let tsc = old.tsc.elapsed(current);
+            if tsc.map_or(false, |span| span.high > clock_quorum::MAX_GAP_NS) {
+                // Long gaps and stale qualification cannot authorize a vote.
+                self.triple = None;
+            } else {
+                let a = first.zip(last).and_then(|(low, high)| Span::elapsed(
+                    Span { low: old.pair.low, high: old.pair.high }, Span { low, high }));
+                let b = shadow.and_then(|ns| ns.checked_sub(old.pair.shadow)).map(Span::exact);
+                match clock_quorum::decide(a, b, tsc) {
+                    Verdict::AllAgree => {
+                        // Retain a sufficiently long common baseline so
+                        // frequent reads cannot hide cumulative rate errors.
+                        if tsc.map_or(false, |s| s.low >= WINDOW_NS) {
+                            if let (Some(low), Some(high), Some(shadow)) = (first,last,shadow) {
+                                self.triple = Some(TripleAnchor {
+                                    pair: Pair { low, high, shadow }, tsc: current,
+                                    global: self.base_ns.saturating_add(low),
+                                });
+                            }
+                        }
+                    }
+                    Verdict::ActiveAndTsc => {
+                        let Some(high) = last else { return self.unavailable(); };
+                        if a.map_or(false, |span| span.low > shadow_source.half_span_ns()) {
+                            self.rebase_standby(shadow_source, shadow_raw);
+                        } else {
+                            self.retire_standby();
+                        }
+                        return self.publish(self.base_ns.saturating_add(high));
+                    }
+                    Verdict::StandbyAndTsc => {
+                        let Some(ns) = shadow else { return self.unavailable(); };
+                        // This anchor was independently corroborated by
+                        // all three clocks, not refreshed by a bad source.
+                        self.anchor = Some(Anchor { global: old.global, shadow: old.pair.shadow });
+                        return self.promote(ns, ns-shadow_prior);
+                    }
+                    Verdict::TscRejected => {
+                        self.triple = None;
+                        self.witness_rejected = true;
+                        self.event = Some(ClockEvent::TscRejected);
+                        if let Some(hooks) = self.witness_hooks.take() { (hooks.reject)(); }
+                    }
+                    Verdict::PhysicalAgree => {
+                        // Nontransitive overlap is insufficient to reject
+                        // a candidate. Keep the agreeing physical pair.
+                        self.triple = None;
+                    }
+                    Verdict::Inconclusive => {
+                        // TSC's uncertainty overlaps both conflicting
+                        // physical readings. It cannot justify promotion.
+                        self.triple = None;
+                        self.clear_qualification();
+                        let Some(high) = last else { return self.unavailable(); };
+                        return self.publish(self.base_ns.saturating_add(high));
+                    }
+                    Verdict::Ambiguous => return self.unavailable(),
+                }
+            }
+        }
 
         // The known elapsed interval can exceed the standby's modulo
         // ambiguity bound even when its raw residue appears plausible.
@@ -285,7 +383,15 @@ impl ClockSet {
         self.stall_samples = 0;
         let consistent = self.qualify_pair(Pair { low, high, shadow: shadow_ns });
         if consistent && self.good_windows >= QUALIFY_WINDOWS && high > prior {
-            self.anchor = Some(Anchor { global: self.base_ns.saturating_add(low), shadow: shadow_ns });
+            let global = self.base_ns.saturating_add(low);
+            self.anchor = Some(Anchor { global, shadow: shadow_ns });
+            if self.triple.is_none() && !self.witness_rejected {
+                if let Some(tsc) = bracket {
+                    self.triple = Some(TripleAnchor {
+                        pair: Pair { low, high, shadow: shadow_ns }, tsc, global,
+                    });
+                }
+            }
         }
         self.publish(time)
     }
@@ -305,8 +411,9 @@ impl SharedClock {
             maintenance: AtomicU64::new(0), event: AtomicU8::new(0) }
     }
 
-    // No other kernel lock or logging operation is acquired under this
-    // gate. Local IRQ masking prevents recursion on the owning CPU.
+    // Local IRQ masking prevents recursion on the owning CPU. A TSC
+    // witness provider may inspect its watchdog gate, which must never
+    // acquire the system clock gate or perform I/O/logging.
     fn with<R>(&self, operation: impl FnOnce(&mut Option<ClockSet>) -> R) -> R {
         let flags: usize;
         unsafe { asm!("pushfq", "pop {}", "cli", out(reg) flags); }
@@ -339,13 +446,27 @@ pub unsafe fn init(pm: Option<PmTimer>, hp: Option<ReferenceClock>)
     })
 }
 
+/// Install the runtime provider after SMP CPU-local state is initialized.
+/// Until every CPU independently qualifies, its read returns None.
+pub(crate) fn attach_witness(read: fn() -> Option<Witness>, reject: fn()) -> bool {
+    CLOCK.with(|clocks| {
+        let Some(clocks) = clocks.as_mut() else { return false; };
+        if clocks.failed || clocks.standby.is_none() || clocks.witness_rejected ||
+           clocks.witness_hooks.is_some() { return false; }
+        clocks.witness_hooks = Some(WitnessHooks { read, reject });
+        true
+    })
+}
+
 pub fn millis() -> Option<u64> { snapshot().map(|(ms, _)| ms) }
 
 /// Both views refer to the same observation and shared absolute epoch.
 pub(crate) fn snapshot() -> Option<(u64, Option<u64>)> {
     CLOCK.with(|clocks| {
         let clocks = clocks.as_mut()?;
-        let result = clocks.sample(|source| unsafe { source.sample() });
+        let read = clocks.witness_hooks.map(|hooks| hooks.read);
+        let result = clocks.sample_with_witness(|source| unsafe { source.sample() },
+            || read.and_then(|f| f()));
         let maintenance = clocks.maintenance_ms().unwrap_or(0);
         if CLOCK.maintenance.load(Ordering::Relaxed) != maintenance {
             CLOCK.maintenance.store(maintenance, Ordering::Release);
@@ -365,6 +486,7 @@ pub(crate) fn take_event() -> Option<ClockEvent> {
         3 => Some(ClockEvent::PromotedHpet),
         4 => Some(ClockEvent::Unavailable),
         5 => Some(ClockEvent::StandbyRebased),
+        6 => Some(ClockEvent::TscRejected),
         _ => None,
     }
 }
