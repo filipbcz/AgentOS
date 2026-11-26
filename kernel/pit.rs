@@ -19,6 +19,14 @@ const PIT_HZ: u64 = 1_193_182;
 // ceil(50ms * PIT_HZ), leaving room for a 16-bit divisor.
 const DIVISOR: u16 = 59_660;
 const INTERVAL_NS: u64 = DIVISOR as u64 * 1_000_000_000 / PIT_HZ;
+const MAX_EDGE_UNCERTAINTY_PPM:u128=960;
+const PPM:u128=1_000_000;
+const PIT_PHASE_TICKS:u128=2;
+// A poor timestamp bracket is not an observation of an inconsistent rate.
+// Bound the acquisition to three valid windows plus at most six fresh
+// attempts (450 ms of nominal one-shot time), within the AP startup budget.
+// Never retry a hardware fault, raw regression or incompatible valid rate.
+const MAX_DISCARDED: usize = 6;
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,6 +51,17 @@ impl MeasureFailure {
     fn new(stage: Stage, values: [u64; 4]) -> Self {
         Self { stage, values, cleanup_state: None }
     }
+    /// Retry only an observed terminal edge with an actually positive
+    /// lower duration bound and excessive read uncertainty. Missing edges,
+    /// regressions, zero duration and failed cleanup remain fatal.
+    fn imprecise_edge(self) -> bool {
+        if self.stage!=Stage::EdgeUncertain || self.cleanup_state.is_some() { return false; }
+        let [a,b,c,d]=self.values;
+        if a>b || b>=c || c>d { return false; }
+        let lo=(c-b) as u128;
+        let hi=(d-a) as u128;
+        (hi-lo)*PPM>((hi+lo)/2)*MAX_EDGE_UNCERTAINTY_PPM
+    }
     // Preserve the historical coarse API for the independent host tests.
     #[cfg(test)]
     fn error(self) -> Error {
@@ -61,6 +80,7 @@ impl MeasureFailure {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum QualificationReason {
     NotDeclared, Unsupported, OwnerBusy, Measure(Stage), Calibration(tsc::CalibrationFault),
+    PrecisionBudget, DiscardedRangeConflict,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -213,7 +233,7 @@ pub(crate) fn measure_detailed(allowed: bool, io: &mut impl Ports, max_polls: u3
                 let upper = after.checked_sub(before_start)
                     .ok_or_else(||fail(EdgeRaw,operands))? as u128;
                 let middle = (lower+upper)/2;
-                if lower == 0 || (upper-lower)*1_000_000 > middle*960 {
+                if lower == 0 || (upper-lower)*PPM > middle*MAX_EDGE_UNCERTAINTY_PPM {
                     return Err(fail(EdgeUncertain,operands));
                 }
                 return Ok(o);
@@ -240,36 +260,143 @@ pub(crate) fn measure_detailed(allowed: bool, io: &mut impl Ports, max_polls: u3
     result
 }
 
-/// The same independent three-window qualification used by hardware and
-/// separate host fixtures. Do not retry, substitute or discard measurements.
+/// Each rejected but monotonic, complete physical observation remains
+/// available for operational diagnosis and a conservative contradiction
+/// check. An imprecise window must never itself contribute a rate token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DiscardedWindow {
+    pub window:u8,
+    pub attempt:u8,
+    pub values:[u64;4],
+}
+impl DiscardedWindow {
+    /// The real rate lies in [lo * PIT_HZ/(DIVISOR+2),
+    /// hi * PIT_HZ/(DIVISOR-2)] under the existing PIT calibration
+    /// assumptions, allowing the same two PIT ticks for load phase.
+    /// If even this wide interval cannot agree with a qualified rate
+    /// under the existing 1000 ppm tolerance, do not hide a contradiction
+    /// by collecting a later narrow observation. No rounded rate is used.
+    pub(crate) fn compatible_with(self,hz:u64)->bool {
+        let [a,b,c,d]=self.values;
+        if hz==0 || a>b || b>=c || c>d {return false;}
+        let lo=(c-b) as u128*PIT_HZ as u128;
+        let hi=(d-a) as u128*PIT_HZ as u128;
+        let hz=hz as u128;
+        let compatible_scale=PPM+tsc::RATE_TOLERANCE_PPM;
+        lo*PPM<=hz*(DIVISOR as u128+PIT_PHASE_TICKS)*compatible_scale &&
+            hi*compatible_scale>=hz*(DIVISOR as u128-PIT_PHASE_TICKS)*PPM
+    }
+}
+
+/// Bounded diagnostic storage, local to one qualification, not a global
+/// test flag. All discarded brackets are emitted after exclusive ownership
+/// is released; no UART or log operations between measured edges.
+pub(crate) struct DiscardedWindows {
+    entries:[Option<DiscardedWindow>;MAX_DISCARDED],
+    len:usize,
+}
+impl DiscardedWindows {
+    pub const fn new()->Self {Self{entries:[None;MAX_DISCARDED],len:0}}
+    pub(crate) fn len(&self)->usize {self.len}
+    fn push(&mut self,window:DiscardedWindow)->bool {
+        if self.len==self.entries.len(){return false;}
+        self.entries[self.len]=Some(window);
+        self.len+=1;
+        true
+    }
+    pub(crate) fn iter(&self)->impl Iterator<Item=DiscardedWindow>+'_ {
+        self.entries[..self.len].iter().flatten().copied()
+    }
+    pub(crate) fn report(&self,cpu:u8,phase:&str,mut emit:impl FnMut(&[u8])) {
+        for entry in self.iter() {
+            let line=tsc::Diagnostic::formatted(format_args!(
+                "PIT TSC APIC={} PHASE={} WINDOW={} ATTEMPT={} RETRY=EdgeUncertain",
+                cpu,phase,entry.window,entry.attempt));
+            emit(line.bytes());
+            let [a,b,c,d]=entry.values;
+            let line=tsc::Diagnostic::formatted(format_args!(
+                "PIT TSC APIC={} A={:016x} B={:016x} C={:016x} D={:016x}",cpu,a,b,c,d));
+            emit(line.bytes());
+        }
+    }
+}
+
+/// Collect the first three sufficiently precise, independent observations
+/// in order. Only insufficient precision permits a bounded fresh one-shot.
+/// Neither a previous observation nor a known conflicting rate may be
+/// replaced. Preserve raw continuity even across discarded measurements.
 pub(crate) fn qualify_samples(caps: tsc::Capabilities, io: &mut impl Ports, max_polls: u32,
-    mut timestamp: impl FnMut()->u64, mut maintain: impl FnMut())
+    mut timestamp: impl FnMut()->u64, mut maintain: impl FnMut(), discarded:&mut DiscardedWindows)
     -> Result<tsc::QualifiedRate, QualificationFailure> {
     use QualificationReason::*;
+    *discarded=DiscardedWindows::new();
     let mut calibration=tsc::Calibration::new(caps);
     let mut rates=[0u64;3];
     let mut last=0u64;
-    for i in 0..3 {
-        let observation=measure_detailed(true,io,max_polls,&mut timestamp,&mut maintain)
-            .map_err(|fault| QualificationFailure {
-                reason: Measure(fault.stage),window:i as u8+1,values:fault.values,
+    let mut i=0usize;
+    let mut attempt=0u8;
+    while i<3 {
+        attempt+=1;
+        let window=i as u8+1;
+        let observation=match measure_detailed(true,io,max_polls,&mut timestamp,&mut maintain) {
+            Ok(o)=>o,
+            Err(fault) if fault.imprecise_edge()=>{
+                let [a,b,_,d]=fault.values;
+                calibration.observe_unqualified_span(a,d).map_err(|reason|QualificationFailure {
+                    reason:Calibration(reason),window,values:[last,a,b,d],
+                    rates,nominal:caps.nominal_hz,cleanup_state:None,
+                })?;
+                last=d;
+                let entry=DiscardedWindow{window,attempt,values:fault.values};
+                // Existing accepted observations or an enumerated nominal
+                // rate already provide a contradiction check. Do not wait
+                // for three more samples when we can reject immediately.
+                let conflict=rates[..i].iter().any(|&hz|!entry.compatible_with(hz)) ||
+                    caps.nominal_hz.map_or(false,|hz|!entry.compatible_with(hz));
+                if conflict {
+                    return Err(QualificationFailure {reason:DiscardedRangeConflict,window,
+                        values:fault.values,rates,nominal:caps.nominal_hz,cleanup_state:None});
+                }
+                if !discarded.push(entry) {
+                    return Err(QualificationFailure {reason:PrecisionBudget,window,
+                        values:fault.values,rates,nominal:caps.nominal_hz,cleanup_state:None});
+                }
+                continue;
+            }
+            Err(fault)=>return Err(QualificationFailure {
+                reason: Measure(fault.stage),window,values:fault.values,
                 rates,nominal:caps.nominal_hz,cleanup_state:fault.cleanup_state,
-            })?;
+            }),
+        };
         rates[i]=calibration.observe_checked(observation).map_err(|fault| {
             let values=if fault==tsc::CalibrationFault::BetweenSamples {
                 [last,observation.before_start,observation.after_start,observation.after_end]
             } else {
                 [observation.before_start,observation.after_start,observation.before_end,observation.after_end]
             };
-            QualificationFailure { reason: Calibration(fault),window:i as u8+1,values,
+            QualificationFailure { reason: Calibration(fault),window,values,
                 rates,nominal:caps.nominal_hz,cleanup_state:None }
         })?;
         last=observation.after_end;
+        // A previously discarded bracket can rule out this new rate even
+        // when it was too wide to authorize any rate of its own.
+        if let Some(entry)=discarded.iter().find(|entry|!entry.compatible_with(rates[i])) {
+            return Err(QualificationFailure {reason:DiscardedRangeConflict,window:entry.window,
+                values:entry.values,rates,nominal:caps.nominal_hz,cleanup_state:None});
+        }
+        i+=1;
     }
-    calibration.finish_checked().map_err(|fault| QualificationFailure {
+    let rate=calibration.finish_checked().map_err(|fault| QualificationFailure {
         reason:Calibration(fault),window:0,values:[0;4],rates,
         nominal:caps.nominal_hz,cleanup_state:None,
-    })
+    })?;
+    // CPUID or the median chosen by Calibration must also be consistent
+    // with each discarded physical span. They can only reject, not qualify.
+    if let Some(entry)=discarded.iter().find(|entry|!entry.compatible_with(rate.hz())) {
+        return Err(QualificationFailure {reason:DiscardedRangeConflict,window:entry.window,
+            values:entry.values,rates,nominal:caps.nominal_hz,cleanup_state:None});
+    }
+    Ok(rate)
 }
 
 static OWNER: AtomicBool = AtomicBool::new(false);
@@ -278,9 +405,10 @@ static OWNER: AtomicBool = AtomicBool::new(false);
 /// transactions across CPUs with local interrupts masked. The callback
 /// may maintain the *other* timekeeper; it must never acquire this owner.
 /// Acquire is bounded; a wedged owner is an error, not a fake interval.
-pub(crate) unsafe fn qualify(allowed: bool, mut maintain: impl FnMut())
+pub(crate) unsafe fn qualify(allowed: bool, mut maintain: impl FnMut(), discarded:&mut DiscardedWindows)
     -> Result<tsc::QualifiedRate,QualificationFailure> {
     use QualificationReason::*;
+    *discarded=DiscardedWindows::new();
     if !allowed { return Err(QualificationFailure::new(NotDeclared,None)); }
     let caps = tsc::detect();
     if !caps.invariant { return Err(QualificationFailure::new(Unsupported,caps.nominal_hz)); }
@@ -296,7 +424,7 @@ pub(crate) unsafe fn qualify(allowed: bool, mut maintain: impl FnMut())
         spin_loop();
     }
     let rate = if acquired {
-        let result=qualify_samples(caps,&mut Io,MAX_POLLS,||tsc::read(),&mut maintain);
+        let result=qualify_samples(caps,&mut Io,MAX_POLLS,||tsc::read(),&mut maintain,discarded);
         OWNER.store(false, Ordering::Release);
         result
     } else { Err(QualificationFailure::new(OwnerBusy,caps.nominal_hz)) };

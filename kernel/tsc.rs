@@ -9,7 +9,7 @@ use core::{arch::{asm, x86_64::__cpuid}, fmt::{self, Write},
 const MEASURE_NS: u64 = 50_000_000;
 const MAX_MEASURE_NS: u64 = 250_000_000;
 const PPM: u128 = 1_000_000;
-const RATE_TOLERANCE_PPM: u128 = 1000;
+pub(crate) const RATE_TOLERANCE_PPM: u128 = 1000;
 const MAX_READ_UNCERTAINTY_PPM: u128 = 1000;
 const ALIGNMENT_NS: u64 = 100_000;
 const EXCHANGES: u32 = 8;
@@ -153,12 +153,30 @@ impl Calibration {
             Ok(rate) => rate,
             Err(reason) => { self.failed = true; return Err(reason); }
         };
-        if self.len==0 { self.first=observation.before_start; }
+        if self.last.is_none() { self.first=observation.before_start; }
         self.samples[self.len] = rate;
         self.len += 1;
         self.last = Some(observation.after_end);
         Ok(rate)
     }
+    /// A physical measurement with insufficient precision has no rate
+    /// proof, but its ordered raw endpoints are still evidence of continuity.
+    /// Preserve them, including the first attempted start, without counting
+    /// this span as one of the three required independent observations.
+    pub(crate) fn observe_unqualified_span(&mut self, before:u64, after:u64)
+        -> Result<(),CalibrationFault> {
+        use CalibrationFault::*;
+        let failure=if self.failed { Some(PreviousFailure) }
+            else if self.len==self.samples.len() { Some(ExcessSamples) }
+            else if after<before { Some(RawOrder) }
+            else if self.last.map_or(false,|last|before<last) { Some(BetweenSamples) }
+            else { None };
+        if let Some(reason)=failure { self.failed=true; return Err(reason); }
+        if self.last.is_none() { self.first=before; }
+        self.last=Some(after);
+        Ok(())
+    }
+
     pub(crate) fn finish(self) -> Option<QualifiedRate> {
         self.finish_checked().ok()
     }

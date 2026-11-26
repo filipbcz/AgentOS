@@ -85,15 +85,19 @@ impl Diagnostic {
 /// has been released, and its gate/speaker cleanup has already been checked.
 /// Mandatory failures retain the native fatal serial diagnostic path; optional
 /// source failures are recorded in the normal kernel history only.
+unsafe fn pit_diagnostic(cpu:u8,mandatory:bool,level:crate::log_policy::Level,line:&[u8]) {
+    let _=crate::logger::LOGGER.record(0,cpu as u32,level,line);
+    if mandatory {
+        let mut record=Diagnostic::new(line);
+        record.text(b"\r\n");
+        serial(&record.fBytes[..record.fLength]);
+    }
+}
 unsafe fn report_pit_failure(cpu: u8, phase: &str, mandatory: bool, fault: crate::pit::QualificationFailure) {
-    fault.report(cpu,phase,|line| {
-        let _=crate::logger::LOGGER.record(0,cpu as u32,crate::log_policy::Level::Error,line);
-        if mandatory {
-            let mut record=Diagnostic::new(line);
-            record.text(b"\r\n");
-            serial(&record.fBytes[..record.fLength]);
-        }
-    });
+    fault.report(cpu,phase,|line|pit_diagnostic(cpu,mandatory,crate::log_policy::Level::Error,line));
+}
+unsafe fn report_pit_discarded(cpu:u8,phase:&str,mandatory:bool,discarded:&crate::pit::DiscardedWindows) {
+    discarded.report(cpu,phase,|line|pit_diagnostic(cpu,mandatory,crate::log_policy::Level::Info,line));
 }
 
 unsafe fn registeredCpus() -> impl Iterator<Item = &'static Cpu> {
@@ -355,7 +359,10 @@ impl Cpu {
                 Err(_)=>return None,
             }
         }
-        match crate::pit::qualify(self.legacy_pit_probe,&mut maintain) {
+        let mut discarded=crate::pit::DiscardedWindows::new();
+        let result=crate::pit::qualify(self.legacy_pit_probe,&mut maintain,&mut discarded);
+        report_pit_discarded(self.expected_id,phase,mandatory,&discarded);
+        match result {
             Ok(rate)=>Some(rate),
             Err(fault)=>{
                 report_pit_failure(self.expected_id,phase,mandatory,fault);
@@ -1275,8 +1282,10 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
     } else {
         // An enumerated crystal ratio is useful for diagnosing the
         // platform, but cannot authorize a public epoch by itself.
-        let rate=crate::pit::qualify(platform.legacy_pit_probe,||{})
-            .map_err(|fault| {
+        let mut discarded=crate::pit::DiscardedWindows::new();
+        let result=crate::pit::qualify(platform.legacy_pit_probe,||{},&mut discarded);
+        report_pit_discarded(apic.id(),"bsp-start",true,&discarded);
+        let rate=result.map_err(|fault| {
                 report_pit_failure(apic.id(),"bsp-start",true,fault);
                 if crate::tsc::detect().nominal_hz.is_some() {
                     b"enumerated TSC rate but no independent bootstrap reference" as Error

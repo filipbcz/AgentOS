@@ -27,13 +27,17 @@ struct Model<'a> {
     writes: Vec<(u16,u8)>,
     reads: usize,
     started: bool,
+    start_delay:u64,
+    terminal_delay:u64,
+    attempts:Option<&'a Cell<u32>>,
 }
 
 impl<'a> Model<'a> {
     fn new(ticks: &'a Cell<u64>, hz: u64, fault: Fault) -> Self {
         Self { ticks, hz, control: 0x0f, programmed: false, status_latched: false,
             count: [0;2], count_bytes: 0, gate_start: None, fault,
-            writes: Vec::new(), reads: 0, started: false }
+            writes: Vec::new(), reads: 0, started: false,
+            start_delay:0,terminal_delay:0,attempts:None }
     }
 
     fn out_high(&self) -> bool {
@@ -53,6 +57,10 @@ impl Ports for Model<'_> {
     fn read(&mut self, port:u16)->u8 {
         self.reads+=1;
         self.io_delay();
+        if port==0x61 && self.gate_start.is_some() && self.out_high() && self.terminal_delay!=0 {
+            self.ticks.set(self.ticks.get()+self.terminal_delay);
+            self.terminal_delay=0;
+        }
         match port {
             0x61 => self.control | 0xd0 | if self.out_high(){0x20}else{0},
             0x42 => {
@@ -77,6 +85,8 @@ impl Ports for Model<'_> {
                 if self.fault==Fault::CleanupStuck && self.started && value&1==0 {return;}
                 self.control=value;
                 if value&1!=0 {
+                    self.ticks.set(self.ticks.get()+self.start_delay);
+                    self.start_delay=0;
                     self.gate_start=Some(self.ticks.get());
                     self.started=true;
                 }
@@ -84,6 +94,7 @@ impl Ports for Model<'_> {
             0x43 if value==0xb0 => {
                 assert_eq!(self.control&3,0);
                 self.programmed=true;
+                if let Some(attempts)=self.attempts {attempts.set(attempts.get()+1);}
                 self.count_bytes=0;
                 self.gate_start=None;
             }
@@ -252,20 +263,22 @@ fn rejected_physical_measurements_preserve_the_actual_operation_and_operands() {
     let ticks=Cell::new(1_000_000);
     let mut model=Model::new(&ticks,hz,Fault::None);
     let caps=tsc::Capabilities{available:true,invariant:true,nominal_hz:Some(hz)};
+    let mut discarded=pit::DiscardedWindows::new();
     let rejection=pit::qualify_samples(caps,&mut model,100,||ticks.get(),
-        ||ticks.set(ticks.get()+30_000_000)).unwrap_err();
-    assert_eq!(rejection.reason,pit::QualificationReason::Measure(EdgeUncertain));
+        ||ticks.set(ticks.get()+30_000_000),&mut discarded).unwrap_err();
+    assert_eq!(rejection.reason,pit::QualificationReason::PrecisionBudget);
+    assert_eq!(discarded.len(),6);
     assert_eq!(rejection.window,1);
     assert_eq!(rejection.rates,[0;3]);
     let [a,b,c,d]=rejection.values;
     let lo=c-b; let hi=d-a;
     assert!((hi-lo) as u128*1_000_000>((hi+lo)/2) as u128*960);
     assert_eq!(model.control&3,0);
-    assert_eq!(model.writes.iter().filter(|&&(port,value)|port==0x43&&value==0xb0).count(),1);
+    assert_eq!(model.writes.iter().filter(|&&(port,value)|port==0x43&&value==0xb0).count(),7);
     let mut messages=Vec::new();
     rejection.report(254,"bsp-confirm",|line|messages.push(line.to_vec()));
     assert_eq!(messages.len(),4);
-    assert!(messages[0].ends_with(b"FAULT=Measure(EdgeUncertain)"));
+    assert!(messages[0].ends_with(b"FAULT=PrecisionBudget"));
     assert!(messages[1].ends_with(format!("D={d:016x}").as_bytes()));
     assert!(messages.iter().all(|line|line.len()<=96));
 }
@@ -276,11 +289,99 @@ fn rejected_calibration_preserves_prior_rates_and_disagrees_with_nominal() {
     let hz=3_000_000_000;
     let mut model=Model::new(&ticks,hz,Fault::None);
     let caps=tsc::Capabilities{available:true,invariant:true,nominal_hz:Some(hz*2)};
+    let mut discarded=pit::DiscardedWindows::new();
     let fault=pit::qualify_samples(caps,&mut model,30_000,||ticks.get(),
-        ||ticks.set(ticks.get()+12_000)).unwrap_err();
+        ||ticks.set(ticks.get()+12_000),&mut discarded).unwrap_err();
+    assert_eq!(discarded.len(),0);
     assert_eq!(fault.reason,pit::QualificationReason::Calibration(tsc::CalibrationFault::NominalMismatch));
     assert_eq!(fault.window,0);
     assert!(fault.rates.iter().all(|rate|rate.abs_diff(hz)<hz/1000));
     assert_eq!(fault.nominal,Some(hz*2));
     assert_eq!(model.control&3,0);
+}
+
+#[test]
+fn actual_rejected_bsp_and_ap_brackets_require_fresh_precise_windows() {
+    // Actual COM1 endpoints, diagnostic CI 45903433211. These are evidence
+    // of an excessive bracket width, NOT fabricated successful rates.
+    for (values,hz) in [
+        ([0x4c6df2204,0x4c6dff2f6,0x4ceead914,0x4ceecb804],2_700_069_082),
+        ([0x498065fea,0x498072d14,0x4a012537a,0x4a013dd0c],2_700_012_263),
+    ] {
+        let [a,b,c,d]=values;
+        let lo=c-b;let hi=d-a;
+        assert!((hi-lo) as u128*1_000_000>((hi+lo)/2) as u128*960);
+        let raw=pit::DiscardedWindow{window:1,attempt:1,values};
+        assert!(raw.compatible_with(hz));
+        assert!(!raw.compatible_with(2_500_000_000));
+        let ticks=Cell::new(1_000_000);
+        let mut model=Model::new(&ticks,hz,Fault::None);
+        // Independently simulated real port transactions: once introduce
+        // the measured start/terminal delays, then use ordinary tight I/O.
+        model.start_delay=b-a;
+        model.terminal_delay=d-c;
+        let caps=tsc::Capabilities{available:true,invariant:true,nominal_hz:Some(hz)};
+        let mut discarded=pit::DiscardedWindows::new();
+        let rate=pit::qualify_samples(caps,&mut model,30_000,||ticks.get(),
+            ||ticks.set(ticks.get()+hz/250_000),&mut discarded).unwrap();
+        assert_eq!(rate.hz(),hz);
+        assert_eq!(discarded.len(),1);
+        let entry=discarded.iter().next().unwrap();
+        assert_eq!((entry.window,entry.attempt),(1,1));
+        let [a,b,c,d]=entry.values;
+        assert!((d-a-(c-b)) as u128*1_000_000>((d-a+c-b)/2) as u128*960);
+        assert_eq!(model.writes.iter().filter(|&&(port,value)|port==0x43&&value==0xb0).count(),4);
+        assert_eq!(model.control&3,0);
+        let mut messages=Vec::new();
+        discarded.report(1,"ap-start",|line|messages.push(line.to_vec()));
+        assert_eq!(messages.len(),2);
+        assert!(messages[0].ends_with(b"ATTEMPT=1 RETRY=EdgeUncertain"));
+        assert!(messages.iter().all(|m|m.len()<=96));
+    }
+}
+
+#[test]
+fn imprecise_but_contradictory_interval_cannot_be_hidden_by_good_later_rate() {
+    let ticks=Cell::new(1_000_000);
+    let attempts=Cell::new(0);
+    let hz=2_700_000_000u64;
+    let mut model=Model::new(&ticks,hz,Fault::None);
+    model.attempts=Some(&attempts);
+    model.start_delay=60_000;
+    model.terminal_delay=100_000;
+    let prior=Cell::new(ticks.get());
+    let raw=Cell::new(ticks.get());
+    let mut discarded=pit::DiscardedWindows::new();
+    let caps=tsc::Capabilities{available:true,invariant:true,nominal_hz:None};
+    let fault=pit::qualify_samples(caps,&mut model,30_000,||{
+        let now=ticks.get();
+        let step=now-prior.replace(now);
+        // First physical interval sees a doubled raw frequency, later
+        // measurements nominal frequency, but with no raw regression.
+        raw.set(raw.get()+step*if attempts.get()==1{2}else{1});
+        raw.get()
+    },||ticks.set(ticks.get()+hz/250_000),&mut discarded).unwrap_err();
+    assert_eq!(fault.reason,pit::QualificationReason::DiscardedRangeConflict);
+    assert_eq!(attempts.get(),2);
+    assert_eq!(discarded.len(),1);
+    assert!(fault.rates[0].abs_diff(hz)<hz/1000);
+    assert_eq!(model.control&3,0);
+}
+
+#[test]
+fn missing_edge_and_gate_failure_are_never_retried() {
+    let hz=2_700_000_000u64;
+    for fault in [Fault::Stopped,Fault::ImmediateHigh,Fault::TerminalNull,Fault::CleanupStuck] {
+        let ticks=Cell::new(1_000_000);
+        let attempts=Cell::new(0);
+        let mut model=Model::new(&ticks,hz,fault);
+        model.attempts=Some(&attempts);
+        let mut discarded=pit::DiscardedWindows::new();
+        let caps=tsc::Capabilities{available:true,invariant:true,nominal_hz:None};
+        let result=pit::qualify_samples(caps,&mut model,30_000,||ticks.get(),
+            ||ticks.set(ticks.get()+hz/250_000),&mut discarded);
+        assert!(result.is_err());
+        assert_eq!(attempts.get(),1);
+        assert_eq!(discarded.len(),0);
+    }
 }

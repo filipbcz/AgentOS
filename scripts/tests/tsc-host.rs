@@ -237,3 +237,35 @@ fn checked_calibration_rejections_are_specific_and_never_create_a_rate() {
     assert_eq!(tsc::qualified_rate_checked(Capabilities{nominal_hz:Some(2_000_000_000),..caps},
         [3_000_000_000;3]),Err(NominalMismatch));
 }
+
+#[test]
+fn discarded_spans_never_qualify_and_cannot_hide_raw_discontinuity() {
+    use tsc::CalibrationFault::*;
+    let caps=Capabilities{available:true,invariant:true,nominal_hz:Some(3_000_000_000)};
+    let observation=|start:u64|Observation{before_start:start,after_start:start,
+        before_end:start+150_000_000,after_end:start+150_000_000,reference_ns:50_000_000};
+    let mut c=tsc::Calibration::new(caps);
+    c.observe_unqualified_span(10,100).unwrap();
+    c.observe_unqualified_span(100,200).unwrap();
+    c.observe_unqualified_span(200,300).unwrap();
+    assert_eq!(c.finish_checked(),Err(Incomplete));
+    let mut c=tsc::Calibration::new(caps);
+    c.observe_unqualified_span(10,100).unwrap();
+    assert_eq!(c.observe_checked(observation(99)),Err(BetweenSamples));
+    assert_eq!(c.finish_checked(),Err(PreviousFailure));
+    let mut c=tsc::Calibration::new(caps);
+    c.observe_checked(observation(100)).unwrap();
+    assert_eq!(c.observe_unqualified_span(100,200),Err(BetweenSamples));
+    assert_eq!(c.finish_checked(),Err(PreviousFailure));
+    let mut c=tsc::Calibration::new(caps);
+    c.observe_unqualified_span(10,100).unwrap();
+    for start in [500_000_000,700_000_000,900_000_000] {c.observe_checked(observation(start)).unwrap();}
+    let rate=c.finish_checked().unwrap();
+    // Prior calibration ended later than this attempt's first rejected
+    // start, but earlier than its first accepted start. Confirm must reject.
+    let mut prior=tsc::Calibration::new(caps);
+    for start in [100,150_000_100,300_000_100] {prior.observe_checked(observation(start)).unwrap();}
+    let peer=Peer::new();
+    peer.publish_rate(Some(prior.finish_checked().unwrap()));
+    assert!(!peer.confirm_rate(rate));
+}
