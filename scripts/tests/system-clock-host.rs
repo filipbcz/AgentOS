@@ -1198,3 +1198,171 @@ fn primary_regression_inside_last_quarantine_probe_cannot_promote_unqualified_de
     assert_eq!(rig.clocks.take_event(),Some(ClockEvent::Unavailable));
     assert!(!rig.clocks.qualified());
 }
+
+
+fn boot_quarantine(primary: ReferenceClock, candidate: ReferenceClock) -> Rig {
+    let mut rig=Rig::new(primary,candidate,100);
+    rig.clocks=ClockSet::new((primary,100),None);
+    assert!(rig.clocks.register_quarantined(candidate));
+    assert!(!rig.clocks.register_quarantined(candidate));
+    assert!(!rig.clocks.register_quarantined(primary));
+    rig
+}
+
+fn lifecycle_sample(rig: &mut Rig, mut restart: impl FnMut(ReferenceClock)->Option<bool>) -> Option<u128> {
+    let (a,b,ar,br)=(rig.primary,rig.shadow,rig.active_raw,rig.shadow_raw);
+    rig.clocks.sample_with_lifecycle(|source| {
+        if source==a {ar} else {assert_eq!(source,b);br}
+    },||None,&mut restart)
+}
+
+#[test]
+fn stopped_boot_hpet_can_be_restarted_then_qualified_without_changing_primary() {
+    let mut rig=boot_quarantine(pm(true),hp(true,100_000_000));
+    let hpet=rig.shadow;
+    assert_eq!(rig.clocks.maintenance_ms(),Some(100));
+    assert_eq!(rig.observe(),Some(0));
+    for i in 1..=2 {
+        rig.active_raw+=715_909;
+        let mut attempted=false;
+        assert_eq!(lifecycle_sample(&mut rig,|source| {
+            assert_eq!(source,hpet);
+            attempted=true;
+            Some(true)
+        }),Some(i*200_000_000));
+        assert_eq!(attempted,i==2);
+        assert!(!rig.clocks.qualified());
+    }
+    assert_eq!(rig.clocks.take_event(),Some(ClockEvent::HpetRestarted));
+    // The hardware may reset its raw value. No pre-restart qualification
+    // or elapsed history may survive that register transaction.
+    rig.shadow_raw=0;
+    for i in 1..=4 {
+        assert_eq!(rig.advance(715_909,2_000_000),Some(400_000_000+i*200_000_000));
+        assert_eq!(rig.clocks.qualified(),i==4);
+        assert_eq!(rig.clocks.source(),Some(rig.primary));
+    }
+    assert_eq!(rig.clocks.take_event(),Some(ClockEvent::StandbyRecovered));
+    rig.active_raw-=1;
+    assert_eq!(rig.advance(0,2_000_000),Some(1_400_000_000));
+    assert_eq!(rig.clocks.source(),Some(hpet));
+}
+
+#[test]
+fn initially_nonprogressing_pm_can_rejoin_without_a_register_restart() {
+    let mut rig=boot_quarantine(hp(true,100_000_000),pm(false));
+    assert_eq!(rig.observe(),Some(0));
+    for i in 1..=8 {
+        rig.active_raw+=2_000_000;
+        assert_eq!(lifecycle_sample(&mut rig,|_|panic!("PM is read only")),Some(i*200_000_000));
+        assert!(!rig.clocks.qualified());
+    }
+    rig.shadow_raw=0xffff00;
+    for _ in 0..4 {rig.advance(2_000_000,715_909).unwrap();}
+    assert!(rig.clocks.qualified());
+    assert_eq!(rig.clocks.take_event(),Some(ClockEvent::StandbyRecovered));
+    assert_eq!(rig.clocks.source(),Some(rig.primary));
+}
+
+#[test]
+fn failed_restarts_are_rate_limited_and_never_publish_candidate_time() {
+    let mut rig=boot_quarantine(pm(true),hp(true,100_000_000));
+    rig.observe();
+    let hpet=rig.shadow;
+    for i in 1..=12 {
+        rig.active_raw+=715_909;
+        let mut attempted=false;
+        assert_eq!(lifecycle_sample(&mut rig,|source| {
+            assert_eq!(source,hpet);
+            attempted=true;
+            Some(false)
+        }),Some(i*200_000_000));
+        let due=matches!(i,2|7|12);
+        assert_eq!(attempted,due,"restart at interval {}",i);
+        assert_eq!(rig.clocks.take_event(),if due{Some(ClockEvent::HpetRestartFailed)}else{None});
+        assert!(!rig.clocks.qualified());
+        assert_eq!(rig.clocks.source(),Some(rig.primary));
+    }
+}
+
+#[test]
+fn restart_is_never_issued_for_active_or_attached_hpet() {
+    let mut rig=Rig::new(hp(true,100_000_000),pm(false),100);
+    // A single active clock cannot time or authorize its own reset.
+    rig.clocks=ClockSet::new((rig.primary,100),None);
+    for _ in 0..10 {
+        assert_eq!(lifecycle_sample(&mut rig,|_|panic!("active HPET reset")),Some(0));
+    }
+    let mut rig=Rig::new(pm(true),hp(true,100_000_000),100);
+    rig.observe();
+    for i in 1..=8 {
+        rig.active_raw+=715_909;
+        rig.shadow_raw+=2_000_000;
+        assert_eq!(lifecycle_sample(&mut rig,|_|panic!("attached standby reset")),Some(i*200_000_000));
+    }
+    assert!(rig.clocks.qualified());
+}
+
+#[test]
+fn moving_but_wrong_rate_hpet_is_not_blindly_restarted() {
+    let mut rig=boot_quarantine(pm(true),hp(true,100_000_000));
+    rig.observe();
+    for i in 1..=12 {
+        rig.active_raw+=715_909;
+        rig.shadow_raw+=1_000_000;
+        assert_eq!(lifecycle_sample(&mut rig,|_|panic!("moving counter reset")),Some(i*200_000_000));
+        assert!(!rig.clocks.qualified());
+    }
+}
+
+#[test]
+fn boot_phase_does_not_enable_hardware_restart() {
+    let mut rig=boot_quarantine(pm(true),hp(true,100_000_000));
+    rig.observe();
+    for i in 1..=8 {
+        rig.active_raw+=715_909;
+        // No restart owner during direct boot reference polling.
+        assert_eq!(lifecycle_sample(&mut rig,|_|None),Some(i*200_000_000));
+        assert_eq!(rig.clocks.take_event(),None);
+    }
+    rig.active_raw+=715_909;
+    let mut attempted=false;
+    assert_eq!(lifecycle_sample(&mut rig,|_|{attempted=true;Some(true)}),Some(1_800_000_000));
+    assert!(attempted);
+    assert_eq!(rig.clocks.take_event(),Some(ClockEvent::HpetRestarted));
+}
+
+#[test]
+fn qualified_holdover_can_restart_stopped_hpet_and_restore_physical_clock() {
+    let mut rig=TripleRig::qualified();
+    lose_both_physical_sources(&mut rig);
+    assert_eq!(rig.advance(0,0,200_000_000),Some(988_000_000));
+    assert_eq!(rig.hardware.clocks.take_event(),Some(ClockEvent::PromotedTsc));
+    let a=rig.hardware.primary;
+    let b=rig.hardware.shadow;
+    for i in 1..=3 {
+        rig.tsc_ticks+=600_000_000;
+        let w=rig.witness(0);
+        let (ar,br)=(rig.hardware.active_raw,rig.hardware.shadow_raw);
+        let mut attempted=false;
+        let ns=rig.hardware.clocks.sample_with_lifecycle(|s|{
+            if s==a {ar}else{assert_eq!(s,b);br}
+        },||Some(w),|source| {
+            assert_eq!(source,a);
+            attempted=true;
+            Some(true)
+        });
+        assert_eq!(ns,Some(988_000_000+i*200_000_000));
+        assert_eq!(attempted,i==3);
+        assert!(rig.hardware.clocks.using_tsc());
+    }
+    assert_eq!(rig.hardware.clocks.take_event(),Some(ClockEvent::HpetRestarted));
+    rig.hardware.active_raw=0;
+    for i in 1..=4 {
+        let ns=rig.advance(2_000_000,0,200_000_000).unwrap();
+        assert_eq!(ns,1_588_000_000+i*200_000_000);
+        assert_eq!(rig.hardware.clocks.using_tsc(),i<4);
+    }
+    assert_eq!(rig.hardware.clocks.source(),Some(a));
+    assert_eq!(rig.hardware.clocks.take_event(),Some(ClockEvent::RecoveredHpet));
+}
