@@ -170,6 +170,16 @@ def hmp(qmp, command):
     return result
 
 
+def verify_pm_read(io, port):
+    # HMP "i/xw" requests a 32-bit read; the output suffix is "l".
+    match = re.fullmatch(r"portl\[0x([0-9a-f]+)\]\s*=\s*0x([0-9a-f]{8})",
+                         io.strip(), re.I)
+    require(match is not None and int(match[1],16)==port,
+            f"Invalid 32-bit PM port read: {io!r}")
+    require(int(match[2],16)==0xffffffff,
+            f"Former PM timer I/O port remains readable: {io!r}")
+
+
 def capture_platform(qmp, dest, cpus, accel, ram):
     # Do not pause a live finite-PIT epoch during the session. This is
     # called only after session completion or a recorded boot failure.
@@ -206,11 +216,6 @@ def capture_platform(qmp, dest, cpus, accel, ram):
             before&0x80 and not after&0x80 and value==0xffffffff,
             "Fixture did not disable actual ICH9 PM I/O decode at EBS")
     require(invtsc in (0,1), "Invalid guest CPUID evidence")
-    # An independent emulator port read after EBS must also be unmapped.
-    # The fixture's own observation by itself is not sufficient.
-    io = hmp(qmp,f"i/lx {port:#x}")
-    (dest/"pm-port-read.txt").write_text(io)
-    require(re.search(r"\b0xffffffff\b",io,re.I), "Former PM timer I/O port remains readable")
     files={}
     def read(address,size):
         require(type(address) is int and type(size) is int and
@@ -224,6 +229,15 @@ def capture_platform(qmp, dest, cpus, accel, ram):
         files[path.name]=smoke.evidence.sha256(path)
         return data
     tables=inspect_tables(read,st,r20,r10,cpus)
+    write_json(dest/"acpi-tables.json",tables)
+    print("Actual EFI/ACPI tables:",json.dumps(tables,sort_keys=True),flush=True)
+    # Independently read the former PM I/O port. Preserve the raw response
+    # before checking its address, width and value.
+    io = qmp.execute("human-monitor-command",{"command-line":f"i/xw {port:#x}"})
+    require(isinstance(io,str),"Missing HMP I/O response")
+    (dest/"pm-port-read.txt").write_text(io)
+    print("Actual PM port read:",repr(io),flush=True)
+    verify_pm_read(io,port)
     result={"result":"verified","hpet_device_absent":True,"hpet_acpi_absent":True,
             "pm_timer_acpi_absent":True,"pm_io_decode_disabled":True,
             "former_pm_port":port,"former_pm_port_read":io.strip(),
@@ -397,7 +411,10 @@ def scenario(args):
                     if qmp is None:
                         qmp=smoke.Qmp(qmp_socket)
                     if not receipt["boot_verified"]:
-                        qmp.screenshot(dest/"failed-screen.ppm")
+                        try:
+                            qmp.screenshot(dest/"failed-screen.ppm")
+                        except Exception as exc:
+                            print("Failure screenshot unavailable:",exc,file=sys.stderr,flush=True)
                     platform=capture_platform(qmp,dest,args.cpus,accel,256*1024*1024)
                     receipt["platform_verified"]=True
                     receipt["guest_invariant_tsc"]=platform["guest_invariant_tsc"]
@@ -428,6 +445,15 @@ def scenario(args):
             path=dest/name
             if path.exists():
                 receipt[name+"_sha256"]=smoke.evidence.sha256(path)
+                if name=="com1.log":
+                    data=path.read_bytes()
+                    lines=data.decode("ascii",errors="replace").splitlines()
+                    receipt["clock_diagnostics"]=[line for line in lines if
+                        any(key in line for key in ("SYSTEM CLOCK:","BRINGUP CLOCK:",
+                            "TSC-HZ=","TSC CPU","AGENTOS TASK ","SMP FAILED"))][:80]
+                    receipt["fallback_selected"]=("[INFO] SYSTEM CLOCK: TSC (independent finite PIT watchdog)" in lines)
+                    receipt["shell_ready"]=b"AGENTOS SHELL READY\r\nagentos> " in data
+                    print("Actual clock/CPU diagnostics:",json.dumps(receipt["clock_diagnostics"]),flush=True)
                 if receipt["result"]!="pass":
                     print(f"{name} tail:\n"+path.read_bytes()[-4096:].decode("ascii",errors="replace"),
                           file=sys.stderr,flush=True)
