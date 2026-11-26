@@ -118,3 +118,24 @@ fn pm_mmio_mapping_refuses_conflicting_firmware_pages() {
     descriptor[24..32].copy_from_slice(&u64::MAX.to_le_bytes());
     assert!(!acpi::timer_mmio_page_ok(&descriptor,48,address));
 }
+
+
+#[test]
+fn legacy_pit_probe_requires_legacy_pic_and_valid_nonreduced_acpi() {
+    let normal=pm_fadt(244,0,0,None);
+    assert!(acpi::legacy_pit_probe(true,Some(&normal)));
+    assert!(!acpi::legacy_pit_probe(false,Some(&normal)));
+    assert!(!acpi::legacy_pit_probe(true,None));
+    // A user-visible ISA/LPC device declaration is not a PIT declaration.
+    let legacy_devices=fadt(6,244,1);
+    assert!(!acpi::legacy_pit_probe(false,Some(&legacy_devices)));
+    let reduced=pm_fadt(244,1<<20,0,None);
+    assert!(!acpi::legacy_pit_probe(true,Some(&reduced)));
+    let mut malformed=normal.clone();
+    malformed[112]^=1;
+    assert!(!acpi::legacy_pit_probe(true,Some(&malformed)));
+    for size in 0..116 {
+        assert!(!acpi::legacy_pit_probe(true,Some(&normal[..size])));
+    }
+    assert!(acpi::legacy_pit_probe(true,Some(&pm_fadt(116,0,0,None))));
+}
