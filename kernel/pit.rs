@@ -252,20 +252,33 @@ pub(crate) unsafe fn start_monitor(allowed: bool) -> Option<u16> {
     result
 }
 
-/// Runtime ownership is serialized by the IRQ-safe timekeeper gate.
-pub(crate) unsafe fn read_monitor() -> Option<u16> {
-    if !MONITOR_ACTIVE.load(Ordering::Acquire) { return None; }
-    monitor_count(&mut Io).ok().flatten()
+/// Keep the reason a finite reference was rejected. None / null count
+/// is not elapsed time; a terminal edge cannot authorize reprogramming.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MonitorError {
+    Inactive, Read(Error), NotLoaded, OutsideRearmWindow, Program(Error),
 }
 
-pub(crate) unsafe fn rearm_monitor() -> Option<u16> {
-    if !MONITOR_ACTIVE.load(Ordering::Acquire) { return None; }
+fn loaded_monitor_count(io: &mut impl Ports) -> Result<u16, MonitorError> {
+    monitor_count(io).map_err(MonitorError::Read)?.ok_or(MonitorError::NotLoaded)
+}
+
+/// Runtime ownership is serialized by the IRQ-safe timekeeper gate.
+pub(crate) unsafe fn read_monitor() -> Result<u16, MonitorError> {
+    if !MONITOR_ACTIVE.load(Ordering::Acquire) { return Err(MonitorError::Inactive); }
+    loaded_monitor_count(&mut Io)
+}
+
+pub(crate) unsafe fn rearm_monitor() -> Result<u16, MonitorError> {
+    if !MONITOR_ACTIVE.load(Ordering::Acquire) { return Err(MonitorError::Inactive); }
     let mut io=Io;
     // Check the still-owned old finite window immediately before reset.
     // In particular do not clear a terminal indication observed late.
-    let remaining=monitor_count(&mut io).ok().flatten()?;
-    if remaining<MIN_REARM_COUNT || remaining>REARM_COUNT { return None; }
-    program_monitor(&mut io, LOAD_POLLS).ok()
+    let remaining=loaded_monitor_count(&mut io)?;
+    if remaining<MIN_REARM_COUNT || remaining>REARM_COUNT {
+        return Err(MonitorError::OutsideRearmWindow);
+    }
+    program_monitor(&mut io, LOAD_POLLS).map_err(MonitorError::Program)
 }
 
 pub(crate) unsafe fn stop_monitor() {

@@ -140,3 +140,59 @@ fn cannot_hide_a_bad_window_by_rearming_or_migrating_mid_sample() {
     let s=at(BSP,BASE+ticks(11_932));
     assert_eq!(e.observe(s,at(AP,s.raw),53_068),None);
 }
+
+#[test]
+fn first_epoch_fault_is_specific_and_sticky() {
+    use tsc_epoch::Fault;
+    let mut e=epoch();
+    let s=at(BSP,BASE+ticks(11_932));
+    assert_eq!(e.observe(s,s,65_000),None);
+    assert_eq!(e.fault(),Some(Fault::StepMismatch));
+    e.invalidate(Fault::Stalled);
+    assert_eq!(e.observe(s,s,53_068),None);
+    assert_eq!(e.fault(),Some(Fault::StepMismatch));
+
+    let mut e=epoch();
+    assert_eq!(e.observe(s,s,pit::MIN_REARM_COUNT-1),None);
+    assert_eq!(e.fault(),Some(Fault::LatePitCount));
+
+    let mut e=epoch();
+    assert_eq!(e.observe(s,s,65_001),None);
+    assert_eq!(e.fault(),Some(Fault::StepCount));
+
+    let mut e=epoch();
+    assert!(e.observe(s,s,53_068).is_some());
+    let bad=Sample{raw:s.raw-1,..s};
+    assert_eq!(e.observe(bad,bad,53_068),None);
+    assert_eq!(e.fault(),Some(Fault::RawRegression));
+
+    let mut e=epoch();
+    assert!(e.observe(s,s,53_068).is_some());
+    assert!(!e.rearm(s,s,65_000));
+    assert_eq!(e.fault(),Some(Fault::RearmCount));
+
+    let mut e=epoch();
+    let s=at(BSP,BASE+ticks(35_796));
+    assert!(e.observe(s,s,29_204).is_some());
+    let late=at(BSP,s.raw+HZ/1000);
+    assert!(!e.rearm(late,late,65_000));
+    assert_eq!(e.fault(),Some(Fault::RearmTooLong));
+}
+
+#[test]
+fn operational_failure_codes_and_pit_stages_remain_distinct() {
+    use pit::{Error,MonitorError};
+    use tsc_epoch::Fault;
+    assert_eq!(Fault::from_code(0),None);
+    for code in 1..=Fault::Stalled as u8 {
+        let fault=Fault::from_code(code).unwrap();
+        assert_eq!(fault as u8,code);
+        assert!(fault.message().starts_with(b"SYSTEM CLOCK: TSC/PIT epoch unavailable: "));
+        assert!(fault.message().len()<=96);
+    }
+    assert_eq!(Fault::pit_read(MonitorError::Read(Error::NoEdge)),Fault::PitReadTerminal);
+    assert_eq!(Fault::pit_rearm(MonitorError::Read(Error::NoEdge)),Fault::RearmReadTerminal);
+    assert_eq!(Fault::pit_rearm(MonitorError::Program(Error::NoEdge)),Fault::RearmProgramNoEdge);
+    assert_eq!(Fault::pit_rearm(MonitorError::OutsideRearmWindow),Fault::RearmOldCount);
+    assert_eq!(Fault::pit_read(MonitorError::NotLoaded),Fault::PitReadNotLoaded);
+}

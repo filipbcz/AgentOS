@@ -62,7 +62,7 @@ pub(crate) enum ClockEvent {
     StandbyRetired = 1, PromotedPm = 2, PromotedHpet = 3,
     Unavailable = 4, StandbyRebased = 5, TscRejected = 6, PromotedTsc = 7,
     RecoveredPm = 8, RecoveredHpet = 9, StandbyRecovered = 10,
-    HpetRestarted = 11, HpetRestartFailed = 12,
+    HpetRestarted = 11, HpetRestartFailed = 12, TscPitUnavailable = 13,
 }
 
 impl ClockEvent {
@@ -80,9 +80,12 @@ impl ClockEvent {
             Self::StandbyRecovered => b"SYSTEM CLOCK: quarantined standby requalified and restored",
             Self::HpetRestarted => b"SYSTEM CLOCK: quarantined HPET reprogrammed; qualification pending",
             Self::HpetRestartFailed => b"SYSTEM CLOCK: quarantined HPET restart failed",
+            Self::TscPitUnavailable => crate::tsc_epoch::Fault::from_code(TSC_PIT_FAILURE.load(Ordering::Acquire))
+                .map(crate::tsc_epoch::Fault::message)
+                .unwrap_or(b"SYSTEM CLOCK: TSC/PIT epoch unavailable; reason unknown"),
         }
     }
-    pub fn error(self) -> bool { matches!(self, Self::Unavailable | Self::HpetRestartFailed) }
+    pub fn error(self) -> bool { matches!(self, Self::Unavailable | Self::HpetRestartFailed | Self::TscPitUnavailable) }
 }
 
 #[derive(Clone, Copy)]
@@ -952,29 +955,42 @@ struct TscFallback {
     local: fn() -> Option<crate::tsc_epoch::Sample>,
 }
 
+// Persistent first-failure diagnosis for the lifetime of this epoch.
+// The event ring is bounded and may drop a contending event; retain the
+// reason separately. Only the failing path writes this under CLOCK.gate.
+static TSC_PIT_FAILURE: AtomicU8 = AtomicU8::new(0);
+
 impl TscFallback {
     fn sample(&mut self) -> Option<u128> {
+        use crate::tsc_epoch::Fault;
         if self.epoch.failed() { return None; }
         let result = (|| {
-            let before=(self.local)()?;
-            let count=unsafe { crate::pit::read_monitor() }?;
-            let after=(self.local)()?;
-            let ns=self.epoch.observe(before,after,count)?;
+            let before=(self.local)().ok_or(Fault::LocalBefore)?;
+            let count=unsafe { crate::pit::read_monitor() }.map_err(Fault::pit_read)?;
+            let after=(self.local)().ok_or(Fault::LocalAfter)?;
+            let ns=self.epoch.observe(before,after,count)
+                .ok_or_else(|| self.epoch.fault().unwrap_or(Fault::InvalidBracket))?;
             if count <= crate::pit::REARM_COUNT {
-                let before=(self.local)()?;
-                let count=unsafe { crate::pit::rearm_monitor() }?;
-                let after=(self.local)()?;
-                if !self.epoch.rearm(before,after,count) { return None; }
+                let before=(self.local)().ok_or(Fault::RearmLocalBefore)?;
+                let count=unsafe { crate::pit::rearm_monitor() }.map_err(Fault::pit_rearm)?;
+                let after=(self.local)().ok_or(Fault::RearmLocalAfter)?;
+                if !self.epoch.rearm(before,after,count) {
+                    return Err(self.epoch.fault().unwrap_or(Fault::InvalidBracket));
+                }
             }
-            Some(ns)
+            Ok(ns)
         })();
-        if result.is_none() { self.invalidate(); }
-        result
+        match result {
+            Ok(ns)=>Some(ns),
+            Err(fault)=>{ self.invalidate(fault); None }
+        }
     }
 
-    fn invalidate(&mut self) {
-        self.epoch.invalidate();
+    fn invalidate(&mut self, fault: crate::tsc_epoch::Fault) {
+        self.epoch.invalidate(fault);
         unsafe { crate::pit::stop_monitor(); }
+        let first=self.epoch.fault().unwrap_or(fault);
+        let _=TSC_PIT_FAILURE.compare_exchange(0,first as u8,Ordering::Release,Ordering::Relaxed);
     }
 }
 
@@ -1108,7 +1124,7 @@ pub(crate) fn snapshot() -> Option<ClockSnapshot> {
             let was_failed=fallback.epoch.failed();
             let result=fallback.sample();
             if result.is_none() && !was_failed {
-                CLOCK.event.store(ClockEvent::Unavailable as u8, Ordering::Release);
+                CLOCK.event.store(ClockEvent::TscPitUnavailable as u8, Ordering::Release);
                 CLOCK.maintenance.store(0, Ordering::Release);
             }
             return result.map(|ns| ClockSnapshot {
@@ -1144,9 +1160,9 @@ pub(crate) fn expire_stalled_holdover() {
     CLOCK.with(|state| {
         if let Some(fallback)=state.fallback.as_mut() {
             if !fallback.epoch.failed() {
-                fallback.invalidate();
+                fallback.invalidate(crate::tsc_epoch::Fault::Stalled);
                 CLOCK.maintenance.store(0, Ordering::Release);
-                CLOCK.event.store(ClockEvent::Unavailable as u8, Ordering::Release);
+                CLOCK.event.store(ClockEvent::TscPitUnavailable as u8, Ordering::Release);
             }
         }
         if let Some(clocks) = state.physical.as_mut() {
@@ -1175,6 +1191,7 @@ pub(crate) fn take_event() -> Option<ClockEvent> {
         10 => Some(ClockEvent::StandbyRecovered),
         11 => Some(ClockEvent::HpetRestarted),
         12 => Some(ClockEvent::HpetRestartFailed),
+        13 => Some(ClockEvent::TscPitUnavailable),
         _ => None,
     }
 }

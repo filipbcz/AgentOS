@@ -209,6 +209,7 @@ def kernel_postmortem(qmp, dest, ram):
         ("::logger::LOGGER","kernel-logger",4096),
         ("::pit::MONITOR_ACTIVE","pit-monitor-active",1),
         ("::system_clock::CLOCK","system-clock",65536),
+        ("::system_clock::TSC_PIT_FAILURE","tsc-pit-failure",1),
     ]:
         matches=[]
         for line in symbols.splitlines():
@@ -233,11 +234,18 @@ def kernel_postmortem(qmp, dest, ram):
             # The actual bounded log owns inline copies of message bytes.
             # Search only this precise mutable object, not ELF string data.
             record["unavailable_event_in_ring"]=(
-                b"SYSTEM CLOCK: no trustworthy elapsed time; epoch unavailable" in raw)
+                b"SYSTEM CLOCK: no trustworthy elapsed time; epoch unavailable" in raw or
+                b"SYSTEM CLOCK: TSC/PIT epoch unavailable:" in raw)
             record["clock_messages"]=[m.decode("ascii") for m in
                 re.findall(rb"SYSTEM CLOCK: [\x20-\x7e]{1,82}",raw)]
         if tag=="pit-monitor-active":
             record["active"]=bool(raw[0]) if raw in (b"\0",b"\1") else None
+        if tag=="tsc-pit-failure":
+            # A single kernel-owned atomic byte, not a guessed Rust layout.
+            # Zero is no latched fault; the exact enum mapping is in the
+            # source revision of kernel/tsc_epoch.rs. Never infer a reason
+            # from a missing symbol or from zero.
+            record["first_failure_code"]=raw[0]
         result[tag]=record
     return result
 
