@@ -27,7 +27,9 @@ mod process;
 mod lifecycle;
 mod hpet;
 mod reference_clock;
+mod bringup_clock;
 mod clock_quorum;
+mod tsc_epoch;
 mod system_clock;
 mod tsc;
 mod pit;
@@ -177,59 +179,43 @@ pub unsafe extern "sysv64" fn kernel_main(info: &BootInfo) -> ! {
         Ok(source) => source,
         Err(reason) => { log.event(0, reason); halt(); }
     };
-    log.event(1, system_clock::name(source));
+    if let Some(source)=source { log.event(1, system_clock::name(source)); }
+    else { log.event(1,b"SYSTEM CLOCK: physical references unavailable; awaiting SMP qualification"); }
     serial(b"AGENTOS OWN CR3="); exceptions::hex(root as u64); serial(b"\r\n");
     if !exceptions::probe(info.stack_base) || !frames.probe() {
         log.event(0, b"EXCEPTION OR RAM PROBE FAILED"); halt();
     }
     serial(b"AGENTOS IDT OK: BP PF-NULL PF-GUARD PF-WP PF-NX\r\n");
     log.event(1, b"PAGING AND IDT READY");
-    if let Err(reason) = pci::inventory(windows).and_then(|devices| {
-        if let Some(device) = devices.oxford { device.bind(root, &mut frames)?; }
-        #[cfg(ahci_dma_acceptance)]
-        {
-            devices.ahci.ok_or(b"AHCI missing" as &[u8])?.exercise(root, &mut frames)?;
+    // Discovery and assigned BAR ownership do not need absolute time.
+    // Preserve BSP-exclusive CF8/CFC and mapping initialization.
+    let mut devices=match pci::inventory(windows) {
+        Ok(devices)=>devices,
+        Err(reason)=>{ serial(b"AGENTOS PCI FAILED: "); serial(reason); serial(b"\r\n"); halt(); }
+    };
+    if let Some(device)=devices.oxford.take() {
+        if let Err(reason)=device.bind(root,&mut frames) {
+            serial(b"AGENTOS PCI FAILED: "); serial(reason); serial(b"\r\n"); halt();
         }
-        #[cfg(ahci_block_acceptance)]
-        {
-            let mut disk = ahci::AhciDisk::open(devices.ahci.ok_or(b"AHCI missing" as &[u8])?, root, &mut frames)?;
-            let result = block_acceptance::run(&mut disk);
-            disk.close(&mut frames)?;
-            result?;
+    }
+    // A physical epoch can service timed device operations immediately.
+    // Otherwise defer them until every enabled CPU is synchronized and
+    // the independent TSC monitor has actually started.
+    let mut pending=Some(devices);
+    if source.is_some() {
+        if let Err(reason)=initialize_timed_devices(pending.take().unwrap(),root,&mut frames) {
+            serial(b"AGENTOS PCI FAILED: "); serial(reason); serial(b"\r\n"); halt();
         }
-        #[cfg(nvme_block_acceptance)]
-        {
-            if devices.nvme_count != 1 { return Err(b"NVMe profile requires exactly one controller" as &[u8]); }
-            let mut disk = nvme::NvmeDisk::open(devices.nvme.ok_or(b"NVMe ECAM/BAR missing" as &[u8])?, root, &mut frames)?;
-            let result = block_acceptance::run(&mut disk);
-            disk.close(&mut frames)?;
-            result?;
-        }
-        #[cfg(virtio_net_acceptance)]
-        {
-            if devices.virtio_net_count != 1 { return Err(b"VirtIO profile requires exactly one network controller" as &[u8]); }
-            let mut net = virtio_net::VirtioNet::open(devices.virtio_net.ok_or(b"VirtIO modern ECAM missing" as &[u8])?, root, &mut frames)?;
-            let result = virtio_net::exercise(&mut net);
-            net.close(&mut frames)?;
-            result?;
-        }
-        #[cfg(xhci_acceptance)]
-        {
-            if devices.xhci_count != 1 { return Err(b"xHCI profile requires exactly one controller" as &[u8]); }
-            let mut hc = xhci::Xhci::open(devices.xhci.ok_or(b"xHCI ECAM/BAR missing" as &[u8])?, root, &mut frames)?;
-            let result = hc.exercise();
-            hc.close(&mut frames)?;
-            result?;
-        }
-        Ok(())
-    }) {
-        serial(b"AGENTOS PCI FAILED: "); serial(reason); serial(b"\r\n"); halt();
     }
     if info.initramfs < info.image_base || info.initramfs.checked_add(info.initramfs_size)
         .zip(info.image_base.checked_add(info.image_size)).map_or(true, |(end, limit)| end > limit) { log.event(0, b"INVALID INITRAMFS"); halt(); }
     let archive = core::slice::from_raw_parts(info.initramfs as *const u8, info.initramfs_size as usize);
     log.event(2, b"INITRAMFS LOCATED");
-    if let Err(reason) = smp::run(&platform, info.ap_boot, root, frames, descriptors.rsp0_slot(), archive, &mut log) {
+    if let Err(reason) = smp::run(&platform, info.ap_boot, root, frames, descriptors.rsp0_slot(), archive, &mut log,
+        source.is_some(), |frames| {
+            if let Some(devices)=pending.take() { initialize_timed_devices(devices,root,frames) }
+            else { Ok(()) }
+        }) {
         log.event(0, b"SMP FAILED");
         serial(b"SMP FAILED: "); serial(reason); serial(b"\r\n"); halt();
     }
@@ -248,6 +234,49 @@ pub unsafe extern "sysv64" fn kernel_main(info: &BootInfo) -> ! {
         serial(b"SHELL FAILED: "); serial(reason); serial(b"\r\n");
     } else { log.event(1, b"INTERACTIVE SHELL STOPPED"); }
     halt()
+}
+
+// Existing timed boot device operations. Their driver implementations
+// are unchanged. This owner is called only after clock publication.
+unsafe fn initialize_timed_devices(devices: pci::Devices, root: usize, frames: &mut frames::Frames<'_>)
+    -> Result<(), &'static [u8]> {
+    let _=(&devices,root,&frames);
+    #[cfg(ahci_dma_acceptance)]
+    {
+        devices.ahci.ok_or(b"AHCI missing" as &[u8])?.exercise(root, frames)?;
+    }
+    #[cfg(ahci_block_acceptance)]
+    {
+        let mut disk = ahci::AhciDisk::open(devices.ahci.ok_or(b"AHCI missing" as &[u8])?, root, frames)?;
+        let result = block_acceptance::run(&mut disk);
+        disk.close(frames)?;
+        result?;
+    }
+    #[cfg(nvme_block_acceptance)]
+    {
+        if devices.nvme_count != 1 { return Err(b"NVMe profile requires exactly one controller" as &[u8]); }
+        let mut disk = nvme::NvmeDisk::open(devices.nvme.ok_or(b"NVMe ECAM/BAR missing" as &[u8])?, root, frames)?;
+        let result = block_acceptance::run(&mut disk);
+        disk.close(frames)?;
+        result?;
+    }
+    #[cfg(virtio_net_acceptance)]
+    {
+        if devices.virtio_net_count != 1 { return Err(b"VirtIO profile requires exactly one network controller" as &[u8]); }
+        let mut net = virtio_net::VirtioNet::open(devices.virtio_net.ok_or(b"VirtIO modern ECAM missing" as &[u8])?, root, frames)?;
+        let result = virtio_net::exercise(&mut net);
+        net.close(frames)?;
+        result?;
+    }
+    #[cfg(xhci_acceptance)]
+    {
+        if devices.xhci_count != 1 { return Err(b"xHCI profile requires exactly one controller" as &[u8]); }
+        let mut hc = xhci::Xhci::open(devices.xhci.ok_or(b"xHCI ECAM/BAR missing" as &[u8])?, root, frames)?;
+        let result = hc.exercise();
+        hc.close(frames)?;
+        result?;
+    }
+    Ok(())
 }
 
 fn draw(info: &BootInfo, line: &[u8], left: usize, top: usize, scale: usize) {
