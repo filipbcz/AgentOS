@@ -471,7 +471,9 @@ impl Cpu {
             .map(|reference_ns| Sample { reference_ns, before, after });
         let watchdog = &mut *self.tsc_watchdog.get();
         let previous = watchdog.health();
-        let health = MONITOR.observe(self.expected_id as u32, rate, alignment, watchdog, sample);
+        let generation = now.as_ref().map(|s| s.reference_generation);
+        let health = MONITOR.observe_at(generation, self.expected_id as u32,
+                                        rate, alignment, watchdog, sample);
         if previous != health && health != Health::Pending {
             let level = if health == Health::Rejected { crate::log_policy::Level::Error }
                         else { crate::log_policy::Level::Info };
@@ -663,13 +665,13 @@ unsafe fn current_cpu() -> &'static Cpu {
 
 /// Called only after SMP publishes CPU-local state and with local IRQs
 /// masked by the system clock gate. It does not acquire that gate again.
-fn clock_witness() -> Option<crate::clock_quorum::Witness> {
+fn clock_witness(generation: u64) -> Option<crate::clock_quorum::Witness> {
     use crate::tsc_watchdog::MONITOR;
     if !MONITOR.active() { return None; }
     let cpu = unsafe { current_cpu() };
     if !cpu.fRuntimeReady.load(Ordering::Acquire) { return None; }
     let alignment = cpu.tsc.alignment()?;
-    MONITOR.witness(cpu.expected_id, alignment, unsafe { crate::tsc::read() })
+    MONITOR.witness_at(generation, cpu.expected_id, alignment, unsafe { crate::tsc::read() })
 }
 
 fn reject_clock_witness() {
