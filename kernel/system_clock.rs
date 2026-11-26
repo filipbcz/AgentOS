@@ -157,6 +157,15 @@ impl ClockSet {
     }
 
     pub(crate) fn using_tsc(&self) -> bool { !self.failed && self.holdover.is_some() }
+
+    pub(crate) fn view(&self, ns: u128) -> ClockSnapshot {
+        let holdover = self.using_tsc();
+        ClockSnapshot {
+            millis: (ns / 1_000_000).min(isize::MAX as u128) as u64,
+            independent_ns: if holdover { None } else { u64::try_from(ns).ok() },
+            holdover,
+        }
+    }
     pub(crate) fn qualified(&self) -> bool { self.anchor.is_some() && !self.failed }
     pub(crate) fn take_event(&mut self) -> Option<ClockEvent> { self.event.take() }
 
@@ -419,6 +428,15 @@ impl ClockSet {
                             self.rebase_standby(shadow_source, shadow_raw);
                         } else {
                             self.retire_standby();
+                            // This surviving pair agreed against the
+                            // previously corroborated triple anchor.
+                            if let Some(low) = first {
+                                self.single = Some(SingleAnchor {
+                                    physical: Span { low, high }, tsc: current,
+                                    global: self.base_ns.saturating_add(low),
+                                });
+                                self.single_qualified = true;
+                            }
                         }
                         return self.publish(self.base_ns.saturating_add(high));
                     }
@@ -427,7 +445,12 @@ impl ClockSet {
                         // This anchor was independently corroborated by
                         // all three clocks, not refreshed by a bad source.
                         self.anchor = Some(Anchor { global: old.global, shadow: old.pair.shadow });
-                        return self.promote(ns, ns-shadow_prior);
+                        let time = self.promote(ns, ns-shadow_prior)?;
+                        self.single = Some(SingleAnchor {
+                            physical: Span::exact(0), tsc: current, global: time,
+                        });
+                        self.single_qualified = true;
+                        return Some(time);
                     }
                     Verdict::TscRejected => {
                         self.triple = None;
@@ -609,12 +632,7 @@ pub(crate) fn snapshot() -> Option<ClockSnapshot> {
             CLOCK.event.store(event as u8, Ordering::Release);
         }
         let ns = result?;
-        let holdover = clocks.using_tsc();
-        Some(ClockSnapshot {
-            millis: (ns / 1_000_000).min(isize::MAX as u128) as u64,
-            independent_ns: if holdover { None } else { u64::try_from(ns).ok() },
-            holdover,
-        })
+        Some(clocks.view(ns))
     })
 }
 
