@@ -124,3 +124,224 @@ fn exact_reference_nanoseconds_do_not_truncate_the_millisecond_abi() {
     assert_eq!(pm(false).total_ns(u128::MAX),None);
     assert_eq!(hp(true,100_000_000).ticks_to_ms(u128::MAX),isize::MAX as u64);
 }
+
+
+use system_clock::{ClockSet, ClockEvent};
+
+struct Rig {
+    clocks: ClockSet,
+    primary: ReferenceClock,
+    shadow: ReferenceClock,
+    active_raw: u64,
+    shadow_raw: u64,
+}
+
+impl Rig {
+    fn new(primary: ReferenceClock, shadow: ReferenceClock, start: u64) -> Self {
+        Self {
+            clocks: ClockSet::new((primary, start & primary.mask()),
+                Some((shadow, start & shadow.mask()))),
+            primary, shadow, active_raw: start & primary.mask(),
+            shadow_raw: start & shadow.mask(),
+        }
+    }
+
+    fn observe(&mut self) -> Option<u128> {
+        let (primary, shadow, a, b) = (self.primary, self.shadow,
+                                      self.active_raw, self.shadow_raw);
+        self.clocks.sample(|source| {
+            if source == primary { a }
+            else { assert_eq!(source, shadow); b }
+        })
+    }
+
+    fn advance(&mut self, active_ticks: u64, shadow_ticks: u64) -> Option<u128> {
+        self.active_raw = self.active_raw.wrapping_add(active_ticks) & self.primary.mask();
+        self.shadow_raw = self.shadow_raw.wrapping_add(shadow_ticks) & self.shadow.mask();
+        self.observe()
+    }
+}
+
+fn qualified_pair() -> Rig {
+    let mut rig = Rig::new(hp(true,100_000_000), pm(false), 0xfff000);
+    assert_eq!(rig.clocks.maintenance_ms(),Some(1000));
+    assert_eq!(rig.observe(),Some(0));
+    // Four 200ms windows, including a genuine standby PM24 wrap.
+    for i in 1..=4 {
+        assert_eq!(rig.advance(2_000_000,715_909),Some(i*200_000_000));
+    }
+    assert!(rig.clocks.qualified());
+    assert_eq!(rig.clocks.source(),Some(rig.primary));
+    rig
+}
+
+#[test]
+fn qualified_standby_preserves_epoch_after_primary_regression() {
+    let mut rig=qualified_pair();
+    rig.active_raw -= 1;
+    let t=rig.advance(0,715_909).unwrap();
+    assert_eq!(t,1_000_000_000);
+    assert_eq!(rig.clocks.source(),Some(rig.shadow));
+    assert_eq!(rig.clocks.take_event(),Some(ClockEvent::PromotedPm));
+    assert!(!rig.clocks.qualified());
+    assert_eq!(rig.advance(0,715_909),Some(1_200_000_000));
+    assert_eq!(rig.clocks.take_event(),None);
+    // The failed primary is not recycled, even when it later progresses.
+    rig.shadow_raw=rig.shadow_raw.wrapping_sub(1)&rig.shadow.mask();
+    assert_eq!(rig.advance(10_000_000,0),None);
+    assert_eq!(rig.clocks.take_event(),Some(ClockEvent::Unavailable));
+    assert_eq!(rig.advance(10_000_000,715_909),None);
+}
+
+#[test]
+fn stalled_primary_needs_sustained_standby_progress() {
+    let mut rig=qualified_pair();
+    assert_eq!(rig.advance(0,715_909),Some(800_000_000));
+    assert_eq!(rig.clocks.source(),Some(rig.primary));
+    for _ in 0..20 { assert_eq!(rig.observe(),Some(800_000_000)); }
+    assert_eq!(rig.advance(0,715_909),Some(1_200_000_000));
+    assert_eq!(rig.clocks.source(),Some(rig.shadow));
+    assert_eq!(rig.clocks.take_event(),Some(ClockEvent::PromotedPm));
+    assert_eq!(rig.advance(0,715_909),Some(1_400_000_000));
+}
+
+#[test]
+fn broken_standby_does_not_interrupt_healthy_primary() {
+    let mut rig=qualified_pair();
+    rig.shadow_raw=rig.shadow_raw.wrapping_sub(1)&rig.shadow.mask();
+    assert_eq!(rig.advance(2_000_000,0),Some(1_000_000_000));
+    assert_eq!(rig.clocks.source(),Some(rig.primary));
+    assert_eq!(rig.clocks.take_event(),Some(ClockEvent::StandbyRetired));
+    assert_eq!(rig.clocks.maintenance_ms(),None);
+    assert_eq!(rig.advance(2_000_000,0),Some(1_200_000_000));
+    assert!(!rig.clocks.qualified());
+}
+
+#[test]
+fn unqualified_or_disagreeing_standby_cannot_replace_primary() {
+    let mut rig=Rig::new(hp(true,100_000_000),pm(false),100);
+    assert_eq!(rig.observe(),Some(0));
+    for i in 1..=8 {
+        assert_eq!(rig.advance(2_000_000,1_000_000),Some(i*200_000_000));
+    }
+    assert!(!rig.clocks.qualified());
+    rig.active_raw -= 1;
+    assert_eq!(rig.advance(0,715_909),None);
+    assert_eq!(rig.clocks.source(),None);
+    assert_eq!(rig.clocks.take_event(),Some(ClockEvent::Unavailable));
+}
+
+#[test]
+fn late_sample_requalifies_standby_instead_of_reusing_ambiguous_residue() {
+    let mut rig=qualified_pair();
+    assert_eq!(rig.advance(50_000_000,17_897_725),Some(5_800_000_000));
+    assert_eq!(rig.clocks.take_event(),Some(ClockEvent::StandbyRebased));
+    assert_eq!(rig.clocks.source(),Some(rig.primary));
+    assert!(!rig.clocks.qualified());
+    for _ in 0..4 {rig.advance(2_000_000,715_909);}
+    assert!(rig.clocks.qualified());
+    rig.active_raw-=1;
+    assert_eq!(rig.advance(0,715_909),Some(6_800_000_000));
+    assert_eq!(rig.clocks.source(),Some(rig.shadow));
+
+    let mut rig=Rig::new(pm(false),hp(true,100_000_000),10);
+    rig.observe();
+    for _ in 0..4 {rig.advance(715_909,2_000_000);}
+    assert!(rig.clocks.qualified());
+    // No third independent witness can resolve the active short counter.
+    assert_eq!(rig.advance(17_897_725,50_000_000),None);
+    assert_eq!(rig.clocks.take_event(),Some(ClockEvent::Unavailable));
+}
+
+#[test]
+fn either_hardware_source_can_be_promoted_and_two_failures_are_terminal() {
+    let mut rig=Rig::new(pm(true),hp(true,100_000_000),100);
+    assert_eq!(rig.observe(),Some(0));
+    for _ in 0..4 {rig.advance(715_909,2_000_000);}
+    assert!(rig.clocks.qualified());
+    rig.active_raw -= 1;
+    assert_eq!(rig.advance(0,2_000_000),Some(1_000_000_000));
+    assert_eq!(rig.clocks.source(),Some(rig.shadow));
+    assert_eq!(rig.clocks.take_event(),Some(ClockEvent::PromotedHpet));
+    let mut both=qualified_pair();
+    both.active_raw-=1;
+    both.shadow_raw=both.shadow_raw.wrapping_sub(1)&both.shadow.mask();
+    assert_eq!(both.observe(),None);
+    assert_eq!(both.clocks.take_event(),Some(ClockEvent::Unavailable));
+}
+
+#[test]
+fn wide_read_bracket_and_stale_anchor_do_not_authorize_switch() {
+    let mut rig=qualified_pair();
+    let a=rig.active_raw;
+    let b=rig.shadow_raw;
+    let mut reads=0;
+    let ns=rig.clocks.sample(|source| {
+        if source==rig.primary {
+            reads+=1;
+            if reads==1 {a} else {a+10_000}
+        } else {b}
+    });
+    assert_eq!(ns,Some(801_000_000));
+    assert!(!rig.clocks.qualified());
+    rig.active_raw=a+9999;
+    assert_eq!(rig.advance(0,715_909),None);
+    let mut rig=qualified_pair();
+    rig.active_raw-=1;
+    assert_eq!(rig.advance(0,8_590_908),None);
+    assert_eq!(rig.clocks.take_event(),Some(ClockEvent::Unavailable));
+}
+
+#[test]
+fn contradictory_sample_between_windows_invalidates_anchor() {
+    let mut rig=qualified_pair();
+    assert_eq!(rig.advance(10_000,35_795),Some(801_000_000));
+    assert!(!rig.clocks.qualified());
+    rig.active_raw-=1;
+    assert_eq!(rig.advance(0,715_909),None);
+}
+
+#[test]
+fn optional_unqualified_source_cannot_disable_primary_by_a_forward_jump() {
+    let mut rig=Rig::new(pm(false),hp(true,100_000_000),10);
+    rig.observe();
+    assert_eq!(rig.advance(715_909,50_000_000),Some(200_000_000));
+    assert_eq!(rig.clocks.take_event(),Some(ClockEvent::StandbyRebased));
+    assert_eq!(rig.clocks.source(),Some(rig.primary));
+    assert!(!rig.clocks.qualified());
+}
+
+#[test]
+fn transient_stall_and_promotion_preserve_absolute_deadline() {
+    let mut rig=qualified_pair();
+    let deadline_ms=1100u128;
+    assert_eq!(rig.advance(0,357_954).unwrap()/1_000_000,800);
+    assert_eq!(rig.advance(2_000_000,357_955).unwrap()/1_000_000,1000);
+    assert_eq!(rig.clocks.source(),Some(rig.primary));
+    assert!(rig.clocks.qualified());
+    rig.active_raw-=1;
+    let now=rig.advance(0,715_909).unwrap()/1_000_000;
+    assert_eq!(now,1200);
+    assert!(now>=deadline_ms);
+}
+
+#[test]
+fn concurrent_readers_use_one_continuous_epoch_after_promotion() {
+    use std::sync::{Arc,Mutex};
+    let state=Arc::new(Mutex::new(qualified_pair()));
+    let mut threads=Vec::new();
+    for _ in 0..4 {
+        let shared=Arc::clone(&state);
+        threads.push(std::thread::spawn(move || {
+            let mut last=0;
+            for _ in 0..1000 {
+                let t=shared.lock().unwrap().advance(0,3579).unwrap();
+                assert!(t>=last);
+                last=t;
+            }
+        }));
+    }
+    for t in threads {t.join().unwrap();}
+    let rig=state.lock().unwrap();
+    assert_eq!(rig.clocks.source(),Some(rig.shadow));
+}
