@@ -241,14 +241,21 @@ struct RestartWatch {
     raw: Option<u64>,
     since: u128,
     attempted: Option<u128>,
+    blocked: bool,
 }
 
 impl RestartWatch {
-    const fn new() -> Self { Self { raw: None, since: 0, attempted: None } }
+    const fn new() -> Self { Self { raw: None, since: 0, attempted: None, blocked: false } }
 
     fn forget(&mut self) { self.raw = None; }
 
     fn due(&mut self, raw: u64, now: u128) -> bool {
+        // A failed register transaction may have left an unsafe partial
+        // configuration. Require a successful reprogramming before
+        // trusting it, even if the counter happens to be advancing.
+        if self.blocked {
+            return self.attempted.map_or(false, |last| now.saturating_sub(last) >= RESTART_COOLDOWN_NS);
+        }
         if self.raw != Some(raw) || now < self.since {
             self.raw = Some(raw);
             self.since = now;
@@ -258,8 +265,9 @@ impl RestartWatch {
             self.attempted.map_or(true, |last| now.saturating_sub(last) >= RESTART_COOLDOWN_NS)
     }
 
-    fn attempted(&mut self, now: u128) {
+    fn attempted(&mut self, now: u128, success: bool) {
         self.attempted = Some(now);
+        self.blocked = !success;
         self.forget();
     }
 }
@@ -398,7 +406,8 @@ impl ClockSet {
         // witness was available, the single-source checker must also
         // confirm a consistent physical/TSC pair before rejoining.
         if primary.high-primary.low > BRACKET_NS ||
-           (witness_available && !self.single_qualified) {
+           (witness_available && !self.single_qualified) ||
+           (matches!(source, ReferenceClock::Hpet { .. }) && self.restart_watch.blocked) {
             self.standby_probe = None;
             return;
         }
@@ -444,7 +453,7 @@ impl ClockSet {
         }
         if !self.restart_watch.due(raw, now) { return false; }
         let Some(success) = restart(source) else { return false; };
-        self.restart_watch.attempted(now);
+        self.restart_watch.attempted(now, success);
         self.standby_probe = None;
         for candidate in self.recovery.iter_mut().flatten() {
             if candidate.source == source { candidate.history = None; }
@@ -580,7 +589,11 @@ impl ClockSet {
         let mut ready = [false; 2];
         for i in 0..2 {
             if let (Some(candidate), Some(raw)) = (&mut self.recovery[i], raw[i]) {
-                ready[i] = candidate.observe(raw, bracket);
+                if matches!(candidate.source, ReferenceClock::Hpet { .. }) && self.restart_watch.blocked {
+                    candidate.history = None;
+                } else {
+                    ready[i] = candidate.observe(raw, bracket);
+                }
             }
         }
         if let Some(index) = ready.iter().position(|&qualified| qualified) {
