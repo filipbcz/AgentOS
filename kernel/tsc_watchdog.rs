@@ -162,9 +162,10 @@ struct Member {
     last_raw: Option<u64>,
     last_witness: Option<u64>,
     verified: Option<Point>,
+    generation: u64,
 }
 impl Member {
-    const fn new() -> Self { Self { alignment: None, last_raw: None, last_witness: None, verified: None } }
+    const fn new() -> Self { Self { alignment: None, last_raw: None, last_witness: None, verified: None, generation: 0 } }
 }
 
 struct Fleet {
@@ -249,6 +250,7 @@ impl Fleet {
 struct MonitorData {
     anchor: Option<Point>,
     fleet: Fleet,
+    generation: u64,
 }
 
 /// Shared BSP anchor and machine-wide, time-bounded TSC qualification.
@@ -271,7 +273,7 @@ impl RuntimeMonitor {
     pub const fn new() -> Self {
         Self { state: AtomicU8::new(0), bsp: AtomicU32::new(0), hz: AtomicU64::new(0),
                gate: AtomicBool::new(false),
-               data: UnsafeCell::new(MonitorData { anchor: None, fleet: Fleet::new() }) }
+               data: UnsafeCell::new(MonitorData { anchor: None, fleet: Fleet::new(), generation: 0 }) }
     }
 
     /// Once, on the BSP before runtime publication, only if every enabled
@@ -301,13 +303,44 @@ impl RuntimeMonitor {
     /// IRQs must be masked. The caller owns its per-CPU Watchdog.
     pub fn observe(&self, cpu: u32, rate: u64, alignment: Alignment,
                    watchdog: &mut Watchdog, sample: Option<Sample>) -> Health {
+        self.observe_at(Some(0), cpu, rate, alignment, watchdog, sample)
+    }
+
+    /// A recovered independent physical epoch starts a new reference
+    /// generation. Invalidate the entire fleet before accepting any new
+    /// measurement; an in-flight sample of the old generation must never
+    /// renew a lease. The caller passes the generation of the actual
+    /// clock snapshot, not one obtained later from another read.
+    pub fn observe_at(&self, generation: Option<u64>, cpu: u32, rate: u64,
+                      alignment: Alignment, watchdog: &mut Watchdog,
+                      sample: Option<Sample>) -> Health {
         self.with_data(|data| {
             if !self.active() { return watchdog.health(); }
             if !data.fleet.contains(cpu) { return watchdog.unverified(); }
-            let Some(sample) = sample else {
+            if let Some(generation) = generation {
+                if generation < data.generation { return watchdog.health(); }
+                if generation > data.generation {
+                    data.generation = generation;
+                    data.anchor = None;
+                    for member in &mut data.fleet.members { member.verified = None; }
+                }
+            }
+            let Some(sample) = sample.filter(|_| generation.is_some()) else {
                 data.fleet.revoke(cpu);
                 return watchdog.unverified();
             };
+            let member = &mut data.fleet.members[cpu as usize];
+            if member.generation != data.generation {
+                // Restart reference interval measurements, not the raw
+                // monotonicity and startup alignment of the actual CPU.
+                if member.last_raw.map_or(false, |last| sample.before < last) ||
+                   member.last_witness.map_or(false, |last| sample.after < last) {
+                    self.state.store(2, Ordering::Release);
+                    return watchdog.reject();
+                }
+                *watchdog = Watchdog::new();
+                member.generation = data.generation;
+            }
             let hz = self.hz.load(Ordering::Relaxed);
             let bsp = cpu == self.bsp.load(Ordering::Relaxed);
             let normalized = sample.point(rate, alignment);
@@ -343,9 +376,14 @@ impl RuntimeMonitor {
     /// observations. The caller samples the local TSC outside this lock,
     /// with IRQs masked; witness acquisition never calls the system clock.
     pub fn witness(&self, cpu: u8, alignment: Alignment, raw: u64) -> Option<Witness> {
+        self.witness_at(0, cpu, alignment, raw)
+    }
+
+    pub fn witness_at(&self, generation: u64, cpu: u8,
+                      alignment: Alignment, raw: u64) -> Option<Witness> {
         if !self.active() { return None; }
         self.with_data(|data| {
-            if !self.active() { return None; }
+            if !self.active() || generation != data.generation { return None; }
             data.fleet.witness(cpu, alignment, raw, self.hz.load(Ordering::Relaxed))
         })
     }
