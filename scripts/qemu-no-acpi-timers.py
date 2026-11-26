@@ -625,7 +625,7 @@ def scenario(args):
                     lines=data.decode("ascii",errors="replace").splitlines()
                     receipt["clock_diagnostics"]=[line for line in lines if
                         any(key in line for key in ("SYSTEM CLOCK:","BRINGUP CLOCK:",
-                            "TSC-HZ=","TSC APIC=","TSC CPU","AGENTOS TASK ","SMP FAILED"))][:80]
+                            "TSC-HZ=","TSC APIC=","TSC CPU","PIT TSC APIC=","AGENTOS TASK ","SMP FAILED"))][:80]
                     receipt["fallback_selected"]=("[INFO] SYSTEM CLOCK: TSC (qualified invariant clocksource)" in lines)
                     receipt["shell_ready"]=b"AGENTOS SHELL READY\r\nagentos> " in data
                     print("Actual clock/CPU diagnostics:",json.dumps(receipt["clock_diagnostics"]),flush=True)

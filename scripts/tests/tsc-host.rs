@@ -217,3 +217,23 @@ fn repeat_rate_must_continue_raw_history_before_sealing() {
     assert!(peer.seal());
     assert!(!peer.confirm_rate(next));
 }
+
+#[test]
+fn checked_calibration_rejections_are_specific_and_never_create_a_rate() {
+    use tsc::CalibrationFault::*;
+    let caps=Capabilities{available:true,invariant:true,nominal_hz:None};
+    let observation=|start:u64,delta:u64| Observation{before_start:start,after_start:start,
+        before_end:start+delta,after_end:start+delta,reference_ns:50_000_000};
+    let o=observation(100,150_000_000);
+    assert_eq!(tsc::measured_rate_checked(Observation{reference_ns:0,..o}),Err(ReferenceDuration));
+    assert_eq!(tsc::measured_rate_checked(Observation{after_start:99,..o}),Err(RawOrder));
+    assert_eq!(tsc::measured_rate_checked(Observation{after_end:o.after_end+1_000_000,..o}),Err(Uncertain));
+    let mut c=tsc::Calibration::new(caps);
+    assert_eq!(c.observe_checked(o),Ok(3_000_000_000));
+    assert_eq!(c.observe_checked(o),Err(BetweenSamples));
+    assert_eq!(c.observe_checked(observation(500_000_000,150_000_000)),Err(PreviousFailure));
+    assert_eq!(c.finish_checked(),Err(PreviousFailure));
+    assert_eq!(tsc::qualified_rate_checked(caps,[3_000_000_000,3_000_000_000,3_010_000_000]),Err(RateSpread));
+    assert_eq!(tsc::qualified_rate_checked(Capabilities{nominal_hz:Some(2_000_000_000),..caps},
+        [3_000_000_000;3]),Err(NominalMismatch));
+}

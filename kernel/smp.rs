@@ -81,6 +81,21 @@ impl Diagnostic {
     }
 }
 
+/// Report a completed, rejected independent qualification. The PIT owner
+/// has been released, and its gate/speaker cleanup has already been checked.
+/// Mandatory failures retain the native fatal serial diagnostic path; optional
+/// source failures are recorded in the normal kernel history only.
+unsafe fn report_pit_failure(cpu: u8, phase: &str, mandatory: bool, fault: crate::pit::QualificationFailure) {
+    fault.report(cpu,phase,|line| {
+        let _=crate::logger::LOGGER.record(0,cpu as u32,crate::log_policy::Level::Error,line);
+        if mandatory {
+            let mut record=Diagnostic::new(line);
+            record.text(b"\r\n");
+            serial(&record.fBytes[..record.fLength]);
+        }
+    });
+}
+
 unsafe fn registeredCpus() -> impl Iterator<Item = &'static Cpu> {
     gCpus.iter().filter_map(|pSlot| {
         let pAddress = pSlot.load(Ordering::Acquire);
@@ -330,17 +345,22 @@ impl Cpu {
     /// The PIT provides an independent finite interval when a direct
     /// ACPI calibration reference has become unresponsive. A reference
     /// that actually measured inconsistent rates must not be bypassed.
-    unsafe fn qualify_tsc(&self) -> Option<crate::tsc::QualifiedRate> {
+    unsafe fn qualify_tsc(&self, phase: &str) -> Option<crate::tsc::QualifiedRate> {
         let mut maintain = || { let _ = crate::system_clock::millis(); };
-        match self.reference {
-            BringupClock::Physical(reference) => match crate::tsc::qualify_reference(reference, &mut maintain) {
-                Ok(hz) => Some(hz),
-                Err(crate::tsc::QualificationError::ReferenceUnavailable) =>
-                    crate::pit::qualify(self.legacy_pit_probe, &mut maintain),
-                Err(_) => None,
-            },
-            BringupClock::LocalTsc { .. } =>
-                crate::pit::qualify(self.legacy_pit_probe, &mut maintain),
+        let mandatory=self.reference.tsc_hz().is_some();
+        if let BringupClock::Physical(reference)=self.reference {
+            match crate::tsc::qualify_reference(reference, &mut maintain) {
+                Ok(hz)=>return Some(hz),
+                Err(crate::tsc::QualificationError::ReferenceUnavailable)=>{},
+                Err(_)=>return None,
+            }
+        }
+        match crate::pit::qualify(self.legacy_pit_probe,&mut maintain) {
+            Ok(rate)=>Some(rate),
+            Err(fault)=>{
+                report_pit_failure(self.expected_id,phase,mandatory,fault);
+                None
+            }
         }
     }
 
@@ -1141,7 +1161,7 @@ unsafe extern "C" fn ap_main(cpu: &'static Cpu) -> ! {
         // On the TSC-only bring-up path each AP must first measure its
         // own rate against PIT. Do not use the BSP's raw TSC as its clock.
         if let Some(bsp_hz)=cpu.reference.tsc_hz() {
-            let rate=cpu.qualify_tsc().ok_or(b"AP independent TSC calibration failed" as Error)?;
+            let rate=cpu.qualify_tsc("ap-start").ok_or(b"AP independent TSC calibration failed" as Error)?;
             if rate.hz().abs_diff(bsp_hz) as u128*1000>rate.hz().min(bsp_hz) as u128 {
                 return Err(b"AP TSC rate mismatch" as Error);
             }
@@ -1155,7 +1175,7 @@ unsafe extern "C" fn ap_main(cpu: &'static Cpu) -> ! {
             // TSC-only bring-up its local rate was qualified above.
             if cpu.reference.tsc_hz().is_none() {
                 let rate = if gBspQualifiedTscHz.load(Ordering::Acquire) != 0 {
-                    cpu.qualify_tsc()
+                    cpu.qualify_tsc("ap-optional")
                 } else { None };
                 cpu.tsc.publish_rate(rate);
             }
@@ -1256,9 +1276,12 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
         // An enumerated crystal ratio is useful for diagnosing the
         // platform, but cannot authorize a public epoch by itself.
         let rate=crate::pit::qualify(platform.legacy_pit_probe,||{})
-            .ok_or(if crate::tsc::detect().nominal_hz.is_some() {
-                b"enumerated TSC rate but no independent bootstrap reference" as Error
-            } else { b"no independent TSC bootstrap calibration" as Error })?;
+            .map_err(|fault| {
+                report_pit_failure(apic.id(),"bsp-start",true,fault);
+                if crate::tsc::detect().nominal_hz.is_some() {
+                    b"enumerated TSC rate but no independent bootstrap reference" as Error
+                } else { b"no independent TSC bootstrap calibration" as Error }
+            })?;
         (BringupClock::LocalTsc { hz:rate.hz() },Some(rate))
     };
     log.event(1, clock.name());
@@ -1279,7 +1302,7 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
     boot_cpu.initialize_local_cpu()?;
     boot_cpu.run_task()?;
     let bsp_proof = if let Some(rate)=boot_rate { Some(rate) } else {
-        let rate=boot_cpu.qualify_tsc();
+        let rate=boot_cpu.qualify_tsc("bsp-optional");
         boot_cpu.tsc.publish_rate(rate);
         rate
     };
@@ -1315,7 +1338,7 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
         // Independent BSP measurements separate the two alignment rounds.
         // Each AP already passed its own independent calibration.
         let first=bsp_proof.ok_or(b"unqualified BSP TSC" as Error)?;
-        let again=boot_cpu.qualify_tsc().ok_or(b"BSP TSC stability qualification failed" as Error)?;
+        let again=boot_cpu.qualify_tsc("bsp-confirm").ok_or(b"BSP TSC stability qualification failed" as Error)?;
         if !boot_cpu.tsc.confirm_rate(again) { return Err(b"BSP TSC frequency or raw time changed"); }
         for cpu in cpus.iter().flatten().filter(|cpu|cpu.expected_id!=bsp) {
             clock.synchronize(&cpu.tsc,first.hz(),||{})

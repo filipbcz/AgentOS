@@ -233,3 +233,54 @@ fn missed_terminal_interval_cannot_become_a_calibration() {
     assert_eq!(sample(&mut model,10,200_000_000),Err(Error::NoEdge));
     assert_eq!(model.control&3,0);
 }
+
+#[test]
+fn rejected_physical_measurements_preserve_the_actual_operation_and_operands() {
+    use pit::Stage::*;
+    let hz=3_000_000_000;
+    for (fault,stage) in [(Fault::Stopped,PollLimit),(Fault::InitialHigh,ProgramStatus),
+        (Fault::ImmediateHigh,FirstHigh),(Fault::WrongStatus,ProgramStatus),
+        (Fault::TerminalNull,TerminalStatus),(Fault::GateStuck,DisableGate),
+        (Fault::CleanupStuck,CleanupGate)] {
+        let ticks=Cell::new(1_000_000);
+        let mut model=Model::new(&ticks,hz,fault);
+        let result=pit::measure_detailed(true,&mut model,30_000,||ticks.get(),
+            ||ticks.set(ticks.get()+12_000)).unwrap_err();
+        assert_eq!(result.stage,stage);
+        assert_eq!(result.cleanup_state.is_some(),fault==Fault::CleanupStuck || fault==Fault::GateStuck);
+    }
+    let ticks=Cell::new(1_000_000);
+    let mut model=Model::new(&ticks,hz,Fault::None);
+    let caps=tsc::Capabilities{available:true,invariant:true,nominal_hz:Some(hz)};
+    let rejection=pit::qualify_samples(caps,&mut model,100,||ticks.get(),
+        ||ticks.set(ticks.get()+30_000_000)).unwrap_err();
+    assert_eq!(rejection.reason,pit::QualificationReason::Measure(EdgeUncertain));
+    assert_eq!(rejection.window,1);
+    assert_eq!(rejection.rates,[0;3]);
+    let [a,b,c,d]=rejection.values;
+    let lo=c-b; let hi=d-a;
+    assert!((hi-lo) as u128*1_000_000>((hi+lo)/2) as u128*960);
+    assert_eq!(model.control&3,0);
+    assert_eq!(model.writes.iter().filter(|&&(port,value)|port==0x43&&value==0xb0).count(),1);
+    let mut messages=Vec::new();
+    rejection.report(254,"bsp-confirm",|line|messages.push(line.to_vec()));
+    assert_eq!(messages.len(),4);
+    assert!(messages[0].ends_with(b"FAULT=Measure(EdgeUncertain)"));
+    assert!(messages[1].ends_with(format!("D={d:016x}").as_bytes()));
+    assert!(messages.iter().all(|line|line.len()<=96));
+}
+
+#[test]
+fn rejected_calibration_preserves_prior_rates_and_disagrees_with_nominal() {
+    let ticks=Cell::new(1_000_000);
+    let hz=3_000_000_000;
+    let mut model=Model::new(&ticks,hz,Fault::None);
+    let caps=tsc::Capabilities{available:true,invariant:true,nominal_hz:Some(hz*2)};
+    let fault=pit::qualify_samples(caps,&mut model,30_000,||ticks.get(),
+        ||ticks.set(ticks.get()+12_000)).unwrap_err();
+    assert_eq!(fault.reason,pit::QualificationReason::Calibration(tsc::CalibrationFault::NominalMismatch));
+    assert_eq!(fault.window,0);
+    assert!(fault.rates.iter().all(|rate|rate.abs_diff(hz)<hz/1000));
+    assert_eq!(fault.nominal,Some(hz*2));
+    assert_eq!(model.control&3,0);
+}

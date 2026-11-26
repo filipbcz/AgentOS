@@ -72,15 +72,27 @@ pub(crate) struct Observation {
 /// Bounds account for the time taken to read both reference registers.
 /// A preempted or unusually slow bracket is unsuitable for calibration.
 pub(crate) fn measured_rate(o: Observation) -> Option<u64> {
-    if !(MEASURE_NS..=MAX_MEASURE_NS).contains(&o.reference_ns) ||
-       o.before_start > o.after_start || o.before_end > o.after_end { return None; }
-    let lower = o.before_end.checked_sub(o.after_start)? as u128;
-    let upper = o.after_end.checked_sub(o.before_start)? as u128;
+    measured_rate_checked(o).ok()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CalibrationFault {
+    Unsupported, ReferenceDuration, RawOrder, Uncertain, RateRange,
+    PreviousFailure, ExcessSamples, BetweenSamples, Incomplete,
+    RateSpread, NominalMismatch,
+}
+
+pub(crate) fn measured_rate_checked(o: Observation) -> Result<u64, CalibrationFault> {
+    use CalibrationFault::*;
+    if !(MEASURE_NS..=MAX_MEASURE_NS).contains(&o.reference_ns) { return Err(ReferenceDuration); }
+    if o.before_start > o.after_start || o.before_end > o.after_end { return Err(RawOrder); }
+    let lower = o.before_end.checked_sub(o.after_start).ok_or(RawOrder)? as u128;
+    let upper = o.after_end.checked_sub(o.before_start).ok_or(RawOrder)? as u128;
     let midpoint = (lower + upper) / 2;
     if lower == 0 || upper < lower ||
-       (upper-lower) * PPM > midpoint * MAX_READ_UNCERTAINTY_PPM { return None; }
+       (upper-lower) * PPM > midpoint * MAX_READ_UNCERTAINTY_PPM { return Err(Uncertain); }
     let hz = midpoint * 1_000_000_000 / o.reference_ns as u128;
-    u64::try_from(hz).ok().filter(|&rate| rate != 0)
+    u64::try_from(hz).ok().filter(|&rate| rate != 0).ok_or(RateRange)
 }
 
 fn compatible(a: u64, b: u64) -> bool {
@@ -88,16 +100,21 @@ fn compatible(a: u64, b: u64) -> bool {
         a.abs_diff(b) as u128 * PPM <= a.min(b) as u128 * RATE_TOLERANCE_PPM
 }
 
-pub(crate) fn qualified_rate(caps: Capabilities, mut samples: [u64; 3]) -> Option<u64> {
-    if !caps.available || !caps.invariant { return None; }
+pub(crate) fn qualified_rate(caps: Capabilities, samples: [u64; 3]) -> Option<u64> {
+    qualified_rate_checked(caps, samples).ok()
+}
+
+pub(crate) fn qualified_rate_checked(caps: Capabilities, mut samples: [u64; 3]) -> Result<u64, CalibrationFault> {
+    use CalibrationFault::*;
+    if !caps.available || !caps.invariant { return Err(Unsupported); }
     if samples[0] > samples[1] { samples.swap(0, 1); }
     if samples[1] > samples[2] { samples.swap(1, 2); }
     if samples[0] > samples[1] { samples.swap(0, 1); }
-    if !compatible(samples[0], samples[2]) { return None; }
+    if !compatible(samples[0], samples[2]) { return Err(RateSpread); }
     if let Some(nominal) = caps.nominal_hz {
-        if !samples.into_iter().all(|hz| compatible(hz, nominal)) { return None; }
-        Some(nominal)
-    } else { Some(samples[1]) }
+        if !samples.into_iter().all(|hz| compatible(hz, nominal)) { return Err(NominalMismatch); }
+        Ok(nominal)
+    } else { Ok(samples[1]) }
 }
 
 /// An opaque rate token: CPUID or an arbitrary integer cannot create it.
@@ -124,23 +141,33 @@ impl Calibration {
         Self { caps, samples: [0;3], len: 0, first:0, last: None, failed: false }
     }
     pub(crate) fn observe(&mut self, observation: Observation) -> Option<()> {
-        let rate = measured_rate(observation);
-        if self.failed || self.len == self.samples.len() ||
-            self.last.map_or(false, |last| observation.before_start < last) ||
-            rate.is_none() {
-            self.failed = true;
-            return None;
-        }
+        self.observe_checked(observation).ok().map(|_| ())
+    }
+    pub(crate) fn observe_checked(&mut self, observation: Observation) -> Result<u64, CalibrationFault> {
+        use CalibrationFault::*;
+        let result = if self.failed { Err(PreviousFailure) }
+            else if self.len == self.samples.len() { Err(ExcessSamples) }
+            else if self.last.map_or(false, |last| observation.before_start < last) { Err(BetweenSamples) }
+            else { measured_rate_checked(observation) };
+        let rate = match result {
+            Ok(rate) => rate,
+            Err(reason) => { self.failed = true; return Err(reason); }
+        };
         if self.len==0 { self.first=observation.before_start; }
-        self.samples[self.len] = rate?;
+        self.samples[self.len] = rate;
         self.len += 1;
         self.last = Some(observation.after_end);
-        Some(())
+        Ok(rate)
     }
     pub(crate) fn finish(self) -> Option<QualifiedRate> {
-        if self.failed || self.len != self.samples.len() { return None; }
-        Some(QualifiedRate{hz:qualified_rate(self.caps,self.samples)?,
-            first:self.first,last:self.last?})
+        self.finish_checked().ok()
+    }
+    pub(crate) fn finish_checked(self) -> Result<QualifiedRate, CalibrationFault> {
+        use CalibrationFault::*;
+        if self.failed { return Err(PreviousFailure); }
+        if self.len != self.samples.len() { return Err(Incomplete); }
+        Ok(QualifiedRate{hz:qualified_rate_checked(self.caps,self.samples)?,
+            first:self.first,last:self.last.ok_or(Incomplete)?})
     }
 }
 
@@ -395,6 +422,15 @@ impl Write for Diagnostic {
     }
 }
 impl Diagnostic {
+    pub(crate) fn formatted(args: fmt::Arguments<'_>) -> Self {
+        let mut out = Self { data: [0; 96], len: 0 };
+        if out.write_fmt(args).is_err() {
+            out.len = 0;
+            let _ = out.write_str("TSC diagnostic overflow");
+        }
+        out
+    }
+
     pub fn new(id: u8, peer: &Peer) -> Self {
         let mut out = Self { data: [0; 96], len: 0 };
         if let Some(hz) = peer.rate() {
