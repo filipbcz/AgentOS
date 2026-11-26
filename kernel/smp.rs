@@ -209,6 +209,23 @@ impl Lapic {
         Ok((per_10ms, tsc_hz))
     }
 
+    unsafe fn send_runtime(self, id: u8, command: u32) -> Result<(), Error> {
+        let start = crate::system_clock::millis();
+        self.write(0x310, (id as u32) << 24);
+        self.write(0x300, command);
+        // An already completed delivery does not depend on clock health.
+        // Bound a genuinely pending delivery even if all clocks stop.
+        for _ in 0..100_000_000u32 {
+            if self.read(0x300) & (1 << 12) == 0 { return Ok(()); }
+            let (Some(before), Some(now)) = (start, crate::system_clock::millis()) else {
+                return Err(b"IPI system clock unavailable");
+            };
+            if now.saturating_sub(before) >= 1000 { return Err(b"IPI delivery timeout"); }
+            spin_loop();
+        }
+        Err(b"IPI delivery polling limit")
+    }
+
     unsafe fn send(self, id: u8, command: u32, clock: &ReferenceClock) -> Result<(), Error> {
         self.write(0x310, (id as u32) << 24);
         self.write(0x300, command);
@@ -272,7 +289,12 @@ impl Cpu {
     }
     unsafe fn requestReschedule(&self, aTarget: &Cpu) {
         if aTarget.fWakePending.swap(true, Ordering::AcqRel) { return; }
-        if self.apic.send(aTarget.expected_id, RESCHEDULE, &self.reference).is_err() {
+        // Runtime IPI waits follow the same resilient absolute clock as
+        // all other deadlines. Never retry the ICR command after timeout.
+        let delivery = if gRuntimeEnabled.load(Ordering::Acquire) {
+            self.apic.send_runtime(aTarget.expected_id, RESCHEDULE)
+        } else { self.apic.send(aTarget.expected_id, RESCHEDULE, &self.reference) };
+        if delivery.is_err() {
             serial(b"SMP FAILED: reschedule IPI delivery\r\n"); halt();
         }
         if aTarget.expected_id != self.expected_id { gRemoteWakeups.fetch_add(1, Ordering::Relaxed); }
@@ -416,6 +438,19 @@ impl Cpu {
     /// eligible, the local invariant-TSC watchdog. IRQs are masked by the
     /// scheduler/interrupt caller; the watchdog has exactly one CPU owner.
     unsafe fn runtime_clock(&self) -> Option<u64> {
+        let now = self.runtime_clock_sample();
+        // The timekeeper publishes events while holding its own gate.
+        // Record them here after release, without a clock/log lock cycle.
+        if let Some(event) = crate::system_clock::take_event() {
+            let level = if event.error() { crate::log_policy::Level::Error }
+                        else { crate::log_policy::Level::Info };
+            let _ = crate::logger::LOGGER.record(crate::logger::ticks(),
+                self.expected_id as u32, level, event.message());
+        }
+        now
+    }
+
+    unsafe fn runtime_clock_sample(&self) -> Option<u64> {
         use crate::tsc_watchdog::{Health, Sample, MONITOR};
         if !self.fRuntimeReady.load(Ordering::Acquire) || !MONITOR.active() {
             return crate::system_clock::millis();
