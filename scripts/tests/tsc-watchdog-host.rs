@@ -200,3 +200,67 @@ fn a_missing_or_expired_member_cannot_be_renewed_by_reading_tsc() {
     assert!(!monitor.active());
     assert_eq!(monitor.witness(0,ZERO,sample(5_720_000_000,0).after),None);
 }
+
+
+#[test]
+fn reference_generation_change_revokes_the_whole_fleet_and_ignores_old_samples() {
+    let monitor=RuntimeMonitor::new();
+    assert!(monitor.start(0,HZ,[0,7]));
+    let mut bsp=Watchdog::new();
+    let mut ap=Watchdog::new();
+    for i in 0..=3 {
+        let ns=i*500_000_000;
+        monitor.observe(0,HZ,ZERO,&mut bsp,Some(sample(ns,0)));
+        monitor.observe(7,HZ,AP,&mut ap,Some(sample(ns+10_000,10_000)));
+    }
+    let raw=sample(1_600_000_000,0).after;
+    assert!(monitor.witness_at(0,0,ZERO,raw).is_some());
+    assert_eq!(monitor.witness_at(1,0,ZERO,raw),None);
+
+    // The recovered reference has a new absolute offset from TSC.
+    // Old interval baselines cannot measure its rate correctly.
+    let recovered=|ns:u64,offset:u64| {
+        let mut s=sample(ns+12_000_000,offset);
+        s.reference_ns=ns;
+        s
+    };
+    let start=2_000_000_000;
+    assert_eq!(monitor.observe_at(Some(1),0,HZ,ZERO,&mut bsp,Some(recovered(start,0))),Health::Pending);
+    // A sample captured before the change may arrive after the new
+    // reference is already visible to another CPU. Ignore it entirely.
+    let stale=sample(100,10_000);
+    assert_eq!(monitor.observe_at(Some(0),7,HZ,AP,&mut ap,Some(stale)),Health::Verified);
+    assert!(monitor.active());
+    let now=recovered(start+20_000,0).after;
+    assert_eq!(monitor.witness_at(0,0,ZERO,now),None);
+    assert_eq!(monitor.witness_at(1,0,ZERO,now),None);
+    assert_eq!(monitor.observe_at(Some(1),7,HZ,AP,&mut ap,Some(recovered(start+10_000,10_000))),Health::Pending);
+    for i in 1..=3 {
+        let ns=start+i*500_000_000;
+        let expected=if i==3 {Health::Verified}else{Health::Pending};
+        assert_eq!(monitor.observe_at(Some(1),0,HZ,ZERO,&mut bsp,Some(recovered(ns,0))),expected);
+        assert_eq!(monitor.observe_at(Some(1),7,HZ,AP,&mut ap,Some(recovered(ns+10_000,10_000))),expected);
+        let raw=recovered(ns+20_000,0).after;
+        assert_eq!(monitor.witness_at(1,0,ZERO,raw).is_some(),i==3);
+        assert_eq!(monitor.witness_at(0,0,ZERO,raw),None);
+    }
+}
+
+#[test]
+fn new_reference_generation_does_not_hide_raw_counter_regression() {
+    let monitor=RuntimeMonitor::new();
+    assert!(monitor.start(0,HZ,[0]));
+    let mut bsp=Watchdog::new();
+    for i in 0..=3 {
+        monitor.observe(0,HZ,ZERO,&mut bsp,Some(sample(i*500_000_000,0)));
+    }
+    let raw=sample(1_900_000_000,0).after;
+    assert!(monitor.witness_at(0,0,ZERO,raw).is_some());
+    // The new independent epoch cannot legitimize a lower raw TSC
+    // than the last actual witness provided by this processor.
+    let mut regressed=sample(1_800_000_000,0);
+    regressed.reference_ns=2_000_000_000;
+    assert_eq!(monitor.observe_at(Some(1),0,HZ,ZERO,&mut bsp,Some(regressed)),Health::Rejected);
+    assert!(!monitor.active());
+    assert_eq!(monitor.witness_at(1,0,ZERO,raw+1),None);
+}
