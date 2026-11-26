@@ -944,9 +944,49 @@ impl ClockSet {
     }
 }
 
+/// Hardware callbacks are owned by the timekeeper and run under its
+/// existing IRQ-safe gate. GS and the complete TSC roster are published
+/// before installing this provider.
+struct TscFallback {
+    epoch: crate::tsc_epoch::Epoch,
+    local: fn() -> Option<crate::tsc_epoch::Sample>,
+}
+
+impl TscFallback {
+    fn sample(&mut self) -> Option<u128> {
+        if self.epoch.failed() { return None; }
+        let result = (|| {
+            let before=(self.local)()?;
+            let count=unsafe { crate::pit::read_monitor() }?;
+            let after=(self.local)()?;
+            let ns=self.epoch.observe(before,after,count)?;
+            if count <= crate::pit::REARM_COUNT {
+                let before=(self.local)()?;
+                let count=unsafe { crate::pit::rearm_monitor() }?;
+                let after=(self.local)()?;
+                if !self.epoch.rearm(before,after,count) { return None; }
+            }
+            Some(ns)
+        })();
+        if result.is_none() { self.invalidate(); }
+        result
+    }
+
+    fn invalidate(&mut self) {
+        self.epoch.invalidate();
+        unsafe { crate::pit::stop_monitor(); }
+    }
+}
+
+struct ClockState {
+    initialized: bool,
+    physical: Option<ClockSet>,
+    fallback: Option<TscFallback>,
+}
+
 struct SharedClock {
     gate: AtomicBool,
-    clocks: UnsafeCell<Option<ClockSet>>,
+    clocks: UnsafeCell<ClockState>,
     maintenance: AtomicU64,
     event: AtomicU8,
 }
@@ -954,14 +994,16 @@ unsafe impl Sync for SharedClock {}
 
 impl SharedClock {
     const fn new() -> Self {
-        Self { gate: AtomicBool::new(false), clocks: UnsafeCell::new(None),
+        Self { gate: AtomicBool::new(false), clocks: UnsafeCell::new(ClockState {
+                initialized: false, physical: None, fallback: None,
+            }),
             maintenance: AtomicU64::new(0), event: AtomicU8::new(0) }
     }
 
     // Local IRQ masking prevents recursion on the owning CPU. A TSC
     // witness provider may inspect its watchdog gate, which must never
     // acquire the system clock gate or perform I/O/logging.
-    fn with<R>(&self, operation: impl FnOnce(&mut Option<ClockSet>) -> R) -> R {
+    fn with<R>(&self, operation: impl FnOnce(&mut ClockState) -> R) -> R {
         let flags: usize;
         unsafe { asm!("pushfq", "pop {}", "cli", out(reg) flags); }
         while self.gate.swap(true, Ordering::Acquire) {
@@ -977,11 +1019,15 @@ impl SharedClock {
 static CLOCK: SharedClock = SharedClock::new();
 
 pub unsafe fn init(pm: Option<PmTimer>, hp: Option<ReferenceClock>, hp_candidate: Option<ReferenceClock>)
-    -> Result<ReferenceClock, &'static [u8]> {
-    CLOCK.with(|clocks| {
-        if clocks.is_some() { return Err(b"system clock already initialized" as &[u8]); }
-        let source = choose(pm, hp, |s| s.progressing())
-            .ok_or(b"no progressing system clock with maintainable wrap interval" as &[u8])?;
+    -> Result<Option<ReferenceClock>, &'static [u8]> {
+    CLOCK.with(|state| {
+        if state.initialized { return Err(b"system clock already initialized" as &[u8]); }
+        state.initialized=true;
+        let Some(source) = choose(pm, hp, |s| s.progressing()) else {
+            // No public time is fabricated while CPU-local bring-up
+            // calibrates and synchronizes a possible alternative.
+            return Ok(None);
+        };
         let standby = [hp, pm.map(ReferenceClock::Pm)].into_iter().flatten()
             .find(|&s| s != source && s.maintenance_ms() != Some(0) && s.progressing());
         let first = source.sample();
@@ -994,16 +1040,40 @@ pub unsafe fn init(pm: Option<PmTimer>, hp: Option<ReferenceClock>, hp_candidate
             set.register_quarantined(candidate);
         }
         CLOCK.maintenance.store(set.maintenance_ms().unwrap_or(0), Ordering::Release);
-        *clocks = Some(set);
-        Ok(source)
+        state.physical = Some(set);
+        Ok(Some(source))
+    })
+}
+
+/// Publish exactly once and only with a validated complete CPU roster
+/// and an independently progressing runtime PIT. Failure leaves the
+/// public clock unavailable; the boot coordinator must not release
+/// timed device operations or userspace on that path.
+pub(crate) unsafe fn publish_tsc(roster: crate::tsc_epoch::Roster, pit_allowed: bool,
+    local: fn() -> Option<crate::tsc_epoch::Sample>) -> Result<(), &'static [u8]> {
+    CLOCK.with(|state| {
+        if !state.initialized || state.physical.is_some() || state.fallback.is_some() {
+            return Err(b"invalid TSC epoch publication state" as &[u8]);
+        }
+        let before=local().ok_or(b"missing BSP TSC sample" as &[u8])?;
+        let count=crate::pit::start_monitor(pit_allowed)
+            .ok_or(b"independent PIT runtime monitor unavailable" as &[u8])?;
+        let epoch=local().and_then(|after| crate::tsc_epoch::Epoch::new(roster,before,after,count));
+        let Some(epoch)=epoch else {
+            crate::pit::stop_monitor();
+            return Err(b"invalid initial normalized TSC/PIT bracket" as &[u8]);
+        };
+        state.fallback=Some(TscFallback{epoch,local});
+        CLOCK.maintenance.store(crate::pit::MONITOR_MAINTENANCE_MS, Ordering::Release);
+        Ok(())
     })
 }
 
 /// Install the runtime provider after SMP CPU-local state is initialized.
 /// Until every CPU independently qualifies, its read returns None.
 pub(crate) fn attach_witness(read: fn(u64) -> Option<Witness>, reject: fn()) -> bool {
-    CLOCK.with(|clocks| {
-        let Some(clocks) = clocks.as_mut() else { return false; };
+    CLOCK.with(|state| {
+        let Some(clocks) = state.physical.as_mut() else { return false; };
         if clocks.failed || clocks.witness_rejected ||
            clocks.witness_hooks.is_some() { return false; }
         clocks.witness_hooks = Some(WitnessHooks { read, reject });
@@ -1015,8 +1085,8 @@ pub(crate) fn attach_witness(read: fn(u64) -> Option<Witness>, reject: fn()) -> 
 /// finished. The clock gate serializes every subsequent restart with
 /// authoritative reads and physical source changes.
 pub(crate) fn enable_hpet_recovery(restart: fn(ReferenceClock) -> bool) {
-    CLOCK.with(|clocks| {
-        if let Some(clocks) = clocks.as_mut() { clocks.restart_hook = Some(restart); }
+    CLOCK.with(|state| {
+        if let Some(clocks) = state.physical.as_mut() { clocks.restart_hook = Some(restart); }
     });
 }
 
@@ -1033,8 +1103,23 @@ pub(crate) struct ClockSnapshot {
 }
 
 pub(crate) fn snapshot() -> Option<ClockSnapshot> {
-    CLOCK.with(|clocks| {
-        let clocks = clocks.as_mut()?;
+    CLOCK.with(|state| {
+        if let Some(fallback) = state.fallback.as_mut() {
+            let was_failed=fallback.epoch.failed();
+            let result=fallback.sample();
+            if result.is_none() && !was_failed {
+                CLOCK.event.store(ClockEvent::Unavailable as u8, Ordering::Release);
+                CLOCK.maintenance.store(0, Ordering::Release);
+            }
+            return result.map(|ns| ClockSnapshot {
+                millis:(ns/1_000_000).min(isize::MAX as u128) as u64,
+                // The ABI is TSC-derived. The finite independent PIT
+                // intervals are validated internally, not fed back as
+                // a fabricated absolute reference to RuntimeMonitor.
+                independent_ns:None, holdover:false, reference_generation:0,
+            });
+        }
+        let clocks = state.physical.as_mut()?;
         let read = clocks.witness_hooks.map(|hooks| hooks.read);
         let generation = clocks.reference_generation;
         let restart = clocks.restart_hook;
@@ -1056,8 +1141,15 @@ pub(crate) fn snapshot() -> Option<ClockSnapshot> {
 /// Independent LAPIC progress can diagnose a frozen holdover even when
 /// TSC itself never advances far enough to age out its qualification.
 pub(crate) fn expire_stalled_holdover() {
-    CLOCK.with(|clocks| {
-        if let Some(clocks) = clocks.as_mut() {
+    CLOCK.with(|state| {
+        if let Some(fallback)=state.fallback.as_mut() {
+            if !fallback.epoch.failed() {
+                fallback.invalidate();
+                CLOCK.maintenance.store(0, Ordering::Release);
+                CLOCK.event.store(ClockEvent::Unavailable as u8, Ordering::Release);
+            }
+        }
+        if let Some(clocks) = state.physical.as_mut() {
             if clocks.using_tsc() {
                 clocks.invalidate_holdover();
                 CLOCK.maintenance.store(0, Ordering::Release);
