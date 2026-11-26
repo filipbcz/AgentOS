@@ -1,4 +1,4 @@
-//! Exclusive 8254 channel-2 calibration, independent of HPET/ACPI PM.
+//! Exclusive 8254 channel-2 calibration and finite runtime watchdog, independent of HPET/ACPI PM.
 //! Only the legacy-compatible platform path may probe these I/O ports.
 //! Channel 0 (IRQ0) and channel 1 are never programmed. Channel 2 is
 //! reserved by the kernel; the speaker and gate are left disabled.
@@ -159,4 +159,108 @@ pub(crate) unsafe fn qualify(allowed: bool, mut maintain: impl FnMut()) -> Optio
     } else { None };
     if flags & (1 << 9) != 0 { asm!("sti", options(nostack)); }
     rate
+}
+
+
+// Keep mode 0 rather than extending a repeating 16-bit counter. OUT2
+// stays high after terminal count, even if the count wraps again. Thus
+// a missed service interval cannot masquerade as a small elapsed delta.
+const MONITOR_DIVISOR: u16 = u16::MAX;
+const COUNT_STATUS2: u8 = 0xc8; // latch count and status for channel 2
+const LOAD_POLLS: u32 = 4096;
+pub(crate) const MONITOR_MAINTENANCE_MS: u64 = 10;
+pub(crate) const REARM_COUNT: u16 = MONITOR_DIVISOR / 2;
+
+pub(crate) fn count_elapsed_ns(from: u16, to: u16) -> Option<u128> {
+    if to == 0 { return None; }
+    Some(from.checked_sub(to)? as u128 * 1_000_000_000 / PIT_HZ as u128)
+}
+
+/// A complete latched status/count transaction. None denotes a new
+/// count not yet loaded; a terminal edge is always a failure for an
+/// observation window, not permission to interpret a wrapped residue.
+pub(crate) fn monitor_count(io: &mut impl Ports) -> Result<Option<u16>, Error> {
+    if io.read(GATE) & (GATE_ENABLE | SPEAKER_ENABLE) != GATE_ENABLE {
+        return Err(Error::Configuration);
+    }
+    io.write(CONTROL, COUNT_STATUS2);
+    let status = io.read(CHANNEL2);
+    let low = io.read(CHANNEL2);
+    let high = io.read(CHANNEL2);
+    if status & 0x3f != 0x30 { return Err(Error::Configuration); }
+    if status & 0x80 != 0 { return Err(Error::NoEdge); }
+    if status & 0x40 != 0 { return Ok(None); }
+    let count = u16::from_le_bytes([low, high]);
+    if count == 0 { return Err(Error::NoEdge); }
+    Ok(Some(count))
+}
+
+fn silence(io: &mut impl Ports) {
+    let control = io.read(GATE) & 0x0c;
+    io.write(GATE, control);
+}
+
+/// Start a fresh finite count and observe actual progress before
+/// authorizing any independent measurements. All operations are bounded
+/// and the speaker is never enabled. The caller brackets the complete
+/// transaction with ordered, normalized TSC samples.
+pub(crate) fn program_monitor(io: &mut impl Ports, max_polls: u32) -> Result<u16, Error> {
+    let control = io.read(GATE) & 0x0c;
+    io.write(GATE, control);
+    let result = (|| {
+        if io.read(GATE) & (GATE_ENABLE | SPEAKER_ENABLE) != 0 {
+            return Err(Error::Configuration);
+        }
+        io.write(CONTROL, MODE0);
+        io.write(CHANNEL2, MONITOR_DIVISOR as u8);
+        io.write(CHANNEL2, (MONITOR_DIVISOR >> 8) as u8);
+        io.write(GATE, control | GATE_ENABLE);
+        let mut initial = None;
+        for _ in 0..max_polls {
+            if let Some(count) = monitor_count(io)? {
+                match initial {
+                    Some(previous) if count < previous => return Ok(count),
+                    Some(previous) if count > previous => return Err(Error::Regression),
+                    None => initial = Some(count),
+                    _ => {}
+                }
+            }
+            spin_loop();
+        }
+        Err(Error::NoEdge)
+    })();
+    if result.is_err() { silence(io); }
+    result
+}
+
+static MONITOR_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// All finite calibration users must have finished before this
+/// transition. Channel 2 remains reserved for the global epoch until
+/// shutdown; no later calibration can overwrite a live count.
+pub(crate) unsafe fn start_monitor(allowed: bool) -> Option<u16> {
+    if !allowed || OWNER.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        return None;
+    }
+    let result = program_monitor(&mut Io, LOAD_POLLS).ok();
+    if result.is_some() { MONITOR_ACTIVE.store(true, Ordering::Release); }
+    else { OWNER.store(false, Ordering::Release); }
+    result
+}
+
+/// Runtime ownership is serialized by the IRQ-safe timekeeper gate.
+pub(crate) unsafe fn read_monitor() -> Option<u16> {
+    if !MONITOR_ACTIVE.load(Ordering::Acquire) { return None; }
+    monitor_count(&mut Io).ok().flatten()
+}
+
+pub(crate) unsafe fn rearm_monitor() -> Option<u16> {
+    if !MONITOR_ACTIVE.load(Ordering::Acquire) { return None; }
+    program_monitor(&mut Io, LOAD_POLLS).ok()
+}
+
+pub(crate) unsafe fn stop_monitor() {
+    if MONITOR_ACTIVE.swap(false, Ordering::AcqRel) { silence(&mut Io); }
+    // Do not release OWNER: a failed runtime epoch must not be restarted
+    // or used for a new calibration behind the timekeeper's back.
 }
