@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 #[path="../../kernel/reference_clock.rs"] mod reference_clock;
 #[path="../../kernel/tsc.rs"] mod tsc;
+#[path="../../kernel/clock_quorum.rs"] mod clock_quorum;
 #[path="../../kernel/tsc_watchdog.rs"] mod tsc_watchdog;
 #[path="../../kernel/timer.rs"] mod timer;
 use tsc::Alignment;
@@ -21,7 +22,7 @@ fn both_cpus_require_three_distinct_windows_and_shared_alignment() {
     let monitor=RuntimeMonitor::new();
     let mut bsp=Watchdog::new();
     let mut ap=Watchdog::new();
-    monitor.start(7,HZ);
+    assert!(monitor.start(7,HZ,[7,19]));
     assert!(monitor.active());
     for i in 0..=3 {
         let ns=i*500_000_000;
@@ -42,7 +43,7 @@ fn a_shift_on_one_cpu_revokes_machine_candidate() {
     let monitor=RuntimeMonitor::new();
     let mut bsp=Watchdog::new();
     let mut ap=Watchdog::new();
-    monitor.start(0,HZ);
+    assert!(monitor.start(0,HZ,[0,1]));
     assert_eq!(monitor.observe(0,HZ,ZERO,&mut bsp,Some(sample(0,0))),Health::Pending);
     monitor.observe(1,HZ,AP,&mut ap,Some(sample(10_000,10_000)));
     monitor.observe(0,HZ,ZERO,&mut bsp,Some(sample(500_000_000,0)));
@@ -120,4 +121,77 @@ fn maintenance_updates_preserve_pending_earlier_deadline() {
     t.set_maintenance(None);
     assert_eq!(t.plan(false,Some(25),20),Action::Keep);
     assert_eq!(t.plan(false,None,25),Action::Disable);
+}
+
+#[test]
+fn complete_sparse_fleet_must_be_verified_before_witness_is_available() {
+    let monitor=RuntimeMonitor::new();
+    assert!(!monitor.start(7,HZ,[19,201]));
+    assert!(!monitor.start(7,HZ,[7,19,19]));
+    assert!(!monitor.start(7,0,[7]));
+    assert!(monitor.start(7,HZ,[7,19,201]));
+    assert!(!monitor.start(7,HZ,[7]));
+    let mut bsp=Watchdog::new();
+    let mut ap1=Watchdog::new();
+    let mut ap2=Watchdog::new();
+    let local=sample(1_500_100_000,0).after;
+    for i in 0..=3 {
+        let ns=i*500_000_000;
+        monitor.observe(7,HZ,ZERO,&mut bsp,Some(sample(ns,0)));
+        monitor.observe(19,HZ,AP,&mut ap1,Some(sample(ns+10_000,10_000)));
+        if i<3 {
+            monitor.observe(201,HZ,ZERO,&mut ap2,Some(sample(ns+20_000,0)));
+        }
+    }
+    assert_eq!(monitor.witness(7,ZERO,local),None);
+    assert_eq!(ap2.health(),Health::Pending);
+    monitor.observe(201,HZ,ZERO,&mut ap2,Some(sample(1_500_020_000,0)));
+    assert_eq!(ap2.health(),Health::Verified);
+    let witness=monitor.witness(7,ZERO,local).unwrap();
+    assert_eq!(witness.ticks,local);
+    assert_eq!(witness.hz,HZ);
+    let ap_raw=local+10_000;
+    assert_eq!(monitor.witness(19,AP,ap_raw).unwrap().ticks,local);
+    assert_eq!(monitor.witness(20,ZERO,local),None);
+    assert_eq!(monitor.witness(19,ZERO,ap_raw),None);
+    assert_eq!(monitor.witness(7,ZERO,1),None);
+}
+
+#[test]
+fn a_missing_or_expired_member_cannot_be_renewed_by_reading_tsc() {
+    let monitor=RuntimeMonitor::new();
+    assert!(monitor.start(0,HZ,[0,1]));
+    let mut bsp=Watchdog::new();
+    let mut ap=Watchdog::new();
+    for i in 0..=3 {
+        let ns=i*500_000_000;
+        monitor.observe(0,HZ,ZERO,&mut bsp,Some(sample(ns,0)));
+        monitor.observe(1,HZ,AP,&mut ap,Some(sample(ns+10_000,10_000)));
+    }
+    let now=sample(1_600_000_000,0).after;
+    assert!(monitor.witness(0,ZERO,now).is_some());
+    // Frequent reads are not independent verification windows.
+    for _ in 0..100 {
+        assert!(monitor.witness(0,ZERO,now).is_some());
+    }
+    for i in 4..=8 {
+        let ns=i*500_000_000;
+        monitor.observe(0,HZ,ZERO,&mut bsp,Some(sample(ns,0)));
+    }
+    assert_eq!(monitor.witness(0,ZERO,sample(4_100_000_000,0).after),None);
+    // Missing AP data invalidates its lease immediately; require three
+    // fresh full windows again, not merely a successful short read.
+    assert_eq!(monitor.observe(1,HZ,AP,&mut ap,None),Health::Unverified);
+    for i in 0..=3 {
+        let ns=4_200_000_000+i*500_000_000;
+        monitor.observe(0,HZ,ZERO,&mut bsp,Some(sample(ns,0)));
+        monitor.observe(1,HZ,AP,&mut ap,Some(sample(ns+10_000,10_000)));
+        if i<3 {
+            assert_eq!(monitor.witness(0,ZERO,sample(ns+20_000,0).after),None);
+        }
+    }
+    assert!(monitor.witness(0,ZERO,sample(5_710_000_000,0).after).is_some());
+    monitor.reject();
+    assert!(!monitor.active());
+    assert_eq!(monitor.witness(0,ZERO,sample(5_720_000_000,0).after),None);
 }
