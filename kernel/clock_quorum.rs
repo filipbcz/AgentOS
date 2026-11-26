@@ -45,21 +45,34 @@ impl Span {
     }
 }
 
+/// The exact first rejected condition, shared by every clock provider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BracketError {
+    CpuMismatch, ZeroRate, RateMismatch, Regression, Width, Uncertainty,
+    LowerUnderflow, UpperOverflow,
+}
+
 impl TscBracket {
     pub fn new(before: Witness, after: Witness) -> Option<Self> {
-        if before.cpu != after.cpu || before.hz == 0 || before.hz != after.hz {
-            return None;
-        }
+        Self::checked(before, after).ok()
+    }
+
+    pub(crate) fn checked(before: Witness, after: Witness) -> Result<Self, BracketError> {
+        if before.cpu != after.cpu { return Err(BracketError::CpuMismatch); }
+        if before.hz == 0 { return Err(BracketError::ZeroRate); }
+        if before.hz != after.hz { return Err(BracketError::RateMismatch); }
         let hz = before.hz as u128;
-        if after.ticks.checked_sub(before.ticks)? as u128 * NS_PER_SECOND >
-                hz * MAX_BRACKET_NS ||
-           before.uncertainty_ticks.max(after.uncertainty_ticks) as u128 * NS_PER_SECOND >
-                hz * MAX_UNCERTAINTY_NS {
-            return None;
+        let delta = after.ticks.checked_sub(before.ticks).ok_or(BracketError::Regression)?;
+        if delta as u128 * NS_PER_SECOND > hz * MAX_BRACKET_NS {
+            return Err(BracketError::Width);
         }
-        Some(Self {
-            low: before.ticks.checked_sub(before.uncertainty_ticks)?,
-            high: after.ticks.checked_add(after.uncertainty_ticks)?,
+        if before.uncertainty_ticks.max(after.uncertainty_ticks) as u128 * NS_PER_SECOND >
+                hz * MAX_UNCERTAINTY_NS {
+            return Err(BracketError::Uncertainty);
+        }
+        Ok(Self {
+            low: before.ticks.checked_sub(before.uncertainty_ticks).ok_or(BracketError::LowerUnderflow)?,
+            high: after.ticks.checked_add(after.uncertainty_ticks).ok_or(BracketError::UpperOverflow)?,
             hz: before.hz,
         })
     }

@@ -210,6 +210,7 @@ def kernel_postmortem(qmp, dest, ram):
         ("::pit::MONITOR_ACTIVE","pit-monitor-active",1),
         ("::system_clock::CLOCK","system-clock",65536),
         ("::system_clock::TSC_PIT_FAILURE","tsc-pit-failure",1),
+        ("::system_clock::TSC_PIT_FAILURE_DETAIL","tsc-pit-failure-detail",128),
     ]:
         matches=[]
         for line in symbols.splitlines():
@@ -246,6 +247,32 @@ def kernel_postmortem(qmp, dest, ram):
             # source revision of kernel/tsc_epoch.rs. Never infer a reason
             # from a missing symbol or from zero.
             record["first_failure_code"]=raw[0]
+        if tag=="tsc-pit-failure-detail":
+            # Versioned, fixed native x86-64 words, not a Rust struct layout.
+            # Read only after the terminal outcome. A missing, torn or
+            # inconsistent record is inconclusive and never passes a test.
+            if size==128:
+                values=struct.unpack("<16Q",raw)
+                keys=("version","fault_code","phase_code","pit_count","previous_pit_count",
+                      "roster_hz","before_cpu","after_cpu","before_raw","after_raw",
+                      "before_member_hz","after_member_hz","before_offset","after_offset",
+                      "before_uncertainty_ticks","after_uncertainty_ticks")
+                detail=dict(zip(keys,values))
+                for key in ("before_offset","after_offset"):
+                    if detail[key]>=1<<63:
+                        detail[key]-=1<<64
+                code=result.get("tsc-pit-failure",{}).get("first_failure_code")
+                consistent=(detail["version"]==1 and code not in (None,0)
+                            and detail["fault_code"]==code and detail["phase_code"] in (1,2))
+                record["consistent_with_first_fault"]=consistent
+                record["detail"]=detail
+                if consistent:
+                    detail["phase"]={1:"observe",2:"rearm"}[detail["phase_code"]]
+                    detail["raw_delta_ticks"]=detail["after_raw"]-detail["before_raw"]
+                    if detail["roster_hz"]:
+                        detail["raw_delta_ns_floor"]=detail["raw_delta_ticks"]*1_000_000_000//detail["roster_hz"]
+            else:
+                record["reason"]="unexpected versioned detail extent"
         result[tag]=record
     return result
 

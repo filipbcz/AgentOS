@@ -960,23 +960,48 @@ struct TscFallback {
 // reason separately. Only the failing path writes this under CLOCK.gate.
 static TSC_PIT_FAILURE: AtomicU8 = AtomicU8::new(0);
 
+// Kernel crash state for the first rejected complete observation. Separate
+// fixed words avoid exposing implementation-specific Rust struct layout.
+// CLOCK.gate serializes writes; the release store of TSC_PIT_FAILURE
+// publishes the completed record. A zero version means no complete sample.
+#[used]
+static TSC_PIT_FAILURE_DETAIL: [AtomicU64; crate::tsc_epoch::FAILURE_WORDS] = [
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+];
+
 impl TscFallback {
+    #[cold]
+    #[inline(never)]
+    fn retain_failure_detail(&self, fault: crate::tsc_epoch::Fault, phase: crate::tsc_epoch::ObservationPhase,
+                             before: crate::tsc_epoch::Sample, after: crate::tsc_epoch::Sample, count: u16) {
+        if TSC_PIT_FAILURE.load(Ordering::Relaxed)!=0 { return; }
+        for (slot, value) in TSC_PIT_FAILURE_DETAIL.iter().zip(self.epoch.failure_words(fault,phase,before,after,count)) {
+            slot.store(value,Ordering::Relaxed);
+        }
+    }
+
     fn sample(&mut self) -> Option<u128> {
-        use crate::tsc_epoch::Fault;
+        use crate::tsc_epoch::{Fault,ObservationPhase};
         if self.epoch.failed() { return None; }
         let result = (|| {
             let before=(self.local)().ok_or(Fault::LocalBefore)?;
             let count=unsafe { crate::pit::read_monitor() }.map_err(Fault::pit_read)?;
             let after=(self.local)().ok_or(Fault::LocalAfter)?;
-            let ns=self.epoch.observe(before,after,count)
-                .ok_or_else(|| self.epoch.fault().unwrap_or(Fault::InvalidBracket))?;
+            let ns=self.epoch.observe(before,after,count).map_err(|fault| {
+                self.retain_failure_detail(fault,ObservationPhase::Observe,before,after,count);
+                fault
+            })?;
             if count <= crate::pit::REARM_COUNT {
                 let before=(self.local)().ok_or(Fault::RearmLocalBefore)?;
                 let count=unsafe { crate::pit::rearm_monitor() }.map_err(Fault::pit_rearm)?;
                 let after=(self.local)().ok_or(Fault::RearmLocalAfter)?;
-                if !self.epoch.rearm(before,after,count) {
-                    return Err(self.epoch.fault().unwrap_or(Fault::InvalidBracket));
-                }
+                self.epoch.rearm(before,after,count).map_err(|fault| {
+                    self.retain_failure_detail(fault,ObservationPhase::Rearm,before,after,count);
+                    fault
+                })?;
             }
             Ok(ns)
         })();
@@ -987,9 +1012,8 @@ impl TscFallback {
     }
 
     fn invalidate(&mut self, fault: crate::tsc_epoch::Fault) {
-        self.epoch.invalidate(fault);
+        let first=self.epoch.invalidate(fault);
         unsafe { crate::pit::stop_monitor(); }
-        let first=self.epoch.fault().unwrap_or(fault);
         let _=TSC_PIT_FAILURE.compare_exchange(0,first as u8,Ordering::Release,Ordering::Relaxed);
     }
 }

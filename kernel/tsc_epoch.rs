@@ -2,7 +2,7 @@
 //! independently rate-qualified and aligned to the BSP. Finite PIT
 //! windows independently corroborate each observation. No modulo wrap
 //! reconstruction or self-renewing TSC watchdog is allowed.
-use crate::{clock_quorum::{Span, TscBracket, Witness}, pit, tsc::Alignment};
+use crate::{clock_quorum::{BracketError, Span, TscBracket, Witness}, pit, tsc::Alignment};
 
 const MAX_ID: usize = 256;
 const MAX_ALIGNMENT_NS: u128 = 100_000;
@@ -69,19 +69,25 @@ impl Roster {
         (actual==expected).then_some(Self{mask:expected,hz})
     }
 
-    fn bracket(&self, before: Sample, after: Sample) -> Option<TscBracket> {
+    fn bracket(&self, before: Sample, after: Sample) -> Result<TscBracket, Fault> {
         let member=before.member;
         let (word,flag)=bit(member.id);
-        if member!=after.member || self.mask[word]&flag==0 ||
-           !valid_member(self.hz,member) || after.raw<before.raw {
-            return None;
-        }
-        let witness=|sample:Sample| Some(Witness {
+        if member.id!=after.member.id { return Err(Fault::MemberCpuMismatch); }
+        if member.hz!=after.member.hz { return Err(Fault::MemberRateMismatch); }
+        if member.alignment!=after.member.alignment { return Err(Fault::MemberAlignmentMismatch); }
+        if self.mask[word]&flag==0 { return Err(Fault::MemberAbsent); }
+        if self.hz==0 || member.hz==0 { return Err(Fault::RosterZeroRate); }
+        if !rate_matches(self.hz,member.hz) { return Err(Fault::RosterRateMismatch); }
+        if member.alignment.uncertainty_ticks as u128 * 1_000_000_000 >
+            self.hz as u128 * MAX_ALIGNMENT_NS { return Err(Fault::RosterUncertainty); }
+        if after.raw<before.raw { return Err(Fault::BracketRawRegression); }
+        let witness=|sample:Sample, fault:Fault| Ok(Witness {
             cpu:member.id, hz:self.hz,
-            ticks:member.alignment.normalize(sample.raw)?,
+            ticks:member.alignment.normalize(sample.raw).ok_or(fault)?,
             uncertainty_ticks:member.alignment.uncertainty_ticks,
         });
-        TscBracket::new(witness(before)?,witness(after)?)
+        TscBracket::checked(witness(before,Fault::NormalizeBefore)?,
+            witness(after,Fault::NormalizeAfter)?).map_err(Fault::bracket)
     }
 }
 
@@ -98,6 +104,7 @@ pub(crate) enum Fault {
     PitReadTerminal = 5,
     PitReadNotLoaded = 6,
     PitReadOther = 7,
+    // Historical code: retained for decoding older crash records only.
     InvalidBracket = 8,
     RawRegression = 9,
     LatePitCount = 10,
@@ -124,6 +131,24 @@ pub(crate) enum Fault {
     RearmElapsed = 31,
     RearmTooLong = 32,
     Stalled = 33,
+    MemberCpuMismatch = 34,
+    MemberRateMismatch = 35,
+    MemberAlignmentMismatch = 36,
+    MemberAbsent = 37,
+    RosterZeroRate = 38,
+    RosterRateMismatch = 39,
+    RosterUncertainty = 40,
+    BracketRawRegression = 41,
+    NormalizeBefore = 42,
+    NormalizeAfter = 43,
+    WitnessCpuMismatch = 44,
+    WitnessZeroRate = 45,
+    WitnessRateMismatch = 46,
+    NormalizedRegression = 47,
+    BracketWidth = 48,
+    BracketUncertainty = 49,
+    BracketLowerUnderflow = 50,
+    BracketUpperOverflow = 51,
 }
 
 impl Fault {
@@ -162,6 +187,24 @@ impl Fault {
             31 => Some(Self::RearmElapsed),
             32 => Some(Self::RearmTooLong),
             33 => Some(Self::Stalled),
+            34 => Some(Self::MemberCpuMismatch),
+            35 => Some(Self::MemberRateMismatch),
+            36 => Some(Self::MemberAlignmentMismatch),
+            37 => Some(Self::MemberAbsent),
+            38 => Some(Self::RosterZeroRate),
+            39 => Some(Self::RosterRateMismatch),
+            40 => Some(Self::RosterUncertainty),
+            41 => Some(Self::BracketRawRegression),
+            42 => Some(Self::NormalizeBefore),
+            43 => Some(Self::NormalizeAfter),
+            44 => Some(Self::WitnessCpuMismatch),
+            45 => Some(Self::WitnessZeroRate),
+            46 => Some(Self::WitnessRateMismatch),
+            47 => Some(Self::NormalizedRegression),
+            48 => Some(Self::BracketWidth),
+            49 => Some(Self::BracketUncertainty),
+            50 => Some(Self::BracketLowerUnderflow),
+            51 => Some(Self::BracketUpperOverflow),
             _ => None,
         }
     }
@@ -201,6 +244,37 @@ impl Fault {
             Self::RearmElapsed => b"SYSTEM CLOCK: TSC/PIT epoch unavailable: invalid TSC rearm interval",
             Self::RearmTooLong => b"SYSTEM CLOCK: TSC/PIT epoch unavailable: TSC rearm interval exceeds bound",
             Self::Stalled => b"SYSTEM CLOCK: TSC/PIT epoch unavailable: independent LAPIC progress detected stall",
+            Self::MemberCpuMismatch => b"SYSTEM CLOCK: TSC/PIT epoch unavailable: sample CPU changed",
+            Self::MemberRateMismatch => b"SYSTEM CLOCK: TSC/PIT epoch unavailable: sample member rate changed",
+            Self::MemberAlignmentMismatch => b"SYSTEM CLOCK: TSC/PIT epoch unavailable: sample alignment changed",
+            Self::MemberAbsent => b"SYSTEM CLOCK: TSC/PIT epoch unavailable: sample CPU outside qualified roster",
+            Self::RosterZeroRate => b"SYSTEM CLOCK: TSC/PIT epoch unavailable: zero roster or member rate",
+            Self::RosterRateMismatch => b"SYSTEM CLOCK: TSC/PIT epoch unavailable: member rate outside qualified tolerance",
+            Self::RosterUncertainty => b"SYSTEM CLOCK: TSC/PIT epoch unavailable: member alignment uncertainty exceeds bound",
+            Self::BracketRawRegression => b"SYSTEM CLOCK: TSC/PIT epoch unavailable: raw TSC regressed within bracket",
+            Self::NormalizeBefore => b"SYSTEM CLOCK: TSC/PIT epoch unavailable: before TSC normalization out of range",
+            Self::NormalizeAfter => b"SYSTEM CLOCK: TSC/PIT epoch unavailable: after TSC normalization out of range",
+            Self::WitnessCpuMismatch => b"SYSTEM CLOCK: TSC/PIT epoch unavailable: normalized witness CPU mismatch",
+            Self::WitnessZeroRate => b"SYSTEM CLOCK: TSC/PIT epoch unavailable: normalized witness has zero rate",
+            Self::WitnessRateMismatch => b"SYSTEM CLOCK: TSC/PIT epoch unavailable: normalized witness rate mismatch",
+            Self::NormalizedRegression => b"SYSTEM CLOCK: TSC/PIT epoch unavailable: normalized TSC regressed within bracket",
+            Self::BracketWidth => b"SYSTEM CLOCK: TSC/PIT epoch unavailable: normalized TSC bracket exceeds width bound",
+            Self::BracketUncertainty => b"SYSTEM CLOCK: TSC/PIT epoch unavailable: normalized witness uncertainty exceeds bound",
+            Self::BracketLowerUnderflow => b"SYSTEM CLOCK: TSC/PIT epoch unavailable: normalized bracket lower bound underflow",
+            Self::BracketUpperOverflow => b"SYSTEM CLOCK: TSC/PIT epoch unavailable: normalized bracket upper bound overflow",
+        }
+    }
+
+    fn bracket(error: BracketError) -> Self {
+        match error {
+            BracketError::CpuMismatch => Self::WitnessCpuMismatch,
+            BracketError::ZeroRate => Self::WitnessZeroRate,
+            BracketError::RateMismatch => Self::WitnessRateMismatch,
+            BracketError::Regression => Self::NormalizedRegression,
+            BracketError::Width => Self::BracketWidth,
+            BracketError::Uncertainty => Self::BracketUncertainty,
+            BracketError::LowerUnderflow => Self::BracketLowerUnderflow,
+            BracketError::UpperOverflow => Self::BracketUpperOverflow,
         }
     }
 
@@ -232,6 +306,16 @@ impl Fault {
     }
 }
 
+/// Stage of a rejected complete hardware observation. No fabricated samples.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u64)]
+pub(crate) enum ObservationPhase { Observe=1, Rearm=2 }
+
+/// Version 1 crash record: fixed native x86-64 u64 words (little endian).
+/// The reason and raw inputs permit offline recalculation without guessing
+/// Rust layout. It is written only after a complete sample was rejected.
+pub(crate) const FAILURE_WORDS: usize = 16;
+
 pub(crate) struct Epoch {
     roster: Roster,
     origin: TscBracket,
@@ -248,7 +332,7 @@ pub(crate) struct Epoch {
 impl Epoch {
     pub(crate) fn new(roster: Roster, before: Sample, after: Sample, count: u16) -> Option<Self> {
         if count==0 || count<=pit::REARM_COUNT {return None;}
-        let initial=roster.bracket(before,after)?;
+        let initial=roster.bracket(before,after).ok()?;
         let mut epoch=Self { roster, origin:initial,window:initial,previous:initial,
             window_count:count,count,last_raw:[0;MAX_ID],seen:[0;4],
             published:0,fault:None };
@@ -257,7 +341,7 @@ impl Epoch {
     }
 
     fn record(&mut self, before: Sample, after: Sample) -> Result<TscBracket, Fault> {
-        let current=self.roster.bracket(before,after).ok_or(Fault::InvalidBracket)?;
+        let current=self.roster.bracket(before,after)?;
         let id=before.member.id;
         let (word,flag)=bit(id);
         if self.seen[word]&flag!=0 && before.raw<self.last_raw[id as usize] {
@@ -268,8 +352,17 @@ impl Epoch {
         Ok(current)
     }
 
-    pub(crate) fn invalidate(&mut self, fault: Fault) {
-        if self.fault.is_none() { self.fault=Some(fault); }
+    pub(crate) fn invalidate(&mut self, fault: Fault) -> Fault {
+        *self.fault.get_or_insert(fault)
+    }
+
+    pub(crate) fn failure_words(&self, fault: Fault, phase: ObservationPhase,
+                                before: Sample, after: Sample, count: u16) -> [u64; FAILURE_WORDS] {
+        [1, fault as u64, phase as u64, count as u64, self.count as u64, self.roster.hz,
+         before.member.id as u64, after.member.id as u64, before.raw, after.raw,
+         before.member.hz, after.member.hz,
+         before.member.alignment.offset as u64, after.member.alignment.offset as u64,
+         before.member.alignment.uncertainty_ticks, after.member.alignment.uncertainty_ticks]
     }
     pub(crate) fn failed(&self)->bool { self.fault.is_some() }
     pub(crate) fn fault(&self)->Option<Fault> { self.fault }
@@ -278,8 +371,8 @@ impl Epoch {
     /// The PIT counts are independently observed; TSC cannot invent
     /// elapsed ticks. Overlap between bounded cross-CPU offset intervals
     /// may clamp publication but never move it backward.
-    pub(crate) fn observe(&mut self, before: Sample, after: Sample, count: u16) -> Option<u128> {
-        if self.failed() {return None;}
+    pub(crate) fn observe(&mut self, before: Sample, after: Sample, count: u16) -> Result<u128, Fault> {
+        if let Some(fault)=self.fault {return Err(fault);}
         let result=(|| {
             let current=self.record(before,after)?;
             if count<pit::MIN_REARM_COUNT {return Err(Fault::LatePitCount);}
@@ -298,16 +391,16 @@ impl Epoch {
             Ok(time)
         })();
         match result {
-            Ok(time)=>Some(time),
-            Err(fault)=>{self.invalidate(fault); None}
+            Ok(time)=>Ok(time),
+            Err(fault)=>Err(self.invalidate(fault))
         }
     }
 
     /// A fresh count starts a new independent rate-check window, not a
     /// new global epoch. Reset overhead is bracketed and bounded; time
     /// from the reset is not itself published as independent evidence.
-    pub(crate) fn rearm(&mut self,before:Sample,after:Sample,count:u16)->bool {
-        if self.failed(){return false;}
+    pub(crate) fn rearm(&mut self,before:Sample,after:Sample,count:u16)->Result<(),Fault> {
+        if let Some(fault)=self.fault{return Err(fault);}
         let result=(||{
             if self.count>pit::REARM_COUNT || self.count<pit::MIN_REARM_COUNT ||
                count<=pit::REARM_COUNT{return Err(Fault::RearmCount);}
@@ -322,8 +415,8 @@ impl Epoch {
             Ok(())
         })();
         match result {
-            Ok(())=>true,
-            Err(fault)=>{self.invalidate(fault); false}
+            Ok(())=>Ok(()),
+            Err(fault)=>Err(self.invalidate(fault))
         }
     }
 }
