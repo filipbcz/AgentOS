@@ -103,6 +103,17 @@ impl ReferenceClock {
         ms.min(isize::MAX as u128) as u64
     }
 
+    /// Exact nanoseconds for a clock comparison. Unlike the ABI millisecond
+    /// conversion, an interval outside the u64 nanosecond range is unavailable.
+    pub(crate) fn total_ns(self, ticks: u128) -> Option<u64> {
+        let ns = match self {
+            Self::Pm(_) => ticks.checked_mul(NS_PER_SECOND as u128)? / PM_HZ as u128,
+            Self::Hpet { period_fs, .. } =>
+                ticks.checked_mul(period_fs as u128)? / FS_PER_NS as u128,
+        };
+        u64::try_from(ns).ok()
+    }
+
     /// Sample before a quarter of a short counter's wrap, including during
     /// idle. The scheduler supports millisecond maintenance deadlines.
     pub(crate) fn maintenance_ms(self) -> Option<u64> {

@@ -114,3 +114,13 @@ fn saturates_abi_and_does_not_invent_progress_when_counter_stops() {
     assert_eq!(epoch.observe(123),Some(0));
     assert_eq!(epoch.observe(10123),Some(1));
 }
+
+#[test]
+fn exact_reference_nanoseconds_do_not_truncate_the_millisecond_abi() {
+    assert_eq!(pm(false).total_ns(3_579_545),Some(1_000_000_000));
+    assert_eq!(pm(true).total_ns(1),Some(279));
+    assert_eq!(hp(true,100_000_000).total_ns(10_000_001),Some(1_000_000_100));
+    assert_eq!(hp(true,100_000_000).total_ns(u128::MAX),None);
+    assert_eq!(pm(false).total_ns(u128::MAX),None);
+    assert_eq!(hp(true,100_000_000).ticks_to_ms(u128::MAX),isize::MAX as u64);
+}

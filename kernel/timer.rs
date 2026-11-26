@@ -27,6 +27,12 @@ impl Timer {
                fLastClockMs: None, fStalledCounts: 0 }
     }
 
+    /// Change a maintenance requirement without resetting consumed ticks or
+    /// extending a pending earlier hardware deadline.
+    pub fn set_maintenance(&mut self, interval_ms: Option<u64>) {
+        self.fMaintenanceMs = interval_ms;
+    }
+
     /// Begin a new scheduler session after disarming any boot-owned timer.
     pub fn reset(&mut self, aNow: Option<u64>) {
         self.fRemaining = 0;

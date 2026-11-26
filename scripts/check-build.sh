@@ -165,6 +165,10 @@ printf 'Testing invariant TSC capability, calibration and SMP alignment with %s\
 "$pRustc" --edition 2021 --test "$pRoot/scripts/tests/tsc-host.rs" -o "$pOut/tsc-tests"
 "$pOut/tsc-tests"
 
+printf 'Testing independent TSC watchdog, CPU skew and maintenance deadlines with %s\n' "$pRustc"
+"$pRustc" --edition 2021 --test "$pRoot/scripts/tests/tsc-watchdog-host.rs" -o "$pOut/tsc-watchdog-tests"
+"$pOut/tsc-watchdog-tests"
+
 printf 'Testing NVMe wire format, geometry and queue ownership\n'
 "$pRustc" --edition 2021 --test "$pRoot/kernel/nvme/protocol.rs" -o "$pOut/nvme-tests"
 "$pOut/nvme-tests"

@@ -29,6 +29,7 @@ mod hpet;
 mod reference_clock;
 mod system_clock;
 mod tsc;
+mod tsc_watchdog;
 mod native_abi;
 mod files;
 mod ipc;

@@ -96,6 +96,18 @@ pub fn millis() -> Option<u64> {
     })
 }
 
+/// Read the same shared epoch once, returning the normal ABI value and
+/// precise time for independent clock comparison. A nanosecond overflow
+/// does not truncate the much larger signed-millisecond ABI range.
+pub(crate) fn snapshot() -> Option<(u64, Option<u64>)> {
+    CLOCK.with(|epoch| {
+        let epoch = epoch.as_mut()?;
+        let raw = unsafe { epoch.source.sample() };
+        let ms = epoch.observe(raw)?;
+        Some((ms, epoch.source.total_ns(epoch.ticks)))
+    })
+}
+
 /// Only one online CPU is required to sample a shared short counter when
 /// there are no runnable tasks or timed waiters. Other CPUs stay tickless.
 pub fn maintenance_ms() -> Option<u64> {

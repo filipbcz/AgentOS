@@ -233,6 +233,7 @@ struct Cpu {
     tsc_hz: u64,
     reference: ReferenceClock,
     tsc: crate::tsc::Peer,
+    tsc_watchdog: UnsafeCell<crate::tsc_watchdog::Watchdog>,
     timer_policy: UnsafeCell<crate::timer::Timer>,
     runtime_timer_irqs: AtomicUsize,
     fTimerSequence: AtomicUsize,
@@ -285,6 +286,7 @@ impl Cpu {
         cpu.write(Self { self_address: addr, syscall_user_rsp: UnsafeCell::new(0), syscall_stack: UnsafeCell::new(0),
                          rsp0, programs, apic, expected_id: id, interval, tsc_hz, reference,
                          tsc: crate::tsc::Peer::new(),
+                         tsc_watchdog: UnsafeCell::new(crate::tsc_watchdog::Watchdog::new()),
                          timer_policy: UnsafeCell::new(crate::timer::Timer::new(interval,
                              if descriptors.is_none() { crate::system_clock::maintenance_ms() } else { None })),
                          runtime_timer_irqs: AtomicUsize::new(0), fTimerSequence: AtomicUsize::new(0),
@@ -348,12 +350,14 @@ impl Cpu {
             let mut pQueue = self.lockQueue();
             pQueue.setRuntimeIdle(true);
         }
-        (*self.timer_policy.get()).reset(crate::system_clock::millis());
         self.apic.write(0x320, MASK | TIMER);
         self.apic.write(0x380, 0);
         self.fRuntimeReady.store(true, Ordering::Release);
-        // The first reschedule IPI records this kernel caller context before
-        // selecting incoming work. Empty AP queues keep IF-enabled HLT.
+        let now = self.runtime_clock();
+        (*self.timer_policy.get()).reset(now);
+        self.arm_timer(false, None, now.unwrap_or(0));
+        // The first IRQ records this kernel caller context before selecting
+        // incoming work. Idle queues need only a real maintenance deadline.
         loop { wait_for_irq(); }
     }
 
@@ -364,7 +368,7 @@ impl Cpu {
         }
         self.fRuntimeReady.store(true, Ordering::Release);
         gRuntimeEnabled.store(true, Ordering::Release);
-        let pNow = crate::system_clock::millis();
+        let pNow = self.runtime_clock();
         (*self.timer_policy.get()).reset(pNow);
         self.arm_timer(true, None, pNow.unwrap_or(0));
         let mut pStatus = None;
@@ -387,7 +391,7 @@ impl Cpu {
                     pChanged |= pQueue.collectRetired(pFrames) != 0;
                     pQueue.wake_io(pFrames);
                 });
-                let pNow = crate::system_clock::millis().unwrap_or(0);
+                let pNow = self.runtime_clock().unwrap_or(0);
                 self.arm_timer(pQueue.runnableCount() != 0, pQueue.next_deadline(), pNow);
             }
             if pChanged { notifyRemote(); }
@@ -408,8 +412,40 @@ impl Cpu {
         }
     }
 
+    /// Use a single independent-clock sample for the scheduler and, when
+    /// eligible, the local invariant-TSC watchdog. IRQs are masked by the
+    /// scheduler/interrupt caller; the watchdog has exactly one CPU owner.
+    unsafe fn runtime_clock(&self) -> Option<u64> {
+        use crate::tsc_watchdog::{Health, Sample, MONITOR};
+        if !self.fRuntimeReady.load(Ordering::Acquire) || !MONITOR.active() {
+            return crate::system_clock::millis();
+        }
+        let (Some(rate), Some(alignment)) = (self.tsc.rate(), self.tsc.alignment()) else {
+            return crate::system_clock::millis();
+        };
+        let before = crate::tsc::read();
+        let now = crate::system_clock::snapshot();
+        let after = crate::tsc::read();
+        let sample = now.and_then(|(_, ns)| ns.map(|reference_ns| Sample { reference_ns, before, after }));
+        let watchdog = &mut *self.tsc_watchdog.get();
+        let previous = watchdog.health();
+        let health = MONITOR.observe(self.expected_id as u32, rate, alignment, watchdog, sample);
+        if previous != health && health != Health::Pending {
+            let level = if health == Health::Rejected { crate::log_policy::Level::Error }
+                        else { crate::log_policy::Level::Info };
+            let _ = crate::logger::LOGGER.record(after, self.expected_id as u32, level, health.message());
+        }
+        now.map(|(ms, _)| ms)
+    }
+
     unsafe fn arm_timer(&self, runnable: bool, deadline: Option<u64>, now: u64) {
-        match (*self.timer_policy.get()).plan(runnable, deadline, now) {
+        let base = if self.descriptors.is_none() { crate::system_clock::maintenance_ms() } else { None };
+        let maintenance = if self.fRuntimeReady.load(Ordering::Acquire) && crate::tsc_watchdog::MONITOR.active() {
+            Some(base.map_or(crate::tsc_watchdog::INTERVAL_MS, |ms| ms.min(crate::tsc_watchdog::INTERVAL_MS)))
+        } else { base };
+        let policy = &mut *self.timer_policy.get();
+        policy.set_maintenance(maintenance);
+        match policy.plan(runnable, deadline, now) {
             crate::timer::Action::Keep => (),
             crate::timer::Action::Disable => {
                 self.apic.write(0x320, MASK | TIMER);
@@ -426,7 +462,7 @@ impl Cpu {
         let mut pGuard = self.lockQueue();
         let queue = &mut *pGuard;
         let scheduled = queue.active;
-        let measured = crate::system_clock::millis();
+        let measured = self.runtime_clock();
         let now = measured.unwrap_or(0);
         let mut pChanged = false;
         if scheduled {
@@ -1202,6 +1238,15 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
         serial(b" TIMERS="); hex(sample.timers as u64);
         serial(b" TSC-TOTAL="); hex(sample.elapsed);
         serial(b" TSC-ACTIVE="); hex(sample.active); serial(b"\r\n");
+    }
+    // An invariant TSC cannot be a system-wide candidate unless every
+    // enabled CPU has a qualified rate and bounded alignment. Monitor
+    // continuously from ordinary runtime startup, including idle CPUs.
+    if let Some(hz) = bsp_rate {
+        if cpus.iter().flatten().all(|cpu| cpu.tsc.rate().is_some() && cpu.tsc.alignment().is_some()) {
+            crate::tsc_watchdog::MONITOR.start(bsp as u32, hz);
+            log.event(1, b"TSC runtime watchdog enabled");
+        }
     }
     for pCpu in cpus.iter().flatten().filter(|pCpu| pCpu.expected_id != bsp) {
         pCpu.phase.store(RUNTIME_PHASE, Ordering::Release);
