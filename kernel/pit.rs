@@ -21,7 +21,7 @@ const DIVISOR: u16 = 59_660;
 const INTERVAL_NS: u64 = DIVISOR as u64 * 1_000_000_000 / PIT_HZ;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Error { NotDeclared, Busy, Configuration, NoEdge, Regression, Uncertain }
+pub(crate) enum Error { NotDeclared, Configuration, NoEdge, Regression, Uncertain }
 
 pub(crate) trait Ports {
     fn read(&mut self, port: u16) -> u8;
@@ -50,7 +50,9 @@ pub(crate) fn measure(allowed: bool, io: &mut impl Ports, max_polls: u32,
                       mut maintain: impl FnMut()) -> Result<Observation, Error> {
     if !allowed { return Err(Error::NotDeclared); }
 
-    let control = io.read(GATE) & !(GATE_ENABLE | SPEAKER_ENABLE);
+    // Only bits 0..3 are legacy writable control bits; do not echo
+    // OUT/refresh/NMI status bits into the register.
+    let control = io.read(GATE) & 0x0c;
     io.write(GATE, control);
     let result = (|| {
         if io.read(GATE) & (GATE_ENABLE | SPEAKER_ENABLE) != 0 {
