@@ -50,7 +50,7 @@ fn a_shift_on_one_cpu_revokes_machine_candidate() {
     // One AP jumped 20ms relative to the BSP and the physical reference.
     assert_eq!(monitor.observe(1,HZ,AP,&mut ap,Some(sample(500_010_000,60_010_000))),Health::Rejected);
     assert!(!monitor.active());
-    monitor.start(0,HZ);
+    assert!(!monitor.start(0,HZ,[0,1]));
     assert!(!monitor.active());
 }
 
@@ -58,7 +58,7 @@ fn a_shift_on_one_cpu_revokes_machine_candidate() {
 fn reference_freeze_or_tsc_regression_is_not_certified() {
     let monitor=RuntimeMonitor::new();
     let mut bsp=Watchdog::new();
-    monitor.start(0,HZ);
+    assert!(monitor.start(0,HZ,[0]));
     monitor.observe(0,HZ,ZERO,&mut bsp,Some(sample(10,0)));
     let mut stopped=sample(1_000_000_000,0);
     stopped.reference_ns=10;
@@ -67,7 +67,7 @@ fn reference_freeze_or_tsc_regression_is_not_certified() {
 
     let monitor=RuntimeMonitor::new();
     let mut bsp=Watchdog::new();
-    monitor.start(0,HZ);
+    assert!(monitor.start(0,HZ,[0]));
     monitor.observe(0,HZ,ZERO,&mut bsp,Some(sample(500_000_000,0)));
     let mut regression=sample(1,0);
     regression.reference_ns=600_000_000;
@@ -78,7 +78,7 @@ fn reference_freeze_or_tsc_regression_is_not_certified() {
 fn bounded_brackets_and_long_gaps_requalify_instead_of_inventing_time() {
     let monitor=RuntimeMonitor::new();
     let mut bsp=Watchdog::new();
-    monitor.start(0,HZ);
+    assert!(monitor.start(0,HZ,[0]));
     for i in 0..=3 {monitor.observe(0,HZ,ZERO,&mut bsp,Some(sample(i*500_000_000,0)));}
     assert_eq!(bsp.health(),Health::Verified);
     let mut slow=sample(2_000_000_000,0);
@@ -97,7 +97,7 @@ fn cross_cpu_brackets_may_be_ordered_in_either_direction() {
     let monitor=RuntimeMonitor::new();
     let mut bsp=Watchdog::new();
     let mut ap=Watchdog::new();
-    monitor.start(0,HZ);
+    assert!(monitor.start(0,HZ,[0,1]));
     monitor.observe(0,HZ,ZERO,&mut bsp,Some(sample(100_000,0)));
     // The AP completed its measurement before the BSP published its anchor.
     assert_eq!(monitor.observe(1,HZ,AP,&mut ap,Some(sample(90_000,10_000))),Health::Pending);
