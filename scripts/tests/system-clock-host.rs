@@ -192,7 +192,7 @@ fn qualified_standby_preserves_epoch_after_primary_regression() {
     assert!(!rig.clocks.qualified());
     assert_eq!(rig.advance(0,715_909),Some(1_200_000_000));
     assert_eq!(rig.clocks.take_event(),None);
-    // The failed primary is not recycled, even when it later progresses.
+    // One new observation cannot authorize reuse of the failed primary.
     rig.shadow_raw=rig.shadow_raw.wrapping_sub(1)&rig.shadow.mask();
     assert_eq!(rig.advance(10_000_000,0),None);
     assert_eq!(rig.clocks.take_event(),Some(ClockEvent::Unavailable));
@@ -218,7 +218,8 @@ fn broken_standby_does_not_interrupt_healthy_primary() {
     assert_eq!(rig.advance(2_000_000,0),Some(1_000_000_000));
     assert_eq!(rig.clocks.source(),Some(rig.primary));
     assert_eq!(rig.clocks.take_event(),Some(ClockEvent::StandbyRetired));
-    assert_eq!(rig.clocks.maintenance_ms(),None);
+    // The BSP now maintains the quarantined source at a bounded cadence.
+    assert_eq!(rig.clocks.maintenance_ms(),Some(100));
     assert_eq!(rig.advance(2_000_000,0),Some(1_200_000_000));
     assert!(!rig.clocks.qualified());
 }
@@ -969,5 +970,193 @@ fn recovered_epoch_requires_actual_fleet_requalification() {
         assert_eq!(monitor.observe_at(Some(1),0,TSC_HZ,BSP,&mut watchdog,Some(sample)),
                    if i==3 {Health::Verified}else{Health::Pending});
         assert_eq!(monitor.witness_at(1,0,BSP,tick+100).is_some(),i==3);
+    }
+}
+
+
+fn retired_pm() -> Rig {
+    let mut rig=qualified_pair();
+    rig.shadow_raw=rig.shadow_raw.wrapping_sub(1)&rig.shadow.mask();
+    assert_eq!(rig.advance(2_000_000,0),Some(1_000_000_000));
+    assert_eq!(rig.clocks.take_event(),Some(ClockEvent::StandbyRetired));
+    assert!(!rig.clocks.qualified());
+    rig
+}
+
+#[test]
+fn quarantined_pm_can_rejoin_and_later_preserve_time_on_hpet_loss() {
+    let mut rig=retired_pm();
+    rig.shadow_raw=0xffff00;
+    for i in 1..=4 {
+        let ns=rig.advance(2_000_000,715_909).unwrap();
+        assert_eq!(ns,1_000_000_000+i*200_000_000);
+        assert_eq!(rig.clocks.source(),Some(rig.primary));
+        assert_eq!(rig.clocks.qualified(),i==4);
+        assert_eq!(rig.clocks.view(ns).reference_generation,0);
+        assert_eq!(rig.clocks.take_event(),if i==4 {
+            Some(ClockEvent::StandbyRecovered)
+        } else {None});
+    }
+    assert_eq!(rig.clocks.maintenance_ms(),Some(1000));
+    rig.active_raw-=1;
+    assert_eq!(rig.advance(0,715_909),Some(2_000_000_000));
+    assert_eq!(rig.clocks.source(),Some(rig.shadow));
+    assert_eq!(rig.clocks.take_event(),Some(ClockEvent::PromotedPm));
+}
+
+#[test]
+fn previously_failed_primary_can_return_as_standby_without_preempting_current_primary() {
+    let mut rig=qualified_pair();
+    rig.active_raw-=1;
+    assert_eq!(rig.advance(0,715_909),Some(1_000_000_000));
+    assert_eq!(rig.clocks.take_event(),Some(ClockEvent::PromotedPm));
+    rig.active_raw=37;
+    for i in 1..=4 {
+        assert_eq!(rig.advance(2_000_000,715_909),Some(1_000_000_000+i*200_000_000));
+        assert_eq!(rig.clocks.source(),Some(rig.shadow));
+        assert_eq!(rig.clocks.qualified(),i==4);
+    }
+    assert_eq!(rig.clocks.take_event(),Some(ClockEvent::StandbyRecovered));
+    rig.shadow_raw=rig.shadow_raw.wrapping_sub(1)&rig.shadow.mask();
+    assert_eq!(rig.advance(2_000_000,0),Some(2_000_000_000));
+    assert_eq!(rig.clocks.source(),Some(rig.primary));
+    assert_eq!(rig.clocks.take_event(),Some(ClockEvent::PromotedHpet));
+}
+
+#[test]
+fn incomplete_standby_requalification_cannot_authorize_failover() {
+    let mut rig=retired_pm();
+    for _ in 0..3 {rig.advance(2_000_000,715_909).unwrap();}
+    assert!(!rig.clocks.qualified());
+    rig.active_raw-=1;
+    assert_eq!(rig.advance(0,715_909),None);
+    assert_eq!(rig.clocks.take_event(),Some(ClockEvent::Unavailable));
+}
+
+#[test]
+fn repeated_reset_during_standby_requalification_discards_all_previous_windows() {
+    let mut rig=retired_pm();
+    rig.advance(2_000_000,715_909).unwrap();
+    rig.advance(2_000_000,715_909).unwrap();
+    rig.shadow_raw=rig.shadow_raw.wrapping_sub(1)&rig.shadow.mask();
+    rig.advance(2_000_000,0).unwrap();
+    assert!(!rig.clocks.qualified());
+    for i in 1..=3 {
+        rig.advance(2_000_000,715_909).unwrap();
+        assert_eq!(rig.clocks.qualified(),i==3);
+    }
+    assert_eq!(rig.clocks.take_event(),Some(ClockEvent::StandbyRecovered));
+}
+
+#[test]
+fn frozen_or_wrong_rate_quarantined_device_cannot_affect_primary_epoch() {
+    let mut rig=retired_pm();
+    for i in 1..=20 {
+        let shadow=if i%2==0 {357_954}else{0};
+        assert_eq!(rig.advance(2_000_000,shadow),Some(1_000_000_000+i*200_000_000));
+        assert_eq!(rig.clocks.source(),Some(rig.primary));
+        assert!(!rig.clocks.qualified());
+        assert_eq!(rig.clocks.take_event(),None);
+    }
+}
+
+#[test]
+fn quarantine_checks_cumulative_rate_not_only_individual_windows() {
+    let mut rig=retired_pm();
+    rig.advance(2_000_000,715_909).unwrap();
+    // Each individual window may differ by the allowed rate budget,
+    // but a new offset cannot be hidden by resetting a checkpoint.
+    // A 1ms excess in each 200ms window is valid (0.5%).
+    for _ in 0..2 {rig.advance(2_000_000,719_489).unwrap();}
+    assert!(!rig.clocks.qualified());
+    // A further 6ms excess contradicts the cumulative observation.
+    rig.advance(2_000_000,737_386).unwrap();
+    assert!(!rig.clocks.qualified());
+    for i in 1..=3 {
+        rig.advance(2_000_000,715_909).unwrap();
+        assert_eq!(rig.clocks.qualified(),i==3);
+    }
+}
+
+#[test]
+fn short_counter_ambiguous_gap_restarts_quarantine_even_with_plausible_residue() {
+    let mut rig=Rig::new(pm(true),hp(false,100_000),100);
+    rig.observe();
+    for _ in 0..4 {rig.advance(715_909,2_000_000_000).unwrap();}
+    assert!(rig.clocks.qualified());
+    rig.shadow_raw=rig.shadow_raw.wrapping_sub(1)&rig.shadow.mask();
+    rig.advance(715_909,0).unwrap();
+    assert_eq!(rig.clocks.take_event(),Some(ClockEvent::StandbyRetired));
+    assert_eq!(rig.clocks.maintenance_ms(),Some(100));
+    rig.advance(715_909,2_000_000_000).unwrap();
+    rig.advance(715_909,2_000_000_000).unwrap();
+    // A whole HPET32 wrap plus a short residue, measured by the
+    // healthy PM timer. Do not preserve the previous good window.
+    rig.advance(1_789_772,5_000_000_000).unwrap();
+    for i in 1..=3 {
+        rig.advance(715_909,2_000_000_000).unwrap();
+        assert_eq!(rig.clocks.qualified(),i==3);
+    }
+    assert_eq!(rig.clocks.take_event(),Some(ClockEvent::StandbyRecovered));
+}
+
+#[test]
+fn slow_readout_does_not_allow_unbounded_quarantine_register_access() {
+    let mut rig=retired_pm();
+    rig.active_raw+=2_000_000;
+    let (a,b,ar,br)=(rig.primary,rig.shadow,rig.active_raw,rig.shadow_raw);
+    let mut primary_reads=0;
+    let mut shadow_reads=0;
+    let ns=rig.clocks.sample(|source|{
+        if source==a {
+            primary_reads+=1;
+            if primary_reads==1 {ar}else{ar+10_000}
+        } else {assert_eq!(source,b);shadow_reads+=1;br}
+    });
+    assert_eq!(ns,Some(1_201_000_000));
+    assert_eq!(shadow_reads,1);
+    rig.active_raw=ar+10_000;
+    // Even though the rejected bracket left no qualification history,
+    // repeated syscalls cannot cause another slow device read yet.
+    for _ in 0..1000 {
+        let ar=rig.active_raw;
+        assert_eq!(rig.clocks.sample(|source|{
+            assert_eq!(source,a,"quarantine access was not rate limited");
+            ar
+        }),Some(1_201_000_000));
+    }
+    assert!(!rig.clocks.qualified());
+}
+
+#[test]
+fn restored_standby_participates_again_in_three_source_decisions() {
+    let mut rig=TripleRig::qualified();
+    rig.hardware.shadow_raw=rig.hardware.shadow_raw.wrapping_sub(1)&rig.hardware.shadow.mask();
+    assert_eq!(rig.advance(2_000_000,0,200_000_000),Some(1_000_000_000));
+    assert_eq!(rig.hardware.clocks.take_event(),Some(ClockEvent::StandbyRetired));
+    for i in 1..=4 {
+        assert_eq!(rig.advance(2_000_000,715_909,200_000_000),Some(1_000_000_000+i*200_000_000));
+        assert_eq!(rig.hardware.clocks.qualified(),i==4);
+    }
+    assert_eq!(rig.hardware.clocks.take_event(),Some(ClockEvent::StandbyRecovered));
+    // The first ordinary agreeing triple establishes a new triple anchor.
+    assert_eq!(rig.advance(2_000_000,715_909,200_000_000),Some(2_000_000_000));
+    assert_eq!(rig.advance(8_000_000,715_909,200_000_000),Some(2_200_000_000));
+    assert_eq!(rig.hardware.clocks.source(),Some(rig.hardware.shadow));
+    assert_eq!(rig.hardware.clocks.take_event(),Some(ClockEvent::PromotedPm));
+}
+
+#[test]
+fn a_contradicting_tsc_witness_prevents_standby_qualification_against_bad_primary() {
+    let mut rig=TripleRig::qualified();
+    rig.hardware.shadow_raw=rig.hardware.shadow_raw.wrapping_sub(1)&rig.hardware.shadow.mask();
+    rig.advance(2_000_000,0,200_000_000).unwrap();
+    assert_eq!(rig.hardware.clocks.take_event(),Some(ClockEvent::StandbyRetired));
+    for _ in 0..8 {
+        // Both physical counters advance twice as fast as the still
+        // qualified TSC. They cannot establish a new trusted standby.
+        rig.advance(4_000_000,1_431_818,200_000_000).unwrap();
+        assert!(!rig.hardware.clocks.qualified());
+        assert_eq!(rig.hardware.clocks.source(),Some(rig.hardware.primary));
     }
 }
