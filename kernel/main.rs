@@ -27,6 +27,7 @@ mod process;
 mod lifecycle;
 mod hpet;
 mod reference_clock;
+mod clock_quorum;
 mod system_clock;
 mod tsc;
 mod tsc_watchdog;
