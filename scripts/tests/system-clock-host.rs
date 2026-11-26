@@ -609,12 +609,14 @@ fn qualified_tsc_preserves_epoch_when_both_physical_epochs_are_invalid() {
     assert!(rig.hardware.clocks.using_tsc());
     assert_eq!(rig.hardware.clocks.source(),None);
     assert_eq!(rig.hardware.clocks.take_event(),Some(ClockEvent::PromotedTsc));
-    assert_eq!(rig.hardware.clocks.maintenance_ms(),Some(1000));
+    assert_eq!(rig.hardware.clocks.maintenance_ms(),Some(100));
 
     rig.tsc_ticks+=600_000_000;
     let w=rig.witness(7);
+    // Quarantined devices may be observed, but their old invalid epoch
+    // may never contribute to the authoritative system time.
+    let ns=rig.observe(Some(w),Some(w)).unwrap();
     let clock=&mut rig.hardware.clocks;
-    let ns=clock.sample_with_witness(|_|panic!("invalid physical source reused"),||Some(w)).unwrap();
     assert_eq!(ns,1_188_000_000);
     let view=clock.view(ns);
     assert_eq!(view.millis,1188);
@@ -786,4 +788,186 @@ fn actual_watchdog_leases_are_not_renewed_by_tsc_holdover_time() {
         }
     }
     assert_eq!(rig.hardware.clocks.take_event(),Some(ClockEvent::Unavailable));
+}
+
+
+#[test]
+fn each_physical_source_can_recover_without_resetting_absolute_time() {
+    for recover_pm in [false,true] {
+        let mut rig=TripleRig::qualified();
+        lose_both_physical_sources(&mut rig);
+        assert_eq!(rig.advance(0,0,200_000_000),Some(988_000_000));
+        assert_eq!(rig.hardware.clocks.take_event(),Some(ClockEvent::PromotedTsc));
+        assert_eq!(rig.hardware.clocks.view(988_000_000).reference_generation,0);
+
+        // Hardware may restart at any raw value, including near a wrap.
+        rig.hardware.active_raw=123;
+        rig.hardware.shadow_raw=0xffff00;
+        let (a,b)=if recover_pm {(0,715_909)}else{(2_000_000,0)};
+        for i in 1..=4 {
+            let now=rig.advance(a,b,200_000_000).unwrap();
+            assert_eq!(now,988_000_000+i*200_000_000);
+            let view=rig.hardware.clocks.view(now);
+            if i<4 {
+                assert!(view.holdover);
+                assert_eq!(view.independent_ns,None);
+                assert_eq!(view.reference_generation,0);
+                assert_eq!(rig.hardware.clocks.take_event(),None);
+            } else {
+                assert!(!view.holdover);
+                assert_eq!(view.reference_generation,1);
+                assert_eq!(view.independent_ns,Some(now as u64));
+            }
+        }
+        assert_eq!(rig.hardware.clocks.source(),Some(if recover_pm {rig.hardware.shadow}else{rig.hardware.primary}));
+        assert_eq!(rig.hardware.clocks.take_event(),Some(if recover_pm {ClockEvent::RecoveredPm}else{ClockEvent::RecoveredHpet}));
+        assert_eq!(rig.advance(a,b,200_000_000),Some(1_988_000_000));
+    }
+}
+
+#[test]
+fn recovery_from_only_one_initialized_physical_source() {
+    let mut rig=qualified_single();
+    rig.hardware.active_raw-=1;
+    assert_eq!(rig.advance(0,0,200_000_000),Some(988_000_000));
+    for i in 1..=4 {
+        assert_eq!(rig.advance(2_000_000,0,200_000_000),Some(988_000_000+i*200_000_000));
+    }
+    assert_eq!(rig.hardware.clocks.source(),Some(rig.hardware.primary));
+    assert_eq!(rig.hardware.clocks.take_event(),Some(ClockEvent::RecoveredHpet));
+    assert!(!rig.hardware.clocks.qualified());
+}
+
+#[test]
+fn both_recovered_sources_must_qualify_again_as_a_physical_pair() {
+    let mut rig=TripleRig::qualified();
+    lose_both_physical_sources(&mut rig);
+    rig.advance(0,0,200_000_000).unwrap();
+    for _ in 0..4 {rig.advance(2_000_000,715_909,200_000_000).unwrap();}
+    assert_eq!(rig.hardware.clocks.source(),Some(rig.hardware.primary));
+    assert_eq!(rig.hardware.clocks.take_event(),Some(ClockEvent::RecoveredHpet));
+    assert!(!rig.hardware.clocks.qualified());
+    assert_eq!(rig.hardware.clocks.maintenance_ms(),Some(1000));
+    for _ in 0..4 {rig.advance(2_000_000,715_909,200_000_000).unwrap();}
+    assert!(rig.hardware.clocks.qualified());
+}
+
+#[test]
+fn transient_recovery_then_regression_requires_three_new_windows() {
+    let mut rig=TripleRig::qualified();
+    lose_both_physical_sources(&mut rig);
+    rig.advance(0,0,200_000_000).unwrap();
+    // Baseline and one valid window are not sufficient.
+    rig.advance(2_000_000,0,200_000_000).unwrap();
+    rig.advance(2_000_000,0,200_000_000).unwrap();
+    rig.hardware.active_raw-=1;
+    rig.advance(0,0,200_000_000).unwrap();
+    for i in 1..=3 {
+        rig.advance(2_000_000,0,200_000_000).unwrap();
+        assert_eq!(rig.hardware.clocks.using_tsc(),i<3);
+    }
+    assert_eq!(rig.hardware.clocks.take_event(),Some(ClockEvent::RecoveredHpet));
+}
+
+#[test]
+fn frozen_or_wrong_rate_devices_do_not_recover_before_lease_expiry() {
+    let mut rig=TripleRig::qualified();
+    lose_both_physical_sources(&mut rig);
+    rig.advance(0,0,200_000_000).unwrap();
+    for _ in 0..10 {
+        // HPET remains frozen; PM runs at half its documented rate.
+        rig.advance(0,357_954,200_000_000).unwrap();
+        assert!(rig.hardware.clocks.using_tsc());
+    }
+    assert_eq!(rig.advance(0,357_954,400_000_000),None);
+    assert_eq!(rig.hardware.clocks.take_event(),Some(ClockEvent::Unavailable));
+}
+
+#[test]
+fn rapid_reads_and_short_windows_cannot_accelerate_recovery() {
+    let mut rig=TripleRig::qualified();
+    lose_both_physical_sources(&mut rig);
+    rig.advance(0,0,200_000_000).unwrap();
+    for _ in 0..1000 {rig.advance(100,0,10_000).unwrap();}
+    assert!(rig.hardware.clocks.using_tsc());
+    assert_eq!(rig.hardware.clocks.view(1_000_000_000).reference_generation,0);
+}
+
+#[test]
+fn an_ambiguous_wrap_during_recovery_discards_previous_evidence() {
+    // 100ps HPET32 tick: the wrap period is about 429ms and half-span
+    // only about 215ms. A 500ms gap hides a whole wrap.
+    let mut rig=TripleRig {
+        hardware:Rig::new(hp(false,100_000),pm(false),0xfff000),
+        tsc_ticks:1_000_000_000,
+    };
+    rig.advance(0,0,0).unwrap();
+    for _ in 0..4 {rig.advance(2_000_000_000,715_909,200_000_000).unwrap();}
+    assert!(rig.hardware.clocks.qualified());
+    lose_both_physical_sources(&mut rig);
+    rig.advance(0,0,200_000_000).unwrap();
+    assert!(rig.hardware.clocks.using_tsc());
+    rig.advance(2_000_000_000,0,200_000_000).unwrap();
+    rig.advance(2_000_000_000,0,200_000_000).unwrap();
+    rig.advance(5_000_000_000,0,500_000_000).unwrap();
+    for i in 1..=3 {
+        rig.advance(2_000_000_000,0,200_000_000).unwrap();
+        assert_eq!(rig.hardware.clocks.using_tsc(),i<3);
+    }
+    assert_eq!(rig.hardware.clocks.take_event(),Some(ClockEvent::RecoveredHpet));
+}
+
+#[test]
+fn recovered_epoch_requires_actual_fleet_requalification() {
+    use tsc::Alignment;
+    use tsc_watchdog::{RuntimeMonitor, Sample, Watchdog, Health};
+    const BSP: Alignment=Alignment{offset:0,uncertainty_ticks:0};
+    let monitor=RuntimeMonitor::new();
+    assert!(monitor.start(0,TSC_HZ,[0]));
+    let mut watchdog=Watchdog::new();
+    let mut rig=TripleRig::new();
+    for i in 0..=3 {
+        if i!=0 {rig.advance_raw(5_000_000,if i%2==1 {1_789_772}else{1_789_773},500_000_000);}
+        let ns=rig.hardware.observe().unwrap() as u64;
+        let tick=rig.tsc_ticks;
+        assert_eq!(monitor.observe(0,TSC_HZ,BSP,&mut watchdog,Some(Sample{
+            reference_ns:ns,before:tick-30,after:tick+30,
+        })),if i==3 {Health::Verified}else{Health::Pending});
+    }
+    rig.advance_raw(2_000_000,715_909,200_000_000);
+    let w=monitor.witness_at(0,0,BSP,rig.tsc_ticks).unwrap();
+    assert_eq!(rig.observe(Some(w),Some(w)),Some(1_700_000_000));
+    lose_both_physical_sources(&mut rig);
+    rig.advance_raw(0,0,200_000_000);
+    let w=monitor.witness_at(0,0,BSP,rig.tsc_ticks).unwrap();
+    let ns=rig.observe(Some(w),Some(w)).unwrap();
+    assert!(rig.hardware.clocks.view(ns).holdover);
+    for i in 1..=4 {
+        rig.advance_raw(2_000_000,0,200_000_000);
+        let w=monitor.witness_at(0,0,BSP,rig.tsc_ticks).unwrap();
+        let ns=rig.observe(Some(w),Some(w)).unwrap();
+        let view=rig.hardware.clocks.view(ns);
+        if i<4 {assert!(view.holdover);}
+        else {
+            assert!(!view.holdover);
+            assert_eq!(view.reference_generation,1);
+            assert_eq!(view.independent_ns,Some(ns as u64));
+            assert_eq!(monitor.witness_at(1,0,BSP,rig.tsc_ticks),None);
+            let tick=rig.tsc_ticks;
+            let sample=Sample{reference_ns:view.independent_ns.unwrap(),before:tick-30,after:tick+30};
+            assert_eq!(monitor.observe_at(Some(view.reference_generation),0,TSC_HZ,BSP,&mut watchdog,Some(sample)),Health::Pending);
+            assert_eq!(monitor.witness_at(0,0,BSP,tick+100),None);
+        }
+    }
+    assert_eq!(rig.hardware.clocks.take_event(),Some(ClockEvent::RecoveredHpet));
+    for i in 1..=3 {
+        rig.advance_raw(5_000_000,0,500_000_000);
+        let ns=rig.observe(None,None).unwrap();
+        let view=rig.hardware.clocks.view(ns);
+        let tick=rig.tsc_ticks;
+        let sample=Sample{reference_ns:view.independent_ns.unwrap(),before:tick-30,after:tick+30};
+        assert_eq!(monitor.observe_at(Some(1),0,TSC_HZ,BSP,&mut watchdog,Some(sample)),
+                   if i==3 {Health::Verified}else{Health::Pending});
+        assert_eq!(monitor.witness_at(1,0,BSP,tick+100).is_some(),i==3);
+    }
 }
