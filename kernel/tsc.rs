@@ -100,29 +100,34 @@ pub(crate) fn qualified_rate(caps: Capabilities, mut samples: [u64; 3]) -> Optio
     } else { Some(samples[1]) }
 }
 
-/// Each logical CPU measures its own rate against the active independent
-/// reference. Never trust a vendor-neutral hypervisor leaf or a nominal CPU
-/// MHz value as proof of TSC invariance or synchronization.
-pub unsafe fn qualify(reference: ReferenceClock, mut maintain: impl FnMut()) -> Option<u64> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QualificationError { Unsupported, ReferenceUnavailable, Inconsistent }
+
+/// Each logical CPU measures its own rate against the independent
+/// reference. Distinguish an unavailable timer (which permits an
+/// independent PIT fallback) from conflicting observations (which do
+/// not). CPUID alone is never proof of synchronization or rate.
+pub(crate) unsafe fn qualify_reference(reference: ReferenceClock, mut maintain: impl FnMut())
+    -> Result<u64, QualificationError> {
+    use QualificationError::*;
     let caps = detect();
-    if !caps.invariant { return None; }
+    if !caps.invariant { return Err(Unsupported); }
     let mut samples = [0u64; 3];
     for sample in &mut samples {
         let before_start = read();
         let start = reference.sample();
         let after_start = read();
-        let waited = reference.delay_ns_with(MEASURE_NS, &mut maintain).ok()?;
+        let waited = reference.delay_ns_with(MEASURE_NS, &mut maintain)
+            .map_err(|_| ReferenceUnavailable)?;
         let before_end = read();
         let end = reference.sample();
         let after_end = read();
-        let reference_ns = reference.elapsed_ns(start, end)?;
-        // Both endpoints enclose the independently accumulated polling time.
-        // Reject ambiguous/missed wraps and samples outside the bound.
-        if reference_ns < waited { return None; }
+        let reference_ns = reference.elapsed_ns(start, end).ok_or(Inconsistent)?;
+        if reference_ns < waited { return Err(Inconsistent); }
         *sample = measured_rate(Observation { before_start, after_start,
-            before_end, after_end, reference_ns })?;
+            before_end, after_end, reference_ns }).ok_or(Inconsistent)?;
     }
-    qualified_rate(caps, samples)
+    qualified_rate(caps, samples).ok_or(Inconsistent)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
