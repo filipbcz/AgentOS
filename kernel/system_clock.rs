@@ -59,7 +59,7 @@ const RECOVERY_MS: u64 = 100;
 pub(crate) enum ClockEvent {
     StandbyRetired = 1, PromotedPm = 2, PromotedHpet = 3,
     Unavailable = 4, StandbyRebased = 5, TscRejected = 6, PromotedTsc = 7,
-    RecoveredPm = 8, RecoveredHpet = 9,
+    RecoveredPm = 8, RecoveredHpet = 9, StandbyRecovered = 10,
 }
 
 impl ClockEvent {
@@ -74,6 +74,7 @@ impl ClockEvent {
             Self::PromotedTsc => b"SYSTEM CLOCK: physical references invalid; qualified TSC holdover",
             Self::RecoveredPm => b"SYSTEM CLOCK: requalified ACPI PM timer; leaving TSC holdover",
             Self::RecoveredHpet => b"SYSTEM CLOCK: requalified HPET; leaving TSC holdover",
+            Self::StandbyRecovered => b"SYSTEM CLOCK: quarantined standby requalified and restored",
         }
     }
     pub fn error(self) -> bool { self == Self::Unavailable }
@@ -185,6 +186,49 @@ impl Recovery {
     }
 }
 
+/// Physical-only standby qualification. The primary is already the
+/// authoritative independent reference; the quarantined device cannot
+/// influence that epoch, watchdog evidence, or a failover before it
+/// completes a new history. Bracket the shadow read with primary reads.
+struct StandbyProbe {
+    epoch: Epoch,
+    origin: Span,
+    previous: Span,
+    checkpoint: Span,
+    checkpoint_ns: u128,
+    windows: u8,
+}
+
+impl StandbyProbe {
+    fn new(source: ReferenceClock, raw: u64, primary: Span) -> Self {
+        Self { epoch: Epoch::new(source, raw), origin: primary,
+               previous: primary, checkpoint: primary, checkpoint_ns: 0, windows: 0 }
+    }
+
+    /// None means all preceding evidence must be discarded. A plausible
+    /// modulo residue after an excessive sampling gap is not evidence.
+    fn observe(&mut self, raw: u64, primary: Span) -> Option<bool> {
+        let gap = Span::elapsed(self.previous, primary)?;
+        let total = Span::elapsed(self.origin, primary)?;
+        let window = Span::elapsed(self.checkpoint, primary)?;
+        if gap.high > self.epoch.source.half_span_ns() ||
+           gap.high > MAX_GAP_NS || total.high > MAX_GAP_NS { return None; }
+        let ns = self.epoch.advance(raw)?;
+        let delta = ns.checked_sub(self.checkpoint_ns)?;
+        if !Span::exact(ns).agrees(total) || !Span::exact(delta).agrees(window) {
+            return None;
+        }
+        self.previous = primary;
+        if window.low >= WINDOW_NS {
+            if delta == 0 { return None; }
+            self.windows = self.windows.saturating_add(1);
+            self.checkpoint = primary;
+            self.checkpoint_ns = ns;
+        }
+        Some(self.windows >= QUALIFY_WINDOWS)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct WitnessHooks {
     read: fn(u64) -> Option<Witness>,
@@ -209,6 +253,7 @@ pub(crate) struct ClockSet {
     single_qualified: bool,
     holdover: Option<Holdover>,
     recovery: [Option<Recovery>; 2],
+    standby_probe: Option<StandbyProbe>,
     reference_generation: u64,
     witness_rejected: bool,
     witness_hooks: Option<WitnessHooks>,
@@ -225,7 +270,7 @@ impl ClockSet {
             base_ns: 0, published_ns: 0, baseline: None, good_windows: 0,
             anchor: None, stall_samples: 0, failed: false, event: None,
             triple: None, single: None, single_qualified: false,
-            holdover: None, recovery, reference_generation: 0,
+            holdover: None, recovery, standby_probe: None, reference_generation: 0,
             witness_rejected: false, witness_hooks: None }
     }
 
@@ -257,11 +302,79 @@ impl ClockSet {
                 .fold(RECOVERY_MS, u64::min));
         }
         let active = self.primary.source.maintenance_ms();
-        let standby = self.standby.as_ref().and_then(|s| s.source.maintenance_ms());
+        let standby = if self.standby.is_none() {
+            self.quarantined_source().map(Self::probe_interval_ms)
+        } else {
+            self.standby.as_ref().and_then(|s| s.source.maintenance_ms())
+        };
         match (active, standby) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (Some(a), None) | (None, Some(a)) => Some(a),
             _ => None,
+        }
+    }
+
+    /// Only devices discovered, mapped and successfully initialized at
+    /// boot are retained in this catalog. Do not touch arbitrary MMIO
+    /// addresses or an uninitialized timer during runtime recovery.
+    fn quarantined_source(&self) -> Option<ReferenceClock> {
+        if self.standby.is_some() { return None; }
+        self.recovery.iter().flatten()
+            .map(|candidate| candidate.source)
+            .find(|&source| source != self.primary.source)
+    }
+
+    fn probe_interval_ms(source: ReferenceClock) -> u64 {
+        source.maintenance_ms().unwrap_or(RECOVERY_MS).min(RECOVERY_MS)
+    }
+
+    fn due_probe(&self, low: u128) -> Option<ReferenceClock> {
+        let source = self.quarantined_source()?;
+        if let Some(probe) = &self.standby_probe {
+            if probe.epoch.source == source &&
+               low.saturating_sub(probe.previous.high) <
+                   Self::probe_interval_ms(source) as u128 * 1_000_000 {
+                return None;
+            }
+        }
+        Some(source)
+    }
+
+    fn qualify_standby_probe(&mut self, source: ReferenceClock, raw: u64,
+                             primary: Span, witness_available: bool) {
+        // The primary read itself must be usable. If an independent TSC
+        // witness was available, the single-source checker must also
+        // confirm a consistent physical/TSC pair before rejoining.
+        if primary.high-primary.low > BRACKET_NS ||
+           (witness_available && !self.single_qualified) {
+            self.standby_probe = None;
+            return;
+        }
+        let result = self.standby_probe.as_mut()
+            .filter(|probe| probe.epoch.source == source)
+            .and_then(|probe| probe.observe(raw, primary));
+        match result {
+            None => self.standby_probe = Some(StandbyProbe::new(source, raw, primary)),
+            Some(false) => {},
+            Some(true) => {
+                // The three new windows are precisely the normal
+                // physical qualification, with an additional cumulative
+                // check. Attach the new counter with a fresh epoch and
+                // a bracketed anchor; no prior failed elapsed value
+                // crosses the quarantine boundary.
+                self.standby = Some(Epoch::new(source, raw));
+                self.standby_probe = None;
+                self.triple = None;
+                self.baseline = Some(Pair {
+                    low: primary.low, high: primary.high, shadow: 0,
+                });
+                self.good_windows = QUALIFY_WINDOWS;
+                self.stall_samples = 0;
+                self.anchor = Some(Anchor {
+                    global: self.base_ns.saturating_add(primary.low), shadow: 0,
+                });
+                self.event = Some(ClockEvent::StandbyRecovered);
+            }
         }
     }
 
@@ -273,6 +386,7 @@ impl ClockSet {
     }
 
     fn retire_standby(&mut self) {
+        self.standby_probe = None;
         self.triple = None;
         self.standby = None;
         self.clear_qualification();
@@ -284,12 +398,14 @@ impl ClockSet {
         // Re-observe agreement before it may preserve absolute time.
         self.triple = None;
         self.standby = Some(Epoch::new(source, raw));
+        self.standby_probe = None;
         self.clear_qualification();
         self.event = Some(ClockEvent::StandbyRebased);
     }
 
     fn unavailable(&mut self) -> Option<u128> {
         self.failed = true;
+        self.standby_probe = None;
         self.triple = None;
         self.single = None;
         self.single_qualified = false;
@@ -321,6 +437,7 @@ impl ClockSet {
         let time = time.max(self.published_ns);
         self.base_ns = time;
         self.primary = Epoch::new(standby.source, standby.last);
+        self.standby_probe = None;
         self.triple = None;
         self.clear_qualification();
         self.event = Some(match self.primary.source {
@@ -342,6 +459,7 @@ impl ClockSet {
         self.single_qualified = false;
         self.clear_qualification();
         for candidate in self.recovery.iter_mut().flatten() { candidate.history = None; }
+        self.standby_probe = None;
         self.holdover = Some(holdover);
         self.event = Some(ClockEvent::PromotedTsc);
         self.publish(time.max(self.published_ns))
@@ -392,6 +510,7 @@ impl ClockSet {
             self.base_ns = time;
             self.primary = Epoch::new(source, first);
             self.standby = standby;
+            self.standby_probe = None;
             self.holdover = None;
             self.reference_generation = generation;
             self.clear_qualification();
@@ -505,10 +624,23 @@ impl ClockSet {
         let prior = self.primary.ns();
         let first = self.primary.advance(read(active));
         let Some(standby) = self.standby.as_mut() else {
-            // Retain the cheap single-read path if no witness is granted.
-            let last = if before.is_some() { self.primary.advance(read(active)) } else { first };
+            // A retired source is read only at a bounded maintenance
+            // cadence. It cannot supply elapsed time until requalified.
+            let probe = first.and_then(|low| self.due_probe(low))
+                .map(|source| (source, read(source)));
+            let last = if before.is_some() || probe.is_some() {
+                self.primary.advance(read(active))
+            } else { first };
             let bracket = before.and_then(|b| witness().and_then(|a| TscBracket::new(b, a)));
-            return self.sample_single(first, last, bracket);
+            let time = self.sample_single(first, last, bracket)?;
+            if let (Some((source, raw)), Some(low), Some(high)) = (probe, first, last) {
+                self.qualify_standby_probe(source, raw, Span { low, high }, before.is_some());
+            } else if before.is_some() && !self.single_qualified {
+                // A newly contradicted or unavailable TSC observation
+                // invalidates in-progress recovery even between probes.
+                self.standby_probe = None;
+            }
+            return Some(time);
         };
         let shadow_source = standby.source;
         let shadow_prior = standby.ns();
@@ -798,6 +930,7 @@ pub(crate) fn take_event() -> Option<ClockEvent> {
         7 => Some(ClockEvent::PromotedTsc),
         8 => Some(ClockEvent::RecoveredPm),
         9 => Some(ClockEvent::RecoveredHpet),
+        10 => Some(ClockEvent::StandbyRecovered),
         _ => None,
     }
 }
