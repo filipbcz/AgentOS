@@ -1,7 +1,7 @@
 //! Qualify the invariant TSC and measure startup alignment between CPUs.
 //! Invariance is a rate guarantee, not a guarantee of equal counter values.
-//! The result is a candidate for a future clocksource, not a replacement
-//! for the active shared hardware clock until long-term drift is checked.
+//! Independent repeated measurements qualify the rate; full CPU
+//! alignment is a separate prerequisite for a shared TSC clocksource.
 use crate::reference_clock::ReferenceClock;
 use core::{arch::{asm, x86_64::__cpuid}, fmt::{self, Write},
     sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering}};
@@ -100,6 +100,54 @@ pub(crate) fn qualified_rate(caps: Capabilities, mut samples: [u64; 3]) -> Optio
     } else { Some(samples[1]) }
 }
 
+/// An opaque rate token: CPUID or an arbitrary integer cannot create it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct QualifiedRate { hz:u64, first:u64, last:u64 }
+
+impl QualifiedRate {
+    pub(crate) fn hz(self) -> u64 { self.hz }
+}
+
+/// Three separate, independently timed observations on the same CPU.
+/// Check raw continuity across measurements as well as each bracket.
+pub(crate) struct Calibration {
+    caps: Capabilities,
+    samples: [u64; 3],
+    len: usize,
+    first: u64,
+    last: Option<u64>,
+    failed: bool,
+}
+
+impl Calibration {
+    pub(crate) fn new(caps: Capabilities) -> Self {
+        Self { caps, samples: [0;3], len: 0, first:0, last: None, failed: false }
+    }
+    pub(crate) fn observe(&mut self, observation: Observation) -> Option<()> {
+        let rate = measured_rate(observation);
+        if self.failed || self.len == self.samples.len() ||
+            self.last.map_or(false, |last| observation.before_start < last) ||
+            rate.is_none() {
+            self.failed = true;
+            return None;
+        }
+        if self.len==0 { self.first=observation.before_start; }
+        self.samples[self.len] = rate?;
+        self.len += 1;
+        self.last = Some(observation.after_end);
+        Some(())
+    }
+    pub(crate) fn finish(self) -> Option<QualifiedRate> {
+        if self.failed || self.len != self.samples.len() { return None; }
+        Some(QualifiedRate{hz:qualified_rate(self.caps,self.samples)?,
+            first:self.first,last:self.last?})
+    }
+}
+
+pub(crate) fn rates_match(a: QualifiedRate, b: QualifiedRate) -> bool {
+    compatible(a.hz(), b.hz())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum QualificationError { Unsupported, ReferenceUnavailable, Inconsistent }
 
@@ -108,12 +156,12 @@ pub(crate) enum QualificationError { Unsupported, ReferenceUnavailable, Inconsis
 /// independent PIT fallback) from conflicting observations (which do
 /// not). CPUID alone is never proof of synchronization or rate.
 pub(crate) unsafe fn qualify_reference(reference: ReferenceClock, mut maintain: impl FnMut())
-    -> Result<u64, QualificationError> {
+    -> Result<QualifiedRate, QualificationError> {
     use QualificationError::*;
     let caps = detect();
     if !caps.invariant { return Err(Unsupported); }
-    let mut samples = [0u64; 3];
-    for sample in &mut samples {
+    let mut calibration = Calibration::new(caps);
+    for _ in 0..3 {
         let before_start = read();
         let start = reference.sample();
         let after_start = read();
@@ -124,10 +172,10 @@ pub(crate) unsafe fn qualify_reference(reference: ReferenceClock, mut maintain: 
         let after_end = read();
         let reference_ns = reference.elapsed_ns(start, end).ok_or(Inconsistent)?;
         if reference_ns < waited { return Err(Inconsistent); }
-        *sample = measured_rate(Observation { before_start, after_start,
+        calibration.observe(Observation { before_start, after_start,
             before_end, after_end, reference_ns }).ok_or(Inconsistent)?;
     }
-    qualified_rate(caps, samples).ok_or(Inconsistent)
+    calibration.finish().ok_or(Inconsistent)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,6 +195,17 @@ impl Alignment {
     pub(crate) fn normalize(self, raw: u64) -> Option<u64> {
         u64::try_from(raw as i128 + self.offset as i128).ok()
     }
+
+    /// Intersect offset intervals rather than rebase to a changed offset.
+    pub(crate) fn intersect(self, other: Self) -> Option<Self> {
+        let lo=(self.offset as i128-self.uncertainty_ticks as i128)
+            .max(other.offset as i128-other.uncertainty_ticks as i128);
+        let hi=(self.offset as i128+self.uncertainty_ticks as i128)
+            .min(other.offset as i128+other.uncertainty_ticks as i128);
+        if lo>hi { return None; }
+        Some(Self { offset:i64::try_from(lo+(hi-lo)/2).ok()?,
+            uncertainty_ticks:u64::try_from((hi-lo+1)/2).ok()? })
+    }
 }
 
 /// A remote sample was taken after the BSP's release request and before
@@ -157,9 +216,12 @@ pub(crate) fn align(bsp_hz: u64, ap_hz: u64,
                     mut exchange: impl FnMut(u32) -> Option<Bracket>) -> Option<Alignment> {
     if !compatible(bsp_hz, ap_hz) { return None; }
     let (mut lo, mut hi) = (i128::MIN, i128::MAX);
+    let mut previous: Option<Bracket> = None;
     for sequence in 1..=EXCHANGES {
         let sample = exchange(sequence)?;
-        if sample.after < sample.before { return None; }
+        if sample.after < sample.before || previous.map_or(false, |p|
+            sample.before < p.after || sample.remote <= p.remote) { return None; }
+        previous = Some(sample);
         lo = lo.max(sample.before as i128 - sample.remote as i128);
         hi = hi.min(sample.after as i128 - sample.remote as i128);
         if lo > hi { return None; }
@@ -177,7 +239,10 @@ pub(crate) fn align(bsp_hz: u64, ap_hz: u64,
 /// Release/Acquire edges make the timestamp bracket valid even on SMP.
 pub(crate) struct Peer {
     ready: AtomicBool,
+    sealed: AtomicBool,
     hz: AtomicU64,
+    first_raw: AtomicU64,
+    last_raw: AtomicU64,
     request: AtomicU32,
     response: AtomicU32,
     remote: AtomicU64,
@@ -187,16 +252,44 @@ pub(crate) struct Peer {
 
 impl Peer {
     pub const fn new() -> Self {
-        Self { ready: AtomicBool::new(false), hz: AtomicU64::new(0),
+        Self { ready: AtomicBool::new(false), sealed: AtomicBool::new(false), hz: AtomicU64::new(0),
+            first_raw: AtomicU64::new(0), last_raw: AtomicU64::new(0),
             request: AtomicU32::new(0), response: AtomicU32::new(0),
             remote: AtomicU64::new(0), offset: AtomicI64::new(0),
             uncertainty: AtomicU64::new(u64::MAX) }
     }
 
     /// Publish once, on the CPU being qualified, before answering requests.
-    pub fn publish_rate(&self, hz: Option<u64>) {
-        self.hz.store(hz.unwrap_or(0), Ordering::Relaxed);
+    pub fn publish_rate(&self, rate: Option<QualifiedRate>) {
+        // One owner CPU during boot, before the SMP release barrier.
+        if self.ready() { return; }
+        if let Some(rate)=rate {
+            self.first_raw.store(rate.first,Ordering::Relaxed);
+            self.last_raw.store(rate.last,Ordering::Relaxed);
+            self.hz.store(rate.hz(),Ordering::Relaxed);
+        }
         self.ready.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn qualification(&self) -> Option<QualifiedRate> {
+        Some(QualifiedRate{hz:self.rate()?,
+            first:self.first_raw.load(Ordering::Relaxed),
+            last:self.last_raw.load(Ordering::Acquire)})
+    }
+
+    /// An independently repeated rate measurement must also continue
+    /// raw time. Keep the original qualified rate and extend only the
+    /// observed floor, before sealing startup metadata.
+    pub(crate) fn confirm_rate(&self, again:QualifiedRate)->bool {
+        let Some(first)=self.qualification() else {return false;};
+        if self.sealed.load(Ordering::Acquire) || !rates_match(first,again) ||
+            again.first<first.last { return false; }
+        self.last_raw.store(again.last,Ordering::Release);
+        true
+    }
+
+    pub(crate) fn last_verified_raw(&self)->u64 {
+        self.last_raw.load(Ordering::Acquire).max(self.remote.load(Ordering::Acquire))
     }
 
     pub fn ready(&self) -> bool { self.ready.load(Ordering::Acquire) }
@@ -220,11 +313,14 @@ impl Peer {
                             wait: impl FnOnce(&Self, u32) -> bool) -> Option<Bracket> {
         if sequence == 0 || sequence <= self.request.load(Ordering::Relaxed) ||
            self.rate().is_none() { return None; }
+        let previous=self.remote.load(Ordering::Acquire);
         let before = timestamp();
         self.request.store(sequence, Ordering::Release);
         if !wait(self, sequence) || !self.answered(sequence) { return None; }
         let after = timestamp();
         let remote = self.remote.load(Ordering::Relaxed);
+        if remote<self.last_raw.load(Ordering::Acquire) ||
+            (previous!=0 && remote<=previous) {return None;}
         Some(Bracket { before, remote, after })
     }
 
@@ -232,9 +328,31 @@ impl Peer {
         self.response.load(Ordering::Acquire) == sequence
     }
 
-    pub fn publish_alignment(&self, alignment: Alignment) {
+    pub fn publish_alignment(&self, alignment: Alignment) -> bool {
+        // BSP is the sole writer before global source publication.
+        if self.sealed.load(Ordering::Acquire) { return false; }
         self.offset.store(alignment.offset, Ordering::Relaxed);
         self.uncertainty.store(alignment.uncertainty_ticks, Ordering::Release);
+        true
+    }
+
+    /// Called after all boot exchanges with APs behind the release barrier.
+    pub(crate) fn seal(&self) -> bool {
+        if self.qualification().is_none() || self.alignment().is_none() { return false; }
+        self.sealed.store(true,Ordering::Release);
+        true
+    }
+
+    pub(crate) fn last_request(&self) -> u32 {
+        self.request.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn refine_alignment(&self, alignment: Alignment) -> Option<Alignment> {
+        let alignment=match self.alignment() {
+            Some(old)=>old.intersect(alignment)?,
+            None=>alignment,
+        };
+        self.publish_alignment(alignment).then_some(alignment)
     }
 
     pub fn alignment(&self) -> Option<Alignment> {
@@ -252,16 +370,16 @@ impl Peer {
             self.ready()
         }).ok()?;
         let ap_hz = self.rate()?;
+        let start=self.last_request();
         let alignment = align(bsp_hz, ap_hz, |sequence| {
             // Maintain the shared epoch between (not within) the measured
             // round trips. The fast acquire path gives a tight bracket.
             maintain();
-            self.exchange(sequence, || read(), |peer, seq| {
+            self.exchange(start.checked_add(sequence)?, || read(), |peer, seq| {
                 reference.wait_until(20_000_000, || peer.answered(seq)).is_ok()
             })
         })?;
-        self.publish_alignment(alignment);
-        Some(alignment)
+        self.refine_alignment(alignment)
     }
 }
 

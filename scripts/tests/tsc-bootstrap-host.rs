@@ -1,33 +1,53 @@
-//! Pure tests of the real startup transport and the runtime epoch.
+//! Actual boot transport, qualified source selection and TSC epoch.
 #![allow(dead_code)]
 #[path="../../kernel/reference_clock.rs"] mod reference_clock;
 #[path="../../kernel/tsc.rs"] mod tsc;
 #[path="../../kernel/clock_quorum.rs"] mod clock_quorum;
-#[path="../../kernel/pit.rs"] mod pit;
 #[path="../../kernel/bringup_clock.rs"] mod bringup_clock;
 #[path="../../kernel/tsc_epoch.rs"] mod tsc_epoch;
 
 use bringup_clock::BringupClock;
 use reference_clock::WaitError;
-use tsc::Alignment;
-use tsc_epoch::{Epoch,Fault,Member,ObservationPhase,Roster,Sample};
+use tsc::{Alignment,Peer};
+use tsc_epoch::{BootSource,Epoch,Fault,Roster,Sample,select};
 const HZ:u64=3_000_000_000;
 const BASE:u64=3_000_000_000;
-const BSP:Member=Member{id:7,hz:HZ,alignment:Alignment{offset:0,uncertainty_ticks:0}};
-const AP:Member=Member{id:201,hz:HZ,alignment:Alignment{offset:-30_000,uncertainty_ticks:300}};
+const BSP:u8=7;
+const AP:u8=201;
+const ZERO:Alignment=Alignment{offset:0,uncertainty_ticks:0};
+const OFFSET:Alignment=Alignment{offset:-30_000,uncertainty_ticks:300};
 
-fn at(member:Member,normalized:u64)->Sample {
-    Sample{member,raw:u64::try_from(normalized as i128-member.alignment.offset as i128).unwrap()}
-}
-fn epoch()->Epoch {
-    let roster=Roster::qualify(7,HZ,&[7,201],[BSP,AP]).unwrap();
-    let first=at(BSP,BASE);
-    Epoch::new(roster,first,first,65_000).unwrap()
-}
-fn ticks(pit_ticks:u16)->u64 {
-    (pit_ticks as u128*HZ as u128/1_193_182) as u64
+
+// Synthetic independent observations, never privileged hardware I/O.
+// The test uses the production proof constructor.
+fn proof(hz:u64)->tsc::QualifiedRate {
+    let caps=tsc::Capabilities{available:true,invariant:true,nominal_hz:Some(hz)};
+    let mut calibration=tsc::Calibration::new(caps);
+    for i in 0..3u64 {
+        let start=1_000_000+i*(hz/10);
+        let end=start+hz/20;
+        calibration.observe(tsc::Observation{before_start:start,after_start:start,
+            before_end:end,after_end:end,reference_ns:50_000_000}).unwrap();
+    }
+    calibration.finish().unwrap()
 }
 
+fn peer(rate:Option<tsc::QualifiedRate>,alignment:Option<Alignment>)->Peer {
+    let p=Peer::new();
+    p.publish_rate(rate);
+    if let Some(a)=alignment { assert!(p.publish_alignment(a)); }
+    p
+}
+fn fleet()->(Peer,Peer) {
+    (peer(Some(proof(HZ)),Some(ZERO)),peer(Some(proof(HZ)),Some(OFFSET)))
+}
+fn epoch<'a>(bsp:&'a Peer,ap:&'a Peer)->Epoch<'a> {
+    let roster=Roster::qualify(BSP,&[BSP,AP],[(BSP,bsp),(AP,ap)]).unwrap();
+    Epoch::new(roster,Sample{id:BSP,raw:BASE}).unwrap()
+}
+fn at(id:u8,normalized:u64)->Sample {
+    Sample{id,raw:if id==AP { normalized+30_000 } else { normalized }}
+}
 #[test]
 fn startup_waits_use_elapsed_local_hardware_not_poll_count() {
     let mut raw=100u64;
@@ -39,197 +59,125 @@ fn startup_waits_use_elapsed_local_hardware_not_poll_count() {
     assert_eq!(BringupClock::local_poll(HZ,100,10,5,||panic!("already complete"),||true),Ok(None));
 }
 
+
+#[test]
+fn safe_selection_prefers_physical_and_requires_complete_proof() {
+    assert!(matches!(select(true,||panic!("physical source needs no TSC")),Some(BootSource::Physical)));
+    assert!(select(false,||None).is_none());
+    let (bsp,ap)=fleet();
+    assert!(matches!(select(false,||Roster::qualify(BSP,&[BSP,AP],[(BSP,&bsp),(AP,&ap)])),
+        Some(BootSource::Tsc(_))));
+    let unqualified=peer(None,Some(OFFSET));
+    assert!(select(false,||Roster::qualify(BSP,&[BSP,AP],[(BSP,&bsp),(AP,&unqualified)])).is_none());
+}
+
 #[test]
 fn incomplete_duplicate_or_misaligned_fleet_cannot_publish() {
-    assert!(Roster::qualify(7,HZ,&[7,201],[BSP]).is_none());
-    assert!(Roster::qualify(7,HZ,&[7,201],[BSP,BSP]).is_none());
-    assert!(Roster::qualify(7,HZ,&[7,7],[BSP]).is_none());
-    assert!(Roster::qualify(7,HZ,&[201],[AP]).is_none());
-    assert!(Roster::qualify(7,HZ,&[7,201],[BSP,Member{hz:HZ+10_000_000,..AP}]).is_none());
-    assert!(Roster::qualify(7,HZ,&[7,201],[BSP,Member{alignment:Alignment{uncertainty_ticks:300_001,..AP.alignment},..AP}]).is_none());
-    assert!(Roster::qualify(7,HZ,&[7],[Member{alignment:Alignment{offset:1,..BSP.alignment},..BSP}]).is_none());
-    assert!(Roster::qualify(7,HZ,&[7],[BSP]).is_some());
-    assert!(Roster::qualify(7,HZ,&[7,201],[AP,BSP]).is_some());
-}
-
-#[test]
-fn missing_or_late_independent_count_prevents_publication() {
-    for count in [0,100,pit::REARM_COUNT] {
-        let roster=Roster::qualify(7,HZ,&[7,201],[BSP,AP]).unwrap();
-        let s=at(BSP,BASE);
-        assert!(Epoch::new(roster,s,s,count).is_none());
-    }
-    let roster=Roster::qualify(7,HZ,&[7,201],[BSP,AP]).unwrap();
-    assert!(Epoch::new(roster,at(BSP,BASE),at(AP,BASE),65_000).is_none());
-}
-
-#[test]
-fn normalized_cpu_reads_and_rearm_preserve_the_same_absolute_epoch() {
-    let mut e=epoch();
-    let mut count=65_000u16;
-    let mut normalized=BASE;
-    let mut published=0;
-    for i in 0..100 {
-        count-=11_932;
-        normalized+=ticks(11_932);
-        let member=if i%2==0 {AP}else{BSP};
-        let s=at(member,normalized);
-        let ns=e.observe(s,s,count).unwrap();
-        assert!(ns>=published);
-        assert!(ns.abs_diff((normalized-BASE) as u128*1_000_000_000/HZ as u128)<1_000);
-        published=ns;
-        if count<=pit::REARM_COUNT {
-            normalized+=30_000; // bounded actual reprogramming interval
-            count=65_000;
-            let s=at(member,normalized);
-            assert_eq!(e.rearm(s,s,count),Ok(()));
-        }
-    }
-    assert!(published>=1_000_000_000);
-}
-
-#[test]
-fn cross_cpu_overlap_is_clamped_without_accepting_raw_regression() {
-    let mut e=epoch();
-    let raw=BASE+ticks(1193);
-    let s=at(BSP,raw);
-    let first=e.observe(s,s,65_000-1193).unwrap();
-    // A different CPU's normalized lower bound may be slightly earlier
-    // inside its startup alignment uncertainty.
-    let a=at(AP,raw-100);
-    assert_eq!(e.observe(a,a,65_000-1193),Ok(first));
-    let bad=Sample{raw:a.raw-1,..a};
-    assert_eq!(e.observe(bad,bad,65_000-1193),Err(Fault::RawRegression));
-    assert!(e.failed());
-    assert_eq!(e.observe(a,a,65_000-1193),Err(Fault::RawRegression));
-}
-
-#[test]
-fn frozen_or_conflicting_independent_reference_invalidates_epoch() {
-    for (tsc_ticks,count) in [
-        (ticks(11_932),65_000), // PIT stuck
-        (0,53_068),            // TSC stuck
-        (ticks(11_932)*2,53_068), // TSC rate jump
-        (ticks(11_932),65_001), // raw PIT regression
-        (ticks(11_932),0),      // terminal count
-        (ticks(11_932),pit::MIN_REARM_COUNT-1),
+    let (bsp,ap)=fleet();
+    assert!(Roster::qualify(BSP,&[BSP,AP],[(BSP,&bsp)]).is_none());
+    assert!(Roster::qualify(BSP,&[BSP,AP],[(BSP,&bsp),(BSP,&bsp)]).is_none());
+    assert!(Roster::qualify(BSP,&[BSP,AP],[(BSP,&bsp),(AP,&bsp)]).is_none());
+    assert!(Roster::qualify(BSP,&[BSP,BSP],[(BSP,&bsp)]).is_none());
+    assert!(Roster::qualify(BSP,&[AP],[(AP,&ap)]).is_none());
+    for p in [
+        peer(None,Some(OFFSET)),
+        peer(Some(proof(HZ)),None),
+        peer(Some(proof(HZ+10_000_000)),Some(OFFSET)),
+        peer(Some(proof(HZ)),Some(Alignment{uncertainty_ticks:300_001,..OFFSET})),
     ] {
-        let mut e=epoch();
-        let s=at(BSP,BASE+tsc_ticks);
-        assert!(e.observe(s,s,count).is_err());
-        assert!(e.failed());
+        assert!(Roster::qualify(BSP,&[BSP,AP],[(BSP,&bsp),(AP,&p)]).is_none());
     }
+    let bad_bsp=peer(Some(proof(HZ)),Some(Alignment{offset:1,..ZERO}));
+    assert!(Roster::qualify(BSP,&[BSP],[(BSP,&bad_bsp)]).is_none());
+    assert!(Roster::qualify(BSP,&[BSP],[(BSP,&bsp)]).is_some());
+    assert!(Roster::qualify(BSP,&[BSP,AP],[(AP,&ap),(BSP,&bsp)]).is_some());
 }
 
 #[test]
-fn cannot_hide_a_bad_window_by_rearming_or_migrating_mid_sample() {
-    let mut e=epoch();
-    let s=at(BSP,BASE+ticks(11_932));
-    assert!(e.observe(s,s,53_068).is_ok());
-    assert_eq!(e.rearm(s,s,65_000),Err(Fault::RearmCount)); // too soon to reset the evidence
-    assert!(e.failed());
-
-    let mut e=epoch();
-    let s=at(BSP,BASE+ticks(35_796));
-    assert!(e.observe(s,s,29_204).is_ok());
-    let late=at(BSP,s.raw+HZ/1000);
-    assert_eq!(e.rearm(late,late,65_000),Err(Fault::RearmTooLong));
-    assert!(e.failed());
-
-    let mut e=epoch();
-    let s=at(BSP,BASE+ticks(11_932));
-    assert_eq!(e.observe(s,at(AP,s.raw),53_068),Err(Fault::MemberCpuMismatch));
+fn only_bsp_may_publish_new_epoch_and_first_sample_must_be_valid() {
+    let (bsp,ap)=fleet();
+    let roster=Roster::qualify(BSP,&[BSP,AP],[(BSP,&bsp),(AP,&ap)]).unwrap();
+    assert!(Epoch::new(roster,at(AP,BASE)).is_none());
+    let roster=Roster::qualify(BSP,&[BSP,AP],[(BSP,&bsp),(AP,&ap)]).unwrap();
+    assert!(Epoch::new(roster,Sample{id:BSP,raw:1}).is_none());
 }
 
 #[test]
-fn first_epoch_fault_is_specific_and_sticky() {
-    let mut e=epoch();
-    let s=at(BSP,BASE+ticks(11_932));
-    assert_eq!(e.observe(s,s,65_000),Err(Fault::StepMismatch));
-    assert_eq!(e.fault(),Some(Fault::StepMismatch));
-    e.invalidate(Fault::Stalled);
-    assert_eq!(e.observe(s,s,53_068),Err(Fault::StepMismatch));
-    assert_eq!(e.fault(),Some(Fault::StepMismatch));
-
-    let mut e=epoch();
-    assert_eq!(e.observe(s,s,pit::MIN_REARM_COUNT-1),Err(Fault::LatePitCount));
-    assert_eq!(e.fault(),Some(Fault::LatePitCount));
-
-    let mut e=epoch();
-    assert_eq!(e.observe(s,s,65_001),Err(Fault::StepCount));
-    assert_eq!(e.fault(),Some(Fault::StepCount));
-
-    let mut e=epoch();
-    assert!(e.observe(s,s,53_068).is_ok());
-    let bad=Sample{raw:s.raw-1,..s};
-    assert_eq!(e.observe(bad,bad,53_068),Err(Fault::RawRegression));
-    assert_eq!(e.fault(),Some(Fault::RawRegression));
-
-    let mut e=epoch();
-    assert!(e.observe(s,s,53_068).is_ok());
-    assert_eq!(e.rearm(s,s,65_000),Err(Fault::RearmCount));
-    assert_eq!(e.fault(),Some(Fault::RearmCount));
-
-    let mut e=epoch();
-    let s=at(BSP,BASE+ticks(35_796));
-    assert!(e.observe(s,s,29_204).is_ok());
-    let late=at(BSP,s.raw+HZ/1000);
-    assert_eq!(e.rearm(late,late,65_000),Err(Fault::RearmTooLong));
-    assert_eq!(e.fault(),Some(Fault::RearmTooLong));
+fn normalized_reads_across_sparse_cpus_and_long_idle_use_one_origin() {
+    let (bsp,ap)=fleet();
+    let mut e=epoch(&bsp,&ap);
+    let mut last=0;
+    for i in 1..=100u64 {
+        let normalized=BASE+i*HZ;
+        let id=if i%2==0 { BSP } else { AP };
+        let ns=e.observe(at(id,normalized)).unwrap();
+        assert!(ns>=last);
+        assert!(ns.abs_diff(i as u128*1_000_000_000)<=100);
+        last=ns;
+    }
+    assert!(last>=100_000_000_000);
+    // A long tickless wait requires neither a renewed calibration nor a
+    // counter-wrap assumption. Time comes from actual qualified raw TSC.
+    assert_eq!(e.observe(at(BSP,BASE+HZ*3600)),Ok(3_600_000_000_000));
+    assert!(!ap.publish_alignment(ZERO));
 }
 
 #[test]
-fn operational_failure_codes_and_pit_stages_remain_distinct() {
-    use pit::{Error,MonitorError};
+fn cross_cpu_overlap_is_clamped_but_local_regression_is_sticky() {
+    let (bsp,ap)=fleet();
+    let mut e=epoch(&bsp,&ap);
+    let raw=BASE+HZ;
+    let ns=e.observe(at(BSP,raw)).unwrap();
+    let sample=at(AP,raw-100);
+    assert_eq!(e.observe(sample),Ok(ns));
+    assert_eq!(e.observe(Sample{raw:sample.raw-1,..sample}),Err(Fault::RawRegression));
+    assert_eq!(e.invalidate(Fault::Stalled),Fault::RawRegression);
+    assert_eq!(e.observe(at(BSP,raw+HZ)),Err(Fault::RawRegression));
+}
+
+#[test]
+fn disjoint_cross_cpu_regression_and_outsider_never_publish() {
+    let (bsp,ap)=fleet();
+    let mut e=epoch(&bsp,&ap);
+    assert!(e.observe(at(BSP,BASE+HZ)).is_ok());
+    assert_eq!(e.observe(at(AP,BASE+HZ-301)),Err(Fault::GlobalRegression));
+    let mut e=epoch(&bsp,&ap);
+    assert_eq!(e.observe(at(0,BASE+HZ)),Err(Fault::UnknownCpu));
+    assert_eq!(e.observe(at(BSP,BASE+2*HZ)),Err(Fault::UnknownCpu));
+    let mut e=epoch(&bsp,&ap);
+    assert_eq!(e.observe(Sample{id:AP,raw:29_999}),Err(Fault::Normalization));
+    let mut e=epoch(&bsp,&ap);
+    assert_eq!(e.observe(Sample{id:AP,raw:100_000}),Err(Fault::RawRegression));
+}
+
+#[test]
+fn repeated_overlapping_reads_cannot_gradually_move_bound_backwards() {
+    let (bsp,ap)=fleet();
+    let mut e=epoch(&bsp,&ap);
+    let raw=BASE+HZ;
+    let ns=e.observe(at(BSP,raw)).unwrap();
+    for i in 0..=300 {
+        assert_eq!(e.observe(at(AP,raw-300+i)),Ok(ns));
+    }
+    // The BSP's raw value is not locally regressing, but it is now
+    // behind a newer nonoverlapping observation from the AP.
+    assert!(e.observe(at(AP,raw+1000)).unwrap()>ns);
+    assert_eq!(e.observe(at(BSP,raw+699)),Err(Fault::GlobalRegression));
+}
+
+#[test]
+fn stall_guard_cannot_renew_failed_epoch() {
+    let (bsp,ap)=fleet();
+    let mut e=epoch(&bsp,&ap);
+    assert_eq!(e.observe(at(BSP,BASE)),Ok(0));
+    assert_eq!(e.invalidate(Fault::Stalled),Fault::Stalled);
+    assert_eq!(e.observe(at(AP,BASE+HZ)),Err(Fault::Stalled));
+    for code in 1..=6 {
+        let f=Fault::from_code(code).unwrap();
+        assert_eq!(f as u8,code);
+        assert!(f.message().len()<=96);
+    }
     assert_eq!(Fault::from_code(0),None);
-    for code in 1..=Fault::BracketUpperOverflow as u8 {
-        let fault=Fault::from_code(code).unwrap();
-        assert_eq!(fault as u8,code);
-        assert!(fault.message().starts_with(b"SYSTEM CLOCK: TSC/PIT epoch unavailable: "));
-        assert!(fault.message().len()<=96);
-    }
-    assert_eq!(Fault::pit_read(MonitorError::Read(Error::NoEdge)),Fault::PitReadTerminal);
-    assert_eq!(Fault::pit_rearm(MonitorError::Read(Error::NoEdge)),Fault::RearmReadTerminal);
-    assert_eq!(Fault::pit_rearm(MonitorError::Program(Error::NoEdge)),Fault::RearmProgramNoEdge);
-    assert_eq!(Fault::pit_rearm(MonitorError::OutsideRearmWindow),Fault::RearmOldCount);
-    assert_eq!(Fault::pit_read(MonitorError::NotLoaded),Fault::PitReadNotLoaded);
-}
-
-#[test]
-fn roster_rejects_each_distinct_condition_without_generic_fallback() {
-    let good=at(BSP,BASE);
-    let wrong_id=Sample{member:Member{id:8,..BSP},..good};
-    let wrong_rate=Sample{member:Member{hz:HZ+10_000_000,..BSP},..good};
-    let zero_rate=Sample{member:Member{hz:0,..BSP},..good};
-    let uncertain=Sample{member:Member{alignment:Alignment{uncertainty_ticks:300_001,..BSP.alignment},..BSP},..good};
-    let backwards=Sample{raw:good.raw-1,..good};
-    let under=Sample{member:Member{alignment:Alignment{offset:-1,..BSP.alignment},..BSP},raw:0};
-    let over_before=Sample{member:Member{alignment:Alignment{offset:1,..BSP.alignment},..BSP},raw:u64::MAX-1};
-    let over_after=Sample{raw:u64::MAX,..over_before};
-    let lower=Sample{member:Member{alignment:Alignment{uncertainty_ticks:1,..BSP.alignment},..BSP},raw:0};
-    let upper=Sample{member:lower.member,raw:u64::MAX};
-    let width=Sample{raw:good.raw+600_001,..good};
-    for (before,after,fault) in [
-        (good,wrong_id,Fault::MemberCpuMismatch),
-        (good,wrong_rate,Fault::MemberRateMismatch),
-        (good,uncertain,Fault::MemberAlignmentMismatch),
-        (wrong_id,wrong_id,Fault::MemberAbsent),
-        (zero_rate,zero_rate,Fault::RosterZeroRate),
-        (wrong_rate,wrong_rate,Fault::RosterRateMismatch),
-        (uncertain,uncertain,Fault::RosterUncertainty),
-        (good,backwards,Fault::BracketRawRegression),
-        (under,under,Fault::NormalizeBefore),
-        (over_before,over_after,Fault::NormalizeAfter),
-        (lower,lower,Fault::BracketLowerUnderflow),
-        (upper,upper,Fault::BracketUpperOverflow),
-        (good,width,Fault::BracketWidth),
-    ] {
-        let mut e=epoch();
-        assert_eq!(e.observe(before,after,53_068),Err(fault));
-        assert_eq!(e.fault(),Some(fault));
-        assert_eq!(e.invalidate(Fault::Stalled),fault);
-        assert_eq!(e.observe(good,good,53_068),Err(fault));
-    }
 }
 
 #[test]
@@ -253,50 +201,3 @@ fn checked_bracket_preserves_exact_width_and_arithmetic_limits() {
     }
 }
 
-#[test]
-fn rejected_complete_observation_retains_raw_inputs_and_stage() {
-    let mut e=epoch();
-    let s=at(BSP,BASE+ticks(35_796));
-    assert!(e.observe(s,s,29_204).is_ok());
-    let after=Sample{raw:s.raw+600_001,..s};
-    assert_eq!(e.rearm(s,after,65_000),Err(Fault::BracketWidth));
-    assert_eq!(e.failure_words(Fault::BracketWidth,ObservationPhase::Rearm,s,after,65_000),
-        [1,Fault::BracketWidth as u64,2,65_000,29_204,HZ,7,7,s.raw,after.raw,HZ,HZ,0,0,0,0]);
-    assert_eq!(e.invalidate(Fault::Stalled),Fault::BracketWidth);
-    assert_eq!(e.rearm(s,s,65_000),Err(Fault::BracketWidth));
-    let mut e=epoch();
-    let before=at(AP,BASE+ticks(11_932));
-    let after=Sample{raw:before.raw+600_001,..before};
-    assert_eq!(e.observe(before,after,53_068),Err(Fault::BracketWidth));
-    assert_eq!(e.failure_words(Fault::BracketWidth,ObservationPhase::Observe,before,after,53_068),
-        [1,Fault::BracketWidth as u64,1,53_068,65_000,HZ,201,201,before.raw,after.raw,
-         HZ,HZ,(-30_000i64) as u64,(-30_000i64) as u64,300,300]);
-}
-
-#[test]
-fn short_new_latch_does_not_justify_unobserved_rearm_time() {
-    use clock_quorum::{BracketError, TscBracket, Witness};
-    let roster=Roster::qualify(BSP.id,HZ,&[BSP.id],[BSP]).unwrap();
-    let first=at(BSP,BASE);
-    let mut e=Epoch::new(roster,first,first,65_000).unwrap();
-    let old=at(BSP,BASE+ticks(65_000-27_124));
-    assert!(e.observe(old,old,27_124).is_ok());
-
-    // Long programming/verification work is not necessarily a wide
-    // count latch. A tight new latch by itself proves no continuity
-    // over the disabled old counter. The present single-channel API
-    // must not be fed a shortened bracket in place of the whole reset.
-    let new_before=Sample{raw:old.raw+700_000,..old};
-    let new_after=Sample{raw:new_before.raw+3_000,..new_before};
-    let witness=|s:Sample| Witness{cpu:s.member.id,hz:s.member.hz,
-        ticks:s.raw,uncertainty_ticks:0};
-    assert!(TscBracket::checked(witness(new_before),witness(new_after)).is_ok());
-    assert_eq!(e.rearm(old,new_after,65_458),Err(Fault::BracketWidth));
-    assert_eq!(e.fault(),Some(Fault::BracketWidth));
-
-    // A genuinely wide count observation must still be rejected, even
-    // with no programming delay and no CPU or alignment change.
-    let wide=Sample{raw:new_before.raw+600_001,..new_before};
-    assert_eq!(TscBracket::checked(witness(new_before),witness(wide)),
-        Err(BracketError::Width));
-}

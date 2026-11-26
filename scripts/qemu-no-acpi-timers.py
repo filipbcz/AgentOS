@@ -207,10 +207,9 @@ def kernel_postmortem(qmp, dest, ram):
     result={"result":"diagnostic","kernel_base":base}
     for wanted,tag,maximum in [
         ("::logger::LOGGER","kernel-logger",4096),
-        ("::pit::MONITOR_ACTIVE","pit-monitor-active",1),
         ("::system_clock::CLOCK","system-clock",65536),
-        ("::system_clock::TSC_PIT_FAILURE","tsc-pit-failure",1),
-        ("::system_clock::TSC_PIT_FAILURE_DETAIL","tsc-pit-failure-detail",128),
+        ("::system_clock::TSC_FAILURE","tsc-failure",1),
+        ("::system_clock::TSC_FAILURE_DETAIL","tsc-failure-detail",32),
     ]:
         matches=[]
         for line in symbols.splitlines():
@@ -236,43 +235,16 @@ def kernel_postmortem(qmp, dest, ram):
             # Search only this precise mutable object, not ELF string data.
             record["unavailable_event_in_ring"]=(
                 b"SYSTEM CLOCK: no trustworthy elapsed time; epoch unavailable" in raw or
-                b"SYSTEM CLOCK: TSC/PIT epoch unavailable:" in raw)
+                b"SYSTEM CLOCK: TSC unavailable:" in raw)
             record["clock_messages"]=[m.decode("ascii") for m in
                 re.findall(rb"SYSTEM CLOCK: [\x20-\x7e]{1,82}",raw)]
-        if tag=="pit-monitor-active":
-            record["active"]=bool(raw[0]) if raw in (b"\0",b"\1") else None
-        if tag=="tsc-pit-failure":
-            # A single kernel-owned atomic byte, not a guessed Rust layout.
-            # Zero is no latched fault; the exact enum mapping is in the
-            # source revision of kernel/tsc_epoch.rs. Never infer a reason
-            # from a missing symbol or from zero.
+        if tag=="tsc-failure":
             record["first_failure_code"]=raw[0]
-        if tag=="tsc-pit-failure-detail":
-            # Versioned, fixed native x86-64 words, not a Rust struct layout.
-            # Read only after the terminal outcome. A missing, torn or
-            # inconsistent record is inconclusive and never passes a test.
-            if size==128:
-                values=struct.unpack("<16Q",raw)
-                keys=("version","fault_code","phase_code","pit_count","previous_pit_count",
-                      "roster_hz","before_cpu","after_cpu","before_raw","after_raw",
-                      "before_member_hz","after_member_hz","before_offset","after_offset",
-                      "before_uncertainty_ticks","after_uncertainty_ticks")
-                detail=dict(zip(keys,values))
-                for key in ("before_offset","after_offset"):
-                    if detail[key]>=1<<63:
-                        detail[key]-=1<<64
-                code=result.get("tsc-pit-failure",{}).get("first_failure_code")
-                consistent=(detail["version"]==1 and code not in (None,0)
-                            and detail["fault_code"]==code and detail["phase_code"] in (1,2))
-                record["consistent_with_first_fault"]=consistent
-                record["detail"]=detail
-                if consistent:
-                    detail["phase"]={1:"observe",2:"rearm"}[detail["phase_code"]]
-                    detail["raw_delta_ticks"]=detail["after_raw"]-detail["before_raw"]
-                    if detail["roster_hz"]:
-                        detail["raw_delta_ns_floor"]=detail["raw_delta_ticks"]*1_000_000_000//detail["roster_hz"]
-            else:
-                record["reason"]="unexpected versioned detail extent"
+        if tag=="tsc-failure-detail" and size==32:
+            version,code,cpu,ticks=struct.unpack("<4Q",raw)
+            record["consistent_with_first_fault"]=(version==1 and code!=0 and
+                code==result.get("tsc-failure",{}).get("first_failure_code"))
+            record["detail"]={"version":version,"fault_code":code,"cpu":cpu,"raw":ticks}
         result[tag]=record
     return result
 
@@ -572,13 +544,29 @@ def scenario(args):
                 data=serial.read_bytes()
                 text=data.decode("ascii",errors="replace")
                 smoke.boot_log.verify(data,"info","both")
-                clocks=re.findall(r"(?m)^\[INFO\] SYSTEM CLOCK: (HPET64|HPET32|ACPI PM24|ACPI PM32|TSC \(independent finite PIT watchdog\))\r?$",text)
-                expected=("ACPI PM24","ACPI PM32") if args.profile=="chain" else ("TSC (independent finite PIT watchdog)",)
+                clocks=re.findall(r"(?m)^\[INFO\] SYSTEM CLOCK: (HPET64|HPET32|ACPI PM24|ACPI PM32|TSC \(qualified invariant clocksource\))\r?$",text)
+                expected=("ACPI PM24","ACPI PM32") if args.profile=="chain" else ("TSC (qualified invariant clocksource)",)
                 require(len(clocks)==1 and clocks[0] in expected,
                         "No unique expected actual clock selection")
                 apics=[int(x,16) for x in re.findall(
                     r"(?m)^AGENTOS TASK (?:BSP|AP) APIC=([0-9a-f]{16}) TIMER-WAKES=0000000000000003\r?$",text)]
                 require(len(apics)==len(set(apics))==args.cpus,"Missing actual per-CPU timer wakes")
+                if args.profile!="chain":
+                    # Ordinary diagnostics of the actual boot-qualified
+                    # fleet, not fabricated test-only CPU capabilities.
+                    qualified={}
+                    for cpu,hz,offset,error in re.findall(
+                        r"(?m)^\[INFO\] TSC APIC=(\d+) HZ=(\d+) OFFSET=(-?\d+) ERROR-TICKS=(\d+)\r?$",text):
+                        qualified[int(cpu)]=(int(hz),int(offset),int(error))
+                    require(set(qualified)==set(apics),"Incomplete qualified TSC diagnostic roster")
+                    bsp=int(re.search(r"(?m)^AGENTOS TASK BSP APIC=([0-9a-f]{16}) ",text)[1],16)
+                    rate=qualified[bsp][0]
+                    require(rate>0 and qualified[bsp][1:]==(0,0),"Invalid BSP TSC qualification")
+                    require(all(hz>0 and abs(hz-rate)*1000<=min(hz,rate) and
+                                error*1_000_000_000<=rate*100_000
+                                for hz,offset,error in qualified.values()),
+                            "Inconsistent TSC fleet diagnostics")
+                    receipt["qualified_tsc_cpus"]=qualified
                 smoke.processes.verify(text,apics)
                 smoke.supervisor.verify(text,args.cpus)
                 smoke.orphans.verify(text,args.cpus)
@@ -587,7 +575,7 @@ def scenario(args):
                 receipt["migration"]=smoke.migration.verify(text,args.cpus)
                 smoke.service_manager.verify(text)
                 receipt["runtime_session"]=smoke.session.verify(data,(dest/"com1-input.bin").read_bytes(),
-                    True,args.cpus,aClockMaintenanceMs=1000 if args.profile=="chain" else 10)
+                    True,args.cpus,aClockMaintenanceMs=1000)
                 receipt["system_clock"]=clocks[0]
                 receipt["boot_verified"]=True
             finally:
@@ -611,7 +599,7 @@ def scenario(args):
                     print("Independent platform proof unavailable:",exc,file=sys.stderr,flush=True)
         require(receipt["boot_verified"] and receipt["platform_verified"] and
                 receipt.get("guest_invariant_tsc") is True,
-                "Missing actual successful TSC/PIT boot or independently verified platform")
+                "Missing actual successful qualified TSC boot or independently verified platform")
         receipt["result"]="pass"
     except Exception as exc:
         receipt["failure"]=str(exc)
@@ -638,7 +626,7 @@ def scenario(args):
                     receipt["clock_diagnostics"]=[line for line in lines if
                         any(key in line for key in ("SYSTEM CLOCK:","BRINGUP CLOCK:",
                             "TSC-HZ=","TSC APIC=","TSC CPU","AGENTOS TASK ","SMP FAILED"))][:80]
-                    receipt["fallback_selected"]=("[INFO] SYSTEM CLOCK: TSC (independent finite PIT watchdog)" in lines)
+                    receipt["fallback_selected"]=("[INFO] SYSTEM CLOCK: TSC (qualified invariant clocksource)" in lines)
                     receipt["shell_ready"]=b"AGENTOS SHELL READY\r\nagentos> " in data
                     print("Actual clock/CPU diagnostics:",json.dumps(receipt["clock_diagnostics"]),flush=True)
                 if receipt["result"]!="pass":

@@ -2,6 +2,8 @@
 //! Physical counter reads, modulo extension and source transitions are
 //! serialized by one IRQ-safe SMP gate. Qualified normalized TSC can
 //! preserve time during bounded holdover, never certify its own rate.
+//! A boot-qualified invariant TSC may be selected if no physical epoch
+//! exists. Its ordinary reads do not reprogram the calibration PIT.
 use crate::{clock_quorum::{self, Span, TscBracket, Verdict, Witness},
     reference_clock::{PmTimer, ReferenceClock}};
 use core::{arch::asm, cell::UnsafeCell, hint::spin_loop,
@@ -62,7 +64,7 @@ pub(crate) enum ClockEvent {
     StandbyRetired = 1, PromotedPm = 2, PromotedHpet = 3,
     Unavailable = 4, StandbyRebased = 5, TscRejected = 6, PromotedTsc = 7,
     RecoveredPm = 8, RecoveredHpet = 9, StandbyRecovered = 10,
-    HpetRestarted = 11, HpetRestartFailed = 12, TscPitUnavailable = 13,
+    HpetRestarted = 11, HpetRestartFailed = 12, TscUnavailable = 13,
 }
 
 impl ClockEvent {
@@ -80,12 +82,12 @@ impl ClockEvent {
             Self::StandbyRecovered => b"SYSTEM CLOCK: quarantined standby requalified and restored",
             Self::HpetRestarted => b"SYSTEM CLOCK: quarantined HPET reprogrammed; qualification pending",
             Self::HpetRestartFailed => b"SYSTEM CLOCK: quarantined HPET restart failed",
-            Self::TscPitUnavailable => crate::tsc_epoch::Fault::from_code(TSC_PIT_FAILURE.load(Ordering::Acquire))
+            Self::TscUnavailable => crate::tsc_epoch::Fault::from_code(TSC_FAILURE.load(Ordering::Acquire))
                 .map(crate::tsc_epoch::Fault::message)
-                .unwrap_or(b"SYSTEM CLOCK: TSC/PIT epoch unavailable; reason unknown"),
+                .unwrap_or(b"SYSTEM CLOCK: TSC unavailable; reason unknown"),
         }
     }
-    pub fn error(self) -> bool { matches!(self, Self::Unavailable | Self::HpetRestartFailed | Self::TscPitUnavailable) }
+    pub fn error(self) -> bool { matches!(self, Self::Unavailable | Self::HpetRestartFailed | Self::TscUnavailable) }
 }
 
 #[derive(Clone, Copy)]
@@ -951,70 +953,41 @@ impl ClockSet {
 /// existing IRQ-safe gate. GS and the complete TSC roster are published
 /// before installing this provider.
 struct TscFallback {
-    epoch: crate::tsc_epoch::Epoch,
-    local: fn() -> Option<crate::tsc_epoch::Sample>,
+    epoch: crate::tsc_epoch::Epoch<'static>,
+    local: fn() -> crate::tsc_epoch::Sample,
 }
 
-// Persistent first-failure diagnosis for the lifetime of this epoch.
-// The event ring is bounded and may drop a contending event; retain the
-// reason separately. Only the failing path writes this under CLOCK.gate.
-static TSC_PIT_FAILURE: AtomicU8 = AtomicU8::new(0);
-
-// Kernel crash state for the first rejected complete observation. Separate
-// fixed words avoid exposing implementation-specific Rust struct layout.
-// CLOCK.gate serializes writes; the release store of TSC_PIT_FAILURE
-// publishes the completed record. A zero version means no complete sample.
+// Sticky operational diagnosis. The clock gate serializes writes; a
+// release publication of the code follows the optional raw observation.
+static TSC_FAILURE: AtomicU8 = AtomicU8::new(0);
 #[used]
-static TSC_PIT_FAILURE_DETAIL: [AtomicU64; crate::tsc_epoch::FAILURE_WORDS] = [
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+static TSC_FAILURE_DETAIL: [AtomicU64; 4] = [
+    AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0),
 ];
 
 impl TscFallback {
-    #[cold]
-    #[inline(never)]
-    fn retain_failure_detail(&self, fault: crate::tsc_epoch::Fault, phase: crate::tsc_epoch::ObservationPhase,
-                             before: crate::tsc_epoch::Sample, after: crate::tsc_epoch::Sample, count: u16) {
-        if TSC_PIT_FAILURE.load(Ordering::Relaxed)!=0 { return; }
-        for (slot, value) in TSC_PIT_FAILURE_DETAIL.iter().zip(self.epoch.failure_words(fault,phase,before,after,count)) {
-            slot.store(value,Ordering::Relaxed);
-        }
-    }
-
     fn sample(&mut self) -> Option<u128> {
-        use crate::tsc_epoch::{Fault,ObservationPhase};
         if self.epoch.failed() { return None; }
-        let result = (|| {
-            let before=(self.local)().ok_or(Fault::LocalBefore)?;
-            let count=unsafe { crate::pit::read_monitor() }.map_err(Fault::pit_read)?;
-            let after=(self.local)().ok_or(Fault::LocalAfter)?;
-            let ns=self.epoch.observe(before,after,count).map_err(|fault| {
-                self.retain_failure_detail(fault,ObservationPhase::Observe,before,after,count);
-                fault
-            })?;
-            if count <= crate::pit::REARM_COUNT {
-                let before=(self.local)().ok_or(Fault::RearmLocalBefore)?;
-                let count=unsafe { crate::pit::rearm_monitor() }.map_err(Fault::pit_rearm)?;
-                let after=(self.local)().ok_or(Fault::RearmLocalAfter)?;
-                self.epoch.rearm(before,after,count).map_err(|fault| {
-                    self.retain_failure_detail(fault,ObservationPhase::Rearm,before,after,count);
-                    fault
-                })?;
-            }
-            Ok(ns)
-        })();
-        match result {
+        let sample=(self.local)();
+        match self.epoch.observe(sample) {
             Ok(ns)=>Some(ns),
-            Err(fault)=>{ self.invalidate(fault); None }
+            Err(fault)=>{ self.invalidate(fault,Some(sample)); None }
         }
     }
 
-    fn invalidate(&mut self, fault: crate::tsc_epoch::Fault) {
+    #[cold]
+    fn invalidate(&mut self, fault: crate::tsc_epoch::Fault,
+                  sample: Option<crate::tsc_epoch::Sample>) {
         let first=self.epoch.invalidate(fault);
-        unsafe { crate::pit::stop_monitor(); }
-        let _=TSC_PIT_FAILURE.compare_exchange(0,first as u8,Ordering::Release,Ordering::Relaxed);
+        if TSC_FAILURE.load(Ordering::Relaxed)!=0 { return; }
+        if let Some(sample)=sample {
+            for (slot,value) in TSC_FAILURE_DETAIL.iter().zip(
+                [1,first as u64,sample.id as u64,sample.raw]) {
+                slot.store(value,Ordering::Relaxed);
+            }
+        }
+        TSC_FAILURE.store(first as u8,Ordering::Release);
     }
 }
 
@@ -1085,26 +1058,21 @@ pub unsafe fn init(pm: Option<PmTimer>, hp: Option<ReferenceClock>, hp_candidate
     })
 }
 
-/// Publish exactly once and only with a validated complete CPU roster
-/// and an independently progressing runtime PIT. Failure leaves the
-/// public clock unavailable; the boot coordinator must not release
-/// timed device operations or userspace on that path.
-pub(crate) unsafe fn publish_tsc(roster: crate::tsc_epoch::Roster, pit_allowed: bool,
-    local: fn() -> Option<crate::tsc_epoch::Sample>) -> Result<(), &'static [u8]> {
+/// A new TSC epoch is legal only before any physical epoch was published,
+/// with all enabled CPU qualification records sealed by the coordinator.
+/// No runtime PIT acquisition, synthesized reference, or rebase.
+pub(crate) unsafe fn publish_tsc(roster: crate::tsc_epoch::Roster<'static>,
+    local: fn() -> crate::tsc_epoch::Sample) -> Result<(), &'static [u8]> {
     CLOCK.with(|state| {
         if !state.initialized || state.physical.is_some() || state.fallback.is_some() {
             return Err(b"invalid TSC epoch publication state" as &[u8]);
         }
-        let before=local().ok_or(b"missing BSP TSC sample" as &[u8])?;
-        let count=crate::pit::start_monitor(pit_allowed)
-            .ok_or(b"independent PIT runtime monitor unavailable" as &[u8])?;
-        let epoch=local().and_then(|after| crate::tsc_epoch::Epoch::new(roster,before,after,count));
-        let Some(epoch)=epoch else {
-            crate::pit::stop_monitor();
-            return Err(b"invalid initial normalized TSC/PIT bracket" as &[u8]);
-        };
+        let epoch=crate::tsc_epoch::Epoch::new(roster,local())
+            .ok_or(b"invalid initial normalized TSC sample" as &[u8])?;
         state.fallback=Some(TscFallback{epoch,local});
-        CLOCK.maintenance.store(crate::pit::MONITOR_MAINTENANCE_MS, Ordering::Release);
+        // Sparse BSP maintenance retains the separate LAPIC stall guard,
+        // even during idle. This is not independent frequency evidence.
+        CLOCK.maintenance.store(1000, Ordering::Release);
         Ok(())
     })
 }
@@ -1148,14 +1116,13 @@ pub(crate) fn snapshot() -> Option<ClockSnapshot> {
             let was_failed=fallback.epoch.failed();
             let result=fallback.sample();
             if result.is_none() && !was_failed {
-                CLOCK.event.store(ClockEvent::TscPitUnavailable as u8, Ordering::Release);
+                CLOCK.event.store(ClockEvent::TscUnavailable as u8, Ordering::Release);
                 CLOCK.maintenance.store(0, Ordering::Release);
             }
             return result.map(|ns| ClockSnapshot {
                 millis:(ns/1_000_000).min(isize::MAX as u128) as u64,
-                // The ABI is TSC-derived. The finite independent PIT
-                // intervals are validated internally, not fed back as
-                // a fabricated absolute reference to RuntimeMonitor.
+                // The ABI is TSC-derived. Never feed it back as an
+                // independent reference or renew a watchdog lease.
                 independent_ns:None, holdover:false, reference_generation:0,
             });
         }
@@ -1184,9 +1151,9 @@ pub(crate) fn expire_stalled_holdover() {
     CLOCK.with(|state| {
         if let Some(fallback)=state.fallback.as_mut() {
             if !fallback.epoch.failed() {
-                fallback.invalidate(crate::tsc_epoch::Fault::Stalled);
+                fallback.invalidate(crate::tsc_epoch::Fault::Stalled,None);
                 CLOCK.maintenance.store(0, Ordering::Release);
-                CLOCK.event.store(ClockEvent::TscPitUnavailable as u8, Ordering::Release);
+                CLOCK.event.store(ClockEvent::TscUnavailable as u8, Ordering::Release);
             }
         }
         if let Some(clocks) = state.physical.as_mut() {
@@ -1215,7 +1182,7 @@ pub(crate) fn take_event() -> Option<ClockEvent> {
         10 => Some(ClockEvent::StandbyRecovered),
         11 => Some(ClockEvent::HpetRestarted),
         12 => Some(ClockEvent::HpetRestartFailed),
-        13 => Some(ClockEvent::TscPitUnavailable),
+        13 => Some(ClockEvent::TscUnavailable),
         _ => None,
     }
 }

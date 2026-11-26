@@ -204,80 +204,32 @@ fn poll_limit_never_becomes_synthetic_elapsed_time() {
 }
 
 
-// Separate finite counter model. OUT remains high after terminal count,
-// even when the 16-bit counter subsequently wraps to a nonzero value.
-struct Finite {
-    gate:u8, count:u16, low:u8, programmed:bool, phase:u8,
-    latched:[u8;3], terminal:bool, frozen:bool, invalid:bool,
-}
-impl Finite {
-    fn new()->Self { Self{gate:0x0c,count:0,low:0,programmed:false,phase:3,
-        latched:[0;3],terminal:false,frozen:false,invalid:false} }
-    fn advance(&mut self,ticks:u32) {
-        if self.gate&1==0 || self.frozen {return;}
-        if ticks>=self.count as u32 {self.terminal=true;}
-        self.count=self.count.wrapping_sub(ticks as u16);
-    }
-}
-impl Ports for Finite {
-    fn read(&mut self,port:u16)->u8 {
-        match port {
-            0x61=>self.gate|if self.terminal{0x20}else{0},
-            0x42=>{
-                assert!(self.phase<3);
-                let value=self.latched[self.phase as usize];
-                self.phase+=1;
-                value
-            }
-            _=>panic!("unexpected finite read"),
-        }
-    }
-    fn write(&mut self,port:u16,value:u8) {
-        match port {
-            0x61=>{assert_eq!(value&2,0);self.gate=value;}
-            0x43 if value==0xb0=>{
-                assert_eq!(self.gate&3,0);
-                self.programmed=false; self.terminal=false; self.count=0;
-            }
-            0x42 if !self.programmed && self.count==0=>{
-                self.low=value;self.count=1;
-            }
-            0x42 if !self.programmed=>{
-                self.count=u16::from_le_bytes([self.low,value]);
-                self.programmed=true;
-            }
-            0x43 if value==0xc8=>{
-                assert_eq!(self.phase,3);
-                self.advance(1);
-                self.latched=[if self.invalid{0xff}else{0x30|if self.terminal{0x80}else{0}},
-                    self.count as u8,(self.count>>8) as u8];
-                self.phase=0;
-            }
-            _=>panic!("unexpected finite write {port:x}:{value:x}"),
-        }
-    }
-}
 #[test]
-fn finite_runtime_window_detects_terminal_even_after_wrapping() {
-    let mut model=Finite::new();
-    let first=pit::program_monitor(&mut model,10).unwrap();
-    assert_eq!(first,u16::MAX-2);
-    model.advance(1000);
-    let next=pit::monitor_count(&mut model).unwrap().unwrap();
-    assert_eq!(first-next,1001);
-    model.advance(131_072);
-    assert!(model.terminal);
-    assert!(model.count!=0);
-    assert_eq!(pit::monitor_count(&mut model),Err(Error::NoEdge));
+fn independent_pit_observations_create_rate_proof_and_leave_channel_silent() {
+    let hz=3_000_000_000;
+    let caps=tsc::Capabilities{available:true,invariant:true,nominal_hz:Some(hz)};
+    let ticks=Cell::new(1_000_000);
+    let mut model=Model::new(&ticks,hz,Fault::None);
+    let mut calibration=tsc::Calibration::new(caps);
+    for _ in 0..3 {
+        calibration.observe(sample(&mut model,30_000,4_000).unwrap()).unwrap();
+        assert_eq!(model.control&3,0);
+    }
+    assert_eq!(calibration.finish().unwrap().hz(),hz);
+    // A subsequent failed physical observation cannot yield a new token.
+    let mut rejected=tsc::Calibration::new(caps);
+    rejected.observe(sample(&mut model,30_000,4_000).unwrap()).unwrap();
+    model.fault=Fault::Stopped;
+    assert_eq!(sample(&mut model,30_000,4_000),Err(Error::NoEdge));
+    assert!(rejected.finish().is_none());
+    assert_eq!(model.control&3,0);
 }
+
 #[test]
-fn runtime_monitor_requires_progress_and_valid_configuration() {
-    let mut model=Finite::new();
-    model.frozen=true;
-    assert_eq!(pit::program_monitor(&mut model,5),Err(Error::NoEdge));
-    assert_eq!(model.gate&3,0);
-    let mut model=Finite::new();
-    model.invalid=true;
-    assert_eq!(pit::program_monitor(&mut model,5),Err(Error::Configuration));
-    assert_eq!(model.gate&3,0);
+fn missed_terminal_interval_cannot_become_a_calibration() {
+    let ticks=Cell::new(1_000_000);
+    let mut model=Model::new(&ticks,3_000_000_000,Fault::None);
+    // Miss more than two finite counter periods before the first poll.
+    assert_eq!(sample(&mut model,10,200_000_000),Err(Error::NoEdge));
+    assert_eq!(model.control&3,0);
 }

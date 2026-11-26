@@ -24,9 +24,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # This diagnostic batch intentionally samples only BSP deferred.
-        # Keep the complete matrix selectable for follow-up validation.
-        cpus: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '[1,2]' || '[1]') }}
+        # Verify the new clocksource on both BSP-only and SMP guests.
+        # The full profile matrix remains available by workflow_dispatch.
+        cpus: [1, 2]
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:

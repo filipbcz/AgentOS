@@ -76,13 +76,13 @@ impl BringupClock {
                                     mut maintain: impl FnMut()) -> Option<crate::tsc::Alignment> {
         self.wait_until(1_000_000_000, || { maintain(); peer.ready() }).ok()?;
         let ap_hz=peer.rate()?;
+        let start=peer.last_request();
         let alignment=crate::tsc::align(bsp_hz,ap_hz,|sequence| {
             maintain();
-            peer.exchange(sequence, || crate::tsc::read(), |p,seq|
+            peer.exchange(start.checked_add(sequence)?, || crate::tsc::read(), |p,seq|
                 self.wait_until(20_000_000,||p.answered(seq)).is_ok())
         })?;
-        peer.publish_alignment(alignment);
-        Some(alignment)
+        peer.refine_alignment(alignment)
     }
 
     pub unsafe fn delay_ns(self, duration_ns: u64) -> Result<u64, WaitError> {
