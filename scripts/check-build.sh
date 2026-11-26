@@ -169,6 +169,10 @@ printf 'Testing independent legacy PIT one-shot calibration and bounded register
 "$pRustc" --edition 2021 --test "$pRoot/scripts/tests/pit-host.rs" -o "$pOut/pit-tests"
 "$pOut/pit-tests"
 
+printf 'Testing CPU-local bootstrap deadlines and qualified SMP TSC epoch with %s\n' "$pRustc"
+"$pRustc" --edition 2021 --test "$pRoot/scripts/tests/tsc-bootstrap-host.rs" -o "$pOut/tsc-bootstrap-tests"
+"$pOut/tsc-bootstrap-tests"
+
 printf 'Testing independent TSC watchdog, CPU skew and maintenance deadlines with %s\n' "$pRustc"
 "$pRustc" --edition 2021 --test "$pRoot/scripts/tests/tsc-watchdog-host.rs" -o "$pOut/tsc-watchdog-tests"
 "$pOut/tsc-watchdog-tests"
