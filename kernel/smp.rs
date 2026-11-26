@@ -653,6 +653,21 @@ unsafe fn current_cpu() -> &'static Cpu {
     &*cpu
 }
 
+/// Called only after SMP publishes CPU-local state and with local IRQs
+/// masked by the system clock gate. It does not acquire that gate again.
+fn clock_witness() -> Option<crate::clock_quorum::Witness> {
+    use crate::tsc_watchdog::MONITOR;
+    if !MONITOR.active() { return None; }
+    let cpu = unsafe { current_cpu() };
+    if !cpu.fRuntimeReady.load(Ordering::Acquire) { return None; }
+    let alignment = cpu.tsc.alignment()?;
+    MONITOR.witness(cpu.expected_id, alignment, unsafe { crate::tsc::read() })
+}
+
+fn reject_clock_witness() {
+    crate::tsc_watchdog::MONITOR.reject();
+}
+
 unsafe fn active_root() -> usize {
     let root: usize;
     asm!("mov {}, cr3", out(reg) root, options(nomem, nostack));
@@ -1279,8 +1294,13 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
     // continuously from ordinary runtime startup, including idle CPUs.
     if let Some(hz) = bsp_rate {
         if cpus.iter().flatten().all(|cpu| cpu.tsc.rate().is_some() && cpu.tsc.alignment().is_some()) {
-            crate::tsc_watchdog::MONITOR.start(bsp as u32, hz);
-            log.event(1, b"TSC runtime watchdog enabled");
+            if crate::tsc_watchdog::MONITOR.start(bsp as u32, hz,
+                cpus.iter().flatten().map(|cpu| cpu.expected_id)) {
+                log.event(1, b"TSC runtime watchdog enabled");
+                if crate::system_clock::attach_witness(clock_witness, reject_clock_witness) {
+                    log.event(1, b"TSC witness registered for independent clock comparison");
+                }
+            }
         }
     }
     for pCpu in cpus.iter().flatten().filter(|pCpu| pCpu.expected_id != bsp) {
