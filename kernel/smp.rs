@@ -249,6 +249,7 @@ struct Cpu {
     interval: u32,
     tsc_hz: u64,
     reference: ReferenceClock,
+    legacy_pit_probe: bool,
     tsc: crate::tsc::Peer,
     tsc_watchdog: UnsafeCell<crate::tsc_watchdog::Watchdog>,
     timer_policy: UnsafeCell<crate::timer::Timer>,
@@ -300,13 +301,13 @@ impl Cpu {
         if aTarget.expected_id != self.expected_id { gRemoteWakeups.fetch_add(1, Ordering::Relaxed); }
     }
     unsafe fn create(frames: &mut Frames<'_>, apic: Lapic, id: u8, interval: u32, tsc_hz: u64,
-                     reference: ReferenceClock,
+                     reference: ReferenceClock, legacy_pit_probe: bool,
                      descriptors: Option<Descriptors>, load: &'static Load, programs: &'static Programs,
                      rsp0: usize) -> Result<&'static Self, Error> {
         let addr = frames.alloc().ok_or(b"CPU allocation" as Error)?.into_address();
         let cpu = addr as *mut Self;
         cpu.write(Self { self_address: addr, syscall_user_rsp: UnsafeCell::new(0), syscall_stack: UnsafeCell::new(0),
-                         rsp0, programs, apic, expected_id: id, interval, tsc_hz, reference,
+                         rsp0, programs, apic, expected_id: id, interval, tsc_hz, reference, legacy_pit_probe,
                          tsc: crate::tsc::Peer::new(),
                          tsc_watchdog: UnsafeCell::new(crate::tsc_watchdog::Watchdog::new()),
                          timer_policy: UnsafeCell::new(crate::timer::Timer::new(interval,
@@ -323,6 +324,19 @@ impl Cpu {
             (*(*cpu).queue.get()).spawn(frames, allocation_task, i).ok_or(b"task stack" as Error)?;
         }
         Ok(&*cpu)
+    }
+
+    /// The PIT provides an independent finite interval when a direct
+    /// ACPI calibration reference has become unresponsive. A reference
+    /// that actually measured inconsistent rates must not be bypassed.
+    unsafe fn qualify_tsc(&self) -> Option<u64> {
+        let mut maintain = || { let _ = crate::system_clock::millis(); };
+        match crate::tsc::qualify_reference(self.reference, &mut maintain) {
+            Ok(hz) => Some(hz),
+            Err(crate::tsc::QualificationError::ReferenceUnavailable) =>
+                crate::pit::qualify(self.legacy_pit_probe, &mut maintain),
+            Err(_) => None,
+        }
     }
 
     unsafe fn run_task(&self) -> Result<(), Error> {
@@ -1101,7 +1115,7 @@ unsafe extern "C" fn ap_main(cpu: &'static Cpu) -> ! {
             // Qualification is optional and separate from the initial
             // CPU-ready handshake. A failed sample cannot disable the CPU.
             let rate = if gBspQualifiedTscHz.load(Ordering::Acquire) != 0 {
-                crate::tsc::qualify(cpu.reference, || { let _ = crate::system_clock::millis(); })
+                cpu.qualify_tsc()
             } else { None };
             cpu.tsc.publish_rate(rate);
             while !cpu.load.started.load(Ordering::Acquire) {
@@ -1206,10 +1220,10 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
     let programs = &*programs;
     storage.write(Load::new(SharedFrames::new(frames), ids.len()));
     let load = &*storage;
-    let boot_cpu = load.frames.with(|f| Cpu::create(f, apic, bsp, interval, tsc_hz, clock, None, load, programs, bsp_rsp0))?;
+    let boot_cpu = load.frames.with(|f| Cpu::create(f, apic, bsp, interval, tsc_hz, clock, platform.legacy_pit_probe, None, load, programs, bsp_rsp0))?;
     gCpus[bsp as usize].store(boot_cpu.self_address, Ordering::Release);
     boot_cpu.run_task()?;
-    let bsp_rate = crate::tsc::qualify(clock, || { let _ = crate::system_clock::millis(); });
+    let bsp_rate = boot_cpu.qualify_tsc();
     boot_cpu.tsc.publish_rate(bsp_rate);
     if let Some(hz) = bsp_rate {
         boot_cpu.tsc.publish_alignment(crate::tsc::Alignment { offset: 0, uncertainty_ticks: 0 });
@@ -1223,7 +1237,7 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
         let cpu = load.frames.with(|f| {
             let descriptors = Descriptors::new(f).ok_or(b"AP descriptors" as Error)?;
             let rsp0 = descriptors.rsp0_slot();
-            Cpu::create(f, apic, id, interval, tsc_hz, clock, Some(descriptors), load, programs, rsp0)
+            Cpu::create(f, apic, id, interval, tsc_hz, clock, platform.legacy_pit_probe, Some(descriptors), load, programs, rsp0)
         })?;
         let stack = load.frames.with(crate::stack::KernelStack::allocate)
             .ok_or(b"AP stack" as Error)?.into_top();
