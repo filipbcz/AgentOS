@@ -53,6 +53,8 @@ const MAX_GAP_NS: u128 = 2_000_000_000;
 const MAX_ANCHOR_AGE_NS: u128 = 2_500_000_000;
 const STALL_NS: u128 = 100_000_000;
 const RECOVERY_MS: u64 = 100;
+const RESTART_STALL_NS: u128 = 300_000_000;
+const RESTART_COOLDOWN_NS: u128 = 1_000_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -60,6 +62,7 @@ pub(crate) enum ClockEvent {
     StandbyRetired = 1, PromotedPm = 2, PromotedHpet = 3,
     Unavailable = 4, StandbyRebased = 5, TscRejected = 6, PromotedTsc = 7,
     RecoveredPm = 8, RecoveredHpet = 9, StandbyRecovered = 10,
+    HpetRestarted = 11, HpetRestartFailed = 12,
 }
 
 impl ClockEvent {
@@ -75,9 +78,11 @@ impl ClockEvent {
             Self::RecoveredPm => b"SYSTEM CLOCK: requalified ACPI PM timer; leaving TSC holdover",
             Self::RecoveredHpet => b"SYSTEM CLOCK: requalified HPET; leaving TSC holdover",
             Self::StandbyRecovered => b"SYSTEM CLOCK: quarantined standby requalified and restored",
+            Self::HpetRestarted => b"SYSTEM CLOCK: quarantined HPET reprogrammed; qualification pending",
+            Self::HpetRestartFailed => b"SYSTEM CLOCK: quarantined HPET restart failed",
         }
     }
-    pub fn error(self) -> bool { self == Self::Unavailable }
+    pub fn error(self) -> bool { matches!(self, Self::Unavailable | Self::HpetRestartFailed) }
 }
 
 #[derive(Clone, Copy)]
@@ -229,6 +234,36 @@ impl StandbyProbe {
     }
 }
 
+/// Observe a stalled *quarantined* HPET using time from a different
+/// source. A moving but disputed counter is not blindly reset. The
+/// cooldown persists across failed transactions and clock transitions.
+struct RestartWatch {
+    raw: Option<u64>,
+    since: u128,
+    attempted: Option<u128>,
+}
+
+impl RestartWatch {
+    const fn new() -> Self { Self { raw: None, since: 0, attempted: None } }
+
+    fn forget(&mut self) { self.raw = None; }
+
+    fn due(&mut self, raw: u64, now: u128) -> bool {
+        if self.raw != Some(raw) || now < self.since {
+            self.raw = Some(raw);
+            self.since = now;
+            return false;
+        }
+        now-self.since >= RESTART_STALL_NS &&
+            self.attempted.map_or(true, |last| now.saturating_sub(last) >= RESTART_COOLDOWN_NS)
+    }
+
+    fn attempted(&mut self, now: u128) {
+        self.attempted = Some(now);
+        self.forget();
+    }
+}
+
 #[derive(Clone, Copy)]
 struct WitnessHooks {
     read: fn(u64) -> Option<Witness>,
@@ -255,6 +290,8 @@ pub(crate) struct ClockSet {
     recovery: [Option<Recovery>; 2],
     standby_probe: Option<StandbyProbe>,
     standby_probe_at: Option<u128>,
+    restart_watch: RestartWatch,
+    restart_hook: Option<fn(ReferenceClock) -> bool>,
     reference_generation: u64,
     witness_rejected: bool,
     witness_hooks: Option<WitnessHooks>,
@@ -272,6 +309,7 @@ impl ClockSet {
             anchor: None, stall_samples: 0, failed: false, event: None,
             triple: None, single: None, single_qualified: false,
             holdover: None, recovery, standby_probe: None, standby_probe_at: None,
+            restart_watch: RestartWatch::new(), restart_hook: None,
             reference_generation: 0,
             witness_rejected: false, witness_hooks: None }
     }
@@ -316,9 +354,22 @@ impl ClockSet {
         }
     }
 
-    /// Only devices discovered, mapped and successfully initialized at
-    /// boot are retained in this catalog. Do not touch arbitrary MMIO
-    /// addresses or an uninitialized timer during runtime recovery.
+    /// Only validated, mapped device identities are registered by boot.
+    /// A known device that did not progress can join via quarantine;
+    /// its raw history cannot influence the initially selected epoch.
+    pub(crate) fn register_quarantined(&mut self, source: ReferenceClock) -> bool {
+        if source.maintenance_ms() == Some(0) ||
+           self.recovery.iter().flatten().any(|candidate|
+               core::mem::discriminant(&candidate.source) == core::mem::discriminant(&source)) {
+            return false;
+        }
+        let Some(slot) = self.recovery.iter_mut().find(|slot| slot.is_none()) else { return false; };
+        *slot = Some(Recovery::new(source));
+        true
+    }
+
+    /// No arbitrary MMIO or unvalidated FADT addresses may enter this catalog.
+
     fn quarantined_source(&self) -> Option<ReferenceClock> {
         if self.standby.is_some() { return None; }
         self.recovery.iter().flatten()
@@ -366,6 +417,7 @@ impl ClockSet {
                 self.standby = Some(Epoch::new(source, raw));
                 self.standby_probe = None;
                 self.standby_probe_at = None;
+                self.restart_watch.forget();
                 self.triple = None;
                 self.baseline = Some(Pair {
                     low: primary.low, high: primary.high, shadow: 0,
@@ -380,6 +432,29 @@ impl ClockSet {
         }
     }
 
+    /// This is the only route to a register restart. It is never used
+    /// for an authoritative primary or an attached standby. A completed
+    /// register transaction, even if unsuccessful, invalidates all
+    /// pre-transaction candidate observations.
+    fn restart_stalled(&mut self, source: ReferenceClock, raw: u64, now: u128,
+                       restart: &mut impl FnMut(ReferenceClock) -> Option<bool>) -> bool {
+        if !matches!(source, ReferenceClock::Hpet { .. }) ||
+           (!self.using_tsc() && (source == self.primary.source || self.standby.is_some())) {
+            return false;
+        }
+        if !self.restart_watch.due(raw, now) { return false; }
+        let Some(success) = restart(source) else { return false; };
+        self.restart_watch.attempted(now);
+        self.standby_probe = None;
+        for candidate in self.recovery.iter_mut().flatten() {
+            if candidate.source == source { candidate.history = None; }
+        }
+        if self.event.is_none() {
+            self.event = Some(if success { ClockEvent::HpetRestarted } else { ClockEvent::HpetRestartFailed });
+        }
+        true
+    }
+
     fn clear_qualification(&mut self) {
         self.baseline = None;
         self.good_windows = 0;
@@ -388,6 +463,7 @@ impl ClockSet {
     }
 
     fn retire_standby(&mut self) {
+        self.restart_watch.forget();
         self.standby_probe = None;
         self.standby_probe_at = None;
         self.single = None;
@@ -444,6 +520,7 @@ impl ClockSet {
         let time = time.max(self.published_ns);
         self.base_ns = time;
         self.primary = Epoch::new(standby.source, standby.last);
+        self.restart_watch.forget();
         self.standby_probe = None;
         self.standby_probe_at = None;
         self.single = None;
@@ -469,6 +546,7 @@ impl ClockSet {
         self.single_qualified = false;
         self.clear_qualification();
         for candidate in self.recovery.iter_mut().flatten() { candidate.history = None; }
+        self.restart_watch.forget();
         self.standby_probe = None;
         self.standby_probe_at = None;
         self.holdover = Some(holdover);
@@ -477,7 +555,8 @@ impl ClockSet {
     }
 
     fn continue_holdover(&mut self, mut read: impl FnMut(ReferenceClock) -> u64,
-                         mut witness: impl FnMut() -> Option<Witness>) -> Option<u128> {
+                         mut witness: impl FnMut() -> Option<Witness>,
+                         mut restart: impl FnMut(ReferenceClock) -> Option<bool>) -> Option<u128> {
         // Only read the already initialized, mapped physical devices.
         // Their failed Epoch objects are never used to compute time again.
         let Some(before) = witness() else { return self.unavailable(); };
@@ -521,6 +600,7 @@ impl ClockSet {
             self.base_ns = time;
             self.primary = Epoch::new(source, first);
             self.standby = standby;
+            self.restart_watch.forget();
             self.standby_probe = None;
             self.standby_probe_at = None;
             self.holdover = None;
@@ -530,6 +610,16 @@ impl ClockSet {
                 ReferenceClock::Pm(_) => ClockEvent::RecoveredPm,
                 ReferenceClock::Hpet { .. } => ClockEvent::RecoveredHpet,
             });
+        } else {
+            // Both devices are still quarantined. Use the independently
+            // leased holdover time, never a candidate's own progress,
+            // to decide if a bounded restart of a stopped HPET is due.
+            for i in 0..2 {
+                if let (Some(candidate), Some(value)) = (self.recovery[i].as_ref(), raw[i]) {
+                    let source = candidate.source;
+                    self.restart_stalled(source, value, time, &mut restart);
+                }
+            }
         }
         self.publish(time)
     }
@@ -627,10 +717,19 @@ impl ClockSet {
     /// The provider only grants a bracket while all enabled CPUs have
     /// fresh independent qualification. TSC arbitrates physical source
     /// disputes and, only on explicit loss, provides bounded holdover.
-    pub(crate) fn sample_with_witness(&mut self, mut read: impl FnMut(ReferenceClock) -> u64,
-        mut witness: impl FnMut() -> Option<Witness>) -> Option<u128> {
+    pub(crate) fn sample_with_witness(&mut self, read: impl FnMut(ReferenceClock) -> u64,
+        witness: impl FnMut() -> Option<Witness>) -> Option<u128> {
+        self.sample_with_lifecycle(read, witness, |_| None)
+    }
+
+    /// The restart operation is a register-owner operation. None means
+    /// the lifecycle owner has not yet enabled runtime recovery (boot
+    /// calibration may still be using a direct hardware reference).
+    pub(crate) fn sample_with_lifecycle(&mut self, mut read: impl FnMut(ReferenceClock) -> u64,
+        mut witness: impl FnMut() -> Option<Witness>,
+        mut restart: impl FnMut(ReferenceClock) -> Option<bool>) -> Option<u128> {
         if self.failed { return None; }
-        if self.using_tsc() { return self.continue_holdover(read, witness); }
+        if self.using_tsc() { return self.continue_holdover(read, witness, restart); }
         let before = if !self.witness_rejected { witness() } else { None };
         let active = self.primary.source;
         let prior = self.primary.ns();
@@ -649,6 +748,12 @@ impl ClockSet {
             let bracket = before.and_then(|b| witness().and_then(|a| TscBracket::new(b, a)));
             let time = self.sample_single(first, last, bracket)?;
             if let (Some((source, raw)), Some(low), Some(high)) = (probe, first, last) {
+                // Do not issue writes after a contradictory independent
+                // observation or an unbounded primary readout bracket.
+                if high-low <= BRACKET_NS && (before.is_none() || self.single_qualified) &&
+                   self.restart_stalled(source, raw, time, &mut restart) {
+                    return Some(time);
+                }
                 self.qualify_standby_probe(source, raw, Span { low, high }, before.is_some());
             } else if before.is_some() && !self.single_qualified {
                 // A newly contradicted or unavailable TSC observation
@@ -858,7 +963,7 @@ impl SharedClock {
 
 static CLOCK: SharedClock = SharedClock::new();
 
-pub unsafe fn init(pm: Option<PmTimer>, hp: Option<ReferenceClock>)
+pub unsafe fn init(pm: Option<PmTimer>, hp: Option<ReferenceClock>, hp_candidate: Option<ReferenceClock>)
     -> Result<ReferenceClock, &'static [u8]> {
     CLOCK.with(|clocks| {
         if clocks.is_some() { return Err(b"system clock already initialized" as &[u8]); }
@@ -868,7 +973,13 @@ pub unsafe fn init(pm: Option<PmTimer>, hp: Option<ReferenceClock>)
             .find(|&s| s != source && s.maintenance_ms() != Some(0) && s.progressing());
         let first = source.sample();
         let standby = standby.map(|s| (s, s.sample()));
-        let set = ClockSet::new((source, first), standby);
+        let mut set = ClockSet::new((source, first), standby);
+        // PM has no enable/reset register. Its validated FADT identity
+        // can still be observed if initially stopped. HPET candidates
+        // come only from the exclusive register owner.
+        for candidate in [pm.map(ReferenceClock::Pm), hp_candidate].into_iter().flatten() {
+            set.register_quarantined(candidate);
+        }
         CLOCK.maintenance.store(set.maintenance_ms().unwrap_or(0), Ordering::Release);
         *clocks = Some(set);
         Ok(source)
@@ -885,6 +996,15 @@ pub(crate) fn attach_witness(read: fn(u64) -> Option<Witness>, reject: fn()) -> 
         clocks.witness_hooks = Some(WitnessHooks { read, reject });
         true
     })
+}
+
+/// Enable writes only after the boot-time direct reference users are
+/// finished. The clock gate serializes every subsequent restart with
+/// authoritative reads and physical source changes.
+pub(crate) fn enable_hpet_recovery(restart: fn(ReferenceClock) -> bool) {
+    CLOCK.with(|clocks| {
+        if let Some(clocks) = clocks.as_mut() { clocks.restart_hook = Some(restart); }
+    });
 }
 
 pub fn millis() -> Option<u64> { snapshot().map(|s| s.millis) }
@@ -904,8 +1024,10 @@ pub(crate) fn snapshot() -> Option<ClockSnapshot> {
         let clocks = clocks.as_mut()?;
         let read = clocks.witness_hooks.map(|hooks| hooks.read);
         let generation = clocks.reference_generation;
-        let result = clocks.sample_with_witness(|source| unsafe { source.sample() },
-            || read.and_then(|f| f(generation)));
+        let restart = clocks.restart_hook;
+        let result = clocks.sample_with_lifecycle(|source| unsafe { source.sample() },
+            || read.and_then(|f| f(generation)),
+            |source| restart.map(|f| f(source)));
         let maintenance = clocks.maintenance_ms().unwrap_or(0);
         if CLOCK.maintenance.load(Ordering::Relaxed) != maintenance {
             CLOCK.maintenance.store(maintenance, Ordering::Release);
@@ -946,6 +1068,8 @@ pub(crate) fn take_event() -> Option<ClockEvent> {
         8 => Some(ClockEvent::RecoveredPm),
         9 => Some(ClockEvent::RecoveredHpet),
         10 => Some(ClockEvent::StandbyRecovered),
+        11 => Some(ClockEvent::HpetRestarted),
+        12 => Some(ClockEvent::HpetRestartFailed),
         _ => None,
     }
 }
