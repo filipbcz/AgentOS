@@ -1064,13 +1064,12 @@ fn frozen_or_wrong_rate_quarantined_device_cannot_affect_primary_epoch() {
 fn quarantine_checks_cumulative_rate_not_only_individual_windows() {
     let mut rig=retired_pm();
     rig.advance(2_000_000,715_909).unwrap();
-    // Each individual window may differ by the allowed rate budget,
-    // but a new offset cannot be hidden by resetting a checkpoint.
-    // A 1ms excess in each 200ms window is valid (0.5%).
-    for _ in 0..2 {rig.advance(2_000_000,719_489).unwrap();}
+    // Each 200ms window has a ~2.08ms excess: within the individual
+    // 1% + 100us allowance, but three windows accumulate ~6.24ms,
+    // above the single cumulative allowance of ~6.16ms.
+    for _ in 0..2 {rig.advance(2_000_000,723_354).unwrap();}
     assert!(!rig.clocks.qualified());
-    // A further 6ms excess contradicts the cumulative observation.
-    rig.advance(2_000_000,737_386).unwrap();
+    rig.advance(2_000_000,723_354).unwrap();
     assert!(!rig.clocks.qualified());
     for i in 1..=3 {
         rig.advance(2_000_000,715_909).unwrap();
@@ -1159,4 +1158,43 @@ fn a_contradicting_tsc_witness_prevents_standby_qualification_against_bad_primar
         assert!(!rig.hardware.clocks.qualified());
         assert_eq!(rig.hardware.clocks.source(),Some(rig.hardware.primary));
     }
+}
+
+
+#[test]
+fn narrow_quarantined_counter_controls_idle_maintenance_and_recovers_across_wraps() {
+    // HPET32 at 50ps: the quarter-wrap maintenance interval is 53ms.
+    // Qualification windows can span several shorter register samples.
+    let mut rig=Rig::new(pm(true),hp(false,50_000),100);
+    assert_eq!(rig.observe(),Some(0));
+    rig.shadow_raw-=1;
+    rig.advance(178_977,0).unwrap();
+    assert_eq!(rig.clocks.take_event(),Some(ClockEvent::StandbyRetired));
+    assert_eq!(rig.clocks.maintenance_ms(),Some(53));
+    for i in 1..=7 {
+        rig.advance(214_773,1_200_000_000).unwrap();
+        assert_eq!(rig.clocks.qualified(),i==7);
+        assert_eq!(rig.clocks.source(),Some(rig.primary));
+    }
+    assert_eq!(rig.clocks.take_event(),Some(ClockEvent::StandbyRecovered));
+    assert_eq!(rig.clocks.maintenance_ms(),Some(53));
+}
+
+#[test]
+fn primary_regression_inside_last_quarantine_probe_cannot_promote_unqualified_device() {
+    let mut rig=retired_pm();
+    for _ in 0..3 {rig.advance(2_000_000,715_909).unwrap();}
+    assert!(!rig.clocks.qualified());
+    rig.active_raw+=2_000_000;
+    rig.shadow_raw=(rig.shadow_raw+715_909)&rig.shadow.mask();
+    let (a,b,ar,br)=(rig.primary,rig.shadow,rig.active_raw,rig.shadow_raw);
+    let mut reads=0;
+    assert_eq!(rig.clocks.sample(|source| {
+        if source==a {
+            reads+=1;
+            if reads==1 {ar} else {ar-1}
+        } else {assert_eq!(source,b);br}
+    }),None);
+    assert_eq!(rig.clocks.take_event(),Some(ClockEvent::Unavailable));
+    assert!(!rig.clocks.qualified());
 }
