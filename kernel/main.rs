@@ -172,7 +172,7 @@ pub unsafe extern "sysv64" fn kernel_main(info: &BootInfo) -> ! {
             log.event(0, reason);
         }
     }
-    let source = match system_clock::init(platform.pm_timer, hpet::reference()) {
+    let source = match system_clock::init(platform.pm_timer, hpet::reference(), hpet::candidate()) {
         Ok(source) => source,
         Err(reason) => { log.event(0, reason); halt(); }
     };
@@ -232,6 +232,10 @@ pub unsafe extern "sysv64" fn kernel_main(info: &BootInfo) -> ! {
         log.event(0, b"SMP FAILED");
         serial(b"SMP FAILED: "); serial(reason); serial(b"\r\n"); halt();
     }
+    // All direct boot calibration and INIT/SIPI reference users have
+    // completed. From now on only the shared clock owner may reset a
+    // quarantined HPET, under its IRQ-safe SMP gate.
+    system_clock::enable_hpet_recovery(|source| unsafe { hpet::restart_quarantined(source).is_ok() });
     log.event(1, b"BOOT COMPLETE");
     serial(MESSAGE);
     serial(b"\r\n");
