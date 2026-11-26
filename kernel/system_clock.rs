@@ -254,6 +254,7 @@ pub(crate) struct ClockSet {
     holdover: Option<Holdover>,
     recovery: [Option<Recovery>; 2],
     standby_probe: Option<StandbyProbe>,
+    standby_probe_at: Option<u128>,
     reference_generation: u64,
     witness_rejected: bool,
     witness_hooks: Option<WitnessHooks>,
@@ -270,7 +271,8 @@ impl ClockSet {
             base_ns: 0, published_ns: 0, baseline: None, good_windows: 0,
             anchor: None, stall_samples: 0, failed: false, event: None,
             triple: None, single: None, single_qualified: false,
-            holdover: None, recovery, standby_probe: None, reference_generation: 0,
+            holdover: None, recovery, standby_probe: None, standby_probe_at: None,
+            reference_generation: 0,
             witness_rejected: false, witness_hooks: None }
     }
 
@@ -330,12 +332,11 @@ impl ClockSet {
 
     fn due_probe(&self, low: u128) -> Option<ReferenceClock> {
         let source = self.quarantined_source()?;
-        if let Some(probe) = &self.standby_probe {
-            if probe.epoch.source == source &&
-               low.saturating_sub(probe.previous.high) <
-                   Self::probe_interval_ms(source) as u128 * 1_000_000 {
-                return None;
-            }
+        // Rate-limit the actual register access even when the previous
+        // observation was rejected and its qualification history lost.
+        if self.standby_probe_at.map_or(false, |previous|
+            low.saturating_sub(previous) < Self::probe_interval_ms(source) as u128 * 1_000_000) {
+            return None;
         }
         Some(source)
     }
@@ -364,6 +365,7 @@ impl ClockSet {
                 // crosses the quarantine boundary.
                 self.standby = Some(Epoch::new(source, raw));
                 self.standby_probe = None;
+                self.standby_probe_at = None;
                 self.triple = None;
                 self.baseline = Some(Pair {
                     low: primary.low, high: primary.high, shadow: 0,
@@ -387,6 +389,9 @@ impl ClockSet {
 
     fn retire_standby(&mut self) {
         self.standby_probe = None;
+        self.standby_probe_at = None;
+        self.single = None;
+        self.single_qualified = false;
         self.triple = None;
         self.standby = None;
         self.clear_qualification();
@@ -399,6 +404,7 @@ impl ClockSet {
         self.triple = None;
         self.standby = Some(Epoch::new(source, raw));
         self.standby_probe = None;
+        self.standby_probe_at = None;
         self.clear_qualification();
         self.event = Some(ClockEvent::StandbyRebased);
     }
@@ -406,6 +412,7 @@ impl ClockSet {
     fn unavailable(&mut self) -> Option<u128> {
         self.failed = true;
         self.standby_probe = None;
+        self.standby_probe_at = None;
         self.triple = None;
         self.single = None;
         self.single_qualified = false;
@@ -438,6 +445,9 @@ impl ClockSet {
         self.base_ns = time;
         self.primary = Epoch::new(standby.source, standby.last);
         self.standby_probe = None;
+        self.standby_probe_at = None;
+        self.single = None;
+        self.single_qualified = false;
         self.triple = None;
         self.clear_qualification();
         self.event = Some(match self.primary.source {
@@ -460,6 +470,7 @@ impl ClockSet {
         self.clear_qualification();
         for candidate in self.recovery.iter_mut().flatten() { candidate.history = None; }
         self.standby_probe = None;
+        self.standby_probe_at = None;
         self.holdover = Some(holdover);
         self.event = Some(ClockEvent::PromotedTsc);
         self.publish(time.max(self.published_ns))
@@ -511,6 +522,7 @@ impl ClockSet {
             self.primary = Epoch::new(source, first);
             self.standby = standby;
             self.standby_probe = None;
+            self.standby_probe_at = None;
             self.holdover = None;
             self.reference_generation = generation;
             self.clear_qualification();
@@ -626,8 +638,11 @@ impl ClockSet {
         let Some(standby) = self.standby.as_mut() else {
             // A retired source is read only at a bounded maintenance
             // cadence. It cannot supply elapsed time until requalified.
-            let probe = first.and_then(|low| self.due_probe(low))
-                .map(|source| (source, read(source)));
+            let probe = first.and_then(|low| {
+                let source = self.due_probe(low)?;
+                self.standby_probe_at = Some(low);
+                Some((source, read(source)))
+            });
             let last = if before.is_some() || probe.is_some() {
                 self.primary.advance(read(active))
             } else { first };
