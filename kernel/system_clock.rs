@@ -52,12 +52,14 @@ const JITTER_NS: u128 = 100_000;
 const MAX_GAP_NS: u128 = 2_000_000_000;
 const MAX_ANCHOR_AGE_NS: u128 = 2_500_000_000;
 const STALL_NS: u128 = 100_000_000;
+const RECOVERY_MS: u64 = 100;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum ClockEvent {
     StandbyRetired = 1, PromotedPm = 2, PromotedHpet = 3,
     Unavailable = 4, StandbyRebased = 5, TscRejected = 6, PromotedTsc = 7,
+    RecoveredPm = 8, RecoveredHpet = 9,
 }
 
 impl ClockEvent {
@@ -70,6 +72,8 @@ impl ClockEvent {
             Self::StandbyRebased => b"SYSTEM CLOCK: standby wrap ambiguous; requalifying",
             Self::TscRejected => b"SYSTEM CLOCK: two physical references disagree with TSC; witness retired",
             Self::PromotedTsc => b"SYSTEM CLOCK: physical references invalid; qualified TSC holdover",
+            Self::RecoveredPm => b"SYSTEM CLOCK: requalified ACPI PM timer; leaving TSC holdover",
+            Self::RecoveredHpet => b"SYSTEM CLOCK: requalified HPET; leaving TSC holdover",
         }
     }
     pub fn error(self) -> bool { self == Self::Unavailable }
@@ -113,9 +117,77 @@ impl Holdover {
     }
 }
 
+/// A previously failed device is not a clocksource until its *new* raw
+/// history agrees with the still independently qualified TSC. No old
+/// modulo residue, device reset, or absolute counter value is trusted.
+struct RecoveryHistory {
+    epoch: Epoch,
+    origin: TscBracket,
+    previous: TscBracket,
+    checkpoint: TscBracket,
+    checkpoint_ns: u128,
+    windows: u8,
+}
+
+struct Recovery {
+    source: ReferenceClock,
+    history: Option<RecoveryHistory>,
+}
+
+impl Recovery {
+    fn new(source: ReferenceClock) -> Self { Self { source, history: None } }
+
+    fn reset(&mut self, raw: u64, bracket: TscBracket) {
+        self.history = Some(RecoveryHistory {
+            epoch: Epoch::new(self.source, raw),
+            origin: bracket, previous: bracket, checkpoint: bracket,
+            checkpoint_ns: 0, windows: 0,
+        });
+    }
+
+    fn observe(&mut self, raw: u64, bracket: TscBracket) -> bool {
+        // Check the gap before interpreting a modulo delta. A plausible
+        // residue after an ambiguous wrap cannot qualify a device.
+        let Some(history) = self.history.as_mut() else {
+            self.reset(raw, bracket);
+            return false;
+        };
+        let gap = history.previous.elapsed(bracket);
+        let total = history.origin.elapsed(bracket);
+        let window = history.checkpoint.elapsed(bracket);
+        let elapsed = history.epoch.advance(raw);
+        let (Some(gap), Some(total), Some(window), Some(ns)) =
+            (gap, total, window, elapsed) else {
+                self.reset(raw, bracket);
+                return false;
+            };
+        let Some(delta) = ns.checked_sub(history.checkpoint_ns) else {
+            self.reset(raw, bracket);
+            return false;
+        };
+        if gap.high > self.source.half_span_ns() ||
+           gap.high > MAX_GAP_NS || total.high > MAX_GAP_NS ||
+           !Span::exact(ns).agrees(total) || !Span::exact(delta).agrees(window) {
+            self.reset(raw, bracket);
+            return false;
+        }
+        history.previous = bracket;
+        if window.low >= WINDOW_NS {
+            if delta < WINDOW_NS/2 {
+                self.reset(raw, bracket);
+                return false;
+            }
+            history.windows = history.windows.saturating_add(1);
+            history.checkpoint = bracket;
+            history.checkpoint_ns = ns;
+        }
+        history.windows >= QUALIFY_WINDOWS
+    }
+}
+
 #[derive(Clone, Copy)]
 struct WitnessHooks {
-    read: fn() -> Option<Witness>,
+    read: fn(u64) -> Option<Witness>,
     reject: fn(),
 }
 
@@ -136,6 +208,8 @@ pub(crate) struct ClockSet {
     single: Option<SingleAnchor>,
     single_qualified: bool,
     holdover: Option<Holdover>,
+    recovery: [Option<Recovery>; 2],
+    reference_generation: u64,
     witness_rejected: bool,
     witness_hooks: Option<WitnessHooks>,
 }
@@ -145,11 +219,14 @@ impl ClockSet {
                       standby: Option<(ReferenceClock, u64)>) -> Self {
         let standby = standby.filter(|(source, _)| *source != primary.0)
             .map(|(source, first)| Epoch::new(source, first));
+        let recovery = [Some(Recovery::new(primary.0)),
+            standby.as_ref().map(|epoch| Recovery::new(epoch.source))];
         Self { primary: Epoch::new(primary.0, primary.1), standby,
             base_ns: 0, published_ns: 0, baseline: None, good_windows: 0,
             anchor: None, stall_samples: 0, failed: false, event: None,
             triple: None, single: None, single_qualified: false,
-            holdover: None, witness_rejected: false, witness_hooks: None }
+            holdover: None, recovery, reference_generation: 0,
+            witness_rejected: false, witness_hooks: None }
     }
 
     pub(crate) fn source(&self) -> Option<ReferenceClock> {
@@ -164,6 +241,7 @@ impl ClockSet {
             millis: (ns / 1_000_000).min(isize::MAX as u128) as u64,
             independent_ns: if holdover { None } else { u64::try_from(ns).ok() },
             holdover,
+            reference_generation: self.reference_generation,
         }
     }
     pub(crate) fn qualified(&self) -> bool { self.anchor.is_some() && !self.failed }
@@ -171,7 +249,13 @@ impl ClockSet {
 
     pub(crate) fn maintenance_ms(&self) -> Option<u64> {
         if self.failed { return None; }
-        if self.using_tsc() { return Some(1000); }
+        if self.using_tsc() {
+            // Probe often enough to qualify before the independent TSC
+            // lease expires, also respecting any narrow counter width.
+            return Some(self.recovery.iter().flatten()
+                .filter_map(|candidate| candidate.source.maintenance_ms())
+                .fold(RECOVERY_MS, u64::min));
+        }
         let active = self.primary.source.maintenance_ms();
         let standby = self.standby.as_ref().and_then(|s| s.source.maintenance_ms());
         match (active, standby) {
@@ -257,17 +341,66 @@ impl ClockSet {
         self.single = None;
         self.single_qualified = false;
         self.clear_qualification();
+        for candidate in self.recovery.iter_mut().flatten() { candidate.history = None; }
         self.holdover = Some(holdover);
         self.event = Some(ClockEvent::PromotedTsc);
         self.publish(time.max(self.published_ns))
     }
 
-    fn continue_holdover(&mut self, witness: Option<Witness>) -> Option<u128> {
-        let Some(current) = witness.and_then(|w| TscBracket::new(w, w))
-            else { return self.unavailable(); };
+    fn continue_holdover(&mut self, mut read: impl FnMut(ReferenceClock) -> u64,
+                         mut witness: impl FnMut() -> Option<Witness>) -> Option<u128> {
+        // Only read the already initialized, mapped physical devices.
+        // Their failed Epoch objects are never used to compute time again.
+        let Some(before) = witness() else { return self.unavailable(); };
+        let raw = core::array::from_fn::<_, 2, _>(|i|
+            self.recovery[i].as_ref().map(|candidate| read(candidate.source)));
+        let Some(after) = witness() else { return self.unavailable(); };
+        if before.cpu != after.cpu || before.hz != after.hz || after.ticks < before.ticks {
+            return self.unavailable();
+        }
+        let Some(current) = TscBracket::new(after, after) else { return self.unavailable(); };
         let Some(time) = self.holdover.as_mut().and_then(|h| h.advance(current))
             else { return self.unavailable(); };
-        self.publish(time.max(self.published_ns))
+        let time = time.max(self.published_ns);
+        let Some(bracket) = TscBracket::new(before, after) else {
+            // A slow or uncertain register read cannot corroborate a
+            // device. It does not itself prove TSC has failed.
+            for candidate in self.recovery.iter_mut().flatten() { candidate.history = None; }
+            return self.publish(time);
+        };
+
+        let mut ready = [false; 2];
+        for i in 0..2 {
+            if let (Some(candidate), Some(raw)) = (&mut self.recovery[i], raw[i]) {
+                ready[i] = candidate.observe(raw, bracket);
+            }
+        }
+        if let Some(index) = ready.iter().position(|&qualified| qualified) {
+            // A new physical epoch starts at the current monotonic time;
+            // arbitrary reset values never become absolute timestamps.
+            // The other recovered source, if present, must qualify again
+            // as a standby against the restored physical primary.
+            let source = self.recovery[index].as_ref().unwrap().source;
+            let Some(first) = raw[index] else { return self.unavailable(); };
+            let other = 1-index;
+            let standby = if ready[other] {
+                self.recovery[other].as_ref().zip(raw[other])
+                    .map(|(candidate, first)| Epoch::new(candidate.source, first))
+            } else { None };
+            let Some(generation) = self.reference_generation.checked_add(1)
+                else { return self.unavailable(); };
+            self.base_ns = time;
+            self.primary = Epoch::new(source, first);
+            self.standby = standby;
+            self.holdover = None;
+            self.reference_generation = generation;
+            self.clear_qualification();
+            self.event = Some(match source {
+                ReferenceClock::Pm(_) => ClockEvent::RecoveredPm,
+                ReferenceClock::Hpet { .. } => ClockEvent::RecoveredHpet,
+            });
+        }
+        self.publish(time)
     }
 
     /// Called by the scheduler's independent LAPIC stalled-clock guard.
@@ -366,7 +499,7 @@ impl ClockSet {
     pub(crate) fn sample_with_witness(&mut self, mut read: impl FnMut(ReferenceClock) -> u64,
         mut witness: impl FnMut() -> Option<Witness>) -> Option<u128> {
         if self.failed { return None; }
-        if self.using_tsc() { return self.continue_holdover(witness()); }
+        if self.using_tsc() { return self.continue_holdover(read, witness); }
         let before = if !self.witness_rejected { witness() } else { None };
         let active = self.primary.source;
         let prior = self.primary.ns();
@@ -597,7 +730,7 @@ pub unsafe fn init(pm: Option<PmTimer>, hp: Option<ReferenceClock>)
 
 /// Install the runtime provider after SMP CPU-local state is initialized.
 /// Until every CPU independently qualifies, its read returns None.
-pub(crate) fn attach_witness(read: fn() -> Option<Witness>, reject: fn()) -> bool {
+pub(crate) fn attach_witness(read: fn(u64) -> Option<Witness>, reject: fn()) -> bool {
     CLOCK.with(|clocks| {
         let Some(clocks) = clocks.as_mut() else { return false; };
         if clocks.failed || clocks.witness_rejected ||
@@ -616,14 +749,16 @@ pub(crate) struct ClockSnapshot {
     pub millis: u64,
     pub independent_ns: Option<u64>,
     pub holdover: bool,
+    pub reference_generation: u64,
 }
 
 pub(crate) fn snapshot() -> Option<ClockSnapshot> {
     CLOCK.with(|clocks| {
         let clocks = clocks.as_mut()?;
         let read = clocks.witness_hooks.map(|hooks| hooks.read);
+        let generation = clocks.reference_generation;
         let result = clocks.sample_with_witness(|source| unsafe { source.sample() },
-            || read.and_then(|f| f()));
+            || read.and_then(|f| f(generation)));
         let maintenance = clocks.maintenance_ms().unwrap_or(0);
         if CLOCK.maintenance.load(Ordering::Relaxed) != maintenance {
             CLOCK.maintenance.store(maintenance, Ordering::Release);
@@ -661,6 +796,8 @@ pub(crate) fn take_event() -> Option<ClockEvent> {
         5 => Some(ClockEvent::StandbyRebased),
         6 => Some(ClockEvent::TscRejected),
         7 => Some(ClockEvent::PromotedTsc),
+        8 => Some(ClockEvent::RecoveredPm),
+        9 => Some(ClockEvent::RecoveredHpet),
         _ => None,
     }
 }
