@@ -3,6 +3,8 @@
 #![allow(dead_code)]
 #[path = "../../kernel/reference_clock.rs"]
 mod reference_clock;
+#[path = "../../kernel/clock_quorum.rs"]
+mod clock_quorum;
 #[path = "../../kernel/system_clock.rs"]
 mod system_clock;
 #[path = "../../kernel/timer.rs"]
@@ -344,4 +346,185 @@ fn concurrent_readers_use_one_continuous_epoch_after_promotion() {
     for t in threads {t.join().unwrap();}
     let rig=state.lock().unwrap();
     assert_eq!(rig.clocks.source(),Some(rig.shadow));
+}
+
+
+// The real transition machine receives three independently controlled
+// raw counter streams. Production code is never compiled in a test mode.
+use clock_quorum::{Witness, TscBracket, Span, Verdict, decide};
+const TSC_HZ: u64 = 3_000_000_000;
+const TSC_ERROR: u64 = 18_000_000; // six milliseconds on the BSP scale
+
+struct TripleRig {
+    hardware: Rig,
+    tsc_ticks: u64,
+}
+
+impl TripleRig {
+    fn new() -> Self {
+        Self { hardware: Rig::new(hp(true,100_000_000), pm(false), 0xfff000),
+               tsc_ticks: 1_000_000_000 }
+    }
+
+    fn qualified() -> Self {
+        let mut rig = Self::new();
+        assert_eq!(rig.advance(0,0,0),Some(0));
+        for i in 1..=4 {
+            assert_eq!(rig.advance(2_000_000,715_909,200_000_000),Some(i*200_000_000));
+        }
+        assert!(rig.hardware.clocks.qualified());
+        rig
+    }
+
+    fn witness(&self, cpu: u8) -> Witness {
+        Witness { cpu, ticks: self.tsc_ticks, hz: TSC_HZ, uncertainty_ticks: TSC_ERROR }
+    }
+
+    fn advance_raw(&mut self, primary: u64, standby: u64, ns: u64) {
+        let h=&mut self.hardware;
+        h.active_raw=h.active_raw.wrapping_add(primary)&h.primary.mask();
+        h.shadow_raw=h.shadow_raw.wrapping_add(standby)&h.shadow.mask();
+        self.tsc_ticks+=ns*3;
+    }
+
+    fn observe(&mut self, before: Option<Witness>, after: Option<Witness>) -> Option<u128> {
+        let h=&mut self.hardware;
+        let (a,b,ar,br)=(h.primary,h.shadow,h.active_raw,h.shadow_raw);
+        let mut samples=[before,after].into_iter();
+        h.clocks.sample_with_witness(|source|{
+            if source==a {ar} else {assert_eq!(source,b);br}
+        },||samples.next().flatten())
+    }
+
+    fn advance(&mut self, primary: u64, standby: u64, ns: u64) -> Option<u128> {
+        self.advance_raw(primary,standby,ns);
+        let w=self.witness(0);
+        self.observe(Some(w),Some(w))
+    }
+}
+
+#[test]
+fn qualified_third_clock_catches_forward_jump_before_publication() {
+    let mut rig=TripleRig::qualified();
+    assert_eq!(rig.advance(8_000_000,715_909,200_000_000),Some(1_000_000_000));
+    assert_eq!(rig.hardware.clocks.source(),Some(rig.hardware.shadow));
+    assert_eq!(rig.hardware.clocks.take_event(),Some(ClockEvent::PromotedPm));
+    assert_eq!(rig.advance(0,715_909,200_000_000),Some(1_200_000_000));
+}
+
+#[test]
+fn two_agreeing_sources_can_retire_either_bad_standby_or_bad_tsc() {
+    let mut rig=TripleRig::qualified();
+    assert_eq!(rig.advance(2_000_000,3_579_545,200_000_000),Some(1_000_000_000));
+    assert_eq!(rig.hardware.clocks.source(),Some(rig.hardware.primary));
+    assert_eq!(rig.hardware.clocks.take_event(),Some(ClockEvent::StandbyRetired));
+
+    let mut rig=TripleRig::qualified();
+    assert_eq!(rig.advance(2_000_000,715_909,800_000_000),Some(1_000_000_000));
+    assert_eq!(rig.hardware.clocks.source(),Some(rig.hardware.primary));
+    assert_eq!(rig.hardware.clocks.take_event(),Some(ClockEvent::TscRejected));
+    // The retired witness is never read again. A later physical
+    // disagreement must not use the same witness to force a switch.
+    let h=&mut rig.hardware;
+    h.active_raw+=2_000_000;
+    h.shadow_raw=(h.shadow_raw+715_909)&h.shadow.mask();
+    let (a,b,ar,br)=(h.primary,h.shadow,h.active_raw,h.shadow_raw);
+    assert_eq!(h.clocks.sample_with_witness(|source|{
+        if source==a {ar} else {assert_eq!(source,b);br}
+    },||panic!("retired TSC must not be sampled")),Some(1_200_000_000));
+}
+
+#[test]
+fn three_conflicting_clocks_cannot_publish_an_arbitrary_jump() {
+    let mut rig=TripleRig::qualified();
+    assert_eq!(rig.advance(6_000_000,1_431_818,200_000_000),None);
+    assert_eq!(rig.hardware.clocks.source(),None);
+    assert_eq!(rig.hardware.clocks.take_event(),Some(ClockEvent::Unavailable));
+}
+
+#[test]
+fn jump_inside_primary_read_bracket_is_not_valid_evidence() {
+    let mut rig=TripleRig::qualified();
+    rig.advance_raw(0,715_909,200_000_000);
+    let w=rig.witness(0);
+    let h=&mut rig.hardware;
+    let (a,b,ar,br)=(h.primary,h.shadow,h.active_raw,h.shadow_raw);
+    let mut calls=0;
+    assert_eq!(h.clocks.sample_with_witness(|source|{
+        if source==a {
+            calls+=1;
+            if calls==1 {ar} else {ar+8_000_000}
+        } else {assert_eq!(source,b);br}
+    },||Some(w)),Some(1_000_000_000));
+    assert_eq!(h.clocks.source(),Some(b));
+}
+
+#[test]
+fn incomplete_or_migrated_tsc_bracket_clears_previous_triple_evidence() {
+    for migrate in [false,true] {
+        let mut rig=TripleRig::qualified();
+        rig.advance_raw(4_000_000,715_909,200_000_000);
+        let w=rig.witness(0);
+        let after=if migrate {Some(rig.witness(1))} else {None};
+        // Preserve the established two-source policy, not an expired
+        // third vote. This disagreement invalidates the physical anchor.
+        assert_eq!(rig.observe(Some(w),after),Some(1_200_000_000));
+        assert_eq!(rig.hardware.clocks.source(),Some(rig.hardware.primary));
+        assert!(!rig.hardware.clocks.qualified());
+        rig.hardware.active_raw-=1;
+        assert_eq!(rig.advance(0,715_909,200_000_000),None);
+    }
+}
+
+#[test]
+fn bounded_overlap_does_not_replace_common_anchor_with_disputed_time() {
+    let mut rig=TripleRig::qualified();
+    // Primary says 200ms, standby about 205ms. Both fit within the
+    // TSC uncertainty; no unambiguous outlier yet.
+    assert_eq!(rig.advance(2_000_000,733_807,202_000_000),Some(1_000_000_000));
+    assert_eq!(rig.hardware.clocks.source(),Some(rig.hardware.primary));
+    assert!(!rig.hardware.clocks.qualified());
+    // Accumulated evidence now identifies a forward jump of primary.
+    let now=rig.advance(8_000_000,715_909,200_000_000).unwrap();
+    assert!((1_204_999_000..=1_205_001_000).contains(&now));
+    assert_eq!(rig.hardware.clocks.source(),Some(rig.hardware.shadow));
+}
+
+#[test]
+fn stale_third_clock_observation_is_not_used_to_choose_source() {
+    let mut rig=TripleRig::qualified();
+    // All readings progress but the interval exceeds the 2s vote
+    // window. No qualified physical anchor may survive this gap.
+    assert_eq!(rig.advance(21_000_000,7_517_044,2_100_000_000),Some(2_900_000_000));
+    assert!(!rig.hardware.clocks.qualified());
+    rig.hardware.active_raw-=1;
+    assert_eq!(rig.advance(0,715_909,200_000_000),None);
+}
+
+#[test]
+fn quorum_distinguishes_absence_overlap_and_disagreement() {
+    let ms=|v:u128| Some(Span::exact(v*1_000_000));
+    assert_eq!(decide(ms(200),ms(200),None),Verdict::PhysicalAgree);
+    assert_eq!(decide(ms(200),ms(300),None),Verdict::Ambiguous);
+    assert_eq!(decide(ms(200),ms(300),ms(200)),Verdict::ActiveAndTsc);
+    assert_eq!(decide(ms(200),ms(300),ms(300)),Verdict::StandbyAndTsc);
+    assert_eq!(decide(ms(200),ms(200),ms(300)),Verdict::TscRejected);
+    assert_eq!(decide(ms(200),ms(210),Some(Span{low:195_000_000,high:215_000_000})),Verdict::Inconclusive);
+    assert_eq!(decide(ms(200),ms(200),ms(200)),Verdict::AllAgree);
+    assert_eq!(decide(ms(200),ms(400),ms(600)),Verdict::Ambiguous);
+}
+
+#[test]
+fn tsc_bracket_validation_and_cross_cpu_normalized_elapsed_bounds() {
+    let w=Witness{cpu:7,ticks:1_000_000_000,hz:TSC_HZ,uncertainty_ticks:3};
+    let later=Witness{cpu:19,ticks:w.ticks+600_000_000,..w};
+    let first=TscBracket::new(w,w).unwrap();
+    let last=TscBracket::new(later,later).unwrap();
+    assert_eq!(first.elapsed(last),Some(Span{low:199_999_998,high:200_000_002}));
+    assert_eq!(last.elapsed(first),None);
+    assert_eq!(TscBracket::new(w,Witness{cpu:19,..w}),None);
+    assert_eq!(TscBracket::new(w,Witness{ticks:w.ticks+1_000_000,..w}),None);
+    assert_eq!(TscBracket::new(w,Witness{ticks:w.ticks-1,..w}),None);
+    assert_eq!(TscBracket::new(w,Witness{hz:0,..w}),None);
+    assert_eq!(TscBracket::new(Witness{uncertainty_ticks:31_000_000,..w},w),None);
 }
