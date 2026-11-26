@@ -160,10 +160,11 @@ const FLEET_GUARD_NS: u128 = 6_000_000;
 struct Member {
     alignment: Option<Alignment>,
     last_raw: Option<u64>,
+    last_witness: Option<u64>,
     verified: Option<Point>,
 }
 impl Member {
-    const fn new() -> Self { Self { alignment: None, last_raw: None, verified: None } }
+    const fn new() -> Self { Self { alignment: None, last_raw: None, last_witness: None, verified: None } }
 }
 
 struct Fleet {
@@ -214,10 +215,11 @@ impl Fleet {
         }
     }
 
-    fn witness(&self, cpu: u8, alignment: Alignment, raw: u64, hz: u64) -> Option<Witness> {
+    fn witness(&mut self, cpu: u8, alignment: Alignment, raw: u64, hz: u64) -> Option<Witness> {
         if hz == 0 || !self.contains(cpu as u32) { return None; }
         let local = &self.members[cpu as usize];
-        if local.alignment != Some(alignment) || raw < local.last_raw? { return None; }
+        if local.alignment != Some(alignment) || raw < local.last_raw? ||
+           local.last_witness.map_or(false, |last| raw < last) { return None; }
         let ticks = alignment.normalize(raw)?;
         let guard = u64::try_from((hz as u128 * FLEET_GUARD_NS + 999_999_999)
             / 1_000_000_000).ok()?;
@@ -237,6 +239,9 @@ impl Fleet {
                 }
             }
         }
+        // A later read may not move backward even within the same
+        // qualification lease. This is evidence, never lease renewal.
+        self.members[cpu as usize].last_witness = Some(raw);
         Some(Witness { cpu, ticks, hz, uncertainty_ticks: uncertainty })
     }
 }
