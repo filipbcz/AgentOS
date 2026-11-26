@@ -99,6 +99,48 @@ class SessionTests(unittest.TestCase):
             self.assertEqual(pResult["restarted_pids"], [11, 12, 13])
             self.assertEqual(pResult["idle"]["timer_irqs"], 5)
 
+    def test_separate_runtime_programs_require_actual_exit_fault_and_same_shell(self):
+        # This fixture intentionally uses disjoint PIDs from subsequent
+        # service restart events. The real QEMU driver obtains all bytes.
+        prefix=(b"run /svc_ok\r\n"
+                b"AGENTOS USER EXIT PID=0000000000000010 CR3=0000000000500000 STATUS=0000000000000000\r\n"
+                b"exit status 0\r\nagentos> "
+                b"run /svc_fail\r\n"
+                b"AGENTOS USER EXIT PID=0000000000000011 CR3=0000000000500000 STATUS=000000000000002a\r\n"
+                b"exit status 42\r\nagentos> "
+                b"run /fault\r\n"
+                b"AGENTOS USER FAULT PID=0000000000000012 PARENT=0000000000000009 CR3=0000000000500000 VECTOR=000000000000000e ERROR=0000000000000005 ADDRESS=0000000002000000\r\n"
+                b"exit status 270\r\nagentos> ")
+        log=transcript().replace(v.READY,v.READY+prefix,1)
+        sent=v.runtime_input()+v.transmitted_input(9)
+        result=v.verify(log,sent,aRuntimeProcess=True)
+        self.assertEqual([r["status"] for r in result["runtime_process_regression"]],[0,42,270])
+        self.assertEqual(result["restarted_pids"],[11,12,13])
+        for old,new in (
+            (b"VECTOR=000000000000000e",b"VECTOR=000000000000000d"),
+            (b"ERROR=0000000000000005",b"ERROR=0000000000000004"),
+            (b"ADDRESS=0000000002000000",b"ADDRESS=0000000002001000"),
+            (b"PARENT=0000000000000009",b"PARENT=0000000000000001"),
+            (b"CR3=0000000000500000",b"CR3=0000000000300000"),
+            (b"STATUS=000000000000002a",b"STATUS=0000000000000000"),
+            (b"PID=0000000000000012",b"PID=0000000000000011"),
+            (b"PID=0000000000000012",b"PID=000000000000000b"),
+            (b"exit status 270",b"exit status 0"),
+        ):
+            with self.subTest(old=old,new=new):
+                with self.assertRaises(v.VerificationError):
+                    v.verify(log.replace(old,new,1),sent,aRuntimeProcess=True)
+        missing=log.replace(next(line for line in prefix.splitlines(keepends=True)
+                            if line.startswith(b"AGENTOS USER FAULT")),b"",1)
+        for invalid,input_bytes in ((missing,sent),(log,None),(log,sent[1:]),
+                                    (transcript(),sent)):
+            with self.assertRaises(v.VerificationError):
+                v.verify(invalid,input_bytes,aRuntimeProcess=True)
+        # Normal transcript verification is still exact; a new scenario
+        # cannot silently replace or satisfy the original one.
+        with self.assertRaises(v.VerificationError):
+            v.verify(log,sent)
+
     def test_each_response_event_and_input_is_required(self):
         pText = transcript()
         for pLine in pText.splitlines(keepends=True):

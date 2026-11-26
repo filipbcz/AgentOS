@@ -58,6 +58,29 @@ jobs:
           python3 scripts/qemu-smoke.py --cpus "$CPU_COUNT" --session \
             --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd \
             --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd --timeout 720
+      - name: Separate foreground ELF and fault regression after real shell readiness
+        env:
+          CPU_COUNT: ${{ matrix.cpus }}
+        run: |
+          set -euo pipefail
+          python3 scripts/qemu-smoke.py --cpus "$CPU_COUNT" --session --runtime-process-regression \
+            --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd \
+            --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd --timeout 720
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          cpu=os.environ["CPU_COUNT"]
+          base=Path("build/check")
+          normal=json.loads((base/f"qemu-cpu{cpu}-session/smoke.json").read_text())
+          separate=json.loads((base/f"qemu-cpu{cpu}-session-runtime-process-regression/smoke.json").read_text())
+          if normal["result"]!=separate["result"] or separate["result"]!="pass":
+              raise SystemExit("Missing real control or separate process session")
+          for field in ("source_commit","signed_efi_sha256","esp_boot_efi_sha256","ovmf_code_sha256","cpus"):
+              if normal[field]!=separate[field]:
+                  raise SystemExit("Different production image or platform: "+field)
+          if [r["status"] for r in separate["runtime_session"]["runtime_process_regression"]]!=[0,42,270]:
+              raise SystemExit("Missing actual foreground process results")
+          PY
       - name: Verify the same signed kernel relocates with different physical RAM
         if: matrix.cpus == 1
         run: |
@@ -138,6 +161,11 @@ jobs:
             build/check/qemu-cpu${{ matrix.cpus }}-session/failure.json
             build/check/qemu-cpu${{ matrix.cpus }}-session/failed-screen.ppm
             build/check/qemu-cpu${{ matrix.cpus }}-session/shell-screen.ppm
+            build/check/qemu-cpu${{ matrix.cpus }}-session-runtime-process-regression/*.log
+            build/check/qemu-cpu${{ matrix.cpus }}-session-runtime-process-regression/*.json
+            build/check/qemu-cpu${{ matrix.cpus }}-session-runtime-process-regression/*.bin
+            build/check/qemu-cpu${{ matrix.cpus }}-session-runtime-process-regression/*.ppm
+            build/check/qemu-cpu${{ matrix.cpus }}-session-runtime-process-regression/esp-bootx64.efi
             build/check/qemu-cpu${{ matrix.cpus }}-session/com1-input.bin
             build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session/com1.log
             build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session/qemu-stderr.log

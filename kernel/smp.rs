@@ -352,11 +352,33 @@ impl Cpu {
         }
     }
 
-    unsafe fn run_task(&self) -> Result<(), Error> {
-        let id = self.apic.id();
-        if id != self.expected_id { return Err(b"wrong executing APIC ID"); }
+    /// Install CPU-local kernel identity and the native syscall transport
+    /// before this processor is declared initialized. Neither a userspace
+    /// test program nor a scheduler/idle acceptance phase owns these MSRs.
+    unsafe fn initialize_local_cpu(&self) -> Result<(), Error> {
+        if self.apic.id() != self.expected_id { return Err(b"wrong executing APIC ID"); }
         asm!("wrmsr", in("ecx") 0xc0000101u32, in("eax") self.self_address as u32,
              in("edx") (self.self_address >> 32) as u32);
+        unsafe fn msr(index: u32, value: u64) {
+            asm!("wrmsr", in("ecx") index, in("eax") value as u32, in("edx") (value >> 32) as u32);
+        }
+        extern "C" { fn native_syscall(); }
+        // User threads currently own x87/SSE context and flat FS/GS selectors.
+        let cr4: usize;
+        asm!("mov {}, cr4", out(reg) cr4);
+        asm!("mov cr4, {}", in(reg) (cr4 & !((1<<16) | (1<<18) | (1<<8))));
+        msr(0xc0000100, 0);
+        msr(0xc0000102, 0);
+        if __cpuid(1).edx & (1 << 11) != 0 { msr(0x174, 0); } // disable legacy SYSENTER
+        msr(0xc0000081, (8u64 << 32) | (0x20u64 << 48));
+        msr(0xc0000082, native_syscall as usize as u64);
+        msr(0xc0000084, 0xffff_ffff);
+        asm!("rdmsr", "or eax, 1", "wrmsr", in("ecx") 0xc0000080u32, out("eax") _, out("edx") _);
+        Ok(())
+    }
+
+    unsafe fn run_task(&self) -> Result<(), Error> {
+        let id = self.apic.id();
         self.apic.write(0x320, TIMER);    // one-shot, unmasked
         for wakeup in 1..=WAKEUPS {
             self.apic.write(0x380, self.interval);
@@ -576,21 +598,6 @@ impl Cpu {
 
     #[allow(non_snake_case)]
     unsafe fn process_test(&self) -> Result<(), Error> {
-        unsafe fn msr(index: u32, value: u64) {
-            asm!("wrmsr", in("ecx") index, in("eax") value as u32, in("edx") (value >> 32) as u32);
-        }
-        extern "C" { fn native_syscall(); }
-        // User threads currently own x87/SSE context and flat FS/GS selectors.
-        let cr4: usize;
-        asm!("mov {}, cr4", out(reg) cr4);
-        asm!("mov cr4, {}", in(reg) (cr4 & !((1<<16) | (1<<18) | (1<<8))));
-        msr(0xc0000100, 0);
-        msr(0xc0000102, 0);
-        if __cpuid(1).edx & (1 << 11) != 0 { msr(0x174, 0); } // disable legacy SYSENTER
-        msr(0xc0000081, (8u64 << 32) | (0x20u64 << 48));
-        msr(0xc0000082, native_syscall as usize as u64);
-        msr(0xc0000084, 0xffff_ffff);
-        asm!("rdmsr", "or eax, 1", "wrmsr", in("ecx") 0xc0000080u32, out("eax") _, out("edx") _);
         // BSP's first process is the actual numeric PID 1, retained through
         // the boot tests; AP tests still use independent finite sessions.
         let bsp_root = self.descriptors.is_none();
@@ -1130,6 +1137,7 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
 unsafe extern "C" fn ap_main(cpu: &'static Cpu) -> ! {
     cpu.descriptors.as_ref().unwrap().load();
     match cpu.apic.enable().and_then(|_| {
+        cpu.initialize_local_cpu()?;
         // On the TSC-only bring-up path each AP must first measure its
         // own rate against PIT. Do not use the BSP's raw TSC as its clock.
         if let Some(bsp_hz)=cpu.reference.tsc_hz() {
@@ -1268,6 +1276,7 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
     let boot_cpu = load.frames.with(|f| Cpu::create(f, apic, bsp, interval, tsc_hz, clock, platform.legacy_pit_probe, None, load, programs, bsp_rsp0))?;
     gCpus[bsp as usize].store(boot_cpu.self_address, Ordering::Release);
     if let Some(rate)=boot_rate { boot_cpu.tsc.publish_rate(Some(rate)); }
+    boot_cpu.initialize_local_cpu()?;
     boot_cpu.run_task()?;
     let bsp_proof = if let Some(rate)=boot_rate { Some(rate) } else {
         let rate=boot_cpu.qualify_tsc();

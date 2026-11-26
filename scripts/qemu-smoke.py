@@ -56,10 +56,14 @@ def main():
                         help="Use real KVM for matching control runs; ordinary regression defaults to TCG")
     parser.add_argument("--session", action="store_true",
                         help="Drive UART/PS2 editing, service control, runtime idle and shutdown")
+    parser.add_argument("--runtime-process-regression", action="store_true",
+                        help="Separate foreground ELF/fault regression through the ordinary shell")
     parser.add_argument("--timeout", type=int, default=720)
     parser.add_argument("--ovmf-code", type=Path, required=True)
     parser.add_argument("--ovmf-vars", type=Path, required=True)
     args = parser.parse_args()
+    if args.runtime_process_regression and not args.session:
+        parser.error("--runtime-process-regression requires --session")
     try:
         return boot(args)
     except Exception as error:
@@ -232,12 +236,20 @@ def wait_session(process, capture, serial, predicate, description, seconds=30):
     raise TimeoutError(f"Interactive guest did not complete {description}")
 
 
-def run_session(process, capture, qmp, destination):
+def run_session(process, capture, qmp, destination, runtime_process_regression=False):
     serial = destination / "com1.log"
     children = list(session.SHELL_START.finditer(serial.read_bytes()))
     if len(children) != 1:
         raise RuntimeError("Cannot identify the real managed shell")
     shell = int(children[0][1], 16)
+    if runtime_process_regression:
+        for command, status in session.RUNTIME_PROGRAMS:
+            offset = serial.stat().st_size
+            print(f"QEMU separate runtime process regression: {command!r}", flush=True)
+            capture.send((command+"\r").encode("ascii"))
+            reply = f"exit status {status}\r\nagentos> ".encode("ascii")
+            wait_session(process, capture, serial,
+                         lambda data: reply in data[offset:], command, 30)
     for step in session.steps(shell, True):
         if step["screenshot"]:
             qmp.screenshot(destination / "keyboard-before.ppm")
@@ -281,6 +293,8 @@ def boot(args):
         profile += "-"+args.accel
     if args.session:
         profile += "-session"
+    if getattr(args, "runtime_process_regression", False):
+        profile += "-runtime-process-regression"
     destination = root / "build/check" / profile
     destination.mkdir(parents=True, exist_ok=True)
     raw = destination / "esp.raw"
@@ -394,7 +408,8 @@ def boot(args):
                     qmp.screenshot(destination / "shell-screen.ppm")
                     console.verify(destination / "shell-screen.ppm", aLevel="info", aOutput="both")
                     if args.session:
-                        run_session(process, serial_capture, qmp, destination)
+                        run_session(process, serial_capture, qmp, destination,
+                                    getattr(args, "runtime_process_regression", False))
                     run_succeeded = True
                     break
                 if process.poll() is not None:
@@ -476,7 +491,8 @@ def boot(args):
     session_result = None
     if args.session:
         session_result = session.verify(serial.read_bytes(), (destination / "com1-input.bin").read_bytes(),
-                                        True, args.cpus)
+                                        True, args.cpus,
+                                        aRuntimeProcess=getattr(args,"runtime_process_regression",False))
     bases = re.findall(r"(?m)^\[INFO\] KERNEL IMAGE BASE=([0-9a-f]{16})\r?$", text)
     if len(bases) != 1:
         raise RuntimeError(f"Expected one actual runtime kernel image address: {bases}")

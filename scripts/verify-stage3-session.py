@@ -22,6 +22,51 @@ KILL = re.compile(rb"AGENTOS USER KILL PID=("+HEX+rb") PARENT=("+HEX+rb") STATUS
 KERNEL_EVENT = re.compile(rb"AGENTOS USER (?:EXIT PID="+HEX+rb" CR3="+HEX+rb" STATUS="+HEX+
                           rb"|KILL PID="+HEX+rb" PARENT="+HEX+rb" STATUS=0000000000000089)\r\n")
 IDLE = re.compile(rb"AGENTOS RUNTIME IDLE MS=("+HEX+rb") TIMERS=("+HEX+rb") IDLE=("+HEX+rb")\r\n")
+FAULT = re.compile(rb"AGENTOS USER FAULT PID=("+HEX+rb") PARENT=("+HEX+
+                   rb") CR3=("+HEX+rb") VECTOR=("+HEX+rb") ERROR=("+HEX+
+                   rb") ADDRESS=("+HEX+rb")\r\n")
+READY = b"AGENTOS SHELL READY\r\nagentos> "
+# Only the separate test harness sends these ordinary shell commands.
+# These ELF fixtures already exist in the historical signed initramfs.
+RUNTIME_PROGRAMS = (("run /svc_ok",0),("run /svc_fail",42),("run /fault",270))
+
+def runtime_input():
+    return b"".join((command+"\r").encode("ascii") for command,_ in RUNTIME_PROGRAMS)
+
+def runtime_process_prefix(data, shell, shell_cr3, prior_pids):
+    """Consume exactly three real command intervals and their own kernel
+    evidence. No missing/foreign/extra events are removed from the transcript.
+    Normal exit, nonzero exit and fatal user #PF must return to the same shell.
+    The root's actual shutdown and whole-session frame accounting remain
+    mandatory in the outer verifier.
+    """
+    offset=0
+    seen=set(prior_pids)
+    records=[]
+    for command,status in RUNTIME_PROGRAMS:
+        echo=(command+"\r\n").encode("ascii")
+        require(data.startswith(echo,offset),"Missing runtime command echo: "+command)
+        offset+=len(echo)
+        if status==270:
+            match=FAULT.match(data,offset)
+            require(match is not None,"Missing actual user fault for foreground child")
+            pid,parent,cr3,vector,error,address=(int(v,16) for v in match.groups())
+            require(parent==shell and (vector,error,address)==(14,5,0x02000000),
+                    "Wrong fault vector, address, privilege or shell ownership")
+        else:
+            match=EXIT.match(data,offset)
+            require(match is not None,"Missing actual foreground child exit")
+            pid,cr3,actual=(int(v,16) for v in match.groups())
+            require(actual==status,"Wrong actual foreground exit status")
+        require(pid>shell and pid not in seen and cr3>0 and cr3%4096==0 and cr3!=shell_cr3,
+                "Foreign/reused child or non-private address space")
+        seen.add(pid)
+        offset=match.end()
+        reply=f"exit status {status}\r\nagentos> ".encode("ascii")
+        require(data.startswith(reply,offset),"Shell failed to collect actual child status")
+        offset+=len(reply)
+        records.append({"pid":pid,"cr3":cr3,"status":status})
+    return offset,records
 
 
 class VerificationError(ValueError):
@@ -142,7 +187,8 @@ def verify_idle(aBytes, aCpus=1, aClockMaintenanceMs=1000):
             "timer_cpu_count":aCpus}
 
 
-def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceMs=1000):
+def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceMs=1000,
+           aRuntimeProcess=False):
     pTimerCpus = timerCpuCount(aLog,aCpus)
     pRoots,pChildren,pEnds = (list(pPattern.finditer(aLog)) for pPattern in
                               (ROOT_START,SHELL_START,SESSION_STOP))
@@ -162,20 +208,35 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
             int(pShellExits[0][2],16)>0 and int(pShellExits[0][2],16)%4096==0,
             "Managed shell did not exit normally from its address space")
     pInteractive = pPhase[:pShellExits[0].start()]
+    require(pInteractive.startswith(READY),"Missing real initial shell prompt")
+    pInteractive=pInteractive[len(READY):]
+    pRuntimeRecords=[]
+    if aRuntimeProcess:
+        # Account for every earlier actual PID, not just the current shell.
+        pPrior={int(m[1],16) for m in re.finditer(
+            rb"AGENTOS USER (?:EXIT|FAULT|PARK|KILL) PID=("+HEX+rb")",
+            aLog[:pChildren[0].end()])}
+        pPrior.update((pRoot,pShell,pCorePid))
+        pConsumed,pRuntimeRecords=runtime_process_prefix(
+            pInteractive,pShell,int(pShellExits[0][2],16),pPrior)
+        pInteractive=pInteractive[pConsumed:]
     pClean = without_kernel_events(pInteractive)
-    pExpected = re.escape(b"AGENTOS SHELL READY\r\nagentos> ")+b"".join(
+    pExpected = b"".join(
         pStep["pattern"].encode("ascii") for pStep in steps(pShell,aKeyboard))
     require(re.fullmatch(pExpected,pClean) is not None,
             "Incorrect extended command echo/response/state sequence")
     pIdle = verify_idle(pClean,pTimerCpus,aClockMaintenanceMs)
+    if aRuntimeProcess:
+        require(aInput is not None,"Separate process regression requires actual transmitted bytes")
     if aInput is not None:
-        require(aInput==transmitted_input(pShell,aKeyboard),"Captured transmitted UART bytes differ from scenario")
+        pPrefix=runtime_input() if aRuntimeProcess else b""
+        require(aInput==pPrefix+transmitted_input(pShell,aKeyboard),"Captured transmitted UART bytes differ from scenario")
     pRestart = pInteractive.find(b"service restart flaky\r\n")
     require(pRestart>=0,"No explicit service RESTART command")
     pAfterRestart = pInteractive[pRestart:]
     pExits = list(EXIT.finditer(pAfterRestart))
     require(len(pExits)==3,"Restart did not produce exactly three real worker exits")
-    pSeen = set()
+    pSeen = {r["pid"] for r in pRuntimeRecords}
     for pMatch in EXIT.finditer(pInteractive):
         pPid,pCr3,pStatus = (int(pValue,16) for pValue in pMatch.groups())
         require(pPid>pShell and pPid not in pSeen and pCr3>0 and pCr3%4096==0 and pStatus==42,
@@ -187,7 +248,8 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
         require(pPid>pShell and pParent==pRoot and pPid not in pSeen and pPid not in pKilled,
                 "Service STOP killed a foreign or already-reaped process")
         pKilled.add(pPid)
-    require(pKilled or len(pSeen)>3,"Initial START/STOP has no actual worker termination evidence")
+    require(pKilled or len(pSeen)-len(pRuntimeRecords)>3,
+            "Initial START/STOP has no actual worker termination evidence")
     pTail = pPhase[pShellExits[0].end():]
     pShutdown = (f"AGENTOS MANAGER SHUTD ROOT={pRoot:016x} COUNT=00000003\r\n"
                  f"AGENTOS USER KILL PID={pCorePid:016x} PARENT={pRoot:016x} STATUS=0000000000000089\r\n"
@@ -198,8 +260,11 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
             int(pExit[2],16)%4096==0 and int(pExit[3],16)==0,"PID1 did not exit cleanly")
     require(aLog[pEnds[0].end():] in (b"[INFO] INTERACTIVE SHELL STOPPED\r\n",b""),
             "Unexpected data after kernel session completion")
-    return {"root_pid":pRoot,"shell_pid":pShell,"core_pid":pCorePid,
+    result={"root_pid":pRoot,"shell_pid":pShell,"core_pid":pCorePid,
             "restarted_pids":sorted(int(pMatch[1],16) for pMatch in pExits),"idle":pIdle}
+    if aRuntimeProcess:
+        result["runtime_process_regression"]=pRuntimeRecords
+    return result
 
 
 def main():
@@ -209,8 +274,10 @@ def main():
     pParser.add_argument("--keyboard",action="store_true")
     pParser.add_argument("--cpus",type=int,choices=(1,2))
     pParser.add_argument("--plan-pid",type=int)
+    pParser.add_argument("--runtime-process-regression",action="store_true")
     pArgs = pParser.parse_args()
     if pArgs.plan_pid is not None:
+        require(not pArgs.runtime_process_regression,"Separate process regression uses the QEMU test driver")
         require(pArgs.plan_pid>1,"Invalid shell PID for input plan")
         print(json.dumps({"steps":steps(pArgs.plan_pid,pArgs.keyboard),
                           "kernel_event_pattern":KERNEL_EVENT.pattern.decode(),
@@ -221,7 +288,7 @@ def main():
         pParser.error("--log or --plan-pid is required")
     try:
         pResult = verify(pArgs.log.read_bytes(),pArgs.input.read_bytes() if pArgs.input else None,
-                         pArgs.keyboard,pArgs.cpus)
+                         pArgs.keyboard,pArgs.cpus,aRuntimeProcess=pArgs.runtime_process_regression)
     except (OSError,VerificationError) as pError:
         print(f"Stage-3 interactive verification failed: {pError}",file=sys.stderr)
         return 1
