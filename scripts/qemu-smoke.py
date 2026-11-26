@@ -52,6 +52,8 @@ def main():
     parser.add_argument("--cpus", type=int, choices=(1, 2), required=True)
     parser.add_argument("--memory-mib", type=int, choices=(256, 512), default=256)
     parser.add_argument("--no-hpet", action="store_true", help="Disable HPET in actual QEMU hardware")
+    parser.add_argument("--accel", choices=("tcg","kvm"), default="tcg",
+                        help="Use real KVM for matching control runs; ordinary regression defaults to TCG")
     parser.add_argument("--session", action="store_true",
                         help="Drive UART/PS2 editing, service control, runtime idle and shutdown")
     parser.add_argument("--timeout", type=int, default=720)
@@ -275,6 +277,8 @@ def boot(args):
         profile += f"-ram{args.memory_mib}"
     if args.no_hpet:
         profile += "-no-hpet"
+    if args.accel != "tcg":
+        profile += "-"+args.accel
     if args.session:
         profile += "-session"
     destination = root / "build/check" / profile
@@ -342,8 +346,9 @@ def boot(args):
         serial_options = ["-serial", f"file:{serial}"]
     qemu = [
         "qemu-system-x86_64",
-        "-machine", "q35,accel=tcg,smm=on,hpet=" + ("off" if args.no_hpet else "on"),
-        "-cpu", "max", "-smp", str(args.cpus), "-m", str(args.memory_mib),
+        "-machine", f"q35,accel={args.accel},smm=on,hpet=" + ("off" if args.no_hpet else "on"),
+        "-cpu", "host,x2apic=off,invtsc=on,enforce=on" if args.accel=="kvm" else "max",
+        "-smp", str(args.cpus), "-m", str(args.memory_mib),
         "-global", "driver=cfi.pflash01,property=secure,value=on",
         "-drive", f"if=pflash,format=raw,unit=0,readonly=on,file={args.ovmf_code}",
         "-drive", f"if=pflash,format=raw,unit=1,file={vm_vars}",
@@ -362,7 +367,9 @@ def boot(args):
     last_progress = start
     last_size = -1
     run_succeeded = False
+    actual_kvm = None
     qmp = None
+    (destination / "qemu-command.json").write_text(json.dumps(qemu,indent=2)+"\n")
     serial_capture = None
     with stdout.open("wb") as diagnostic:
         process = subprocess.Popen(qemu, cwd=root, stdin=subprocess.DEVNULL,
@@ -381,6 +388,9 @@ def boot(args):
                     raise RuntimeError("Guest reported critical kernel failure; see COM1")
                 if b"AGENTOS SHELL READY\r\nagentos> " in content:
                     qmp = Qmp(qmp_socket)
+                    actual_kvm=qmp.execute("query-kvm")
+                    if bool(actual_kvm["enabled"]) != (args.accel=="kvm"):
+                        raise RuntimeError("Unexpected actual accelerator")
                     qmp.screenshot(destination / "shell-screen.ppm")
                     console.verify(destination / "shell-screen.ppm", aLevel="info", aOutput="both")
                     if args.session:
@@ -404,7 +414,8 @@ def boot(args):
             failure = {
                 "schema": 1, "result": "fail", "source_commit": commit,
                 "cpu_count": args.cpus, "memory_mib": args.memory_mib,
-                "hpet_enabled": not args.no_hpet, "failure": str(error),
+                "hpet_enabled": not args.no_hpet, "accelerator":args.accel,
+                "failure": str(error),
                 "last_com1_bytes": tail,
                 "host_elapsed_seconds": round(time.monotonic() - start, 3),
                 "signed_efi_sha256": image["artifacts"]["agentos.efi"],
@@ -480,7 +491,9 @@ def boot(args):
     receipt = {
         "schema": 1,
         "result": "pass",
-        "emulator": "QEMU TCG with OVMF Secure Boot",
+        "emulator": f"QEMU {args.accel.upper()} with OVMF Secure Boot",
+        "accelerator":args.accel,"qmp_kvm":actual_kvm,
+        "qemu_version":subprocess.check_output(["qemu-system-x86_64","--version"],text=True).splitlines()[0],
         "source_commit": commit,
         "cpus": args.cpus,
         "memory_mib": args.memory_mib,

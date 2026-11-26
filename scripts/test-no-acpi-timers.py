@@ -145,6 +145,22 @@ class EvidenceTests(unittest.TestCase):
             with self.subTest(reply=reply), self.assertRaises(RuntimeError):
                 mod.verify_pm_read(reply,0x608)
 
+    def test_chain_control_requires_declared_pm(self):
+        m=Memory()
+        with self.assertRaisesRegex(RuntimeError,"declared PM"):
+            mod.inspect_tables(m.read,m.st,m.rsdp,0,2,0x608)
+        fadt=m.mem[m.fadt]
+        put(fadt,76,0x608,4)
+        fadt[91]=4
+        checksum(fadt)
+        result=mod.inspect_tables(m.read,m.st,m.rsdp,0,2,0x608)
+        self.assertEqual(result["roots"][0]["fadt_pm_tmr_blk"],0x608)
+        with self.assertRaisesRegex(RuntimeError,"Legacy PM timer"):
+            m.inspect()
+        self.assertEqual(mod.verify_pm_read("portl[0x0608] = 0x00000abc",0x608,False),0xabc)
+        with self.assertRaises(RuntimeError):
+            mod.verify_pm_read("portl[0x0608] = 0xffffffff",0x608,False)
+
     def test_normal_idle_budget_is_unchanged(self):
         session=mod.smoke.session
         def idle(timers):

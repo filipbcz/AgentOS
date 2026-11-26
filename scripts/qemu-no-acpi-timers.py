@@ -65,7 +65,7 @@ def read_table(read, address, expected=None):
     return table
 
 
-def read_root(read, address, width, cpus):
+def read_root(read, address, width, cpus, pm_port=None):
     root = read_table(read, address, b"XSDT" if width == 8 else b"RSDT")
     require((len(root)-36) % width == 0, "Truncated ACPI root entry")
     children = []
@@ -80,11 +80,18 @@ def read_root(read, address, width, cpus):
             "Expected one valid FADT and MADT per root")
     fadt_addr, fadt = next((addr, table) for addr, table in children if table[:4] == b"FACP")
     require(len(fadt) >= 116, "Missing FADT fixed fields")
-    require(uint(fadt, 76, 4) == 0 and fadt[91] == 0, "Legacy PM timer still exposed")
-    require(uint(fadt,112,4) & ((1<<8)|(1<<15)|(1<<20)) == 0,
-            "Unexpected PM clock flags or hardware-reduced platform")
-    require(len(fadt) <= 208 or (len(fadt) >= 220 and fadt[208:220] == bytes(12)),
-            "Extended PM timer GAS remains exposed or truncated")
+    if pm_port is None:
+        require(uint(fadt, 76, 4) == 0 and fadt[91] == 0, "Legacy PM timer still exposed")
+        require(uint(fadt,112,4) & ((1<<8)|(1<<15)|(1<<20)) == 0,
+                "Unexpected PM clock flags or hardware-reduced platform")
+        require(len(fadt) <= 208 or (len(fadt) >= 220 and fadt[208:220] == bytes(12)),
+                "Extended PM timer GAS remains exposed or truncated")
+    else:
+        require(uint(fadt,76,4)==pm_port and fadt[91]==4 and
+                not uint(fadt,112,4)&(1<<20),"Control lost its declared PM timer")
+        require(len(fadt)<=208 or (len(fadt)>=220 and
+                (uint(fadt,212,8)==0 or (fadt[208]==1 and uint(fadt,212,8)==pm_port))),
+                "Control has conflicting extended PM GAS")
     madt_addr, madt = next((addr,table) for addr,table in children if table[:4] == b"APIC")
     require(len(madt) >= 44 and uint(madt,40,4)&1, "No PCAT-compatible MADT")
     ids = []
@@ -106,32 +113,32 @@ def read_root(read, address, width, cpus):
     return {"address":address,"signature":root[:4].decode("ascii"),
             "tables":[{"address":addr,"signature":table[:4].decode("ascii")}
                       for addr,table in children],
-            "fadt_address":fadt_addr,"fadt_pm_tmr_blk":0,"fadt_pm_tmr_len":0,
+            "fadt_address":fadt_addr,"fadt_pm_tmr_blk":uint(fadt,76,4),"fadt_pm_tmr_len":fadt[91],
             "fadt_x_pm_tmr_blk":fadt[208:220].hex() if len(fadt)>=220 else None,
             "madt_address":madt_addr,"enabled_apic_ids":sorted(ids)}
 
 
-def read_rsdp(read, address, extended, cpus):
+def read_rsdp(read, address, extended, cpus, pm_port=None):
     first = read(address,20)
     require(first[:8] == b"RSD PTR " and checksum(first), "Invalid RSDP checksum")
     roots = []
     rsdt = uint(first,16,4)
     if rsdt:
-        roots.append(read_root(read,rsdt,4,cpus))
+        roots.append(read_root(read,rsdt,4,cpus,pm_port))
     if extended or first[15] >= 2:
         head = read(address,36)
         size = uint(head,20,4)
         require(first[15]>=2 and 36<=size<=MAX_TABLE, "Invalid extended RSDP")
         full = read(address,size)
         require(full[:20]==first and checksum(full), "Invalid extended RSDP checksum")
-        roots.append(read_root(read,uint(full,24,8),8,cpus))
+        roots.append(read_root(read,uint(full,24,8),8,cpus,pm_port))
     require(roots, "Empty ACPI root set")
     require(all(r["enabled_apic_ids"]==roots[0]["enabled_apic_ids"] for r in roots),
             "ACPI root CPU disagreement")
     return roots
 
 
-def inspect_tables(read, st, rsdp20, rsdp10, cpus):
+def inspect_tables(read, st, rsdp20, rsdp10, cpus, pm_port=None):
     # Read EFI_SYSTEM_TABLE itself after EBS, not just the fixture's
     # suggested FADT address. Both the firmware table CRC and all ACPI
     # roots/checksums must be valid in the actual guest physical memory.
@@ -156,7 +163,7 @@ def inspect_tables(read, st, rsdp20, rsdp10, cpus):
     require(actual==expected, "Published EFI ACPI pointers differ from prepared platform")
     roots = []
     for guid,address in actual.items():
-        roots.extend(read_rsdp(read,address,guid==ACPI20,cpus))
+        roots.extend(read_rsdp(read,address,guid==ACPI20,cpus,pm_port))
     require(all(r["enabled_apic_ids"]==roots[0]["enabled_apic_ids"] for r in roots),
             "Enabled CPU disagreement between EFI ACPI versions")
     return {"system_table":st,"rsdp20":rsdp20,"rsdp10":rsdp10,"roots":roots}
@@ -170,22 +177,42 @@ def hmp(qmp, command):
     return result
 
 
-def verify_pm_read(io, port):
+def verify_pm_read(io, port, disabled=True):
     # HMP "i/xw" requests a 32-bit read; the output suffix is "l".
     match = re.fullmatch(r"portl\[0x([0-9a-f]+)\]\s*=\s*0x([0-9a-f]{8})",
                          io.strip(), re.I)
     require(match is not None and int(match[1],16)==port,
             f"Invalid 32-bit PM port read: {io!r}")
-    require(int(match[2],16)==0xffffffff,
-            f"Former PM timer I/O port remains readable: {io!r}")
+    value=int(match[2],16)
+    require((value==0xffffffff)==disabled,
+            f"PM I/O read does not match expected decode state: {io!r}")
+    return value
 
 
-def capture_platform(qmp, dest, cpus, accel, ram):
+def capture_platform(qmp, dest, cpus, accel, ram, profile="disabled"):
     # Do not pause a live finite-PIT epoch during the session. This is
     # called only after session completion or a recorded boot failure.
     qmp.execute("stop")
     state = qmp.execute("query-status")
     require(not state["running"], "QEMU did not pause for final read-only inspection")
+    disabled=profile=="disabled"
+    hidden=profile!="chain"
+    # Capture stopped architectural state before any validation can fail.
+    # No guest instruction, clock counter or RAM is changed.
+    for command,name in [("info registers -a","registers-all.txt"),
+                         ("info lapic","lapic.txt"),("info pic","pic.txt")]:
+        try:
+            (dest/name).write_text(hmp(qmp,command))
+        except Exception as exc:
+            print("Diagnostic unavailable:",command,exc,flush=True)
+    for index in range(cpus):
+        try:
+            qmp.execute("human-monitor-command",{"command-line":f"cpu {index}"})
+            code=hmp(qmp,"x/12i $rip")
+            (dest/f"cpu{index}-instructions.txt").write_text(code)
+            print(f"Stopped CPU {index} instructions:",code,flush=True)
+        except Exception as exc:
+            print("CPU instruction diagnostic unavailable:",exc,flush=True)
     qtree = hmp(qmp,"info qtree")
     mtree = hmp(qmp,"info mtree -f")
     (dest/"qtree.txt").write_text(qtree)
@@ -201,8 +228,8 @@ def capture_platform(qmp, dest, cpus, accel, ram):
             not re.search(r"(?i)\bhpet\b",mtree), "HPET device or active mapping remains")
     require(re.search(r"(?m)^\s*dev:\s*(?:isa-pit|kvm-pit)(?:,|\s|$)",qtree),
             "No actual PIT device")
-    require(not re.search(r"(?i)\b(?:acpi-tmr|ich9-pm)\b",mtree),
-            "ACPI PM timer/bank still mapped in a flat address space")
+    require(bool(re.search(r"(?i)\b(?:acpi-tmr|ich9-pm)\b",mtree)) != disabled,
+            "PM timer/bank mapping does not match requested profile")
     fixture = (dest/"fixture-debug.log").read_text(encoding="ascii",errors="replace")
     prepared,ebs=list(PREPARED.finditer(fixture)),list(EBS.finditer(fixture))
     require(len(prepared)==len(ebs)==1 and prepared[0].end()<ebs[0].start(),
@@ -213,8 +240,9 @@ def capture_platform(qmp, dest, cpus, accel, ram):
     st,port,r20,r10,invtsc=map(lambda v:int(v,16),prepared[0].groups())
     st2,port2,lpc,base,before,after,value=map(lambda v:int(v,16),ebs[0].groups())
     require(st==st2 and port==port2 and lpc==0x29188086 and base+8==port and
-            before&0x80 and not after&0x80 and value==0xffffffff,
-            "Fixture did not disable actual ICH9 PM I/O decode at EBS")
+            before&0x80 and bool(after&0x80)!=disabled and
+            (value==0xffffffff)==disabled,
+            "Fixture EBS PM I/O state does not match profile")
     require(invtsc in (0,1), "Invalid guest CPUID evidence")
     files={}
     def read(address,size):
@@ -228,7 +256,7 @@ def capture_platform(qmp, dest, cpus, accel, ram):
         require(len(data)==size,"Incomplete QEMU physical memory read")
         files[path.name]=smoke.evidence.sha256(path)
         return data
-    tables=inspect_tables(read,st,r20,r10,cpus)
+    tables=inspect_tables(read,st,r20,r10,cpus,None if hidden else port)
     write_json(dest/"acpi-tables.json",tables)
     print("Actual EFI/ACPI tables:",json.dumps(tables,sort_keys=True),flush=True)
     # Independently read the former PM I/O port. Preserve the raw response
@@ -237,9 +265,9 @@ def capture_platform(qmp, dest, cpus, accel, ram):
     require(isinstance(io,str),"Missing HMP I/O response")
     (dest/"pm-port-read.txt").write_text(io)
     print("Actual PM port read:",repr(io),flush=True)
-    verify_pm_read(io,port)
-    result={"result":"verified","hpet_device_absent":True,"hpet_acpi_absent":True,
-            "pm_timer_acpi_absent":True,"pm_io_decode_disabled":True,
+    verify_pm_read(io,port,disabled)
+    result={"result":"verified","profile":profile,"hpet_device_absent":True,"hpet_acpi_absent":True,
+            "pm_timer_acpi_absent":hidden,"pm_io_decode_disabled":disabled,
             "former_pm_port":port,"former_pm_port_read":io.strip(),
             "pit_device_present":True,"guest_invariant_tsc":bool(invtsc),
             "accelerator":accel,"qmp_cpus":len(cpu_info),"qmp_kvm":kvm,
@@ -261,7 +289,10 @@ def prepare_fixture(dest, signed_hash, args):
     obj,elf,unsigned=(dest/n for n in ("timer-fixture.o","timer-fixture.so","timer-fixture.unsigned.efi"))
     run(["gcc-13","-I/usr/include/efi","-I/usr/include/efi/x86_64","-DGNU_EFI_USE_MS_ABI",
          "-O2","-Wall","-Wextra","-Werror","-fpic","-ffreestanding","-fno-stack-protector",
-         "-fshort-wchar","-mno-red-zone","-c",str(ROOT/"scripts/tests/no-acpi-timers-efi.c"),"-o",str(obj)])
+         "-fshort-wchar","-mno-red-zone",
+         f"-DFIXTURE_HIDE_PM={int(args.profile!='chain')}",
+         f"-DFIXTURE_DISABLE_PM={int(args.profile=='disabled')}",
+         "-c",str(ROOT/"scripts/tests/no-acpi-timers-efi.c"),"-o",str(obj)])
     run(["ld","-nostdlib","--build-id=none","-znocombreloc","-T","/usr/lib/elf_x86_64_efi.lds",
          "-shared","-Bsymbolic","/usr/lib/crt0-efi-x86_64.o",str(obj),"-L/usr/lib","-lefi","-lgnuefi","-o",str(elf)])
     run(["objcopy","--strip-all","-j",".text","-j",".sdata","-j",".data","-j",".dynamic",
@@ -306,7 +337,8 @@ def scenario(args):
             baseline["cpus"]==args.cpus and baseline["hpet_enabled"] and
             baseline["interactive_com1_manager_session"],
             "Missing ordinary interactive boot of the exact same signed EFI")
-    dest=ROOT/f"build/check/qemu-cpu{args.cpus}-no-acpi-timers-session"
+    suffix="no-acpi-timers" if args.profile=="disabled" else "clock-"+args.profile
+    dest=ROOT/f"build/check/qemu-cpu{args.cpus}-{suffix}-session"
     # Never consume a previous result as current evidence.
     if dest.exists():
         shutil.rmtree(dest)
@@ -318,7 +350,7 @@ def scenario(args):
              "memory_mib":256,"signed_efi_sha256":digest,
              "ordinary_session_receipt_sha256":smoke.evidence.sha256(baseline_path),
              "ordinary_signed_efi_sha256":baseline["signed_efi_sha256"],
-             "accelerator":accel,"requested_accelerator":args.accel,
+             "accelerator":accel,"requested_accelerator":args.accel,"profile":args.profile,
              "dev_kvm_accessible":os.access("/dev/kvm",os.R_OK|os.W_OK),
              "platform_verified":False,"boot_verified":False,
              "note":"QEMU-only; no VirtualBox/physical hardware claim"}
@@ -326,6 +358,18 @@ def scenario(args):
     process=capture=qmp=None
     try:
         receipt["qemu_version"]=subprocess.check_output(["qemu-system-x86_64","--version"],text=True).splitlines()[0]
+        # Matching direct KVM PM control (even failure is useful evidence).
+        # A missing or differently configured comparison cannot imply causality.
+        control=ROOT/f"build/check/qemu-cpu{args.cpus}-no-hpet-{accel}-session"
+        for name in ("smoke.json","failure.json"):
+            path=control/name
+            if path.is_file():
+                observed=json.loads(path.read_text())
+                require(observed["source_commit"]==commit and observed["signed_efi_sha256"]==digest
+                        and observed["accelerator"]==accel,"Control was not the same signed EFI/accelerator")
+                receipt["matched_direct_control"]={"result":observed["result"],
+                    "receipt_sha256":smoke.evidence.sha256(path)}
+                break
         raw,vars_file,fixture_hash=prepare_fixture(dest,digest,args)
         receipt["fixture_efi_sha256"]=fixture_hash
         receipt["esp_agentos_efi_sha256"]=smoke.evidence.sha256(dest/"esp-agentos.efi")
@@ -387,8 +431,9 @@ def scenario(args):
                 text=data.decode("ascii",errors="replace")
                 smoke.boot_log.verify(data,"info","both")
                 clocks=re.findall(r"(?m)^\[INFO\] SYSTEM CLOCK: (HPET64|HPET32|ACPI PM24|ACPI PM32|TSC \(independent finite PIT watchdog\))\r?$",text)
-                require(clocks==["TSC (independent finite PIT watchdog)"],
-                        "No unique actual TSC/PIT clock selection")
+                expected=("ACPI PM24","ACPI PM32") if args.profile=="chain" else ("TSC (independent finite PIT watchdog)",)
+                require(len(clocks)==1 and clocks[0] in expected,
+                        "No unique expected actual clock selection")
                 apics=[int(x,16) for x in re.findall(
                     r"(?m)^AGENTOS TASK (?:BSP|AP) APIC=([0-9a-f]{16}) TIMER-WAKES=0000000000000003\r?$",text)]
                 require(len(apics)==len(set(apics))==args.cpus,"Missing actual per-CPU timer wakes")
@@ -400,7 +445,7 @@ def scenario(args):
                 receipt["migration"]=smoke.migration.verify(text,args.cpus)
                 smoke.service_manager.verify(text)
                 receipt["runtime_session"]=smoke.session.verify(data,(dest/"com1-input.bin").read_bytes(),
-                    True,args.cpus,aClockMaintenanceMs=10)
+                    True,args.cpus,aClockMaintenanceMs=1000 if args.profile=="chain" else 10)
                 receipt["system_clock"]=clocks[0]
                 receipt["boot_verified"]=True
             finally:
@@ -415,7 +460,7 @@ def scenario(args):
                             qmp.screenshot(dest/"failed-screen.ppm")
                         except Exception as exc:
                             print("Failure screenshot unavailable:",exc,file=sys.stderr,flush=True)
-                    platform=capture_platform(qmp,dest,args.cpus,accel,256*1024*1024)
+                    platform=capture_platform(qmp,dest,args.cpus,accel,256*1024*1024,args.profile)
                     receipt["platform_verified"]=True
                     receipt["guest_invariant_tsc"]=platform["guest_invariant_tsc"]
                     receipt["platform_sha256"]=smoke.evidence.sha256(dest/"platform.json")
@@ -450,7 +495,7 @@ def scenario(args):
                     lines=data.decode("ascii",errors="replace").splitlines()
                     receipt["clock_diagnostics"]=[line for line in lines if
                         any(key in line for key in ("SYSTEM CLOCK:","BRINGUP CLOCK:",
-                            "TSC-HZ=","TSC CPU","AGENTOS TASK ","SMP FAILED"))][:80]
+                            "TSC-HZ=","TSC APIC=","TSC CPU","AGENTOS TASK ","SMP FAILED"))][:80]
                     receipt["fallback_selected"]=("[INFO] SYSTEM CLOCK: TSC (independent finite PIT watchdog)" in lines)
                     receipt["shell_ready"]=b"AGENTOS SHELL READY\r\nagentos> " in data
                     print("Actual clock/CPU diagnostics:",json.dumps(receipt["clock_diagnostics"]),flush=True)
@@ -467,6 +512,8 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cpus",type=int,choices=(1,2),required=True)
     parser.add_argument("--accel",choices=("auto","tcg","kvm"),default="auto")
+    parser.add_argument("--profile",choices=("chain","hidden","disabled"),default="disabled",
+                        help="Chain retains PM; hidden omits FADT PM only; disabled also removes PM I/O")
     parser.add_argument("--ovmf-code",type=Path,required=True)
     parser.add_argument("--ovmf-vars",type=Path,required=True)
     parser.add_argument("--timeout",type=int,default=360)

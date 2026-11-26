@@ -57,13 +57,25 @@ jobs:
           python3 scripts/qemu-smoke.py --cpus "$CPU_COUNT" --session \
             --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd \
             --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd --timeout 720
-      - name: Attempt independently proven no-HPET/no-PM boot of the same image
+      - name: Matching KVM controls and fault profiles, same signed EFI
         env:
           CPU_COUNT: ${{ matrix.cpus }}
         run: |
-          python3 scripts/qemu-no-acpi-timers.py --cpus "$CPU_COUNT" --accel auto \
-            --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd \
-            --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd --timeout 360
+          set -uo pipefail
+          code=/usr/share/OVMF/OVMF_CODE_4M.secboot.fd
+          vars=/usr/share/OVMF/OVMF_VARS_4M.fd
+          if ! test -r /dev/kvm || ! test -w /dev/kvm; then
+            echo 'Matching KVM controls unavailable; not substituting TCG.'
+            exit 1
+          fi
+          status=0
+          python3 scripts/qemu-smoke.py --cpus "$CPU_COUNT" --accel kvm --no-hpet --session \
+            --ovmf-code "$code" --ovmf-vars "$vars" --timeout 180 || status=1
+          for profile in chain hidden disabled; do
+            python3 scripts/qemu-no-acpi-timers.py --cpus "$CPU_COUNT" --accel kvm \
+              --profile "$profile" --ovmf-code "$code" --ovmf-vars "$vars" --timeout 180 || status=1
+          done
+          exit "$status"
       - name: Preserve real platform, boot and failure evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -84,3 +96,12 @@ jobs:
             build/check/qemu-cpu${{ matrix.cpus }}-no-acpi-timers-session/*.ppm
             build/check/qemu-cpu${{ matrix.cpus }}-no-acpi-timers-session/*.efi
             build/check/qemu-cpu${{ matrix.cpus }}-no-acpi-timers-session/OVMF_VARS.secboot.fd
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-kvm-session/*.json
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-kvm-session/*.log
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-kvm-session/*.ppm
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session/*.json
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session/*.txt
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session/*.log
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session/*.bin
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session/*.ppm
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session/*.efi

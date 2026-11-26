@@ -19,6 +19,15 @@
 #define ICH9_ID 0x29188086u
 #define PMBASE_MASK 0xff80u
 #define ACPI_EN 0x80u
+#ifndef FIXTURE_HIDE_PM
+#define FIXTURE_HIDE_PM 1
+#endif
+#ifndef FIXTURE_DISABLE_PM
+#define FIXTURE_DISABLE_PM 1
+#endif
+#if FIXTURE_DISABLE_PM && !FIXTURE_HIDE_PM
+#error "PM disable requires the reference to be absent"
+#endif
 
 static uint32_t original_port;
 static EFI_SYSTEM_TABLE *system_table;
@@ -111,12 +120,14 @@ static uint8_t *replace_root(uint64_t address, UINTN width) {
         }
         uint8_t *fadt=clone(table,n);
         if (!fadt) return NULL;
-        store(fadt+76,0,4);
-        fadt[91]=0;
-        store(fadt+112,le32(fadt+112)&~((1u<<8)|(1u<<15)),4);
-        if (n>=220) store(fadt+208,0,8), store(fadt+216,0,4);
-        else if (n>208) return NULL;
-        fix_checksum(fadt,n,9);
+        if (FIXTURE_HIDE_PM) {
+            store(fadt+76,0,4);
+            fadt[91]=0;
+            store(fadt+112,le32(fadt+112)&~((1u<<8)|(1u<<15)),4);
+            if (n>=220) store(fadt+208,0,8), store(fadt+216,0,4);
+            else if (n>208) return NULL;
+            fix_checksum(fadt,n,9);
+        }
         store(copy+offset,(UINTN)fadt,width);
     }
     if (fadt_count!=1 || madt_count!=1) return NULL;
@@ -154,17 +165,17 @@ static uint32_t config(uint32_t offset) {
     return in32(0xcfc);
 }
 
-/* Standard EBS event: OVMF has terminated memory services and stopped its
- * boot timer. No allocation or firmware calls here. This disables the
- * entire ICH9 PM I/O bank, not just the PM timer. The test is expressly
- * not evidence for ACPI power-management functions. */
+/* EBS notification is NOT proof that ExitBootServices has returned.
+ * The control fixture leaves PM I/O working so firmware callbacks can
+ * finish. Only the original fault profile disables the whole PM bank.
+ * No allocation or boot service calls from this callback. */
 static VOID EFIAPI disable_pm(EFI_EVENT event, VOID *context) {
     (void)event; (void)context;
     uint32_t previous=in32(0xcf8);
     uint32_t id=config(0);
     uint32_t base=config(0x40)&PMBASE_MASK;
     uint32_t before=config(0x44);
-    if (id==ICH9_ID && base+8==original_port && (before&ACPI_EN)) {
+    if (FIXTURE_DISABLE_PM && id==ICH9_ID && base+8==original_port && (before&ACPI_EN)) {
         out8(0xcfc,(uint8_t)(before&~ACPI_EN));
     }
     uint32_t after=config(0x44);
@@ -194,6 +205,8 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *table) {
     InitializeLib(image,table);
     system_table=table;
     note("FIXTURE ENTRY\n");
+    note("FIXTURE MODE"); field(" HIDE_PM=",FIXTURE_HIDE_PM);
+    field(" DISABLE_PM=",FIXTURE_DISABLE_PM); note("\n");
     if (!variable_is(L"SecureBoot",1) || !variable_is(L"SetupMode",0))
         return EFI_SECURITY_VIOLATION;
     uint32_t previous=in32(0xcf8);
