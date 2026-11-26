@@ -271,7 +271,11 @@ def capture_platform(qmp, dest, cpus, accel, ram, profile="disabled"):
     for index in range(cpus):
         try:
             qmp.execute("human-monitor-command",{"command-line":f"cpu {index}"})
-            code=hmp(qmp,"x/12i $rip")
+            registers=hmp(qmp,"info registers")
+            (dest/f"cpu{index}-registers.txt").write_text(registers)
+            match=re.search(r"\b(?:RIP|EIP)=([0-9a-fA-F]+)",registers)
+            require(match is not None,"Stopped CPU instruction pointer unavailable")
+            code=hmp(qmp,f"x/12i 0x{match[1]}")
             (dest/f"cpu{index}-instructions.txt").write_text(code)
             print(f"Stopped CPU {index} instructions:",code,flush=True)
         except Exception as exc:
