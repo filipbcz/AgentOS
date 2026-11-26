@@ -5,6 +5,10 @@
 mod reference_clock;
 #[path = "../../kernel/clock_quorum.rs"]
 mod clock_quorum;
+#[path = "../../kernel/tsc.rs"]
+mod tsc;
+#[path = "../../kernel/tsc_watchdog.rs"]
+mod tsc_watchdog;
 #[path = "../../kernel/system_clock.rs"]
 mod system_clock;
 #[path = "../../kernel/timer.rs"]
@@ -527,4 +531,64 @@ fn tsc_bracket_validation_and_cross_cpu_normalized_elapsed_bounds() {
     assert_eq!(TscBracket::new(w,Witness{ticks:w.ticks-1,..w}),None);
     assert_eq!(TscBracket::new(w,Witness{hz:0,..w}),None);
     assert_eq!(TscBracket::new(Witness{uncertainty_ticks:31_000_000,..w},w),None);
+}
+
+
+#[test]
+fn real_cpu_watchdog_lease_controls_the_three_source_failover() {
+    use tsc::Alignment;
+    use tsc_watchdog::{RuntimeMonitor, Sample, Watchdog, Health};
+
+    const BSP: Alignment=Alignment{offset:0,uncertainty_ticks:0};
+    const AP: Alignment=Alignment{offset:-10_000,uncertainty_ticks:30};
+
+    for revoke_ap in [false,true] {
+        let monitor=RuntimeMonitor::new();
+        assert!(monitor.start(0,TSC_HZ,[0,7]));
+        let mut bsp_watch=Watchdog::new();
+        let mut ap_watch=Watchdog::new();
+        let mut rig=TripleRig::new();
+
+        // Establish independent physical qualification and actual
+        // per-CPU watchdog verification before the provider may vote.
+        // Alternate fractional PM ticks to retain the correct mean rate.
+        for i in 0..=3 {
+            if i!=0 { rig.advance_raw(5_000_000, if i%2==1 {1_789_772} else {1_789_773},500_000_000); }
+            let ns=rig.hardware.observe().unwrap() as u64;
+            let tick=rig.tsc_ticks;
+            let expected=if i==3 {Health::Verified} else {Health::Pending};
+            assert_eq!(monitor.observe(0,TSC_HZ,BSP,&mut bsp_watch,Some(Sample{
+                reference_ns:ns,before:tick-30,after:tick+30
+            })),expected);
+            assert_eq!(monitor.observe(7,TSC_HZ,AP,&mut ap_watch,Some(Sample{
+                reference_ns:ns,before:tick+10_000-30,after:tick+10_000+30
+            })),expected);
+            assert_eq!(monitor.witness(0,BSP,tick+100).is_some(),i==3);
+        }
+        assert!(rig.hardware.clocks.qualified());
+
+        rig.advance_raw(2_000_000,715_909,200_000_000);
+        let tick=rig.tsc_ticks;
+        let fresh=monitor.witness(0,BSP,tick).unwrap();
+        assert_eq!(rig.observe(Some(fresh),Some(fresh)),Some(1_700_000_000));
+
+        if revoke_ap {
+            assert_eq!(monitor.observe(7,TSC_HZ,AP,&mut ap_watch,None),Health::Unverified);
+        }
+        rig.advance_raw(8_000_000,715_909,200_000_000);
+        let lease=monitor.witness(0,BSP,rig.tsc_ticks);
+        let result=rig.observe(lease,lease).unwrap();
+        if revoke_ap {
+            // No valid vote: existing two-reference policy remains in
+            // force and the contradicted pair loses qualification.
+            assert!(lease.is_none());
+            assert_eq!(rig.hardware.clocks.source(),Some(rig.hardware.primary));
+            assert!(!rig.hardware.clocks.qualified());
+        } else {
+            assert!(lease.is_some());
+            assert_eq!(rig.hardware.clocks.source(),Some(rig.hardware.shadow));
+            assert_eq!(result,1_900_000_000);
+            assert_eq!(rig.hardware.clocks.take_event(),Some(ClockEvent::PromotedPm));
+        }
+    }
 }
