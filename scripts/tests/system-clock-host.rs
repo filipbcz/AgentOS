@@ -1064,12 +1064,12 @@ fn frozen_or_wrong_rate_quarantined_device_cannot_affect_primary_epoch() {
 fn quarantine_checks_cumulative_rate_not_only_individual_windows() {
     let mut rig=retired_pm();
     rig.advance(2_000_000,715_909).unwrap();
-    // Each 200ms window has a ~2.08ms excess: within the individual
-    // 1% + 100us allowance, but three windows accumulate ~6.24ms,
-    // above the single cumulative allowance of ~6.16ms.
-    for _ in 0..2 {rig.advance(2_000_000,723_354).unwrap();}
+    // Each 200ms window has a ~2.06ms excess: within the individual
+    // 1% + 100us allowance. Two windows accumulate ~4.12ms, below
+    // ~4.141ms; three accumulate ~6.18ms, above ~6.162ms.
+    for _ in 0..2 {rig.advance(2_000_000,723_283).unwrap();}
     assert!(!rig.clocks.qualified());
-    rig.advance(2_000_000,723_354).unwrap();
+    rig.advance(2_000_000,723_283).unwrap();
     assert!(!rig.clocks.qualified());
     for i in 1..=3 {
         rig.advance(2_000_000,715_909).unwrap();
