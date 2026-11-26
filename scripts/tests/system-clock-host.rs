@@ -592,3 +592,198 @@ fn real_cpu_watchdog_lease_controls_the_three_source_failover() {
         }
     }
 }
+
+
+fn lose_both_physical_sources(rig: &mut TripleRig) {
+    rig.hardware.active_raw=rig.hardware.active_raw.wrapping_sub(1)&rig.hardware.primary.mask();
+    rig.hardware.shadow_raw=rig.hardware.shadow_raw.wrapping_sub(1)&rig.hardware.shadow.mask();
+}
+
+#[test]
+fn qualified_tsc_preserves_epoch_when_both_physical_epochs_are_invalid() {
+    let mut rig=TripleRig::qualified();
+    lose_both_physical_sources(&mut rig);
+    // The two endpoint uncertainties total 12ms. Use the conservative
+    // lower bound, not the midpoint or an invented exact time.
+    assert_eq!(rig.advance(0,0,200_000_000),Some(988_000_000));
+    assert!(rig.hardware.clocks.using_tsc());
+    assert_eq!(rig.hardware.clocks.source(),None);
+    assert_eq!(rig.hardware.clocks.take_event(),Some(ClockEvent::PromotedTsc));
+    assert_eq!(rig.hardware.clocks.maintenance_ms(),Some(1000));
+
+    rig.tsc_ticks+=600_000_000;
+    let w=rig.witness(7);
+    let clock=&mut rig.hardware.clocks;
+    let ns=clock.sample_with_witness(|_|panic!("invalid physical source reused"),||Some(w)).unwrap();
+    assert_eq!(ns,1_188_000_000);
+    let view=clock.view(ns);
+    assert_eq!(view.millis,1188);
+    assert!(view.holdover);
+    assert_eq!(view.independent_ns,None);
+    assert_eq!(clock.take_event(),None);
+}
+
+#[test]
+fn both_invalid_sources_without_current_qualified_witness_fail_closed() {
+    for expired in [false,true] {
+        let mut rig=TripleRig::qualified();
+        lose_both_physical_sources(&mut rig);
+        if expired {
+            assert_eq!(rig.advance(0,0,2_100_000_000),None);
+        } else {
+            rig.advance_raw(0,0,200_000_000);
+            let w=rig.witness(0);
+            assert_eq!(rig.observe(Some(w),None),None);
+        }
+        assert!(!rig.hardware.clocks.using_tsc());
+        assert_eq!(rig.hardware.clocks.take_event(),Some(ClockEvent::Unavailable));
+    }
+}
+
+fn qualified_single() -> TripleRig {
+    let mut rig=TripleRig::new();
+    let h=&mut rig.hardware;
+    h.clocks=ClockSet::new((h.primary,h.active_raw),None);
+    assert_eq!(rig.advance(0,0,0),Some(0));
+    for i in 1..=4 {
+        assert_eq!(rig.advance(2_000_000,0,200_000_000),Some(i*200_000_000));
+    }
+    rig
+}
+
+#[test]
+fn only_one_physical_reference_can_anchor_tsc_before_explicit_loss() {
+    let mut rig=qualified_single();
+    let view=rig.hardware.clocks.view(800_000_000);
+    assert_eq!(view.independent_ns,Some(800_000_000));
+    assert!(!view.holdover);
+    rig.hardware.active_raw-=1;
+    assert_eq!(rig.advance(0,0,200_000_000),Some(988_000_000));
+    assert!(rig.hardware.clocks.using_tsc());
+    assert_eq!(rig.hardware.clocks.take_event(),Some(ClockEvent::PromotedTsc));
+}
+
+#[test]
+fn single_source_disagreement_or_missing_bracket_invalidates_tsc_anchor() {
+    for missing in [false,true] {
+        let mut rig=qualified_single();
+        rig.advance_raw(8_000_000,0,200_000_000);
+        let w=rig.witness(0);
+        assert_eq!(rig.observe(Some(w),if missing {None}else{Some(w)}),Some(1_600_000_000));
+        assert!(!rig.hardware.clocks.using_tsc());
+        rig.hardware.active_raw-=1;
+        assert_eq!(rig.advance(0,0,200_000_000),None);
+        assert_eq!(rig.hardware.clocks.take_event(),Some(ClockEvent::Unavailable));
+    }
+}
+
+#[test]
+fn surviving_physical_pair_carries_independent_anchor_across_failover() {
+    let mut rig=TripleRig::qualified();
+    assert_eq!(rig.advance(8_000_000,715_909,200_000_000),Some(1_000_000_000));
+    assert_eq!(rig.hardware.clocks.take_event(),Some(ClockEvent::PromotedPm));
+    rig.hardware.shadow_raw=rig.hardware.shadow_raw.wrapping_sub(1)&rig.hardware.shadow.mask();
+    assert_eq!(rig.advance(0,0,200_000_000),Some(1_188_000_000));
+    assert!(rig.hardware.clocks.using_tsc());
+}
+
+#[test]
+fn holdover_never_extends_its_original_anchor_or_recovers_on_missing_lease() {
+    for missing in [false,true] {
+        let mut rig=TripleRig::qualified();
+        lose_both_physical_sources(&mut rig);
+        assert_eq!(rig.advance(0,0,200_000_000),Some(988_000_000));
+        assert_eq!(rig.hardware.clocks.take_event(),Some(ClockEvent::PromotedTsc));
+        for i in 1..=10 {
+            assert_eq!(rig.advance(0,0,200_000_000),Some(988_000_000+i*200_000_000));
+        }
+        if missing {
+            assert_eq!(rig.observe(None,None),None);
+        } else {
+            // Even an incorrectly prolonged provider lease cannot extend
+            // the holdover beyond its original physical anchor.
+            assert_eq!(rig.advance(0,0,400_000_000),None);
+        }
+        assert_eq!(rig.hardware.clocks.take_event(),Some(ClockEvent::Unavailable));
+        assert!(!rig.hardware.clocks.using_tsc());
+        assert_eq!(rig.advance(0,0,200_000_000),None);
+    }
+}
+
+#[test]
+fn holdover_cross_cpu_uncertainty_clamps_overlap_but_not_large_regression() {
+    let mut rig=TripleRig::qualified();
+    lose_both_physical_sources(&mut rig);
+    let last=rig.advance(0,0,200_000_000).unwrap();
+    let w=rig.witness(7);
+    for i in 1..=4 {
+        let sample=Witness{ticks:w.ticks-i*3_000_000,..w};
+        assert_eq!(rig.observe(Some(sample),Some(sample)),Some(last));
+    }
+    // Relative to the greatest established lower bound, not just the
+    // previous overlapping sample, 20ms backward cannot be accepted.
+    let sample=Witness{ticks:w.ticks-60_000_000,..w};
+    assert_eq!(rig.observe(Some(sample),Some(sample)),None);
+    assert_eq!(rig.hardware.clocks.take_event(),Some(ClockEvent::Unavailable));
+}
+
+#[test]
+fn independent_lapic_guard_expires_a_frozen_holdover() {
+    let mut rig=TripleRig::qualified();
+    lose_both_physical_sources(&mut rig);
+    let ns=rig.advance(0,0,200_000_000).unwrap();
+    let ms=rig.hardware.clocks.view(ns).millis;
+    let mut timer=timer::Timer::new(1000,Some(1000));
+    timer.reset(Some(ms));
+    for i in 1..=5 {
+        assert_eq!(timer.plan(false,None,ms),timer::Action::Arm(100_000));
+        let now=rig.advance(0,0,0).unwrap();
+        let stalled=timer.sample(0,Some(rig.hardware.clocks.view(now).millis));
+        assert_eq!(stalled,i==5);
+        if stalled { rig.hardware.clocks.invalidate_holdover(); }
+    }
+    assert_eq!(rig.hardware.clocks.take_event(),Some(ClockEvent::Unavailable));
+    assert_eq!(rig.advance(0,0,200_000_000),None);
+}
+
+#[test]
+fn actual_watchdog_leases_are_not_renewed_by_tsc_holdover_time() {
+    use tsc::Alignment;
+    use tsc_watchdog::{RuntimeMonitor, Sample, Watchdog, Health};
+    const BSP: Alignment=Alignment{offset:0,uncertainty_ticks:0};
+    let monitor=RuntimeMonitor::new();
+    assert!(monitor.start(0,TSC_HZ,[0]));
+    let mut watchdog=Watchdog::new();
+    let mut rig=TripleRig::new();
+    for i in 0..=3 {
+        if i!=0 { rig.advance_raw(5_000_000,if i%2==1 {1_789_772}else{1_789_773},500_000_000); }
+        let ns=rig.hardware.observe().unwrap() as u64;
+        let raw=rig.tsc_ticks;
+        let health=monitor.observe(0,TSC_HZ,BSP,&mut watchdog,Some(Sample{
+            reference_ns:ns,before:raw-30,after:raw+30,
+        }));
+        assert_eq!(health,if i==3 {Health::Verified}else{Health::Pending});
+    }
+    // Obtain a fresh corroborated triple anchor using the real provider.
+    rig.advance_raw(2_000_000,715_909,200_000_000);
+    let w=monitor.witness(0,BSP,rig.tsc_ticks).unwrap();
+    assert_eq!(rig.observe(Some(w),Some(w)),Some(1_700_000_000));
+    lose_both_physical_sources(&mut rig);
+    // The actual watchdog's lease remains valid for at most 2.5s
+    // after its last independently completed observation, not after
+    // the switch or any subsequent ABI read.
+    for i in 1..=12 {
+        rig.tsc_ticks+=600_000_000;
+        let w=monitor.witness(0,BSP,rig.tsc_ticks);
+        let ns=rig.observe(w,w);
+        if i<12 {
+            let view=rig.hardware.clocks.view(ns.unwrap());
+            assert!(view.holdover);
+            assert_eq!(view.independent_ns,None);
+        } else {
+            assert!(w.is_none());
+            assert_eq!(ns,None);
+        }
+    }
+    assert_eq!(rig.hardware.clocks.take_event(),Some(ClockEvent::Unavailable));
+}
