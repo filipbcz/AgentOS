@@ -40,7 +40,7 @@ pub(crate) fn capabilities(max_basic: u32, leaf1_edx: u32, max_extended: u32,
     Capabilities { available, invariant, nominal_hz }
 }
 
-unsafe fn detect() -> Capabilities {
+pub(crate) unsafe fn detect() -> Capabilities {
     let basic = __cpuid(0).eax;
     let extended = __cpuid(0x8000_0000).eax;
     let flags = if basic >= 1 { __cpuid(1).edx } else { 0 };
