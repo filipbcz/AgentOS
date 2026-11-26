@@ -1366,3 +1366,34 @@ fn qualified_holdover_can_restart_stopped_hpet_and_restore_physical_clock() {
     assert_eq!(rig.hardware.clocks.source(),Some(a));
     assert_eq!(rig.hardware.clocks.take_event(),Some(ClockEvent::RecoveredHpet));
 }
+
+
+#[test]
+fn partially_failed_restart_blocks_requalification_even_if_counter_moves() {
+    let mut rig=boot_quarantine(pm(true),hp(true,100_000_000));
+    rig.observe();
+    rig.advance(715_909,0).unwrap();
+    rig.active_raw+=715_909;
+    assert_eq!(lifecycle_sample(&mut rig,|_|Some(false)),Some(400_000_000));
+    assert_eq!(rig.clocks.take_event(),Some(ClockEvent::HpetRestartFailed));
+    // A partially programmed device happens to run at the correct rate.
+    // Neither its good frequency nor its former history can qualify it.
+    for i in 1..=4 {
+        rig.active_raw+=715_909;
+        rig.shadow_raw+=2_000_000;
+        assert_eq!(lifecycle_sample(&mut rig,|_|panic!("restart cooldown")),Some(400_000_000+i*200_000_000));
+        assert!(!rig.clocks.qualified());
+    }
+    rig.active_raw+=715_909;
+    rig.shadow_raw+=2_000_000;
+    let mut attempted=false;
+    assert_eq!(lifecycle_sample(&mut rig,|_|{attempted=true;Some(true)}),Some(1_400_000_000));
+    assert!(attempted);
+    assert_eq!(rig.clocks.take_event(),Some(ClockEvent::HpetRestarted));
+    rig.shadow_raw=0;
+    for i in 1..=4 {
+        rig.advance(715_909,2_000_000).unwrap();
+        assert_eq!(rig.clocks.qualified(),i==4);
+    }
+    assert_eq!(rig.clocks.take_event(),Some(ClockEvent::StandbyRecovered));
+}
