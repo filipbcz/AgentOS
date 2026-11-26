@@ -461,7 +461,14 @@ impl Cpu {
         let before = crate::tsc::read();
         let now = crate::system_clock::snapshot();
         let after = crate::tsc::read();
-        let sample = now.and_then(|(_, ns)| ns.map(|reference_ns| Sample { reference_ns, before, after }));
+        // Holdover supplies real ABI time, but it is derived from TSC.
+        // Feeding it back to the watchdog would falsely renew the lease
+        // from the very counter it is supposed to qualify independently.
+        if now.as_ref().map_or(false, |s| s.holdover) {
+            return now.map(|s| s.millis);
+        }
+        let sample = now.as_ref().and_then(|s| s.independent_ns)
+            .map(|reference_ns| Sample { reference_ns, before, after });
         let watchdog = &mut *self.tsc_watchdog.get();
         let previous = watchdog.health();
         let health = MONITOR.observe(self.expected_id as u32, rate, alignment, watchdog, sample);
@@ -470,7 +477,7 @@ impl Cpu {
                         else { crate::log_policy::Level::Info };
             let _ = crate::logger::LOGGER.record(after, self.expected_id as u32, level, health.message());
         }
-        now.map(|(ms, _)| ms)
+        now.map(|s| s.millis)
     }
 
     unsafe fn arm_timer(&self, runnable: bool, deadline: Option<u64>, now: u64) {
@@ -502,6 +509,7 @@ impl Cpu {
         let mut pChanged = false;
         if scheduled {
             let clock_error = (*self.timer_policy.get()).sample(self.apic.read(0x390), measured);
+            if clock_error { crate::system_clock::expire_stalled_holdover(); }
             self.load.frames.with(|pFrames| {
                 pChanged |= queue.processPendingKills(pFrames);
                 pChanged |= queue.collectRetired(pFrames) != 0;
