@@ -132,6 +132,7 @@ impl Epoch {
         if self.failed {return None;}
         let result=(|| {
             let current=self.record(before,after)?;
+            if count<pit::MIN_REARM_COUNT {return None;}
             let step=pit::count_elapsed_ns(self.count,count)?;
             let total=pit::count_elapsed_ns(self.window_count,count)?;
             if !Span::exact(step).agrees(self.previous.elapsed(current)?) ||
@@ -154,7 +155,8 @@ impl Epoch {
     pub(crate) fn rearm(&mut self,before:Sample,after:Sample,count:u16)->bool {
         if self.failed{return false;}
         let result=(||{
-            if self.count>pit::REARM_COUNT || count<=pit::REARM_COUNT{return None;}
+            if self.count>pit::REARM_COUNT || self.count<pit::MIN_REARM_COUNT ||
+               count<=pit::REARM_COUNT{return None;}
             let current=self.record(before,after)?;
             if self.previous.elapsed(current)?.high>MAX_REARM_NS{return None;}
             self.previous=current;
