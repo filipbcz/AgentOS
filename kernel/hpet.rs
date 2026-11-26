@@ -147,7 +147,7 @@ impl Hpet {
         }
         let address = self.base.load(Ordering::Relaxed);
         let caps = self.caps.load(Ordering::Relaxed);
-        let result = if ptr::read_volatile((address + CAPABILITIES) as *const u64) != caps {
+        let result: Result<(), Error> = if ptr::read_volatile((address + CAPABILITIES) as *const u64) != caps {
             // A changed descriptor cannot be safely reconfigured with
             // the previously validated width or comparator count.
             Err(b"HPET capabilities changed")
