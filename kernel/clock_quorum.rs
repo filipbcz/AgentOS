@@ -81,6 +81,7 @@ pub(crate) enum Verdict {
     StandbyAndTsc,
     PhysicalAgree,
     TscRejected,
+    Inconclusive,
     Ambiguous,
 }
 
@@ -99,6 +100,7 @@ pub(crate) fn decide(active: Option<Span>, standby: Option<Span>,
         (true, _, _) => Verdict::PhysicalAgree,
         (false, true, false) => Verdict::ActiveAndTsc,
         (false, false, true) => Verdict::StandbyAndTsc,
+        (false, true, true) => Verdict::Inconclusive,
         _ => Verdict::Ambiguous,
     }
 }
