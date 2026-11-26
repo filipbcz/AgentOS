@@ -173,6 +173,9 @@ printf 'Testing CPU-local bootstrap deadlines and qualified SMP TSC epoch with %
 "$pRustc" --edition 2021 --test "$pRoot/scripts/tests/tsc-bootstrap-host.rs" -o "$pOut/tsc-bootstrap-tests"
 "$pOut/tsc-bootstrap-tests"
 
+printf 'Testing the single-channel PIT rearm continuity counterexample\n'
+"$pPython" "$pRoot/scripts/tests/pit-rearm-continuity-host.py"
+
 printf 'Testing independent TSC watchdog, CPU skew and maintenance deadlines with %s\n' "$pRustc"
 "$pRustc" --edition 2021 --test "$pRoot/scripts/tests/tsc-watchdog-host.rs" -o "$pOut/tsc-watchdog-tests"
 "$pOut/tsc-watchdog-tests"

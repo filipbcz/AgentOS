@@ -272,3 +272,31 @@ fn rejected_complete_observation_retains_raw_inputs_and_stage() {
         [1,Fault::BracketWidth as u64,1,53_068,65_000,HZ,201,201,before.raw,after.raw,
          HZ,HZ,(-30_000i64) as u64,(-30_000i64) as u64,300,300]);
 }
+
+#[test]
+fn short_new_latch_does_not_justify_unobserved_rearm_time() {
+    use clock_quorum::{BracketError, TscBracket, Witness};
+    let roster=Roster::qualify(BSP.id,HZ,&[BSP.id],[BSP]).unwrap();
+    let first=at(BSP,BASE);
+    let mut e=Epoch::new(roster,first,first,65_000).unwrap();
+    let old=at(BSP,BASE+ticks(65_000-27_124));
+    assert!(e.observe(old,old,27_124).is_ok());
+
+    // Long programming/verification work is not necessarily a wide
+    // count latch. A tight new latch by itself proves no continuity
+    // over the disabled old counter. The present single-channel API
+    // must not be fed a shortened bracket in place of the whole reset.
+    let new_before=Sample{raw:old.raw+700_000,..old};
+    let new_after=Sample{raw:new_before.raw+3_000,..new_before};
+    let witness=|s:Sample| Witness{cpu:s.member.id,hz:s.member.hz,
+        ticks:s.raw,uncertainty_ticks:0};
+    assert!(TscBracket::checked(witness(new_before),witness(new_after)).is_ok());
+    assert_eq!(e.rearm(old,new_after,65_458),Err(Fault::BracketWidth));
+    assert_eq!(e.fault(),Some(Fault::BracketWidth));
+
+    // A genuinely wide count observation must still be rejected, even
+    // with no programming delay and no CPU or alignment change.
+    let wide=Sample{raw:new_before.raw+600_001,..new_before};
+    assert_eq!(TscBracket::checked(witness(new_before),witness(wide)),
+        Err(BracketError::Width));
+}
