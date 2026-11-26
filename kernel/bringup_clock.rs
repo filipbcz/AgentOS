@@ -69,6 +69,22 @@ impl BringupClock {
         }
     }
 
+    /// The requesting CPU uses its own boot deadline transport. The
+    /// peer's timestamp is used only inside the existing round-trip
+    /// alignment bracket, never as a local deadline counter.
+    pub(crate) unsafe fn synchronize(self, peer: &crate::tsc::Peer, bsp_hz: u64,
+                                    mut maintain: impl FnMut()) -> Option<crate::tsc::Alignment> {
+        self.wait_until(1_000_000_000, || { maintain(); peer.ready() }).ok()?;
+        let ap_hz=peer.rate()?;
+        let alignment=crate::tsc::align(bsp_hz,ap_hz,|sequence| {
+            maintain();
+            peer.exchange(sequence, || crate::tsc::read(), |p,seq|
+                self.wait_until(20_000_000,||p.answered(seq)).is_ok())
+        })?;
+        peer.publish_alignment(alignment);
+        Some(alignment)
+    }
+
     pub unsafe fn delay_ns(self, duration_ns: u64) -> Result<u64, WaitError> {
         match self {
             Self::Physical(clock) => clock.delay_ns(duration_ns),
