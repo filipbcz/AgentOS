@@ -1,0 +1,86 @@
+name: QEMU absent ACPI timers (supplementary)
+
+on:
+  pull_request:
+    paths:
+      - 'boot/**'
+      - 'kernel/**'
+      - 'user/**'
+      - 'scripts/**'
+      - '.github/workflows/qemu-clock-bootstrap.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agentos-qemu-clock-bootstrap-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  no-acpi-timers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        cpus: [1, 2]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install EFI build and emulator dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            binutils cpio gcc-13 gnu-efi rustc python3 openssl \
+            sbsigntool efitools gdisk mtools qemu-system-x86 ovmf \
+            python3-virt-firmware
+      - name: Build the ordinary signed production EFI once
+        run: bash scripts/build.sh
+      - name: Record host accelerator capabilities
+        run: |
+          qemu-system-x86_64 --version
+          qemu-system-x86_64 -accel help
+          if test -c /dev/kvm; then
+            ls -l /dev/kvm
+            # This is an isolated ephemeral runner. Grant access to its
+            # existing KVM device, not to a fabricated CPU capability.
+            sudo chmod a+rw /dev/kvm
+          else
+            echo 'No /dev/kvm on this runner; TCG must prove its own capabilities.'
+          fi
+      - name: Boot and exercise the ordinary signed image
+        env:
+          CPU_COUNT: ${{ matrix.cpus }}
+        run: |
+          python3 scripts/qemu-smoke.py --cpus "$CPU_COUNT" --session \
+            --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd \
+            --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd --timeout 720
+      - name: Attempt independently proven no-HPET/no-PM boot of the same image
+        env:
+          CPU_COUNT: ${{ matrix.cpus }}
+        run: |
+          python3 scripts/qemu-no-acpi-timers.py --cpus "$CPU_COUNT" --accel auto \
+            --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd \
+            --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd --timeout 360
+      - name: Preserve real platform, boot and failure evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-no-acpi-timers-${{ matrix.cpus }}cpu
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            build/build-provenance.json
+            build/agentos.efi
+            build/db.esl
+            build/check/qemu-cpu${{ matrix.cpus }}-session/smoke.json
+            build/check/qemu-cpu${{ matrix.cpus }}-session/com1.log
+            build/check/qemu-cpu${{ matrix.cpus }}-no-acpi-timers-session/*.json
+            build/check/qemu-cpu${{ matrix.cpus }}-no-acpi-timers-session/*.txt
+            build/check/qemu-cpu${{ matrix.cpus }}-no-acpi-timers-session/*.log
+            build/check/qemu-cpu${{ matrix.cpus }}-no-acpi-timers-session/*.bin
+            build/check/qemu-cpu${{ matrix.cpus }}-no-acpi-timers-session/*.ppm
+            build/check/qemu-cpu${{ matrix.cpus }}-no-acpi-timers-session/*.efi
+            build/check/qemu-cpu${{ matrix.cpus }}-no-acpi-timers-session/OVMF_VARS.secboot.fd
