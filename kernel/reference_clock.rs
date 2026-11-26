@@ -103,15 +103,25 @@ impl ReferenceClock {
         ms.min(isize::MAX as u128) as u64
     }
 
-    /// Exact nanoseconds for a clock comparison. Unlike the ABI millisecond
-    /// conversion, an interval outside the u64 nanosecond range is unavailable.
-    pub(crate) fn total_ns(self, ticks: u128) -> Option<u64> {
-        let ns = match self {
-            Self::Pm(_) => ticks.checked_mul(NS_PER_SECOND as u128)? / PM_HZ as u128,
+    /// Accumulated elapsed nanoseconds, retaining a wider range than the
+    /// signed native millisecond ABI. No conversion on each increment.
+    pub(crate) fn wide_ns(self, ticks: u128) -> u128 {
+        match self {
+            Self::Pm(_) => ticks.saturating_mul(NS_PER_SECOND as u128) / PM_HZ as u128,
             Self::Hpet { period_fs, .. } =>
-                ticks.checked_mul(period_fs as u128)? / FS_PER_NS as u128,
-        };
-        u64::try_from(ns).ok()
+                ticks.saturating_mul(period_fs as u128) / FS_PER_NS as u128,
+        }
+    }
+
+    /// Exact nanoseconds for a clock comparison. An interval outside the
+    /// u64 nanosecond range is unavailable, not truncated or wrapped.
+    pub(crate) fn total_ns(self, ticks: u128) -> Option<u64> {
+        u64::try_from(self.wide_ns(ticks)).ok()
+    }
+
+    /// Elapsed-time bound for an unambiguous modulo-counter observation.
+    pub(crate) fn half_span_ns(self) -> u128 {
+        self.wide_ns((self.mask() / 2) as u128)
     }
 
     /// Sample before a quarter of a short counter's wrap, including during
