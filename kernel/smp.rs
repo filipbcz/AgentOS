@@ -1399,13 +1399,18 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
     for pCpu in cpus.iter().flatten().filter(|pCpu| pCpu.expected_id != bsp) {
         pCpu.phase.store(RUNTIME_PHASE, Ordering::Release);
     }
-    clock.wait_until(2_000_000_000, || cpus.iter().flatten()
-        .filter(|cpu| cpu.expected_id != bsp)
-        .all(|cpu| cpu.fRuntimeReady.load(Ordering::Acquire)))
+    clock.wait_until(2_000_000_000, || {
+        let _=crate::system_clock::millis();
+        cpus.iter().flatten().filter(|cpu| cpu.expected_id != bsp)
+            .all(|cpu| cpu.fRuntimeReady.load(Ordering::Acquire))
+    })
         .map_err(|error| match error {
             WaitError::Timeout => b"runtime CPU startup timeout" as Error,
             WaitError::Unresponsive => b"runtime CPU startup reference clock stopped" as Error,
         })?;
+    if crate::system_clock::millis().is_none() {
+        return Err(b"system clock unavailable at runtime publication");
+    }
 
     Ok(())
 }
