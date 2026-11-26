@@ -31,6 +31,8 @@ MAX_TABLE = 1024 * 1024
 HEX = r"([0-9a-f]{16})"
 PREPARED = re.compile(r"(?m)^FIXTURE PREPARED ST="+HEX+r" PMPORT="+HEX+
                       r" RSDP20="+HEX+r" RSDP10="+HEX+r" INVTSC="+HEX+r"$")
+DEFER = re.compile(r"(?m)^FIXTURE DEFER EBS_ENTRY="+HEX+r" CHILD_BASE="+HEX+
+                   r" CHILD_SIZE="+HEX+r" ST="+HEX+r" PMPORT="+HEX+r"$")
 EBS = re.compile(r"(?m)^FIXTURE EBS ST="+HEX+r" PMPORT="+HEX+r" LPC="+HEX+
                  r" PMBASE="+HEX+r" CTRL_BEFORE="+HEX+r" CTRL_AFTER="+HEX+
                  r" PORT_AFTER="+HEX+r"$")
@@ -246,7 +248,8 @@ def capture_platform(qmp, dest, cpus, accel, ram, profile="disabled"):
     qmp.execute("stop")
     state = qmp.execute("query-status")
     require(not state["running"], "QEMU did not pause for final read-only inspection")
-    disabled=profile=="disabled"
+    disabled=profile in ("disabled","deferred")
+    callback_disabled=profile=="disabled"
     hidden=profile!="chain"
     try:
         diagnostic=kernel_postmortem(qmp,dest,ram)
@@ -300,8 +303,8 @@ def capture_platform(qmp, dest, cpus, accel, ram, profile="disabled"):
     st,port,r20,r10,invtsc=map(lambda v:int(v,16),prepared[0].groups())
     st2,port2,lpc,base,before,after,value=map(lambda v:int(v,16),ebs[0].groups())
     require(st==st2 and port==port2 and lpc==0x29188086 and base+8==port and
-            before&0x80 and bool(after&0x80)!=disabled and
-            (value==0xffffffff)==disabled,
+            before&0x80 and bool(after&0x80)!=callback_disabled and
+            (value==0xffffffff)==callback_disabled,
             "Fixture EBS PM I/O state does not match profile")
     require(invtsc in (0,1), "Invalid guest CPUID evidence")
     files={}
@@ -317,6 +320,13 @@ def capture_platform(qmp, dest, cpus, accel, ram, profile="disabled"):
         files[path.name]=smoke.evidence.sha256(path)
         return data
     tables=inspect_tables(read,st,r20,r10,cpus,None if hidden else port)
+    if profile=="deferred":
+        deferred=json.loads((dest/"deferred-removal.json").read_text())
+        require(deferred["result"]=="pass" and deferred["system_table"]==st and
+                deferred["pm_port"]==port and deferred["efi_status"]==0 and
+                deferred["boot_services"]==0 and deferred["control_before"]&0x80 and
+                not deferred["control_after"]&0x80 and deferred["port_after"]==0xffffffff,
+                "Missing proven PM removal after successful EBS return")
     write_json(dest/"acpi-tables.json",tables)
     print("Actual EFI/ACPI tables:",json.dumps(tables,sort_keys=True),flush=True)
     # Independently read the former PM I/O port. Preserve the raw response
@@ -352,6 +362,7 @@ def prepare_fixture(dest, signed_hash, args):
          "-fshort-wchar","-mno-red-zone",
          f"-DFIXTURE_HIDE_PM={int(args.profile!='chain')}",
          f"-DFIXTURE_DISABLE_PM={int(args.profile=='disabled')}",
+         f"-DFIXTURE_DEFER_PM={int(args.profile=='deferred')}",
          "-c",str(ROOT/"scripts/tests/no-acpi-timers-efi.c"),"-o",str(obj)])
     run(["ld","-nostdlib","--build-id=none","-znocombreloc","-T","/usr/lib/elf_x86_64_efi.lds",
          "-shared","-Bsymbolic","/usr/lib/crt0-efi-x86_64.o",str(obj),"-L/usr/lib","-lefi","-lgnuefi","-o",str(elf)])
@@ -453,6 +464,11 @@ def scenario(args):
               "-serial","chardev:uart","-debugcon",f"file:{dest/'fixture-debug.log'}",
               "-global","isa-debugcon.iobase=0xe9","-vga","std","-display","none",
               "-nic","none","-boot","order=c","-no-reboot","-no-shutdown"]
+        if args.profile=="deferred":
+            # UNIX socket inside the private run directory. QEMU is not
+            # listening for external debug connections on a network port.
+            qemu.extend(["-chardev",f"socket,id=ebsdbg,path={dest/'ebs-gdb.sock'},server=on,wait=off",
+                         "-gdb","chardev:ebsdbg"])
         write_json(dest/"qemu-command.json",qemu)
         serial=dest/"com1.log"
         with (dest/"qemu-stderr.log").open("wb") as diagnostics:
@@ -462,8 +478,34 @@ def scenario(args):
             last_progress=time.monotonic()
             last_size=-1
             deadline=last_progress+args.timeout
+            deferred_done=False
             try:
                 while time.monotonic()<deadline:
+                    if args.profile=="deferred" and not deferred_done:
+                        debug=dest/"fixture-debug.log"
+                        if debug.exists():
+                            matches=list(DEFER.finditer(debug.read_text(encoding="ascii",errors="replace")))
+                            if len(matches)==1:
+                                entry,child,size,st,port=map(lambda value:int(value,16),matches[0].groups())
+                                require(4096<=entry<256*1024*1024 and 4096<=child and
+                                        0<size<=16*1024*1024 and child+size<=256*1024*1024 and
+                                        4096<=st<256*1024*1024-120 and 0<port<65536,
+                                        "Invalid fixture debugger rendezvous")
+                                request=dest/"deferred-request.json"
+                                write_json(request,{"entry":entry,"child_base":child,"child_size":size,
+                                    "system_table":st,"pm_port":port,"destination":str(dest)})
+                                env=dict(os.environ,AGENTOS_EBS_REQUEST=str(request))
+                                with (dest/"ebs-gdb.log").open("wb") as gdb_log:
+                                    completed=subprocess.run(["gdb","-nx","-nh","-batch",
+                                        "-ex","set pagination off","-ex","set confirm off",
+                                        "-ex",f"target remote {dest/'ebs-gdb.sock'}",
+                                        "-x",str(ROOT/"scripts/tests/defer-pm-gdb.py")],
+                                        cwd=ROOT,env=env,stdout=gdb_log,stderr=subprocess.STDOUT,timeout=60)
+                                print("Post-EBS debugger:",(dest/"ebs-gdb.log").read_text(errors="replace"),flush=True)
+                                require(completed.returncode==0 and (dest/"deferred-removal.json").is_file(),
+                                        "Post-EBS hardware removal did not complete")
+                                deferred_done=True
+                                last_progress=time.monotonic()
                     data=serial.read_bytes() if serial.exists() else b""
                     if capture.error:
                         raise RuntimeError(f"UART capture stopped: {capture.error}")
@@ -487,6 +529,7 @@ def scenario(args):
                     raise TimeoutError("Guest did not reach a complete interactive session")
                 # Full standard session except for its explicit watchdog
                 # budget. Never substitute a transcript for a real session.
+                require(args.profile!="deferred" or deferred_done,"No completed post-EBS removal")
                 data=serial.read_bytes()
                 text=data.decode("ascii",errors="replace")
                 smoke.boot_log.verify(data,"info","both")
@@ -572,8 +615,8 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cpus",type=int,choices=(1,2),required=True)
     parser.add_argument("--accel",choices=("auto","tcg","kvm"),default="auto")
-    parser.add_argument("--profile",choices=("chain","hidden","disabled"),default="disabled",
-                        help="Chain retains PM; hidden omits FADT PM only; disabled also removes PM I/O")
+    parser.add_argument("--profile",choices=("chain","hidden","disabled","deferred"),default="disabled",
+                        help="Chain retains PM; hidden omits FADT PM; disabled removes PM during EBS; deferred removes after EBS return")
     parser.add_argument("--ovmf-code",type=Path,required=True)
     parser.add_argument("--ovmf-vars",type=Path,required=True)
     parser.add_argument("--timeout",type=int,default=360)

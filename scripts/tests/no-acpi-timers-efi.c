@@ -25,6 +25,12 @@
 #ifndef FIXTURE_DISABLE_PM
 #define FIXTURE_DISABLE_PM 1
 #endif
+#ifndef FIXTURE_DEFER_PM
+#define FIXTURE_DEFER_PM 0
+#endif
+#if FIXTURE_DEFER_PM && (FIXTURE_DISABLE_PM || !FIXTURE_HIDE_PM)
+#error "Deferred PM removal keeps firmware I/O until successful EBS return"
+#endif
 #if FIXTURE_DISABLE_PM && !FIXTURE_HIDE_PM
 #error "PM disable requires the reference to be absent"
 #endif
@@ -206,7 +212,8 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *table) {
     system_table=table;
     note("FIXTURE ENTRY\n");
     note("FIXTURE MODE"); field(" HIDE_PM=",FIXTURE_HIDE_PM);
-    field(" DISABLE_PM=",FIXTURE_DISABLE_PM); note("\n");
+    field(" DISABLE_PM=",FIXTURE_DISABLE_PM);
+    field(" DEFER_PM=",FIXTURE_DEFER_PM); note("\n");
     if (!variable_is(L"SecureBoot",1) || !variable_is(L"SetupMode",0))
         return EFI_SECURITY_VIOLATION;
     uint32_t previous=in32(0xcf8);
@@ -254,6 +261,21 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *table) {
     status=BS->LoadImage(FALSE,image,path,NULL,0,&child);
     if (EFI_ERROR(status)) { note("FIXTURE LOAD ERROR="); hex(status); note("\n"); return status; }
     note("FIXTURE VERIFIED LOAD\n");
+    if (FIXTURE_DEFER_PM) {
+        EFI_LOADED_IMAGE *child_image;
+        status=BS->HandleProtocol(child,&LoadedImageProtocol,(VOID **)&child_image);
+        if (EFI_ERROR(status)) return status;
+        // Only this test application rendezvous with the host debugger.
+        // The debugger will use a hardware breakpoint at the actual EBS
+        // entry and return; it never patches the signed child or calls EBS.
+        note("FIXTURE DEFER");
+        field(" EBS_ENTRY=",(UINTN)BS->ExitBootServices);
+        field(" CHILD_BASE=",(UINTN)child_image->ImageBase);
+        field(" CHILD_SIZE=",child_image->ImageSize);
+        field(" ST=",(UINTN)table); field(" PMPORT=",original_port); note("\n");
+        status=BS->Stall(5000000);
+        if (EFI_ERROR(status)) return status;
+    }
     status=BS->StartImage(child,NULL,NULL);
     note("FIXTURE CHILD RETURN="); hex(status); note("\n");
     return EFI_ERROR(status)?status:EFI_ABORTED;

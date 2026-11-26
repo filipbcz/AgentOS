@@ -35,7 +35,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             binutils cpio gcc-13 gnu-efi rustc python3 openssl \
             sbsigntool efitools gdisk mtools qemu-system-x86 ovmf \
-            python3-virt-firmware
+            python3-virt-firmware gdb
       - name: Build the ordinary signed production EFI once
         run: bash scripts/build.sh
       - name: Record host accelerator capabilities
@@ -71,7 +71,7 @@ jobs:
           status=0
           python3 scripts/qemu-smoke.py --cpus "$CPU_COUNT" --accel kvm --no-hpet --session \
             --ovmf-code "$code" --ovmf-vars "$vars" --timeout 180 || status=1
-          for profile in chain hidden disabled; do
+          for profile in chain hidden deferred; do
             python3 scripts/qemu-no-acpi-timers.py --cpus "$CPU_COUNT" --accel kvm \
               --profile "$profile" --ovmf-code "$code" --ovmf-vars "$vars" --timeout 180 || status=1
           done
