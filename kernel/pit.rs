@@ -260,7 +260,12 @@ pub(crate) unsafe fn read_monitor() -> Option<u16> {
 
 pub(crate) unsafe fn rearm_monitor() -> Option<u16> {
     if !MONITOR_ACTIVE.load(Ordering::Acquire) { return None; }
-    program_monitor(&mut Io, LOAD_POLLS).ok()
+    let mut io=Io;
+    // Check the still-owned old finite window immediately before reset.
+    // In particular do not clear a terminal indication observed late.
+    let remaining=monitor_count(&mut io).ok().flatten()?;
+    if remaining<MIN_REARM_COUNT || remaining>REARM_COUNT { return None; }
+    program_monitor(&mut io, LOAD_POLLS).ok()
 }
 
 pub(crate) unsafe fn stop_monitor() {
