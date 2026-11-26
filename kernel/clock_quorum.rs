@@ -1,5 +1,6 @@
-//! Bounded three-source clock comparison. A normalized TSC is a witness,
-//! not an absolute time epoch. This module contains no hardware accesses.
+//! Bounded three-source clock comparison and normalized TSC intervals.
+//! An absolute time epoch must be anchored to independently verified time.
+//! This module contains no hardware accesses.
 const NS_PER_SECOND: u128 = 1_000_000_000;
 pub(crate) const MAX_GAP_NS: u128 = 2_000_000_000;
 const MAX_BRACKET_NS: u128 = 200_000;
@@ -34,7 +35,7 @@ impl Span {
 
     pub fn exact(ns: u128) -> Self { Self { low: ns, high: ns } }
 
-    fn agrees(self, other: Self) -> bool {
+    pub(crate) fn agrees(self, other: Self) -> bool {
         // Account for the independently calibrated rates and reference
         // quantization, in addition to the explicit endpoint uncertainty.
         let budget = self.high.max(other.high) / 100 + QUANTIZATION_NS;
@@ -61,6 +62,15 @@ impl TscBracket {
             high: after.ticks.checked_add(after.uncertainty_ticks)?,
             hz: before.hz,
         })
+    }
+
+    /// Retain the greatest established lower bound, so a series of
+    /// overlapping reads on different CPUs cannot gradually hide a
+    /// regression. Neither a rate change nor disjoint backward movement
+    /// is a valid continuation.
+    pub fn advance(self, next: Self) -> Option<Self> {
+        if self.hz != next.hz || next.high < self.low { return None; }
+        Some(if next.low >= self.low { next } else { self })
     }
 
     pub fn elapsed(self, last: Self) -> Option<Span> {
