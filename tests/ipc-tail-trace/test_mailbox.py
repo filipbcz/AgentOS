@@ -85,7 +85,7 @@ def load_callbacks(directory, fixture):
     # These files are only read at initialization; runtime ELF matching is
     # deliberately outside this callback-only test.
     (directory/"build/kernel.elf").write_bytes(b"")
-    (stage/"ipc-runner").write_bytes(b"")
+    (stage/"supervisor-runner").write_bytes(b"")
     request = directory/"request.json"
     request.write_text(json.dumps(dict(base=BASE, shell=11, root=str(directory), destination=str(directory))))
     ns = {"__name__": "trace_host_fixture", "__file__": str(TRACE)}

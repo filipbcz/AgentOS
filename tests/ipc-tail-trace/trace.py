@@ -7,6 +7,7 @@ This observes the normal guest: no INT3, guest writes, injected test markers,
 forced scheduling, altered clocks or extended session deadline.
 """
 import gdb
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -16,7 +17,7 @@ request = json.loads(Path(os.environ["AGENTOS_IPC_TRACE_REQUEST"]).read_text())
 base, shell = request["base"], request["shell"]
 dest, rootdir = Path(request["destination"]), Path(request["root"])
 kernel = (rootdir/"build/kernel.elf").read_bytes()
-runner = (rootdir/"build/supervisor-staging/ipc-runner").read_bytes()
+runner = (rootdir/"build/supervisor-staging/supervisor-runner").read_bytes()
 inferior = gdb.selected_inferior()
 U = 0x8000400000
 Q = 0x1b8
@@ -29,9 +30,9 @@ SITES = {
     0x1f9ac: "blocked_child", 0xcf71: "collect_result",
     0x26da7: "ipc_send_committed", 0x26cba: "ipc_receive_committed",
 }
-# Return PCs in sample()'s callers (from exact stripped ipc-runner ELF).
+# Return PCs in sample()'s callers (from exact stripped supervisor-runner ELF).
 CALLS = {0xa3a: "RUNNER", 0x1080: "PEER_BEGIN", 0x11f9: "PEER_END",
-         0x12fe: "BEGIN", 0x13cc: "ENDED", 0x1bc5: "COMPLETE"}
+         0x12fe: "BEGIN", 0x13c8: "ENDED", 0x1bc1: "COMPLETE"}
 root_pid = None
 pre = {}
 counts = {}
@@ -156,7 +157,7 @@ def context(address):
             "address":address}
 
 def code_matches(address, length=12):
-    return U<=address<=U+0x35fc-length and mem(address,length)==runner[
+    return U<=address<=U+0x28b0-length and mem(address,length)==runner[
         0x1000+address-U:0x1000+address-U+length]
 
 def sched_stats():
@@ -179,8 +180,12 @@ def sched_stats():
     require(t["pid"]==pid and t["moves"]==own,"SCHED_STATS owner mismatch")
     label=CALLS.get(caller-U,"OTHER")
     if root_pid is None and label=="RUNNER" and parent==shell:
+        require(mem(U,0x1000)==runner[0x1000:0x2000],
+                "Runtime supervisor entry page differs from pinned ELF")
         root_pid=pid
-        record("root_identified",pid=pid,parent=parent,apic=apic,cr3=t["cr3"])
+        record("root_identified",pid=pid,parent=parent,apic=apic,cr3=t["cr3"],
+               runner="supervisor-runner",runner_sha256=hashlib.sha256(runner).hexdigest(),
+               runtime_entry_page_sha256=hashlib.sha256(runner[0x1000:0x2000]).hexdigest())
     if pid!=root_pid and parent!=root_pid:
         return
     record("sched_stats_loaded",label=label,caller=caller,pid=pid,parent=parent,
@@ -245,7 +250,8 @@ def collect():
     if related(t) or t["pid"]==shell:
         record("collect_result",pid=t["pid"],apic=cpus[cpu],
                child=word(sp+0x10),tag=word(sp+0x1e0),
-               status=signed(word(sp+0x1e8)),global_count=global_count(),
+               status=signed(word(sp+0x1e8)),boundary="kernel_collect_result",
+               global_count=global_count(),
                gate=val(mem(cpu+0x150,1)))
 
 def exit_committed():
@@ -302,6 +308,11 @@ def save(name,value):
 
 def main():
     global cpus,stops,stop_ns,max_stop_ns,armed_ns
+    require(request.get("arm_command")=="run /supervisor-runner" and
+            request.get("profile")=="qemu-cpu2-session-sv-test" and
+            request.get("runner_sha256")==hashlib.sha256(runner).hexdigest()==
+            "29204eedf0f068e7b6dd751c62fdb60543904145cafb955c7685eebf464593c4",
+            "Wrong supervisor ARM command, profile or runner identity")
     raw=mem(base+0x424c0,255*8)
     pointers=[val(raw,i) for i in range(0,len(raw),8) if val(raw,i)]
     cpus={p:val(mem(p+0x30,4),0,4) for p in pointers}

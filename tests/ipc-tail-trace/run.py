@@ -3,7 +3,7 @@
 
 Run the original signed qemu-smoke implementation and original criteria.
 Only this wrapper adds the existing QEMU GDB chardev and records UART
-timestamps. Attach immediately before the ordinary IPC command, after
+timestamps. Attach immediately before the ordinary supervisor command, after
 all preceding foreground programs have returned. No guest image edits.
 """
 import ast
@@ -22,13 +22,22 @@ import traceback
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[2]
-DEST = ROOT / "build/check/qemu-cpu2-no-hpet-session-sv-test"
+PROFILE = "qemu-cpu2-session-sv-test"
+DEST = ROOT / "build/check" / PROFILE
 HERE = Path(__file__).resolve().parent
+ARM_COMMAND = "run /supervisor-runner"
+ARM_INPUT = (ARM_COMMAND+"\r").encode("ascii")
+SMOKE_ARGS = ["--cpus", "2", "--memory-mib", "256", "--session",
+              "--runtime-process-regression", "--supervisor-image", "test",
+              "--guest-oom", "--accel", "tcg",
+              "--ovmf-code", "/usr/share/OVMF/OVMF_CODE_4M.secboot.fd",
+              "--ovmf-vars", "/usr/share/OVMF/OVMF_VARS_4M.fd", "--timeout", "720"]
 EXPECTED = {
     "build/kernel.elf": "ae7dbc731ea84e98a4559dfba0642271ca0c2970f508f47e29656446e31f746c",
     "build/initramfs.cpio": "23974b23c3bad07110806c19f10e808495dfd7541846045c828cf71652dbab25",
     "build/supervisor-staging/test.cpio": "24b760b8dda39b4f46e5a8c041191992f27c58236af8e9728da51be40c3c106d",
     "build/supervisor-staging/ipc-runner": "0a25e6d359e8ec27a5106c43f1bddae662604148018988e353ed8e83b610ad6e",
+    "build/supervisor-staging/supervisor-runner": "29204eedf0f068e7b6dd751c62fdb60543904145cafb955c7685eebf464593c4",
 }
 
 def save(name, value):
@@ -76,6 +85,103 @@ def require(condition, message):
     if not condition:
         raise RuntimeError(message)
 
+def arm_requested(command):
+    return command == ARM_INPUT
+
+def verify_arm(smoke):
+    require(smoke.session.SUPERVISOR_COMMAND == ARM_COMMAND and
+            smoke.session.SUPERVISOR_INPUT == ARM_INPUT and
+            arm_requested(smoke.session.SUPERVISOR_INPUT) and
+            not any(arm_requested(value) for name,value in vars(smoke.session).items()
+                    if name.endswith("_INPUT") and name != "SUPERVISOR_INPUT" and isinstance(value,bytes)) and
+            not arm_requested(ARM_COMMAND.encode("ascii")) and
+            not arm_requested(b"run /supervisor-runner\n"),
+            "Supervisor ARM command is not the unique actual harness input")
+    return {"command": ARM_COMMAND, "input_hex": ARM_INPUT.hex(),
+            "profile": PROFILE, "smoke_args": SMOKE_ARGS}
+
+def verify_symbols(constants):
+    # Decoded from the archived failed HPET supervisor ELF and matching kernel.
+    # Addresses are relative to the kernel image / fixed user ELF base.
+    sites = {0xb98f:"move_before", 0xba78:"move_after_increment",
+             0x15b80:"sched_stats_loaded", 0x20428:"exit_committed",
+             0x1fe9d:"wake_io", 0x820d:"wake_timed", 0x81df:"wake_clock_error",
+             0x1f9ac:"blocked_child", 0xcf71:"collect_result",
+             0x26da7:"ipc_send_committed", 0x26cba:"ipc_receive_committed"}
+    calls = {0xa3a:"RUNNER", 0x1080:"PEER_BEGIN", 0x11f9:"PEER_END",
+             0x12fe:"BEGIN", 0x13c8:"ENDED", 0x1bc1:"COMPLETE"}
+    require(constants == {"SITES":sites,"CALLS":calls}, "Wrong supervisor tracer site/return map")
+    kernel_path=ROOT/"build/kernel.elf"
+    runner_path=ROOT/"build/supervisor-staging/supervisor-runner"
+    kernel,runner=kernel_path.read_bytes(),runner_path.read_bytes()
+    # Exact instruction bytes at every breakpoint and supporting return PC.
+    code = {
+        0xb98f:"e8ac4f010048837c2408000f", 0xba78:"4d8da7b80100004c89e7e849",
+        0x15b80:"4c8b1559d10200488b0948c7", 0x20428:"41c687d00000000049c74758",
+        0x1fe9d:"41c741780400000041c681d0", 0x820d:"c7477804000000c687d00000",
+        0x81df:"c7477804000000c687d10000", 0x1f9ac:"58c3488d15bb070200be0900",
+        0xcf71:"4883bc24e001000000488bb4", 0x26da7:"4d89f9eb2fb8010000004c29",
+        0x26cba:"4c8b4c2410e91701000048c7",
+        0xd37c:"4889d64885c0480f44f0e909", 0xc608:"4883c41041c64424380041f7",
+        0x154b4:"4883c410c643380041f7c600", 0xc8f3:"488b4424704883f80a0f847f",
+        0x20940:"554157415641554154534883", 0x15600:"41574156415453504889f349",
+    }
+    symbols = {
+        "finish_context_switch":0xb560, "dispatch_syscall":0xc2b0,
+        "_ZN4main6frames12SharedFrames4with17hb00e6cb9ee26f98cE":0x15ae0,
+        "_ZN4main9scheduler5Queue9terminate17h78822d9be4f1dcb7E":0x203e0,
+        "_ZN4main9scheduler5Queue7wake_io17h73db3196f0f37af5E":0x1fe50,
+        "_ZN4main3smp3Cpu6switch17hb7417c7cd214c040E":0x7e00,
+        "_ZN4main9scheduler5Queue11block_child17ha7a88421d688fc3aE":0x1f960,
+        "_ZN4main5files11Descriptors7message17haa9559fe4cf1fe18E":0x26a60,
+        "_ZN4main6frames12SharedFrames4with17h5e0295aa47836cd7E":0x15450,
+        "_ZN4main6frames12SharedFrames4with17h731fd3ed52612c53E":0x15600,
+        "_ZN4main9scheduler5Queue14moveRunnableTo17heb15b9282e1d5070E":0x20940,
+        "_ZN4main3smp5gCpus17h5763cf52e37c3718E":0x424c0,
+        "_ZN4main3smp12gOnlineCount17he11f3f5949bf833aE.0":0x42cd0,
+        "_ZN4main3smp11gMigrations17h0099a42543e68e47E":0x42cd8,
+    }
+    observed={}
+    for line in capture("nm","-n",str(kernel_path)).splitlines():
+        fields=line.split()
+        if len(fields)==3 and re.fullmatch("[0-9a-fA-F]+",fields[0]):
+            observed[fields[2]]=int(fields[0],16)
+    require(all(observed.get(name)==address for name,address in symbols.items()),
+            "Kernel symbol identity mismatch")
+    def instructions(path):
+        result={}
+        for line in capture("objdump","-d","-M","intel","--no-show-raw-insn",str(path)).splitlines():
+            match=re.match(r"^\s*([0-9a-f]+):\s+(.+)$",line)
+            if match:
+                result[int(match[1],16)]=match[2].strip()
+        return result
+    kd,ud=instructions(kernel_path),instructions(runner_path)
+    for offset,expected in code.items():
+        require(offset in kd and kernel[0x1000+offset:0x1000+offset+12].hex()==expected,
+                f"Kernel instruction/offset mismatch: {offset:#x}")
+    # The sample syscall's return and each actual call-return PC, not a later
+    # instruction on its successful branch. The user ELF is stripped.
+    user={0x49:"c80f054989c14885c075dbb8100001",
+          0xa3a:"00ffd085c0750ab842000000e96e14",
+          0x1080:"41ffd485c0750abf50000000e9ba03",
+          0x11f9:"00ffd085c0750abf53000000e94102",
+          0x12fe:"41ffd4bf4900000085c00f843d0100",
+          0x13c8:"41ffd485c074e7488b450048398424",
+          0x1bc1:"00ffd085c074de48b8503040008000"}
+    u=0x8000400000
+    for offset,expected in user.items():
+        require(u+offset in ud and runner[0x1000+offset-3:0x1000+offset+12].hex()==expected,
+                f"Supervisor sample return mismatch: {offset:#x}")
+    page=runner[0x1000:0x2000]
+    require(hashlib.sha256(page).hexdigest()=="9b83d9ab1e63d586e8c3c9c0aaea6aa367db2935bdf358ce170562924e99a1a5" and
+            all(p.read_bytes()[0x1000:0x2000]!=page for p in runner_path.parent.glob("*-runner") if p!=runner_path),
+            "Supervisor entry page is not distinct from other staged runners")
+    return {"kernel_symbols":symbols,
+            "kernel_code":{hex(a):{"bytes":b,"instruction":kd[a]} for a,b in code.items()},
+            "supervisor_returns":{hex(a):{"bytes_from_minus3":b,"instruction":ud[u+a]} for a,b in user.items()},
+            "entry_page_sha256":hashlib.sha256(page).hexdigest(),
+            "collect_boundary":"kernel_collect_result (not userland return)"}
+
 def preflight_inputs():
     paths = [ROOT/p for p in EXPECTED] + [
         ROOT/"build/build-provenance.json", ROOT/"build/agentos.efi",
@@ -117,9 +223,11 @@ def preflight():
         require(callable(smoke.main) and callable(smoke.boot) and
                 all(callable(getattr(smoke.UartCapture, name, None))
                     for name in ("__init__", "send", "close")) and
-                smoke.session.IPC_INPUT == b"run /ipc-runner\r" and
+                smoke.session.SUPERVISOR_INPUT == ARM_INPUT and
                 hasattr(smoke.session.SHELL_START, "finditer"),
                 "Original wrapper/harness interface changed")
+        receipt["stage"] = "arm_command"
+        receipt["arm"] = verify_arm(smoke)
         # Also load the real modules deferred by the staged session and identity checks.
         receipt["stage"] = "deferred_imports"
         for filename in ("verify-supervisor-image.py", "verify-boot-roots.py",
@@ -135,7 +243,7 @@ def preflight():
                 paired = module
         receipt["stage"] = "host_dependencies"
         receipt["tools"] = {}
-        for name in ("git", "bash", "gcc-13", "ld", "objcopy", "objdump", "rustc",
+        for name in ("git", "bash", "gcc-13", "ld", "objcopy", "objdump", "nm", "rustc",
                      "truncate", "sgdisk", "mformat", "mmd", "mcopy", "virt-fw-vars",
                      "openssl", "sbverify", "qemu-system-x86_64", "gdb", "dpkg-query", "uname"):
             path = shutil.which(name)
@@ -175,18 +283,7 @@ def preflight():
                 for target in node.targets:
                     if isinstance(target, ast.Name) and target.id in ("SITES", "CALLS"):
                         constants[target.id] = ast.literal_eval(node.value)
-        kernel = (ROOT/"build/kernel.elf").read_bytes()
-        runner = (ROOT/"build/supervisor-staging/ipc-runner").read_bytes()
-        require(set(constants) == {"SITES", "CALLS"} and
-                {"move_before", "move_after_increment", "sched_stats_loaded", "exit_committed",
-                 "collect_result", "ipc_send_committed", "ipc_receive_committed"}
-                <= set(constants["SITES"].values()) and
-                {"RUNNER", "ENDED", "PEER_END"} <= set(constants["CALLS"].values()),
-                "Incomplete tracer interface")
-        for key, data in (("SITES", kernel), ("CALLS", runner)):
-            require(all(type(offset) is int and 0 <= offset and
-                        0x1000+offset+12 <= len(data) for offset in constants[key]),
-                    "Tracer ELF offset outside file: "+key)
+        receipt["symbol_evidence"] = verify_symbols(constants)
         receipt["sites"] = constants["SITES"]
         receipt["calls"] = constants["CALLS"]
         # GDB's actual embedded Python, without attaching or loading a guest.
@@ -222,6 +319,10 @@ def require_preflight():
             receipt.get("commit") == capture("git", "rev-parse", "HEAD") and
             receipt.get("tree") == capture("git", "rev-parse", "HEAD^{tree}") and
             receipt.get("mailbox_host_test", {}).get("returncode") == 0 and
+            receipt.get("arm") == {"command": ARM_COMMAND, "input_hex": ARM_INPUT.hex(),
+                                   "profile": PROFILE, "smoke_args": SMOKE_ARGS} and
+            receipt.get("symbol_evidence", {}).get("entry_page_sha256") ==
+            "9b83d9ab1e63d586e8c3c9c0aaea6aa367db2935bdf358ce170562924e99a1a5" and
             receipt.get("hashes") == EXPECTED and receipt.get("inputs") == preflight_inputs(),
             "Missing or stale successful preflight; diagnostic guest forbidden")
 
@@ -233,6 +334,7 @@ def run():
         "commit": capture("git", "rev-parse", "HEAD"),
         "tree": capture("git", "rev-parse", "HEAD^{tree}"),
         "hashes": actual, "expected": EXPECTED,
+        "arm_command": ARM_COMMAND, "profile": PROFILE, "smoke_args": SMOKE_ARGS,
         "qemu_version": capture("qemu-system-x86_64", "--version"),
         "gdb_version": capture("gdb", "--version"),
         "packages": capture("dpkg-query", "-W", "qemu-system-x86", "ovmf", "gdb", "rustc"),
@@ -247,6 +349,7 @@ def run():
         return 1
 
     smoke = load_smoke()
+    verify_arm(smoke)
     original_capture = smoke.UartCapture
     state = {"qemu_count": 0, "attach_count": 0, "process": None,
              "uart": None, "attach_ns": None, "ready_ns": None}
@@ -257,6 +360,9 @@ def run():
                 return getattr(subprocess, name)
             def Popen(self, command, *args, **kwargs):
                 if isinstance(command, list) and command and command[0] == "qemu-system-x86_64":
+                    require(command[command.index("-machine")+1]=="q35,accel=tcg,smm=on,hpet=on" and
+                            command[command.index("-smp")+1]=="2" and command[command.index("-m")+1]=="256" and
+                            any(str(DEST/"esp.raw") in str(arg) for arg in command), "Wrong HPET supervisor guest profile")
                     state["qemu_count"] += 1
                     if state["qemu_count"] != 1:
                         raise RuntimeError("diagnostic may boot exactly one guest")
@@ -274,17 +380,21 @@ def run():
                 super().__init__(wrapped, destination)
 
             def send(self, command):
-                if command == smoke.session.IPC_INPUT:
+                if arm_requested(command):
                     state["attach_count"] += 1
                     if state["attach_count"] != 1:
-                        raise RuntimeError("IPC trace may attach exactly once")
+                        raise RuntimeError("Supervisor trace may attach exactly once")
                     transcript = self.destination.read_bytes()
                     bases = re.findall(rb"\[INFO\] KERNEL IMAGE BASE=([0-9a-f]{16})", transcript)
                     shells = list(smoke.session.SHELL_START.finditer(transcript))
-                    if len(bases) != 1 or len(shells) != 1 or b"SYSTEM CLOCK: ACPI PM" not in transcript:
-                        raise RuntimeError("missing unique actual kernel base/shell/PM clock")
+                    clocks = re.findall(rb"(?m)^\[INFO\] SYSTEM CLOCK: (HPET64|HPET32)\r?$", transcript)
+                    if len(bases) != 1 or len(shells) != 1 or len(clocks)!=1:
+                        raise RuntimeError("missing unique actual kernel base/shell/HPET clock")
                     request = {"base": int(bases[0], 16), "shell": int(shells[0][1],16),
-                               "destination": str(DEST), "root": str(ROOT)}
+                               "destination": str(DEST), "root": str(ROOT),
+                               "arm_command": ARM_COMMAND, "profile": PROFILE,
+                               "runner_sha256": EXPECTED["build/supervisor-staging/supervisor-runner"],
+                               "clock": clocks[0].decode("ascii")}
                     save("trace-request.json", request)
                     env = os.environ.copy()
                     env["AGENTOS_IPC_TRACE_REQUEST"] = str(DEST/"trace-request.json")
@@ -307,10 +417,7 @@ def run():
 
         smoke.subprocess = SubprocessProxy()
         smoke.UartCapture = Capture
-        sys.argv = ["qemu-smoke.py", "--cpus", "2", "--session", "--runtime-process-regression",
-                    "--supervisor-image", "test", "--no-hpet", "--accel", "tcg",
-                    "--ovmf-code", "/usr/share/OVMF/OVMF_CODE_4M.secboot.fd",
-                    "--ovmf-vars", "/usr/share/OVMF/OVMF_VARS_4M.fd", "--timeout", "720"]
+        sys.argv = ["qemu-smoke.py", *SMOKE_ARGS]
         status = 1
         try:
             status = smoke.main()
@@ -340,7 +447,7 @@ def run():
                       "ready_ns": state["ready_ns"], "gdb_returncode": debugger.returncode if debugger else None,
                       "trace": trace}
             save("trace-wrapper.json", result)
-            print("IPC diagnostic result:", json.dumps(result, sort_keys=True), flush=True)
+            print("Supervisor diagnostic result:", json.dumps(result, sort_keys=True), flush=True)
         return 0 if status == 0 and result["result"]=="recorded" and result["gdb_returncode"]==0 else 1
 
 if __name__ == "__main__":
