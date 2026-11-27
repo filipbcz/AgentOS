@@ -58,9 +58,6 @@ _start:
     syscall
     cmp $survived_len, %rax
     jne failed
-    call run_ipc
-    test %eax, %eax
-    jne finished
     call run_orphans
     test %eax, %eax
     jne finished

@@ -35,6 +35,9 @@ PIPE_COMMAND = "run /pipe-runner"
 PIPE_INPUT = (PIPE_COMMAND+"\r").encode("ascii")
 MEMORY_COMMANDS = ("run /cow-runner", "run /demand-runner")
 MEMORY_INPUT = b"".join((command+"\r").encode("ascii") for command in MEMORY_COMMANDS)
+IPC_COMMAND = "run /ipc-runner"
+IPC_INPUT = (IPC_COMMAND+"\r").encode("ascii")
+IPC_MARKER = b"AGENTOS IPC TEST "
 SUPERVISOR_MISSING = b"run: spawn failed (-2)\r\nagentos> "
 ADOPTION_COMMAND = "run /adoption-runner"
 ADOPTION_INPUT = (ADOPTION_COMMAND+"\r").encode("ascii")
@@ -81,11 +84,11 @@ def runtime_process_prefix(data, shell, shell_cr3, prior_pids):
     return offset,records
 
 
-def supervisor_prefix(data, shell, shell_cr3, prior_pids, variant, apics, *, pipe=False, memory=None):
+def supervisor_prefix(data, shell, shell_cr3, prior_pids, variant, apics, *, pipe=False, memory=None, ipc=False):
     """Consume only a verified per-CPU foreground workload (or real ENOENT)."""
     require(variant in ("control", "test"), "Invalid supervisor image variant")
-    require(memory in (None,"cow","demand") and not (pipe and memory),"Invalid workload kind")
-    command=("run /"+memory+"-runner" if memory else PIPE_COMMAND if pipe else SUPERVISOR_COMMAND)
+    require(memory in (None,"cow","demand") and sum((bool(memory),pipe,ipc))<=1,"Invalid workload kind")
+    command=("run /"+memory+"-runner" if memory else PIPE_COMMAND if pipe else IPC_COMMAND if ipc else SUPERVISOR_COMMAND)
     echo = (command+"\r\n").encode("ascii")
     require(data.startswith(echo), "Missing supervisor command echo")
     offset = len(echo)
@@ -100,6 +103,8 @@ def supervisor_prefix(data, shell, shell_cr3, prior_pids, variant, apics, *, pip
         filenames+=("verify-pipe-transfer.py",)
     elif memory:
         filenames+=("verify-memory-workload.py",)
+    elif ipc:
+        filenames+=("verify-ipc-workload.py",)
     for filename in filenames:
         spec=importlib.util.spec_from_file_location(filename,Path(__file__).with_name(filename))
         module=importlib.util.module_from_spec(spec)
@@ -107,7 +112,8 @@ def supervisor_prefix(data, shell, shell_cr3, prior_pids, variant, apics, *, pip
         modules.append(module)
     consumed,result,pids=modules[1].verify(data[offset:],shell,shell_cr3,prior_pids,apics,modules[0],require,
                                            pipe=modules[2] if pipe else None,
-                                           memory=modules[2] if memory else None,memory_kind=memory)
+                                           memory=modules[2] if memory else None,memory_kind=memory,
+                                           ipc=modules[2] if ipc else None)
     return offset+consumed,result,pids
 
 
@@ -250,7 +256,7 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
             "Supervisor image scenario requires the existing foreground regression")
     require(re.search(rb"AGENTOS PIPE (?!TEST )",aLog) is None,
             "Historical boot pipe transfer is not permitted in either signed image")
-    pWorkloadMarkers=(b"AGENTOS SUPERVISOR",b"AGENTOS SERVICE ",b"AGENTOS TEST ",b"AGENTOS PIPE TEST ",ADOPTION_MARKER)
+    pWorkloadMarkers=(b"AGENTOS SUPERVISOR",b"AGENTOS SERVICE ",b"AGENTOS TEST ",b"AGENTOS PIPE TEST ",ADOPTION_MARKER,IPC_MARKER)
     if aHistoricalBootMemory:
         # Explicit historical receipt inspection only, after its independent
         # old boot-memory validators have run. Never selected by QEMU or the
@@ -262,7 +268,9 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
             "Historical memory evidence outside the boot interval")
     else:
         pWorkloadMarkers+=(b"AGENTOS COW ",b"AGENTOS DEMAND ")
-    require(aLog.count(b"AGENTOS TEST RUNNER ")==4*int(aSupervisorImage=="test"),
+        require(re.search(rb"AGENTOS IPC (?!TEST )",aLog) is None,
+                "Historical boot IPC evidence is forbidden in current signed images")
+    require(aLog.count(b"AGENTOS TEST RUNNER ")==5*int(aSupervisorImage=="test"),
             "Unexpected runner invocation outside its foreground interval")
     if aSupervisorImage!="test":
         require(not any(marker in aLog for marker in pWorkloadMarkers),
@@ -293,6 +301,7 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
     pPipe=None
     pMemory={}
     pAdoption=None
+    pIpc=None
     pPrefixPids=set()
     if aRuntimeProcess:
         # Account for every earlier actual PID, not just the current shell.
@@ -328,6 +337,12 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
                 pWorkloadLog+=pInteractive[:pConsumed]
                 pPrefixPids.update(pNewPids)
                 pInteractive=pInteractive[pConsumed:]
+            pConsumed,pIpc,pNewPids=supervisor_prefix(
+                pInteractive,pShell,int(pShellExits[0][2],16),
+                pPrior | pPrefixPids,aSupervisorImage,set(pApicList),ipc=True)
+            pWorkloadLog+=pInteractive[:pConsumed]
+            pPrefixPids.update(pNewPids)
+            pInteractive=pInteractive[pConsumed:]
             pConsumed,pAdoption,pNewPids=adoption_prefix(
                 pInteractive,pRoot,pShell,int(pShellExits[0][2],16),
                 pPrior | pPrefixPids,aSupervisorImage,set(pApicList))
@@ -349,7 +364,7 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
     if aInput is not None:
         pPrefix=runtime_input() if aRuntimeProcess else b""
         if aSupervisorImage is not None:
-            pPrefix+=SUPERVISOR_INPUT+PIPE_INPUT+MEMORY_INPUT+ADOPTION_INPUT
+            pPrefix+=SUPERVISOR_INPUT+PIPE_INPUT+MEMORY_INPUT+IPC_INPUT+ADOPTION_INPUT
             if aSupervisorImage=="test":
                 pPrefix+=ADOPTION_BYTES
         require(aInput==pPrefix+transmitted_input(pShell,aKeyboard),"Captured transmitted UART bytes differ from scenario")
@@ -400,6 +415,7 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
         result["runtime_cow"]=pMemory["cow"]
         result["runtime_demand"]=pMemory["demand"]
         result["runtime_adoption"]=pAdoption
+        result["runtime_ipc"]=pIpc
     return result
 
 

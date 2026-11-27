@@ -1,4 +1,4 @@
-#include "abi.h"
+#include "../../user/abi.h"
 .global _start
 .text
 _start:
@@ -7,3 +7,5 @@ _start:
     mov $SYS_EXIT, %eax
     syscall
     ud2
+
+.section .note.GNU-stack,"",@progbits

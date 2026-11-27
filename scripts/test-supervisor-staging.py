@@ -65,7 +65,7 @@ def fake_certificate(unsigned):
 
 class ImageTests(unittest.TestCase):
     def setUp(self):
-        self.entries=[(n,n.encode()) for n in ("stage","init","fault","service","shell","svc_ok",
+        self.entries=[(n,n.encode()) for n in ("stage","init","fault","shell","svc_ok",
                       "svc_fail","svc_hang","orphan_parent","manager","svc_alive","svc_flaky","data")]
         self.entries.append(("data/transfer.bin",bytes((i*73+i//251*19)%256 for i in range(8193))))
         self.control=archive(self.entries)
@@ -75,9 +75,12 @@ class ImageTests(unittest.TestCase):
         self.cow_runner=b"cow runner fixture"
         self.demand_runner=b"demand runner fixture"
         self.adoption_runner=b"adoption runner fixture"
+        self.ipc_runner=b"ipc runner fixture"
+        self.ipc_service=b"ipc service fixture"
         self.additions=[(images.RUNNER,self.runner),(images.PIPE_RUNNER,self.pipe_runner),
                         (images.PIPE_RECEIVER,self.pipe_receiver),(images.COW_RUNNER,self.cow_runner),
-                        (images.DEMAND_RUNNER,self.demand_runner),(images.ADOPTION_RUNNER,self.adoption_runner)]
+                        (images.DEMAND_RUNNER,self.demand_runner),(images.ADOPTION_RUNNER,self.adoption_runner),
+                        (images.IPC_RUNNER,self.ipc_runner),(images.IPC_SERVICE,self.ipc_service)]
         self.staged=archive([*self.entries,*self.additions])
         self.kernel=b"kernel fixture"
 
@@ -87,7 +90,7 @@ class ImageTests(unittest.TestCase):
         return images.verify_contents(images.signed_payload(a,fake_certificate(a)),
             images.signed_payload(b,fake_certificate(b)),self.kernel,control,staged,
             self.runner if runner is None else runner,self.pipe_runner,self.pipe_receiver,
-            self.cow_runner,self.demand_runner,self.adoption_runner)
+            self.cow_runner,self.demand_runner,self.adoption_runner,self.ipc_runner,self.ipc_service)
 
     def test_exact_archive_addition(self):
         result=self.check(self.control,self.staged)
@@ -150,6 +153,22 @@ class ImageTests(unittest.TestCase):
             with self.assertRaises(images.VerificationError):
                 self.check(self.control,archive([*self.entries,*changed]))
 
+    def test_ipc_clients_legacy_service_and_code_forbidden_in_distribution(self):
+        for name in ("service","other/service","ipc-test.h",images.IPC_RUNNER,images.IPC_SERVICE,
+                     "nested/ipc-runner","nested/ipc-service"):
+            extra=(name,b"ipc fixture")
+            with self.subTest(name=name),self.assertRaises(images.VerificationError):
+                self.check(archive([*self.entries,extra]),archive([*self.entries,extra,*self.additions]))
+        for marker in (b"AGENTOS IPC TEST ",b"AGENTOS IPC SERVICE ",b"AGENTOS IPC REPLY "):
+            entries=[(name,payload+marker if name=="init" else payload) for name,payload in self.entries]
+            with self.subTest(marker=marker),self.assertRaises(images.VerificationError):
+                self.check(archive(entries),archive([*entries,*self.additions]))
+        for name in (images.IPC_RUNNER,images.IPC_SERVICE):
+            for changed in ([(n,v) for n,v in self.additions if n!=name],
+                            [(n,b"wrong" if n==name else v) for n,v in self.additions]):
+                with self.assertRaises(images.VerificationError):
+                    self.check(self.control,archive([*self.entries,*changed]))
+
     def test_archive_duplicates_aliases_truncation_and_junk(self):
         for bad in (archive([*self.entries,self.entries[0]]),archive([("./init",b"alias")]),
                     self.control[:-4],self.control+b"junk",archive([("../init",b"alias")])):
@@ -192,13 +211,41 @@ def supervisor_phase(parent, first, cr3=0x600000):
     return records
 
 
+def ipc_phase(pid,child,cpu,cpus,total,ms):
+    """Synthetic data for rejecting malformed proof, never a VM receipt."""
+    records=[]
+    def event(kind,**fields):
+        records.append("AGENTOS IPC TEST "+kind+"".join(
+            f" {name}={value & ((1<<64)-1):016x}" for name,value in fields.items()))
+    event("TIMER_BEFORE",PID=pid,VERSION=2,MS=ms+1,TIMERS=10,IDLE=2)
+    event("TIMER_ERRORS",PID=pid,NULL=-14,WRAP=-14,RO=-14,SIZE=-22,FLAGS=-22)
+    event("TIMER_AFTER",PID=pid,VERSION=2,MS=ms+2,TIMERS=11,IDLE=2)
+    event("CHANNEL_ERRORS",PID=pid,FULL=-11,SHORT=-90,NULL=-14,RO=-14,WRAP=-14)
+    for seq,fd,length in ((1,5,1024),(2,3,1),(3,5,7),(4,6,1024)):
+        digest=2166136261
+        for i in range(length):
+            digest=((digest^((i*73+i//251)&255))*16777619)&0xffffffff
+        event("MESSAGE",PID=pid,SEQ=seq,PEER=pid,UID=1000,GID=1000,FD=fd,BYTES=length,FNV=digest)
+    event("CHANNEL_END",PID=pid,EMPTY=-11,EOF=0,TRYPIPE=-32,PIPE=-32)
+    event("FDS",PID=pid,INITIAL=7,OCCUPIED=23,HELD=4,FIRST=3,SECOND=5,DUP=6,RESTORED=7)
+    event("SERVICE_CPU",PID=child,PARENT=pid,APIC=cpu,CPUS=cpus,MOVES=0,TOTAL=total,MS=ms+3)
+    event("SERVICE_FDS",PID=child,INHERITED=0x8000000f,REMAINING=0x80000007,SHORT=-90,NULL=-14)
+    challenge=(pid*0x9e3779b97f4a7c15+child)&((1<<64)-1)
+    response=(((challenge<<9)|(challenge>>55))&((1<<64)-1))^0x6d97341b
+    event("SERVICE",PID=child,PEER=pid,UID=1000,GID=1000,CHALLENGE=challenge,ANSWER=response,DENIED=-1)
+    records.append(f"AGENTOS USER EXIT PID={child:016x} CR3=0000000000600000 STATUS=0000000000000000")
+    event("REPLY",PID=pid,PEER=child,UID=1000,GID=1000,OBSERVED=pid,CHALLENGE=challenge,ANSWER=response)
+    event("REAP",PID=pid,CHILD=child,STATUS=0,AGAIN=-10,EOF=0,PIPE=-32,INHERITED=0x8000000f,RESTORED=7)
+    return records
+
+
 def supervisor_transcript(shell=9,runner=20,apics=(7,),moving=False,skipping=False,
-                          peer_moving=False,peer_missed=False,peer_unpaired=False,pipe=False,probe="runnable",memory=None):
+                          peer_moving=False,peer_missed=False,peer_unpaired=False,pipe=False,probe="runnable",memory=None,ipc=False):
     """Synthetic evidence, not a guest execution or signature proof."""
     cpus=len(apics)
     count=1 if cpus==1 else 2*cpus
     total=0 if cpus==1 else 4
-    records=["run /"+memory+"-runner" if memory else session.PIPE_COMMAND if pipe else session.SUPERVISOR_COMMAND]
+    records=["run /"+memory+"-runner" if memory else session.PIPE_COMMAND if pipe else session.IPC_COMMAND if ipc else session.SUPERVISOR_COMMAND]
     def note(kind,**fields):
         records.append("AGENTOS TEST "+kind+"".join(f" {k}={v:016x}" for k,v in fields.items()))
     def snap(kind,pid,parent,cpu,ms,moves=0,work=None):
@@ -261,6 +308,9 @@ def supervisor_transcript(shell=9,runner=20,apics=(7,),moving=False,skipping=Fal
                     records.append(f"AGENTOS PIPE TEST RECEIVED PID={child:016x} BYTES=00002001 FNV32=1490a95f EOF=00000002")
                     exit_line(child,0,0x600000)
                     records.append(f"AGENTOS PIPE TEST SENT PID={pid:016x} CHILD={child:016x} BYTES=0000000000002001 DIRECT=000000000000000c DUP=000000000000000b WRITES=0000000000000018 SHORT=0000000000000001")
+                    next_pid+=1
+                elif ipc:
+                    records.extend(ipc_phase(pid,next_pid,cpu,cpus,total,ms))
                     next_pid+=1
                 elif memory:
                     child=next_pid
@@ -456,13 +506,15 @@ class RuntimeTests(unittest.TestCase):
             b"exit status 42\r\nagentos> run /fault\r\n"
             b"AGENTOS USER FAULT PID=0000000000000012 PARENT=0000000000000009 CR3=0000000000500000 VECTOR=000000000000000e ERROR=0000000000000005 ADDRESS=0000000002000000\r\n"
             b"exit status 270\r\nagentos> ")
-        common_input=session.runtime_input()+session.SUPERVISOR_INPUT+session.PIPE_INPUT+session.MEMORY_INPUT+session.ADOPTION_INPUT
+        common_input=session.runtime_input()+session.SUPERVISOR_INPUT+session.PIPE_INPUT+session.MEMORY_INPUT+session.IPC_INPUT+session.ADOPTION_INPUT
         for variant,prefix in (("control",(session.SUPERVISOR_COMMAND+"\r\n").encode()+session.SUPERVISOR_MISSING+
                                           (session.PIPE_COMMAND+"\r\n").encode()+session.SUPERVISOR_MISSING+
                                           b"".join((command+"\r\n").encode()+session.SUPERVISOR_MISSING
-                                                   for command in session.MEMORY_COMMANDS)),
+                                                   for command in session.MEMORY_COMMANDS)+
+                                          (session.IPC_COMMAND+"\r\n").encode()+session.SUPERVISOR_MISSING),
                                ("test",supervisor_transcript()+supervisor_transcript(runner=40,pipe=True)+
-                                supervisor_transcript(runner=60,memory="cow")+supervisor_transcript(runner=80,memory="demand"))):
+                                supervisor_transcript(runner=60,memory="cow")+supervisor_transcript(runner=80,memory="demand")+
+                                supervisor_transcript(runner=90,ipc=True))):
             prefix+=((session.ADOPTION_COMMAND+"\r\n").encode()+session.SUPERVISOR_MISSING
                      if variant=="control" else adoption_transcript())
             serial=common_input+(session.ADOPTION_BYTES if variant=="test" else b"")+session.transmitted_input(9,True)
@@ -474,6 +526,7 @@ class RuntimeTests(unittest.TestCase):
                 log=log.replace(ending,cleanup+ending,1)
             result=session.verify(log,serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant)
             self.assertEqual(result["runtime_adoption"]["absent"],variant=="control")
+            self.assertEqual(result["runtime_ipc"]["absent"],variant=="control")
             if variant=="test":
                 self.assertEqual(result["runtime_adoption"]["shutdown_collection"],{"pid":106,"status":137})
                 self.assertEqual(result,json.loads(json.dumps(result)))
@@ -500,6 +553,8 @@ class RuntimeTests(unittest.TestCase):
                      b"AGENTOS COW BEGIN ROOT=0000000000000001\r\n",
                      b"AGENTOS DEMAND BASE ROOT=0000000000000001\r\n",
                      b"AGENTOS ADOPTION TEST SNAP ROLE=0000000000000001\r\n",
+                     b"AGENTOS IPC TEST TIMER_BEFORE PID=0000000000000001\r\n",
+                     b"AGENTOS IPC SERVICE PID=0000000000000001\r\n",
                      b"AGENTOS MANAGER REAP ROOT=0000000000000001 PID=000000000000006a STATUS=0000000000000089\r\n")
             for marker in markers:
                 for bad in (marker+log,log.replace(prefix,prefix+marker,1)):
@@ -559,6 +614,61 @@ class RuntimeTests(unittest.TestCase):
                 verify(data.replace(reap,b"",1).replace(go,go+reap,1))
             with self.assertRaises(session.VerificationError):
                 verify(data.replace(reap,reap+reap,1))
+
+    def test_ipc_preserves_complete_message_timer_and_peer_evidence_per_cpu(self):
+        for apics in ((7,),(7,19)):
+            data=supervisor_transcript(apics=apics,ipc=True)
+            def verify(log,roster=apics):
+                return session.supervisor_prefix(log,9,0x300000,{1,2,9},"test",set(roster),ipc=True)
+            consumed,result,pids=verify(data)
+            self.assertEqual(consumed,len(data))
+            self.assertEqual(result["covered_apics"],list(apics))
+            self.assertEqual(result,json.loads(json.dumps(result)))
+            for interval in result["intervals"]:
+                self.assertEqual(interval["child"]["apic"],interval["apic"])
+                self.assertEqual(interval["timer_errors"],[-14,-14,-14,-22,-22])
+                self.assertEqual([v["bytes"] for v in interval["messages"]],[1024,1,7,1024])
+                self.assertEqual(interval["fd_pair"],[3,5])
+                self.assertEqual(interval["fd_restored"],7)
+                self.assertEqual(interval["collected_status"],0)
+                self.assertEqual(interval["second_wait"],-10)
+                self.assertIn(interval["child_pid"],pids)
+            lines=data.splitlines(keepends=True)
+            for i,row in enumerate(lines):
+                if row.startswith(b"AGENTOS IPC TEST "):
+                    with self.subTest(apics=apics,removed=i),self.assertRaises(session.VerificationError):
+                        verify(b"".join(lines[:i]+lines[i+1:]))
+                    with self.subTest(apics=apics,duplicate=i),self.assertRaises(session.VerificationError):
+                        verify(b"".join(lines[:i]+[row]+lines[i:]))
+            for old,new in (
+                (b"UID=00000000000003e8",b"UID=00000000000003e9"),
+                (b"GID=00000000000003e8",b"GID=0000000000000000"),
+                (b"FLAGS=ffffffffffffffea",b"FLAGS=fffffffffffffff2"),
+                (b"FULL=fffffffffffffff5",b"FULL=0000000000000001"),
+                (b"SECOND=0000000000000005",b"SECOND=0000000000000004"),
+                (b"RESTORED=0000000000000007",b"RESTORED=0000000000000006"),
+                (b"AGAIN=fffffffffffffff6",b"AGAIN=0000000000000000"),
+                (b"ANSWER=",b"ANSWER=1"),
+                (b"FNV=",b"FNV=1"),
+            ):
+                self.assertIn(old,data)
+                with self.subTest(old=old),self.assertRaises(session.VerificationError):
+                    verify(data.replace(old,new,1))
+            child_cpu=next(row for row in lines if row.startswith(b"AGENTOS IPC TEST SERVICE_CPU "))
+            import re
+            for name,value in ((b"PARENT",0),(b"APIC",31),(b"CPUS",0)):
+                bad=re.sub(name+rb"=[0-9a-f]{16}",name+f"={value:016x}".encode(),child_cpu)
+                self.assertNotEqual(bad,child_cpu)
+                with self.assertRaises(session.VerificationError):
+                    verify(data.replace(child_cpu,bad,1))
+            if len(apics)==2:
+                with self.assertRaises(session.VerificationError):
+                    verify(supervisor_transcript(apics=(7,),ipc=True))
+        missing=(session.IPC_COMMAND+"\r\n").encode()+session.SUPERVISOR_MISSING
+        self.assertEqual(session.supervisor_prefix(missing,9,0x300000,{1,2,9},"control",{7},ipc=True),
+                         (len(missing),{"absent":True},set()))
+        with self.assertRaises(session.VerificationError):
+            session.supervisor_prefix(missing,9,0x300000,{1,2,9},"test",{7},ipc=True)
 
     def test_memory_full_locality_and_descendant_evidence(self):
         for kind in ("cow","demand"):

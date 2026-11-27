@@ -259,7 +259,8 @@ def run_session(process, capture, qmp, destination, runtime_process_regression=F
         for command,request in ((session.SUPERVISOR_COMMAND,session.SUPERVISOR_INPUT),
                                 (session.PIPE_COMMAND,session.PIPE_INPUT),
                                 *((command,(command+"\r").encode("ascii"))
-                                  for command in session.MEMORY_COMMANDS)):
+                                  for command in session.MEMORY_COMMANDS),
+                                (session.IPC_COMMAND,session.IPC_INPUT)):
             offset = serial.stat().st_size
             print(f"QEMU {supervisor_image} signed image: {command!r}", flush=True)
             capture.send(request)
@@ -535,7 +536,7 @@ def boot(args):
     apics = [int(x, 16) for x in marker.findall(text)]
     if len(apics) != args.cpus or len(set(apics)) != args.cpus:
         raise RuntimeError(f"Missing per-CPU APIC timer evidence: {apics}")
-    processes.verify(text, apics)
+    processes.verify(text, apics, ipc_staged=True, allow_ipc_workload=supervisor_image=="test")
     if supervisor_image!="test":
         supervisor.verify_absent(text)
     # The test image must pass the full authenticated runtime session below.

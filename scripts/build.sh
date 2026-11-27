@@ -61,12 +61,12 @@ python3 "$root/scripts/verify-trap-return.py" kernel.elf
 # Preserve the exact linked ELF for symbolization of a real guest fault.
 cp kernel.elf "$out/kernel.elf"
 printf 'AgentOS stage 1\n' > stage
-for app in init fault service shell svc_ok svc_fail svc_hang orphan_parent manager svc_alive svc_flaky; do
+for app in init fault shell svc_ok svc_fail svc_hang orphan_parent manager svc_alive svc_flaky; do
     entry="$app"
     if [[ "$app" == svc_alive || "$app" == svc_flaky ]]; then entry=svc_worker; fi
     gcc-13 -c "$root/user/$entry.S" -o user.o
     objects=(user.o)
-    case "$app" in init) sources=(client orphans migration service_manager);; service) sources=(service);; shell) sources=(shell service_client);; manager) sources=(service_manager);; svc_alive|svc_flaky) sources=(svc_worker);; *) sources=();; esac
+    case "$app" in init) sources=(orphans migration service_manager);; shell) sources=(shell service_client);; manager) sources=(service_manager);; svc_alive|svc_flaky) sources=(svc_worker);; *) sources=();; esac
     for src in "${sources[@]}"; do
         defines=()
         if [[ "$app" == svc_flaky ]]; then defines=(-DAGENTOS_FLAKY); fi
@@ -78,7 +78,7 @@ for app in init fault service shell svc_ok svc_fail svc_hang orphan_parent manag
     python3 "$root/scripts/verify-user-abi.py" "$app"
 done
 awk 'BEGIN {for (i=0;i<8193;i++) printf "%c",(i*73+int(i/251)*19)%256}' > data/transfer.bin
-files=(stage init fault service shell svc_ok svc_fail svc_hang orphan_parent manager svc_alive svc_flaky data data/transfer.bin)
+files=(stage init fault shell svc_ok svc_fail svc_hang orphan_parent manager svc_alive svc_flaky data data/transfer.bin)
 touch -d @0 "${files[@]}"
 printf '%s\n' "${files[@]}" | cpio --quiet --reproducible --owner=0:0 -o -H newc > initramfs.cpio
 python3 "$root/scripts/verify-supervisor-image.py" --distribution-archive initramfs.cpio
@@ -177,7 +177,7 @@ if ((staging)); then
     for app in pipe-runner pipe-receiver; do
         python3 "$root/scripts/verify-user-abi.py" "$app"
     done
-    for app in cow demand; do
+    for app in cow demand ipc; do
         define="-D${app^^}_WORKLOAD"
         gcc-13 -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
             -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large "$define" \
@@ -196,9 +196,16 @@ if ((staging)); then
     ld --no-undefined --build-id=none -z noexecstack -s -T "$root/user/user.ld" \
         -o adoption-runner adoption-entry.o adoption-runner.o
     python3 "$root/scripts/verify-user-abi.py" adoption-runner
-    cp supervisor-runner pipe-runner pipe-receiver cow-runner demand-runner adoption-runner "$stage_out/"
-    touch -d @0 supervisor-runner pipe-runner pipe-receiver cow-runner demand-runner adoption-runner
-    printf '%s\n' "${files[@]}" supervisor-runner pipe-runner pipe-receiver cow-runner demand-runner adoption-runner | cpio --quiet --reproducible --owner=0:0 -o -H newc > initramfs.cpio
+    gcc-13 -c "$root/scripts/tests/ipc-service.S" -o ipc-service-entry.o
+    gcc-13 -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
+        -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large \
+        -c "$root/scripts/tests/ipc-service.c" -o ipc-service.o
+    ld --no-undefined --build-id=none -z noexecstack -s -T "$root/user/user.ld" \
+        -o ipc-service ipc-service-entry.o ipc-service.o
+    python3 "$root/scripts/verify-user-abi.py" ipc-service
+    cp supervisor-runner pipe-runner pipe-receiver cow-runner demand-runner adoption-runner ipc-runner ipc-service "$stage_out/"
+    touch -d @0 supervisor-runner pipe-runner pipe-receiver cow-runner demand-runner adoption-runner ipc-runner ipc-service
+    printf '%s\n' "${files[@]}" supervisor-runner pipe-runner pipe-receiver cow-runner demand-runner adoption-runner ipc-runner ipc-service | cpio --quiet --reproducible --owner=0:0 -o -H newc > initramfs.cpio
     cp initramfs.cpio "$stage_out/test.cpio"
     gcc-13 -c "$root/boot/payload.S" -o payload.o
     ld -nostdlib --build-id=none -znocombreloc -T layout.ld -shared -Bsymbolic \

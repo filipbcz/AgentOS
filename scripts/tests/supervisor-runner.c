@@ -3,6 +3,8 @@
 
 #if defined(PIPE_WORKLOAD)
 int run_pipe_transfer(long deadline);
+#elif defined(IPC_WORKLOAD)
+int run_ipc(long deadline);
 #elif defined(COW_WORKLOAD)
 int run_forktest(void);
 #elif defined(DEMAND_WORKLOAD)
@@ -250,6 +252,8 @@ static int worker(unsigned slot,unsigned round) {
     if (!snapshot("BEGIN",&before)) return 74;
 #if defined(PIPE_WORKLOAD)
     int result=run_pipe_transfer(gDeadline);
+#elif defined(IPC_WORKLOAD)
+    int result=run_ipc(gDeadline);
 #elif defined(COW_WORKLOAD)
     int result=run_forktest();
 #elif defined(DEMAND_WORKLOAD)

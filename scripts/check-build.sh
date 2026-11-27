@@ -244,15 +244,14 @@ printf 'Compiling and linking the kernel with %s and %s\n' "$pRustc" "$pCc"
 "$pOut/kernel-elf-tests" "$pOut/kernel-xhci.elf"
 "$pPython" "$pRoot/scripts/verify-trap-return.py" "$pOut/kernel-xhci.elf"
 
-for pApp in init fault service shell svc_ok svc_fail svc_hang orphan_parent manager svc_alive svc_flaky; do
+for pApp in init fault shell svc_ok svc_fail svc_hang orphan_parent manager svc_alive svc_flaky; do
     printf 'Compiling and linking user program %s\n' "$pApp"
     pEntry="$pApp"
     if [[ "$pApp" == svc_alive || "$pApp" == svc_flaky ]]; then pEntry=svc_worker; fi
     "$pCc" -c "$pRoot/user/$pEntry.S" -o "$pOut/$pApp-entry.o"
     pObjects=("$pOut/$pApp-entry.o")
     case "$pApp" in
-        init) pSources=(client orphans migration service_manager);;
-        service) pSources=(service);;
+        init) pSources=(orphans migration service_manager);;
         shell) pSources=(shell service_client);;
         manager) pSources=(service_manager);;
         svc_alive|svc_flaky) pSources=(svc_worker);;
@@ -297,7 +296,7 @@ done
 for pApp in pipe-runner pipe-receiver; do
     "$pPython" "$pRoot/scripts/verify-user-abi.py" "$pOut/$pApp"
 done
-for pApp in cow demand; do
+for pApp in cow demand ipc; do
     "$pCc" -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
         -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large "-D${pApp^^}_WORKLOAD" \
         -c "$pRoot/scripts/tests/supervisor-runner.c" -o "$pOut/$pApp-runner.o"
@@ -315,5 +314,12 @@ done
 "$pLd" --no-undefined --build-id=none -z noexecstack -s -T "$pRoot/user/user.ld" \
     -o "$pOut/adoption-runner" "$pOut/adoption-entry.o" "$pOut/adoption-runner.o"
 "$pPython" "$pRoot/scripts/verify-user-abi.py" "$pOut/adoption-runner"
+"$pCc" -c "$pRoot/scripts/tests/ipc-service.S" -o "$pOut/ipc-service-entry.o"
+"$pCc" -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
+    -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large \
+    -c "$pRoot/scripts/tests/ipc-service.c" -o "$pOut/ipc-service.o"
+"$pLd" --no-undefined --build-id=none -z noexecstack -s -T "$pRoot/user/user.ld" \
+    -o "$pOut/ipc-service" "$pOut/ipc-service-entry.o" "$pOut/ipc-service.o"
+"$pPython" "$pRoot/scripts/verify-user-abi.py" "$pOut/ipc-service"
 printf 'Host tests and kernel/user ELF links passed: %s\n' "$pOut"
 printf 'EFI assembly/signing, pinned-toolchain reproducibility and VM execution remain separate checks.\n'

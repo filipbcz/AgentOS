@@ -41,6 +41,27 @@ class ProcessEvidenceTests(unittest.TestCase):
         verifier.verify("AGENTOS STARTING USER PROCESSES\n" + self.log +
                         "AGENTOS IDLE BEGIN TSC-HZ=0000000000000001\n", [0])
 
+    def test_current_boot_retains_fault_and_orphan_roots_without_legacy_ipc(self):
+        # The dedicated orphan verifier still owns the full interval. This
+        # sibling must bind its boundary to the real fault and CPU root.
+        def relocated(cpu,parent):
+            lines=scenario(cpu,parent).splitlines()
+            return "\n".join(lines[:2]+[
+                f"AGENTOS ORPHAN BEGIN ROOT={parent:016x}",
+                f"AGENTOS ORPHAN ENDED ROOT={parent:016x}"]+lines[5:])+"\n"
+        data=relocated(7,1)+relocated(19,5)
+        verifier.verify(data,[7,19],ipc_staged=True)
+        with self.assertRaises(verifier.VerificationError):
+            verifier.verify(data,[7,19]) # no implicit fallback for an incomplete historical log
+        for bad in (relocated(7,1),data.replace("AGENTOS ORPHAN BEGIN ROOT=0000000000000005",
+                                               "AGENTOS ORPHAN BEGIN ROOT=0000000000000001"),
+                    data+scenario(),data+"AGENTOS IPC TEST SERVICE PID=bad\n"):
+            with self.assertRaises(verifier.VerificationError):
+                verifier.verify(bad,[7,19],ipc_staged=True)
+        with self.assertRaises(verifier.VerificationError):
+            verifier.verify("AGENTOS IPC TEST TIMER_BEFORE PID=bad\n"+data,[7,19],
+                            ipc_staged=True,allow_ipc_workload=True)
+
     def test_two_cpus_and_crlf(self):
         verifier.verify((scenario(7, 1) + scenario(2, 5)).replace("\n", "\r\n"), [2, 7])
 
