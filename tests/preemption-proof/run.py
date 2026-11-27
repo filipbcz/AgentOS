@@ -1,4 +1,4 @@
-"""One independently staged signed 1-CPU timer-context proof."""
+"""One independently staged signed SMP timer-context proof per ordered profile."""
 import hashlib
 import importlib.util
 import json
@@ -18,6 +18,7 @@ HERE=Path(__file__).resolve().parent
 ROOT=HERE.parent.parent
 OUT=ROOT/"build"
 DEST=OUT/"preemption-proof"
+CPUS=0
 CLIENT="preempt-runner"
 CODE=Path("/usr/share/OVMF/OVMF_CODE_4M.secboot.fd")
 VARS=Path("/usr/share/OVMF/OVMF_VARS_4M.fd")
@@ -86,7 +87,7 @@ def wait_initial_session(smoke, process, uart, serial, predicate, deadline, on_r
     return log
 
 
-def wait_debugger_ready(debugger, path, deadline):
+def wait_debugger_ready(debugger, path, deadline, cpus=1):
     """The observer writes JSON non-atomically; existence is not readiness."""
     while True:
         remaining=startup_remaining(deadline,"Debugger did not arm before deadline")
@@ -97,7 +98,7 @@ def wait_debugger_ready(debugger, path, deadline):
         except (FileNotFoundError,json.JSONDecodeError):
             time.sleep(min(.01,remaining))
             continue
-        if not isinstance(ready,dict) or ready.get("hardware") is not True or ready.get("threads")!=1:
+        if not isinstance(ready,dict) or ready.get("hardware") is not True or ready.get("threads")!=cpus:
             raise ValueError("Invalid debugger readiness record")
         startup_remaining(deadline,"Debugger did not arm before deadline")
         if debugger.poll() is not None:
@@ -113,18 +114,47 @@ def inputs():
            ROOT/"scripts/qemu-smoke.py",DEST/"startup-host.json"]
     return {str(x):sha(x) for x in paths}
 
+def prior_proof():
+    # Never advance on a green heading alone: replay the immediately
+    # preceding profile's archived raw local-IRQ proof.
+    if CPUS==2:
+        return None
+    previous=CPUS//2
+    dest=OUT/f"preemption-proof-{previous}cpu"
+    receipt=json.loads((dest/"preflight.json").read_text())
+    result=json.loads((dest/"result.json").read_text())
+    request=json.loads((dest/"trace-request.json").read_text())
+    ready=json.loads((dest/"trace-ready.json").read_text())
+    trace=json.loads((dest/"trace-result.json").read_text())
+    rows=[json.loads(line) for line in (dest/"irq-trace.jsonl").read_text().splitlines()]
+    require(receipt["result"]=="pass" and receipt["cpus"]==previous and
+            receipt["commit"]==capture("git","rev-parse","HEAD") and
+            result["result"]=="pass" and result["cpus"]==previous and result["guests"]==1 and
+            result["shutdown"] is True and request["cpus"]==previous and
+            trace["error"] is None and trace["complete"] is True and len(rows)==trace["stops"] and
+            result["com1_sha256"]==sha(dest/"com1.log") and
+            result["trace_sha256"]==sha(dest/"irq-trace.jsonl") and
+            result["chains"]==proof.verify_smp(rows,request,ready,result["identities"],result["bounds"]),
+            "Previous SMP profile has no complete raw proof")
+    return {"cpus":previous,"result_sha256":sha(dest/"result.json"),
+            "trace_sha256":sha(dest/"irq-trace.jsonl")}
+
 def preflight():
     require(not DEST.exists(),"Stale proof directory; no repeat")
     DEST.mkdir(parents=True)
-    receipt={"result":"fail","guests":0,"stage":"source"}
+    receipt={"result":"fail","guests":0,"stage":"source","cpus":CPUS,"workers":CPUS*2}
     try:
         commit=capture("git","rev-parse","HEAD")
         tree=capture("git","rev-parse","HEAD^{tree}")
         receipt.update(commit=commit,tree=tree)
+        receipt["stage"]="prior_profile"
+        receipt["prior_proof"]=prior_proof()
         require(not capture("git","status","--porcelain","--untracked-files=normal"),"Dirty checkout")
         receipt["stage"]="verifier"
         receipt["selftest"]=capture(sys.executable,HERE/"proof.py")
-        require("PREEMPTION VERIFIER POSITIVE + 13 NEGATIVE OK" in receipt["selftest"],"Missing verifier test")
+        require("PREEMPTION VERIFIER POSITIVE + 13 NEGATIVE OK" in receipt["selftest"] and
+                "SMP VERIFIER POSITIVE + 9 NEGATIVE OK" in receipt["selftest"],"Missing verifier test")
+        print(receipt["selftest"],flush=True)
         receipt["stage"]="startup_host"
         cmd(sys.executable,HERE/"test-startup.py","--receipt",DEST/"startup-host.json")
         startup_host=json.loads((DEST/"startup-host.json").read_text())
@@ -141,7 +171,7 @@ def preflight():
                      "sgdisk","mformat","mmd","sbsign","sbverify","openssl","virt-fw-vars"):
             require(shutil.which(name),"Missing "+name)
         receipt["gdb"]=capture("gdb","-nx","-nh","-batch","-ex",
-            "python import gdb, struct, json, time; assert hasattr(gdb.Inferior,'read_memory') and hasattr(gdb,'BP_HARDWARE_BREAKPOINT'); print('GDB_API_OK')")
+            "python import gdb, struct, json, time; assert hasattr(gdb.Inferior,'read_memory') and hasattr(gdb,'BP_HARDWARE_BREAKPOINT') and hasattr(gdb.InferiorThread,'switch') and hasattr(gdb.InferiorThread,'ptid'); print('GDB_API_OK')")
         require("GDB_API_OK" in receipt["gdb"],"GDB API preflight failed")
         receipt["qemu"]=capture("qemu-system-x86_64","--version")
         images=load("verify-supervisor-image.py")
@@ -162,11 +192,14 @@ def preflight():
         require(kernel[0x1186:0x1190].hex()=="e8c59e0000e926010000" and
                 kernel[0x1000+0x20dca:0x1000+0x20dd1].hex()=="48ff86c0000000",
                 "Wrong timer return/preemption increment instruction")
+        require(kernel[0x115c:0x115f].hex()=="0f01f8" and
+                kernel[0x1000+0xa05a:0x1000+0xa063].hex()=="65488b3c2500000000",
+                "Wrong timer SWAPGS / CPU GS load")
         receipt["kernel_symbols"]=required
         receipt["runtime_bytes"]={str(offset):kernel[0x1000+offset:0x1000+offset+size].hex()
-            for offset,size in ((0x17e,18),(0xa050,36),(0xa2b3,26),(0x20db0,49),(0x2b6,16),(0x84ee,8))}
+            for offset,size in ((0x155,11),(0x17e,18),(0xa050,36),(0xa2b3,26),(0x20db0,49),(0x2b6,16),(0x84ee,8))}
         receipt["stage"]="client"
-        cmd("gcc-13","-c",HERE/"client.S","-o",DEST/"entry.o")
+        cmd("gcc-13",f"-DPREEMPT_CPUS={CPUS}","-c",HERE/"client.S","-o",DEST/"entry.o")
         cmd("ld","--no-undefined","--build-id=none","-z","noexecstack","-T",ROOT/"user/user.ld",
             "-o",DEST/"client.symbols.elf",DEST/"entry.o")
         cmd("objcopy","--strip-all",DEST/"client.symbols.elf",DEST/CLIENT)
@@ -174,13 +207,21 @@ def preflight():
         load("verify-user-abi.py").verify(elf)
         user=symbols(DEST/"client.symbols.elf")
         windows={}
-        for label in ("A","B"):
+        tags=proof.smp_tags(CPUS)
+        require(set(name for name in user if name.startswith("window_"))==
+                {"window_"+label+"_"+end for label in tags for end in ("begin","end")},
+                "Unexpected actual compiled worker windows")
+        for label,(a,b) in tags.items():
             lo,hi=(user["window_"+label+"_"+end] for end in ("begin","end"))
             require(hi-lo==7 and lo//4096==(hi-1)//4096,"Unexpected bounded loop")
             off=0x1000+lo-0x8000400000
             require(elf[off:off+7].hex()=="f39048ffc975f9","Unexpected loop instructions")
+            setup=(bytes.fromhex("49ba")+struct.pack("<Q",a)+bytes.fromhex("49be")+struct.pack("<Q",b)+
+                   bytes.fromhex("66490f6ec266490f6ece660f6cc1664d0f6efe66490f6eca66440f6cf9b900000004"))
+            require(elf[off-len(setup):off]==setup,"Wrong actual GPR/XMM sentinel setup "+label)
             windows[label]=[lo,lo+2,lo+5]
-        require(not set(windows["A"])&set(windows["B"]),"Worker windows overlap")
+        require(len({pc for pcs in windows.values() for pc in pcs})==3*len(tags),"Worker windows overlap")
+        receipt["tags"]=tags
         receipt["windows"]=windows
         (DEST/"client-disassembly.txt").write_text(capture("objdump","-d","-Mintel",DEST/"client.symbols.elf")+"\n")
         receipt["stage"]="signed_stage"
@@ -247,7 +288,8 @@ def preflight():
 
 def guest():
     receipt=json.loads((DEST/"preflight.json").read_text())
-    require(receipt.get("result")=="pass" and receipt.get("guests")==0 and
+    require(receipt.get("result")=="pass" and receipt.get("guests")==0 and receipt["cpus"]==CPUS and
+            receipt["prior_proof"]==prior_proof() and
             receipt["commit"]==capture("git","rev-parse","HEAD") and receipt["inputs"]==inputs() and
             receipt["arm"]==ARM.hex() and receipt["startup_host_sha256"]==sha(DEST/"startup-host.json"),
             "Missing/stale successful preflight")
@@ -261,7 +303,7 @@ def guest():
     with socket.socket() as temp:
         temp.bind(("127.0.0.1",0))
         port=temp.getsockname()[1]
-    qemu=["qemu-system-x86_64","-machine","q35,accel=tcg,smm=on,hpet=on","-cpu","max","-smp","1","-m","256",
+    qemu=["qemu-system-x86_64","-machine","q35,accel=tcg,smm=on,hpet=on","-cpu","max","-smp",str(CPUS),"-m","256",
           "-global","driver=cfi.pflash01,property=secure,value=on",
           "-drive",f"if=pflash,format=raw,unit=0,readonly=on,file={CODE}",
           "-drive",f"if=pflash,format=raw,unit=1,file={DEST/'OVMF_VARS.secboot.fd'}",
@@ -271,8 +313,8 @@ def guest():
           "-qmp",f"unix:{qmp_sock},server=on,wait=off","-vga","std","-display","none",
           "-chardev",f"socket,id=uart,path={sock},server=on,wait=on","-serial","chardev:uart",
           "-nic","none","-boot","order=c","-no-reboot","-no-shutdown","-gdb",f"tcp:127.0.0.1:{port}"]
-    save("guest-start.json",dict(guests=1,command=qemu,host_ns=time.monotonic_ns()))
-    result={"result":"fail","guests":1}
+    save("guest-start.json",dict(guests=1,cpus=CPUS,command=qemu,host_ns=time.monotonic_ns()))
+    result={"result":"fail","guests":1,"cpus":CPUS,"commit":receipt["commit"],"tree":receipt["tree"]}
     process=debugger=uart=qmp=None
     stderr=(DEST/"qemu-stderr.log").open("wb")
     dbglog=(DEST/"gdb.log").open("wb")
@@ -299,29 +341,26 @@ def guest():
         kvm=qmp.execute("query-kvm")
         require(not kvm["enabled"],"Unexpected KVM")
         actual=qmp.execute("query-cpus-fast")
-        require(len(actual)==1 and type(actual[0]["cpu-index"]) is int and
-                type(actual[0]["thread-id"]) is int and actual[0]["thread-id"]>0 and
-                actual[0]["target"]=="x86_64" and actual[0]["qom-path"],
-                "Missing sole live QMP vCPU identity")
-        apic=qmp.execute("qom-get",{"path":actual[0]["qom-path"],"property":"apic-id"})
-        require(type(apic) is int and 0<=apic<255,"Invalid QOM APIC")
-        actual[0]["apic-id"]=apic
-        save("qmp-roster.json",{"accelerator":"tcg","kvm":kvm,"cpus":actual})
-        apics=smoke.session.bootCpuRoster(log,1)
-        require(apics=={apic},"QOM/COM1 APIC mismatch")
+        for cpu in actual:
+            cpu["apic-id"]=qmp.execute("qom-get",{"path":cpu["qom-path"],"property":"apic-id"})
+        qmp_record={"accelerator":"tcg","kvm":kvm,"cpus":actual}
+        actual_apics=set(proof.qmp_roster(qmp_record,CPUS).values())
+        save("qmp-roster.json",qmp_record)
+        apics=smoke.session.bootCpuRoster(log,CPUS,aBasicSmp=CPUS in (4,8))
+        require(apics==actual_apics,"QOM/COM1 APIC mismatch")
         qmp.screenshot(DEST/"shell-screen.ppm")
         smoke.console.verify(DEST/"shell-screen.ppm",aLevel="info",aOutput="both")
-        request=dict(base=base,apic=apic,windows=receipt["windows"],runtime_bytes=receipt["runtime_bytes"],
+        request=dict(base=base,cpus=CPUS,qmp=qmp_record,windows=receipt["windows"],runtime_bytes=receipt["runtime_bytes"],
                      destination=str(DEST))
         save("trace-request.json",request)
         environment=dict(os.environ,AGENTOS_PREEMPT_REQUEST=str(DEST/"trace-request.json"))
         expression="exec(compile(open("+repr(str(HERE/"proof.py"))+").read(), 'proof.py', 'exec'), {'__name__':'__preemption_gdb__'})"
-        debugger=sp.Popen(["gdb","-nx","-nh","-batch","-ex","set pagination off","-ex","set architecture i386:x86-64",
+        debugger=sp.Popen(["gdb","-nx","-nh","-batch","-ex","set pagination off","-ex","set non-stop off","-ex","set architecture i386:x86-64",
                            "-ex",f"target remote 127.0.0.1:{port}","-ex","python "+expression],
                           cwd=ROOT,env=environment,stdout=dbglog,stderr=sp.STDOUT)
-        ready=wait_debugger_ready(debugger,DEST/"trace-ready.json",time.monotonic()+20)
-        require(ready["site"]==base+proof.SITE and ready["apic"]==apic and
-                0<ready["armed_ns"]<=time.monotonic_ns(),"Wrong debugger readiness identity")
+        ready=wait_debugger_ready(debugger,DEST/"trace-ready.json",time.monotonic()+20,CPUS)
+        proof.bind_roster(request,ready)
+        require(0<ready["armed_ns"]<=time.monotonic_ns(),"Wrong debugger readiness time")
         offset=serial.stat().st_size
         arm_ns=time.monotonic_ns()
         uart.send(ARM)
@@ -352,7 +391,7 @@ def guest():
         require(root>shell and pid(b"REG COMPLETE")==root,"Wrong root")
         ids={}
         prior={int(m[1],16) for m in smoke.session.EXIT.finditer(log[:offset])}
-        for label in ("A","B"):
+        for label in proof.smp_tags(CPUS):
             mark=b"REG "+label.encode()
             worker=pid(mark)
             require(worker>root and worker not in prior and all(pid(mark+b" "+v)==worker
@@ -365,16 +404,18 @@ def guest():
         root_exit=[m for m in smoke.session.EXIT.finditer(raw) if int(m[1],16)==root]
         require(len(root_exit)==1 and int(root_exit[0][3],16)==0 and
                 raw.index(b"REG COMPLETE PID=")<root_exit[0].start(),"Missing root completion")
-        require(len({ids["A"][0],ids["B"][0]})==2 and ids["A"][2]!=ids["B"][2] and root not in prior,
+        require(len(ids)==CPUS*2 and len({v[0] for v in ids.values()})==len(ids) and
+                len({v[2] for v in ids.values()})==len(ids) and root not in prior,
                 "Aliased or reused identity")
         require(int(smoke.session.SESSION_STOP.search(log)[1],16)==1,"Wrong reaper shutdown")
         smoke.boot_log.verify(log,"info","both",physical_oom_dir=DEST,source_commit=receipt["commit"])
         smoke.processes.verify(log.decode("ascii"),sorted(apics),ipc_staged=True,root_orphan_v1=True,require_shutdown=True)
-        smoke.orphans.verify(log.decode("ascii"),1)
+        smoke.orphans.verify(log.decode("ascii"),CPUS,basic_smp=CPUS in (4,8))
         rows=[json.loads(l) for l in (DEST/"irq-trace.jsonl").read_text().splitlines()]
         require(len(rows)==trace["stops"] and ready["armed_ns"]<=arm_ns<=sent_ns<=finish_ns,"Invalid trace bounds")
-        chain=proof.verify(rows,request,ids,(sent_ns,finish_ns))
-        result.update(result="pass",identities=ids,chain=chain,trace=trace,
+        chains=proof.verify_smp(rows,request,ready,ids,(sent_ns,finish_ns))
+        require(trace["complete"] is True,"Observer did not complete all APICs")
+        result.update(result="pass",identities=ids,chains=chains,trace=trace,
                       bounds=[sent_ns,finish_ns],shell=shell,root=root,shutdown=True,
                       com1_sha256=sha(serial),trace_sha256=sha(DEST/"irq-trace.jsonl"))
     except Exception as exc:
@@ -396,5 +437,8 @@ def guest():
     return int(result["result"]!="pass")
 
 if __name__=="__main__":
-    require(sys.argv[1:] in (["--preflight"],["--guest"]),"Explicit phase required")
+    require(len(sys.argv)==3 and sys.argv[1] in ("--preflight","--guest") and
+            sys.argv[2] in ("2","4","8"),"Explicit SMP phase and 2/4/8 profile required")
+    CPUS=int(sys.argv[2])
+    DEST=OUT/f"preemption-proof-{CPUS}cpu"
     raise SystemExit(preflight() if sys.argv[1]=="--preflight" else guest())
