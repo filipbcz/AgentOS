@@ -1,0 +1,71 @@
+name: Isolated signed runtime preemption proof
+# Exactly one authorized synchronization from the pinned prior head.
+on:
+  pull_request:
+    types: [synchronize]
+    paths:
+      - 'tests/preemption-proof/**'
+      - '.github/workflows/qemu-preemption-proof.yml'
+permissions:
+  contents: read
+jobs:
+  proof:
+    if: github.repository == 'filipbcz/AgentOS' && github.event.pull_request.number == 2 && github.event.pull_request.head.ref == 'dev/stage4-nvme' && github.event.pull_request.head.repo.full_name == github.repository && github.event.before == 'e88159559668961bddcd4166b1df9739d4780eeb' && github.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Deterministic verifier rejection cases before any guest
+        run: python3 tests/preemption-proof/proof.py
+      - name: Install existing pinned signed build and debugger dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends binutils cpio gcc-13 gnu-efi rustc python3 openssl sbsigntool efitools gdisk mtools qemu-system-x86 ovmf python3-virt-firmware gdb
+      - name: Build unchanged production and existing staging
+        run: bash scripts/build.sh --supervisor-staging
+      - name: Exact client and kernel preflight, independent signed ESP, no guest
+        id: preflight
+        run: python3 tests/preemption-proof/run.py --preflight
+      - name: Archive preflight before guest
+        if: always() && steps.preflight.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: preemption-preflight-1cpu
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            build/preemption-proof/preflight.json
+            build/preemption-proof/client-disassembly.txt
+      - name: One signed staged TCG HPET 1 CPU guest
+        if: success() && steps.preflight.outcome == 'success'
+        run: python3 tests/preemption-proof/run.py --guest
+      - name: Preserve actual evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: preemption-proof-1cpu
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            build/build-provenance.json
+            build/kernel.elf
+            build/initramfs.cpio
+            build/agentos.efi
+            build/agentos.unsigned.efi
+            build/db.cer
+            build/db.esl
+            build/preemption-proof/*.json
+            build/preemption-proof/*.jsonl
+            build/preemption-proof/*.log
+            build/preemption-proof/*.bin
+            build/preemption-proof/*.elf
+            build/preemption-proof/*.efi
+            build/preemption-proof/*.cpio
+            build/preemption-proof/*.txt
+            build/preemption-proof/*.ppm
+            build/preemption-proof/*.fd
+            build/preemption-proof/preempt-runner
+            build/preemption-proof/esp.raw
