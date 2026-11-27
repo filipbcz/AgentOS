@@ -140,7 +140,7 @@ def supervisor_phase(parent, first, cr3=0x600000):
 
 
 def supervisor_transcript(shell=9,runner=20,apics=(7,),moving=False,skipping=False,
-                          peer_moving=False,peer_missed=False,peer_unpaired=False,pipe=False,probe=None):
+                          peer_moving=False,peer_missed=False,peer_unpaired=False,pipe=False,probe="runnable"):
     """Synthetic evidence, not a guest execution or signature proof."""
     cpus=len(apics)
     count=1 if cpus==1 else 2*cpus
@@ -469,50 +469,53 @@ class RuntimeTests(unittest.TestCase):
                     check(bad)
 
     def test_wait_probe_requires_authentic_bounded_transitions(self):
-        from unittest.mock import patch
-        import os
-        for mode in ("blocked","runnable"):
-            for pipe in (False,True):
-                data=supervisor_transcript(apics=(7,19),peer_missed=True,pipe=pipe,probe=mode)
-                with patch.dict(os.environ,{"AGENTOS_READY_WAIT_PROBE":mode}):
-                    def check(log):
-                        return session.supervisor_prefix(log,9,0x300000,{1,2,9},"test",{7,19},pipe=pipe)
-                    offset,result,_=check(data)
-                    self.assertEqual(offset,len(data))
-                    self.assertEqual(result["covered_apics"],[7,19])
-                    transitions=result["wait_transitions"]
-                    first=transitions[0]
-                    self.assertEqual(first["entry"]["apic"],19)
-                    self.assertEqual(first["return"]["apic"],7)
-                    self.assertEqual(first["return"]["moves"],1)
-                    lines=data.splitlines(keepends=True)
-                    selected={kind:next(l for l in lines if l.startswith(b"AGENTOS TEST "+kind+b" "))
-                              for kind in (b"WAIT_SEND",b"WAIT_ENTER",b"WAIT_RETURN",b"WAIT_RECEIVED",b"WAIT_RESULT")}
-                    for line in selected.values():
-                        with self.assertRaises(session.VerificationError):
-                            check(data.replace(line,b"",1))
-                        with self.assertRaises(session.VerificationError):
-                            check(data.replace(line,line+line,1))
-                    for kind,old,new in (
-                        (b"WAIT_SEND",b"TARGET=0000000000000016",b"TARGET=0000000000000015"),
-                        (b"WAIT_RETURN",b"MOVES=0000000000000001",b"MOVES=0000000000000000"),
-                        (b"WAIT_RECEIVED",b"MOVES=0000000000000001",b"MOVES=0000000000000000"),
-                        (b"WAIT_RESULT",b"BYTES=0000000000000018",b"BYTES=0000000000000000"),
-                        (b"WAIT_RESULT",b"MODE="+(b"0000000000000001" if mode=="blocked" else b"0000000000000002"),
-                         b"MODE=0000000000000003"),
-                    ):
-                        line=selected[kind]
-                        bad=line.replace(old,new,1)
-                        self.assertNotEqual(line,bad)
-                        with self.assertRaises(session.VerificationError):
-                            check(data.replace(line,bad,1))
-                    line=selected[b"WAIT_RESULT"]
-                    import re
-                    with self.assertRaises(session.VerificationError):
-                        check(data.replace(line,re.sub(rb"POLLS=[0-9a-f]{16}",b"POLLS=00000000001e8481",line),1))
-                with patch.dict(os.environ,{"AGENTOS_READY_WAIT_PROBE":""}):
-                    with self.assertRaises(session.VerificationError):
-                        check(data)
+        import re
+        for pipe in (False,True):
+            data=supervisor_transcript(apics=(7,19),peer_missed=True,pipe=pipe)
+            def check(log):
+                return session.supervisor_prefix(log,9,0x300000,{1,2,9},"test",{7,19},pipe=pipe)
+            offset,result,_=check(data)
+            self.assertEqual(offset,len(data))
+            self.assertEqual(result["covered_apics"],[7,19])
+            transitions=result["wait_transitions"]
+            first=transitions[0]
+            self.assertEqual(first["entry"]["apic"],19)
+            self.assertEqual(first["return"]["apic"],7)
+            self.assertEqual(first["return"]["moves"],1)
+            lines=data.splitlines(keepends=True)
+            selected={kind:next(l for l in lines if l.startswith(b"AGENTOS TEST "+kind+b" "))
+                      for kind in (b"WAIT_SEND",b"WAIT_ENTER",b"WAIT_RETURN",b"WAIT_RECEIVED",b"WAIT_RESULT")}
+            for line in selected.values():
+                with self.assertRaises(session.VerificationError):
+                    check(data.replace(line,b"",1))
+                with self.assertRaises(session.VerificationError):
+                    check(data.replace(line,line+line,1))
+            for kind,old,new in (
+                (b"WAIT_SEND",b"TARGET=0000000000000016",b"TARGET=0000000000000015"),
+                (b"WAIT_RETURN",b"MOVES=0000000000000001",b"MOVES=0000000000000000"),
+                (b"WAIT_RECEIVED",b"MOVES=0000000000000001",b"MOVES=0000000000000000"),
+                (b"WAIT_RESULT",b"BYTES=0000000000000018",b"BYTES=0000000000000000"),
+                (b"WAIT_RESULT",b"MODE=0000000000000002",b"MODE=0000000000000001"),
+                (b"WAIT_RESULT",b"EVENTS=0000000000000000",b"EVENTS=0000000000000004"),
+            ):
+                line=selected[kind]
+                bad=line.replace(old,new,1)
+                self.assertNotEqual(line,bad)
+                with self.assertRaises(session.VerificationError):
+                    check(data.replace(line,bad,1))
+            for polls in (b"0000000000000000",b"00000000001e8481"):
+                line=selected[b"WAIT_RESULT"]
+                with self.assertRaises(session.VerificationError):
+                    check(data.replace(line,re.sub(rb"POLLS=[0-9a-f]{16}",b"POLLS="+polls,line),1))
+            for kind in (b"WAIT_ENTER",b"WAIT_RETURN",b"WAIT_RECEIVED"):
+                line=selected[kind]
+                with self.assertRaises(session.VerificationError):
+                    check(data.replace(line,re.sub(rb"MS=[0-9a-f]{16}",b"MS=0000000000000000",line),1))
+            # There is no ordinary staged mode that may omit the wait proof
+            # or silently fall back to the blocked control experiment.
+            for mode in (None,"blocked"):
+                with self.assertRaises(session.VerificationError):
+                    check(supervisor_transcript(apics=(7,19),peer_missed=True,pipe=pipe,probe=mode))
 
     def test_reject_fake_locality_duplicate_cpu_pid_incomplete_and_replay(self):
         data=supervisor_transcript(apics=(7,19))

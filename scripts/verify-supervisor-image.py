@@ -172,12 +172,6 @@ def command(work, *args):
                    env={**os.environ,"LC_ALL":"C","SOURCE_DATE_EPOCH":"0"})
 
 
-def probe_flags():
-    mode=os.environ.get("AGENTOS_READY_WAIT_PROBE","")
-    require(mode in ("","blocked","runnable"),"Unknown ready-wait diagnostic arm")
-    return () if not mode else ("-DREADY_WAIT_PROBE="+str(1 if mode=="blocked" else 2),)
-
-
 def reproduce(root, out, stage, write_maps):
     """Rebuild both complete unsigned EFI files from the one archived loader
     object and the actual CPIOs. This verifies all link-time changes, not just
@@ -212,11 +206,11 @@ def reproduce(root, out, stage, write_maps):
         require((work/"supervisor.check.o").read_bytes()==(work/"supervisor.o").read_bytes(),
                 "Runner supervisor object differs from source")
         command(work,"gcc-13","-c",str(root/"scripts/tests/supervisor-runner.S"),"-o","runner-entry.o")
-        command(work,"gcc-13",*CFLAGS,*probe_flags(),"-c",str(root/"scripts/tests/supervisor-runner.c"),"-o","runner.o")
+        command(work,"gcc-13",*CFLAGS,"-c",str(root/"scripts/tests/supervisor-runner.c"),"-o","runner.o")
         command(work,"ld","--no-undefined","--build-id=none","-z","noexecstack","-s",
                 "-T",str(root/"user/user.ld"),"-o",RUNNER,"runner-entry.o","runner.o","supervisor.o")
         require((work/RUNNER).read_bytes()==(stage/RUNNER).read_bytes(),"Runner relink differs")
-        command(work,"gcc-13",*CFLAGS,*probe_flags(),"-DPIPE_WORKLOAD","-c",str(root/"scripts/tests/supervisor-runner.c"),"-o","pipe-runner.o")
+        command(work,"gcc-13",*CFLAGS,"-DPIPE_WORKLOAD","-c",str(root/"scripts/tests/supervisor-runner.c"),"-o","pipe-runner.o")
         command(work,"gcc-13",*CFLAGS,"-c",str(root/"scripts/tests/pipe-workload.c"),"-o","pipe-workload.o")
         command(work,"gcc-13","-c",str(root/"user/receiver.S"),"-o","pipe-receiver-entry.o")
         command(work,"gcc-13",*CFLAGS,"-c",str(root/"scripts/tests/pipe-receive.c"),"-o","pipe-receive.o")
@@ -287,8 +281,6 @@ def verify_identity(root=ROOT, *, write=False):
             "map_sha256":{v:sha(stage/(v+".map")) for v in ("control","test")},
             "control":describe(control_unsigned,control_signed,control),
             "test":describe(test_unsigned,test_signed,test)}
-    if probe_flags():
-        result["ready_wait_probe"]=os.environ["AGENTOS_READY_WAIT_PROBE"]
     require(result["control"]["signed_sha256"]!=result["test"]["signed_sha256"],"Expected distinct signed images")
     if write:
         path.write_text(json.dumps(result,sort_keys=True,indent=2)+"\n",encoding="utf-8")

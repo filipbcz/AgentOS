@@ -117,16 +117,14 @@ static int command(unsigned slot,unsigned round,unsigned kind,unsigned long apic
     const struct Command c={kind,round,apic};
     return send(gChannels[slot][0],&c,sizeof(c));
 }
-/* Diagnostic arms only. No changed scheduler/ABI, no new children, no
- * extra time allowance: both use the original absolute runner deadline.
- * The runnable arm additionally has the original finite peer iteration cap.
- * Emit observations after receipt so no console output occurs inside the
- * measured wait. A failed probe is a real failure, never a fallback. */
-#ifdef READY_WAIT_PROBE
+/* Keep the existing test pool runnable after READY, using only ordinary
+ * authenticated nonblocking IPC. The original runner deadline and finite
+ * peer iteration cap bound the wait. Record actual boundaries after receipt;
+ * never fall back to blocking or count an incomplete interval. */
 static int probeAbort(const struct Sample *entry,unsigned reason,unsigned polls,long result) {
     const char *const names[]={" PID="," PARENT="," MODE="," REASON="," POLLS="," RESULT="," NOW="};
     long ms=now();
-    const unsigned long v[]={entry->stats[6],gRoot,READY_WAIT_PROBE,reason,polls,(unsigned long)result,(unsigned long)ms};
+    const unsigned long v[]={entry->stats[6],gRoot,2,reason,polls,(unsigned long)result,(unsigned long)ms};
     (void)snapshot("WAIT_ENTER",entry);
     (void)record("WAIT_ABORT",names,v,7);
     return 0;
@@ -137,13 +135,6 @@ static int postReadyCommand(int fd,unsigned round,struct Command *c) {
     long events=0,n=-11;
     unsigned polls=0;
     if (!sample(&entry) || entry.stats[7]!=gRoot || fd<0 || fd>=32) return 0;
-#if READY_WAIT_PROBE == 1
-    unsigned long mask=1UL<<fd;
-    events=os_call(SYS_WAIT_EVENTS_UNTIL,mask,gDeadline,0);
-    if (events!=(long)mask) return probeAbort(&entry,1,polls,events);
-    if (!sample(&wake)) return probeAbort(&entry,2,polls,events);
-    n=os_call(SYS_IPC_TRY_RECV,fd,(long)&in,sizeof(in.body));
-#elif READY_WAIT_PROBE == 2
     for (;polls<peerIterations;) {
         long ms=now();
         if (ms<0 || ms>gDeadline) return probeAbort(&entry,3,polls,ms);
@@ -153,15 +144,12 @@ static int postReadyCommand(int fd,unsigned round,struct Command *c) {
     }
     if (n==-11) return probeAbort(&entry,4,polls,n);
     if (!sample(&wake)) return probeAbort(&entry,2,polls,n);
-#else
-#error Invalid diagnostic ready wait arm
-#endif
     if (n!=sizeof(in.body) || in.peer.pid!=gRoot || in.body.round!=round ||
         (in.body.kind!=peerCommand && in.body.kind!=runCommand && in.body.kind!=stopCommand))
         return probeAbort(&entry,5,polls,n);
     if (!sample(&received)) return probeAbort(&entry,6,polls,n);
     const char *const names[]={" PID="," MODE="," KIND="," POLLS="," EVENTS="," BYTES="};
-    const unsigned long v[]={received.stats[6],READY_WAIT_PROBE,in.body.kind,polls,(unsigned long)events,(unsigned long)n};
+    const unsigned long v[]={received.stats[6],2,in.body.kind,polls,(unsigned long)events,(unsigned long)n};
     if (!snapshot("WAIT_ENTER",&entry) || !snapshot("WAIT_RETURN",&wake) ||
         !snapshot("WAIT_RECEIVED",&received) || !record("WAIT_RESULT",names,v,6)) return 0;
     *c=in.body;
@@ -174,10 +162,7 @@ static int postReadySend(unsigned slot,unsigned round,unsigned kind,unsigned lon
     const unsigned long v[]={gRoot,round,(unsigned long)gPids[slot],kind,s.stats[1],s.ms,s.stats[4]};
     return record("WAIT_SEND",names,v,7) && command(slot,round,kind,apic);
 }
-#else
-#define postReadyCommand receiveCommand
-#define postReadySend command
-#endif
+
 
 static int placementWork(void) {
     long start=now();

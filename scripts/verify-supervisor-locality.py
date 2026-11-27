@@ -2,10 +2,9 @@
 import re
 
 
-def verify(data, shell, shell_cr3, prior_pids, apics, supervisor, require, pipe=None, probe=None):
+def verify(data, shell, shell_cr3, prior_pids, apics, supervisor, require, pipe=None):
     """Consume the bounded candidate protocol and every real child event."""
     require(len(apics) in (1,2), "Missing independently observed CPU roster")
-    require(probe in (None,"blocked","runnable"),"Invalid ready-wait diagnostic arm")
     waits=[]
     offset=0
     seen=set(prior_pids)
@@ -99,8 +98,6 @@ def verify(data, shell, shell_cr3, prior_pids, apics, supervisor, require, pipe=
 
         def wait_transition(pid,kind):
             nonlocal floor_ms,floor_total
-            if probe is None:
-                return
             root,number,target,op,cpu,send_ms,send_total=fields(
                 "WAIT_SEND",("ROOT","ROUND","TARGET","KIND","APIC","MS","TOTAL"))
             require((root,number,target,op)==(runner,rnd,pid,kind) and cpu in apics and
@@ -116,9 +113,7 @@ def verify(data, shell, shell_cr3, prior_pids, apics, supervisor, require, pipe=
             actual,mode,op,polls,events,size=fields(
                 "WAIT_RESULT",("PID","MODE","KIND","POLLS","EVENTS","BYTES"))
             require((actual,op,size)==(pid,kind,24) and
-                    ((probe=="blocked" and mode==1 and polls==0 and 0<events<2**32 and
-                      events&(events-1)==0) or
-                     (probe=="runnable" and mode==2 and 0<polls<=2000000 and events==0)),
+                    mode==2 and 0<polls<=2000000 and events==0,
                     "Invalid wait method, authentication or iteration evidence")
             waits.append({"round":rnd,"pid":pid,"kind":kind,"send_ms":send_ms,"send_total":send_total,
                           "entry":entry,"return":wake,"received":received,"polls":polls})
@@ -139,7 +134,7 @@ def verify(data, shell, shell_cr3, prior_pids, apics, supervisor, require, pipe=
                 first=line()
                 skipped=first.startswith("AGENTOS TEST SKIP ")
                 before=snap("SKIP" if skipped else "BEGIN",first)
-                require(progresses(placement,before) and (live is None or progresses(live,before)) and
+                require(progresses(placement,before) and progresses(live,before) and
                         floor_ms<=before["ms"]<=deadline-3000 and
                         before["total"]>=floor_total,"Stale or regressed candidate snapshot")
                 if skipped:
@@ -209,7 +204,7 @@ def verify(data, shell, shell_cr3, prior_pids, apics, supervisor, require, pipe=
                         "Wrong or replayed peer activation")
                 live=wait_transition(peer,4)
                 before=snap("PEER_BEGIN")
-                require(progresses(placements[peer],before) and (live is None or progresses(live,before)) and
+                require(progresses(placements[peer],before) and progresses(live,before) and
                         before["work"]==0 and
                         floor_ms<=before["ms"]<=deadline and before["total"]>=floor_total,
                         "Invalid peer start identity, counters or time")
@@ -274,4 +269,4 @@ def verify(data, shell, shell_cr3, prior_pids, apics, supervisor, require, pipe=
     return offset+len(reply),{"absent":False,"runner_pid":runner,"shell_pid":shell,"runner_cr3":root,
         "runner_status":0,"cpus":len(apics),"covered_apics":sorted(covered),"rounds":rounds,
         "intervals":intervals,"rejected":rejected,"elapsed_ms":end["ms"]-start["ms"],
-        **({"ready_wait_probe":probe,"wait_transitions":waits} if probe else {})},seen-set(prior_pids)
+        "ready_wait_probe":"runnable","wait_transitions":waits},seen-set(prior_pids)

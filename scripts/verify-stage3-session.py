@@ -8,7 +8,6 @@ real restarted worker exits, timer-backed idle, TTY editing and clean shutdown.
 import argparse
 import importlib.util
 import json
-import os
 from pathlib import Path
 import re
 import sys
@@ -96,8 +95,7 @@ def supervisor_prefix(data, shell, shell_cr3, prior_pids, variant, apics, *, pip
         spec.loader.exec_module(module)
         modules.append(module)
     consumed,result,pids=modules[1].verify(data[offset:],shell,shell_cr3,prior_pids,apics,modules[0],require,
-                                           pipe=modules[2] if pipe else None,
-                                           probe=os.environ.get("AGENTOS_READY_WAIT_PROBE") or None)
+                                           pipe=modules[2] if pipe else None)
     return offset+consumed,result,pids
 
 
