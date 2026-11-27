@@ -218,10 +218,20 @@ class VmEvidenceTests(unittest.TestCase):
                     self.manifest["artifacts"][path.name] = evidence.sha256(path)
                     self.save_manifest()
                     if reason is None:
-                        self.assertEqual(evidence.verify_run(self.root, self.run)["result"], "pass")
+                        self.assertEqual(evidence.verify_run(self.root, self.run, historical_boot_oom=True)["result"], "pass")
                     else:
                         with self.assertRaisesRegex(evidence.EvidenceError, f"Missing required {reason}"):
-                            evidence.verify_run(self.root, self.run)
+                            evidence.verify_run(self.root, self.run, historical_boot_oom=True)
+
+    def test_current_signed_requires_separate_oom_contract_and_artifacts(self):
+        with self.assertRaisesRegex(evidence.EvidenceError, "Missing current separate physical OOM contract"):
+            evidence.verify_run(self.root, self.run)
+        self.manifest["physical_oom_contract"] = evidence.PHYSICAL_OOM_CONTRACT
+        self.save_manifest()
+        with self.assertRaisesRegex(evidence.EvidenceError, "Missing required VM artifacts"):
+            evidence.verify_run(self.root, self.run)
+        with self.assertRaisesRegex(evidence.EvidenceError, "Historical or negative VM evidence"):
+            self.verify_legacy()
 
     def testRehashedPartialOrFabricatedMigrationIsRejected(self):
         pOriginal = self.migrationLog()

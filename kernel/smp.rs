@@ -1,5 +1,5 @@
 #![allow(non_snake_case, non_upper_case_globals)]
-use crate::{acpi::Platform, exceptions::{hex, Descriptors}, frames::{Exhaustion, Frames, SharedFrames},
+use crate::{acpi::Platform, exceptions::{hex, Descriptors}, frames::{Frames, SharedFrames},
             halt, out, process::Programs, scheduler::{Context, Queue}, serial, stress::{self, Load}};
 use crate::{bringup_clock::BringupClock, reference_clock::{ReferenceClock, WaitError}};
 use core::{arch::{asm, x86_64::__cpuid}, cell::UnsafeCell, hint::spin_loop, ptr,
@@ -21,10 +21,8 @@ const PAGE: usize = 4096;
 const TIMER: u32 = 0xe0;
 const MASK: u32 = 1 << 16;
 const WAKEUPS: u32 = 3;
-const OOM_PHASE: u32 = 1;
 const PROCESS_PHASE: u32 = 2;
 const IDLE_PHASE: u32 = 3;
-const OOM_CHECKED: u32 = 4;
 const IDLE_FINISHED: u32 = 5;
 const PROCESSES_FINISHED: u32 = 6;
 const RUNTIME_PHASE: u32 = 4;
@@ -663,17 +661,6 @@ impl Cpu {
         Ok(())
     }
 
-    fn check_empty(&self) -> bool {
-        self.load.frames.with(|frames| {
-            let before = frames.available();
-            let plain = frames.alloc();
-            let zeroed = frames.alloc_zeroed();
-            let rejected = plain.is_none() && zeroed.is_none();
-            for frame in [plain, zeroed].into_iter().flatten() { frames.release(frame); }
-            before == 0 && rejected && frames.available() == 0
-        })
-    }
-
     unsafe fn measure_idle(&self) -> Result<(), Error> {
         let baseline = self.interrupts.load(Ordering::Acquire);
         // 30 s at divide-by-128, using the 10 ms calibration at divide-by-16.
@@ -1221,9 +1208,6 @@ unsafe extern "C" fn ap_main(cpu: &'static Cpu) -> ! {
             }
             cpu.schedule();
             cpu.complete.store(2, Ordering::Release);
-            while cpu.phase.load(Ordering::Acquire) < OOM_PHASE { spin_loop(); }
-            if !cpu.check_empty() { cpu.complete.store(3, Ordering::Release); halt(); }
-            cpu.complete.store(OOM_CHECKED, Ordering::Release);
             while cpu.phase.load(Ordering::Acquire) < PROCESS_PHASE { spin_loop(); }
             if let Err(reason) = cpu.process_test() {
                 serial(b"SMP FAILED: "); serial(reason); serial(b"\r\n");
@@ -1420,21 +1404,6 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
     serial(b"AGENTOS FRAME STRESS BITMAP OK HELD="); hex(load.overlapping_pages() as u64);
     serial(b" FREE-BEFORE="); hex(baseline.count as u64);
     serial(b" FREE-AFTER="); hex(load.frames.with(|f| f.available()) as u64); serial(b"\r\n");
-    let held = load.frames.with(Exhaustion::drain);
-    let drained = held.count;
-    for cpu in cpus.iter().flatten() { cpu.phase.store(OOM_PHASE, Ordering::Release); }
-    let mut rejected = boot_cpu.check_empty() as usize;
-    for cpu in cpus.iter().flatten().filter(|c| c.expected_id != bsp) {
-        while cpu.complete.load(Ordering::Acquire) == 2 { let _ = crate::system_clock::millis(); spin_loop(); }
-        if cpu.complete.load(Ordering::Acquire) == OOM_CHECKED { rejected += 1; }
-    }
-    let restored = load.frames.with(|f| held.recover(f) && baseline.matches(f) && f.probe() && baseline.matches(f));
-    if !restored || drained != baseline.count || rejected != ids.len() {
-        return Err(b"physical memory exhaustion or recovery");
-    }
-    serial(b"AGENTOS OOM OK DRAINED="); hex(drained as u64);
-    serial(b" REJECT-CPUS="); hex(rejected as u64);
-    serial(b" RESTORED="); hex(load.frames.with(|f| f.available()) as u64); serial(b"\r\n");
     load.frames.with(|f| {
         baseline.release(f);
         for cpu in cpus.iter().flatten() { (*cpu.queue.get()).reap(f); }
@@ -1443,7 +1412,7 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
     boot_cpu.process_test()?;
     for cpu in cpus.iter().flatten().filter(|c| c.expected_id != bsp) {
         cpu.phase.store(PROCESS_PHASE, Ordering::Release);
-        while cpu.complete.load(Ordering::Acquire) == OOM_CHECKED { let _ = crate::system_clock::millis(); spin_loop(); }
+        while cpu.complete.load(Ordering::Acquire) == 2 { let _ = crate::system_clock::millis(); spin_loop(); }
         if cpu.complete.load(Ordering::Acquire) != PROCESSES_FINISHED { return Err(b"AP user processes"); }
     }
     serial(b"AGENTOS IDLE BEGIN TSC-HZ="); hex(tsc_hz); serial(b"\r\n");

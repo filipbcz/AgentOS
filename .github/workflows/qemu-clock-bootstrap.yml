@@ -106,6 +106,8 @@ jobs:
             build/build-provenance.json
             build/agentos.efi
             build/db.esl
+            build/check/qemu-cpu${{ matrix.cpus }}-session/physical-oom.json
+            build/check/qemu-cpu${{ matrix.cpus }}-session/physical-oom.log
             build/check/qemu-cpu${{ matrix.cpus }}-session/smoke.json
             build/check/qemu-cpu${{ matrix.cpus }}-session/com1.log
             build/check/qemu-cpu${{ matrix.cpus }}-session/com1-input.bin

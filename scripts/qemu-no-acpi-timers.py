@@ -428,6 +428,9 @@ def scenario(args):
             baseline["cpus"]==args.cpus and baseline["hpet_enabled"] and
             baseline["interactive_com1_manager_session"] and baseline.get("supervisor_image")==variant,
             "Missing ordinary interactive boot of the exact same signed EFI")
+    require(baseline.get("physical_oom")==smoke.physical_oom.verify_boot(
+        (baseline_path.parent/"com1.log").read_bytes(),ROOT,baseline_path.parent,commit),
+        "Missing current ordinary physical OOM proof")
     suffix="no-acpi-timers" if args.profile=="disabled" else "clock-"+args.profile
     dest=ROOT/f"build/check/qemu-cpu{args.cpus}-{suffix}-session{variant_suffix}"
     # Never consume a previous result as current evidence.
@@ -450,6 +453,7 @@ def scenario(args):
     start=time.monotonic()
     process=capture=qmp=None
     try:
+        receipt["physical_oom"]=smoke.physical_oom.run(ROOT,dest,commit)
         receipt["qemu_version"]=subprocess.check_output(["qemu-system-x86_64","--version"],text=True).splitlines()[0]
         # Matching direct KVM PM control (even failure is useful evidence).
         # A missing or differently configured comparison cannot imply causality.
@@ -558,7 +562,7 @@ def scenario(args):
                 require(args.profile!="deferred" or deferred_done,"No completed post-EBS removal")
                 data=serial.read_bytes()
                 text=data.decode("ascii",errors="replace")
-                smoke.boot_log.verify(data,"info","both")
+                smoke.boot_log.verify(data,"info","both",physical_oom_dir=dest,source_commit=commit)
                 clocks=re.findall(r"(?m)^\[INFO\] SYSTEM CLOCK: (HPET64|HPET32|ACPI PM24|ACPI PM32|TSC \(qualified invariant clocksource\))\r?$",text)
                 expected=("ACPI PM24","ACPI PM32") if args.profile=="chain" else ("TSC (qualified invariant clocksource)",)
                 require(len(clocks)==1 and clocks[0] in expected,

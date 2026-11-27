@@ -1,5 +1,6 @@
 param([Parameter(Mandatory)][string]$RunDir, [Parameter(Mandatory)][string[]]$ApicIds,
-      [Parameter(Mandatory)][double]$HostSeconds)
+      [Parameter(Mandatory)][double]$HostSeconds,
+      [string]$SourceCommit, [switch]$HistoricalBootOom)
 $ErrorActionPreference = 'Stop'
 $log = Join-Path $RunDir 'serial-com1.log'
 function Record([string]$pattern) {
@@ -11,11 +12,20 @@ function Number($field) { [Convert]::ToUInt64($field.Value, 16) }
 
 $hex = '([0-9a-f]{16})'
 $stress = Record "^AGENTOS FRAME STRESS BITMAP OK HELD=$hex FREE-BEFORE=$hex FREE-AFTER=$hex$"
-$oom = Record "^AGENTOS OOM OK DRAINED=$hex REJECT-CPUS=$hex RESTORED=$hex$"
-$drained = Number $oom.Groups[1]
-if ($drained -eq 0 -or $drained -ne (Number $stress.Groups[3]) -or
-    $drained -ne (Number $oom.Groups[3]) -or (Number $oom.Groups[2]) -ne $ApicIds.Count) {
-    throw "Incomplete OOM or recovery evidence in $log"
+if ($HistoricalBootOom) {
+    if ($SourceCommit) { throw 'Historical idle inspection cannot claim current OOM evidence' }
+    $oom = Record "^AGENTOS OOM OK DRAINED=$hex REJECT-CPUS=$hex RESTORED=$hex$"
+    $drained = Number $oom.Groups[1]
+    if ($drained -eq 0 -or $drained -ne (Number $stress.Groups[3]) -or
+        $drained -ne (Number $oom.Groups[3]) -or (Number $oom.Groups[2]) -ne $ApicIds.Count) {
+        throw "Incomplete OOM or recovery evidence in $log"
+    }
+} else {
+    if (!$SourceCommit) { throw 'Missing source commit for separate physical OOM evidence' }
+    if (!(Number $stress.Groups[2]) -or (Number $stress.Groups[2]) -ne (Number $stress.Groups[3]) -or
+        (Number $stress.Groups[1]) -ne 16 * $ApicIds.Count) { throw "Incomplete boot stress evidence in $log" }
+    & python "$PSScriptRoot/physical_oom_evidence.py" --verify --directory $RunDir --commit $SourceCommit --boot-log $log
+    if ($LASTEXITCODE -ne 0) { throw "Missing or invalid separate physical OOM evidence: $RunDir" }
 }
 $begin = Record "^AGENTOS IDLE BEGIN TSC-HZ=$hex$"
 $hz = Number $begin.Groups[1]

@@ -413,6 +413,8 @@ def verify_pair(root, cpus, no_hpet=False, guest_oom=False):
                     "::EFI/BOOT/BOOTX64.EFI",str(extracted))
             require(sha(extracted)==expected,"Actual ESP signed image differs: "+variant)
         log=(folder/"com1.log").read_bytes()
+        require(receipt.get("physical_oom")==load(root,"physical_oom_evidence.py").verify_boot(
+            log,root,folder,identity["source_commit"]),"Missing current physical allocator OOM evidence: "+variant)
         sent=(folder/"com1-input.bin").read_bytes()
         require(digest(log)==receipt.get("com1_sha256") and digest(sent)==receipt.get("com1_input_sha256"),
                 "Actual UART evidence differs from receipt: "+variant)

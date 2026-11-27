@@ -320,51 +320,6 @@ impl Frames<'_> {
     }
 }
 
-// Hold physical pages without requiring heap storage as memory runs out.
-// Each owned page stores the previous address in its first word.
-pub struct Exhaustion { head: usize, pub count: usize }
-
-impl Exhaustion {
-    pub fn drain(frames: &mut Frames<'_>) -> Self {
-        let mut held = Self { head: 0, count: 0 };
-        let initial = frames.available();
-        while held.count < initial {
-            let Some(frame) = frames.alloc() else { break; };
-            let address = frame.into_address();
-            unsafe { (address as *mut usize).write(held.head); }
-            held.head = address;
-            held.count += 1;
-        }
-        held
-    }
-
-    fn pop(&mut self) -> Option<Frame> {
-        if self.head == 0 { return None; }
-        let frame = Frame(self.head);
-        self.head = unsafe { (self.head as *const usize).read() };
-        Some(frame)
-    }
-
-    pub fn recover(mut self, frames: &mut Frames<'_>) -> bool {
-        let Some(spare) = self.pop() else { return false; };
-        let address = spare.address();
-        unsafe { ptr::write_bytes(address as *mut u8, 0xa5, PAGE); }
-        frames.release(spare);
-        // A two-page request must roll back cleanly with only one page left.
-        let partial_ok = !frames.probe() && frames.available() == 1;
-        let mut reused = false;
-        if let Some(frame) = frames.alloc_zeroed() {
-            reused = frame.address() == address && frames.available() == 0 &&
-                (0..PAGE / size_of::<usize>()).all(|i| unsafe {
-                    (frame.address() as *const usize).add(i).read_volatile() == 0
-                });
-            frames.release(frame);
-        }
-        while let Some(frame) = self.pop() { frames.release(frame); }
-        partial_ok && reused
-    }
-}
-
 const SNAPSHOT_WORDS: usize = PAGE / size_of::<usize>() - 1;
 pub struct BitmapSnapshot { first: usize, pub count: usize }
 

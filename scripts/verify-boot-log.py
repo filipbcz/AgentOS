@@ -9,6 +9,9 @@ from pathlib import Path
 import re
 import sys
 
+sys.dont_write_bytecode = True
+import physical_oom_evidence as physical_oom
+
 
 class VerificationError(ValueError):
     pass
@@ -24,7 +27,12 @@ def require(condition, description):
         raise VerificationError(description)
 
 
-def verify(log, level, output):
+def verify(log, level, output, *, physical_oom_dir=None, source_commit=None, historical_boot_oom=False):
+    if historical_boot_oom:
+        require(physical_oom_dir is None and source_commit is None, "Historical boot inspection cannot claim current OOM proof")
+    else:
+        require(physical_oom_dir is not None and source_commit is not None, "Missing separate OOM proof context")
+        physical_oom.verify_boot(log, physical_oom.ROOT, physical_oom_dir, source_commit)
     require(level in LEVELS and output in SINKS, "Unsupported BOOT.LOG policy")
     lines = log.decode("ascii", errors="replace").splitlines()
     require("AGENTOS KERNEL OK STAGE 1" in lines, "Missing mandatory raw kernel boot marker")
@@ -60,11 +68,15 @@ def main():
     parser.add_argument("--log", type=Path, required=True)
     parser.add_argument("--level", required=True, choices=LEVELS)
     parser.add_argument("--output", required=True, choices=SINKS)
+    parser.add_argument("--physical-oom-dir", type=Path)
+    parser.add_argument("--source-commit")
+    parser.add_argument("--historical-boot-oom", action="store_true", help="Inspect only the historical BOOT.LOG policy")
     args = parser.parse_args()
     try:
         log = args.log.read_bytes()
-        records = verify(log, args.level, args.output)
-    except (OSError, VerificationError) as error:
+        records = verify(log, args.level, args.output, physical_oom_dir=args.physical_oom_dir,
+                         source_commit=args.source_commit, historical_boot_oom=args.historical_boot_oom)
+    except (OSError, ValueError) as error:
         print(f"BOOT.LOG acceptance failed: {error}", file=sys.stderr)
         return 1
     print(f"Verified BOOT.LOG {args.level}/{args.output}: {len(records)} COM1 events")

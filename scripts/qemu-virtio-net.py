@@ -65,9 +65,9 @@ def exchange(link, records_path):
     return records
 
 
-def verify_kernel(data, cpus):
+def verify_kernel(data, cpus, *, physical_oom_dir, source_commit):
     text = data.decode("ascii",errors="replace")
-    smoke.boot_log.verify(data,"info","both")
+    smoke.boot_log.verify(data,"info","both",physical_oom_dir=physical_oom_dir,source_commit=source_commit)
     apics = re.findall(r"(?m)^AGENTOS TASK (?:BSP|AP) APIC=([0-9a-f]{16}) "
                        r"TIMER-WAKES=0000000000000003\r?$",text)
     require(len(apics)==cpus and len(set(apics))==cpus,"Missing real per-CPU timer evidence")
@@ -90,6 +90,7 @@ def run(args):
     out = Path(tempfile.mkdtemp(prefix="run-",dir=root))
     print(f"QEMU_VIRTIO_NET_DIR={out}",flush=True)
     try:
+        oom_proof=smoke.physical_oom.run(ROOT,out,commit)
         subprocess.run(["bash","scripts/disk.sh",str(out),"build/agentos.efi","info both"],cwd=ROOT,check=True)
         esp = out/"esp.raw"
         copied = out/"esp-bootx64.efi"
@@ -149,17 +150,17 @@ def run(args):
                     records=exchange(host,out/"packets.json")
                     helpers.wait_guest(process,capture,serial,b"AGENTOS VIRTIO NET CLOSED STATUS=0 MASTER=0 DMA=4\r\n",30)
                     data=helpers.wait_guest(process,capture,serial,b"AGENTOS SHELL READY\r\nagentos> ",args.timeout)
-                    verify_kernel(data,args.cpus)
+                    verify_kernel(data,args.cpus,physical_oom_dir=out,source_commit=commit)
                     monitor.screenshot(out/"shell-screen.ppm")
                     smoke.console.verify(out/"shell-screen.ppm",aLevel="info",aOutput="both")
                     monitor.execute("quit")
                     require(process.wait(timeout=15)==0,"QEMU did not exit cleanly")
                     # Closing QEMU flushes its independent filter-dump PCAP.
                     result=net.verify(data.decode("ascii",errors="replace"),records,(out/"wire.pcap").read_bytes())
-                    files=("command.json","pci.json","packets.json","wire.pcap","com1.log",
+                    files=("physical-oom.log","physical-oom.json","command.json","pci.json","packets.json","wire.pcap","com1.log",
                            "shell-screen.ppm","esp-bootx64.efi","OVMF_VARS.secboot.fd")
                     receipt={"schema":1,"result":"pass","source_commit":commit,"cpus":args.cpus,
-                             "signed_efi_sha256":build["artifacts"]["agentos.efi"],
+                             "physical_oom":oom_proof,"signed_efi_sha256":build["artifacts"]["agentos.efi"],
                              "ovmf_code_sha256":sha(args.ovmf_code),"pci_bdf":bdf,
                              "emulator":subprocess.check_output(["qemu-system-x86_64","--version"],text=True).splitlines()[0],
                              "seconds":round(time.monotonic()-started,3),**result,

@@ -43,6 +43,7 @@ demand = load("qemu_demand_evidence", "verify-demand-paging.py")
 migration = load("qemu_migration_evidence", "verify-migration.py")
 service_manager = load("qemu_service_manager_evidence", "verify-service-manager.py")
 boot_log = load("qemu_boot_log_evidence", "verify-boot-log.py")
+physical_oom = load("physical_oom_evidence", "physical_oom_evidence.py")
 session = load("qemu_stage3_session", "verify-stage3-session.py")
 console = load("qemu_console_image", "verify-console-image.py")
 
@@ -402,6 +403,9 @@ def boot(args):
         profile += "-soak"
     destination = root / "build/check" / profile
     destination.mkdir(parents=True, exist_ok=True)
+    for name in ("smoke.json", "failure.json"):
+        (destination/name).unlink(missing_ok=True)
+    oom_proof = physical_oom.run(root, destination, commit)
     if basic_smp:
         for name in ("smoke.json","failure.json","basic-smp.json","qmp-basic-smp.json"):
             (destination/name).unlink(missing_ok=True)
@@ -597,7 +601,8 @@ def boot(args):
     text = serial.read_text(encoding="ascii", errors="replace")
     if not guest_oom and ("AGENTOS PAGE OOM" in text or "AGENTOS TEST OOM " in text):
         raise RuntimeError("Unexpected runtime OOM outside explicit pressure scenario")
-    boot_log.verify(text.encode("ascii", errors="replace"), "info", "both")
+    boot_log.verify(text.encode("ascii", errors="replace"), "info", "both",
+                    physical_oom_dir=destination, source_commit=commit)
     if text.splitlines().count("AGENTOS KERNEL STACK GUARD OK") != 1:
         raise RuntimeError("Missing actual guarded kernel stack fault-probe evidence")
     marker = re.compile(r"(?m)^AGENTOS TASK (?:BSP|AP) APIC=([0-9a-f]{16}) "
@@ -654,6 +659,7 @@ def boot(args):
         "accelerator":args.accel,"qmp_kvm":actual_kvm,
         "qemu_version":subprocess.check_output(["qemu-system-x86_64","--version"],text=True).splitlines()[0],
         "source_commit": commit,
+        "physical_oom": oom_proof,
         "cpus": args.cpus,
         "memory_mib": args.memory_mib,
         "kernel_image_base": image_base,
@@ -687,7 +693,8 @@ def boot(args):
                         else basic.verify_image(root,after,commit))
         if after_identity!=identity:
             raise RuntimeError("Distribution EFI identity changed during basic SMP session")
-        progress=basic.verify_progress(text,args.cpus,qmp_roster,soak_interval=soak_interval)
+        progress=basic.verify_progress(text,args.cpus,qmp_roster,soak_interval=soak_interval,
+                                       physical_oom_dir=destination,source_commit=commit)
         if progress["boot_roots"]!=boot_roots:
             raise RuntimeError("Basic SMP boot root replay differs")
         receipt["basic_smp"]={"contract":"staged-smp-soak-v1" if smp_soak else "ordinary-smp-v1","host":host,"qmp":qmp_roster,

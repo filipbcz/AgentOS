@@ -92,6 +92,7 @@ def run(args):
     out = Path(tempfile.mkdtemp(prefix="run-",dir=root))
     print(f"QEMU_NO_UART_DIR={out}",flush=True)
     try:
+        oom_proof=smoke.physical_oom.run(ROOT,out,commit)
         # Request only serial boot logs. With no UART present, operational
         # diagnostics must still be visible on the actual GOP framebuffer.
         subprocess.run(["bash","scripts/disk.sh",str(out),"build/agentos.efi","info serial"],cwd=ROOT,check=True)
@@ -99,6 +100,9 @@ def run(args):
         copied=out/"esp-bootx64.efi"
         subprocess.run(["mcopy","-i",f"{esp}@@1048576","::EFI/BOOT/BOOTX64.EFI",str(copied)],check=True)
         require(sha(copied)==build["artifacts"]["agentos.efi"],"ESP differs from signed EFI")
+        # This profile deliberately has no UART. Do not claim a COM1 observation.
+        require(smoke.physical_oom.MARKER not in copied.read_bytes(),
+                "Historic forced boot OOM marker in the verified signed EFI")
         vars_file=out/"OVMF_VARS.secboot.fd"
         cert=Path.home()/".local/share/agentos/stage1-test-keys/db.crt"
         owner="d7663630-f07a-4739-bc6f-b9f6d6444865"
@@ -162,10 +166,10 @@ def run(args):
                     # claim of orderly guest shutdown or storage durability.
                     qmp.execute("quit")
                     require(process.wait(timeout=15)==0,"QEMU did not exit")
-                    files=("command.json","qtree.txt","keyboard.json","shell-before.ppm",
+                    files=("physical-oom.log","physical-oom.json","command.json","qtree.txt","keyboard.json","shell-before.ppm",
                            "shell-after-1.ppm","shell-after-2.ppm","esp-bootx64.efi","OVMF_VARS.secboot.fd")
                     receipt={"schema":1,"result":"pass","source_commit":commit,"cpus":args.cpus,
-                             "signed_efi_sha256":build["artifacts"]["agentos.efi"],
+                             "physical_oom":oom_proof,"signed_efi_sha256":build["artifacts"]["agentos.efi"],
                              "ovmf_code_sha256":sha(args.ovmf_code),"uart_present":False,
                              "ps2_keyboard":True,"boot_log":"info serial","gop_fallback":True,
                              "width":geometry[0],"height":geometry[1],"responses":len(records),

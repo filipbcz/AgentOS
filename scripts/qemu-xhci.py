@@ -41,6 +41,7 @@ def run(args):
     out=Path(tempfile.mkdtemp(prefix="run-",dir=root))
     print(f"QEMU_XHCI_DIR={out}",flush=True)
     try:
+        oom_proof=smoke.physical_oom.run(ROOT,out,commit)
         subprocess.run(["bash","scripts/disk.sh",str(out),"build/agentos.efi","info both"],cwd=ROOT,check=True)
         esp=out/"esp.raw";copied=out/"esp-bootx64.efi"
         subprocess.run(["mcopy","-i",f"{esp}@@1048576","::EFI/BOOT/BOOTX64.EFI",str(copied)],check=True)
@@ -115,16 +116,16 @@ def run(args):
                     phase=whole[offset:].decode("utf-8",errors="strict")
                     (out/"xhci-exercise-trace.log").write_text(phase)
                     independent=xhci.verify_trace(phase,info)
-                    net.verify_kernel(data,args.cpus)
+                    net.verify_kernel(data,args.cpus,physical_oom_dir=out,source_commit=commit)
                     monitor.screenshot(out/"shell-screen.ppm")
                     smoke.console.verify(out/"shell-screen.ppm",aLevel="info",aOutput="both")
                     monitor.execute("quit")
                     require(process.wait(timeout=15)==0,"QEMU did not exit cleanly")
-                    files=("command.json","pci.json","com1.log","usb-before.txt","usb-attached.txt",
+                    files=("physical-oom.log","physical-oom.json","command.json","pci.json","com1.log","usb-before.txt","usb-attached.txt",
                            "usb-detached.txt","trace-start.json","trace-events.txt","xhci-trace.log",
                            "xhci-exercise-trace.log","shell-screen.ppm","esp-bootx64.efi","OVMF_VARS.secboot.fd")
                     receipt={"schema":1,"result":"pass","source_commit":commit,"cpus":args.cpus,
-                             "signed_efi_sha256":build["artifacts"]["agentos.efi"],"pci_bdf":bdf,
+                             "physical_oom":oom_proof,"signed_efi_sha256":build["artifacts"]["agentos.efi"],"pci_bdf":bdf,
                              "ovmf_code_sha256":sha(args.ovmf_code),
                              "emulator":subprocess.check_output(["qemu-system-x86_64","--version"],text=True).splitlines()[0],
                              "seconds":round(time.monotonic()-started,3),

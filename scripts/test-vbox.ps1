@@ -193,6 +193,11 @@ if ($LASTEXITCODE -ne 0 -or $dirty.Count -ne 0) {
 }
 & python "$PSScriptRoot/verify-vm-evidence.py" --root $root --commit $sourceCommit
 if ($LASTEXITCODE -ne 0) { throw 'Signed EFI build provenance check failed; rebuild from this exact commit' }
+if ($Case -eq 'signed') {
+    # Run the same production allocator regression in the Linux build environment.
+    & wsl -d Ubuntu-24.04 -- python3 scripts/physical_oom_evidence.py --directory $relative --commit $sourceCommit
+    if ($LASTEXITCODE -ne 0) { throw 'Separate physical allocator OOM regression failed' }
+}
 $vboxVersion=(& $vbox --version).Trim()
 $buildProfile=(Get-Content -Raw (Join-Path $root 'build/build-provenance.json') | ConvertFrom-Json).profile
 if ([bool]$AhciDma -ne ($buildProfile -eq 'ahci-dma')) { throw 'Use build.sh --ahci-dma with -AhciDma, or build.sh for normal boots' }
@@ -416,7 +421,7 @@ try {
         if (!(Select-String -LiteralPath "$dir\serial-com1.log" -SimpleMatch 'AGENTOS KERNEL STACK GUARD OK' -Quiet)) {
             throw "Kernel stack guard fault probes missing: $dir"
         }
-        & python "$PSScriptRoot/verify-boot-log.py" --log "$dir\serial-com1.log" --level $LogLevel --output $LogOutput
+        & python "$PSScriptRoot/verify-boot-log.py" --log "$dir\serial-com1.log" --level $LogLevel --output $LogOutput --physical-oom-dir $dir --source-commit $sourceCommit
         if ($LASTEXITCODE -ne 0) { throw "BOOT.LOG sink/severity verification failed: $dir" }
         & "$PSScriptRoot/verify-processes.ps1" -Log "$dir\serial-com1.log" -ApicIds $ids
         & python "$PSScriptRoot/verify-supervisor.py" --log "$dir\serial-com1.log" --cpus $Cpus
@@ -431,7 +436,7 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "Actual process migration and cross-CPU state preservation failed: $dir" }
         & python "$PSScriptRoot/verify-service-manager.py" --log "$dir\serial-com1.log"
         if ($LASTEXITCODE -ne 0) { throw "Persistent service registry readiness/restart evidence failed: $dir" }
-        & "$PSScriptRoot/verify-idle.ps1" -RunDir $dir -ApicIds $ids -HostSeconds $hostIdleSeconds
+        & "$PSScriptRoot/verify-idle.ps1" -RunDir $dir -ApicIds $ids -HostSeconds $hostIdleSeconds -SourceCommit $sourceCommit
         if ($Shell) {
             # Resume the same COM1 log after all boot-time file verifiers.
             $serial.Log=[IO.File]::Open("$dir\serial-com1.log",'Append','Write','ReadWrite')
@@ -473,7 +478,7 @@ try {
             if ($Keyboard) { $verifyArgs+='--keyboard' }
             & python "$PSScriptRoot/verify-stage3-session.py" @verifyArgs
             if ($LASTEXITCODE -ne 0) { throw "Stage-3 interactive verification failed: $dir" }
-            & python "$PSScriptRoot/verify-boot-log.py" --log "$dir\serial-com1.log" --level $LogLevel --output $LogOutput
+            & python "$PSScriptRoot/verify-boot-log.py" --log "$dir\serial-com1.log" --level $LogLevel --output $LogOutput --physical-oom-dir $dir --source-commit $sourceCommit
             if ($LASTEXITCODE -ne 0) { throw 'BOOT.LOG policy violated during interactive session' }
         }
     } elseif ($serial.Text.ToString() -notmatch 'BdsDxe: failed to load [^\r\n]*HARDDISK[^\r\n]*(Access Denied|Security Violation)') {
@@ -546,7 +551,8 @@ try {
             }
             foreach ($name in @('esp.raw','esp.vdi','changed.efi','serial-com1.log',
                                 'com1-input.bin','display.png','shell-before.png',
-                                'shell-keyboard.png','idle.csv','failure.png','vbox-pci.txt','dma.raw','dma.vdi','vbox-ahci.log') + $blockFiles) {
+                                'shell-keyboard.png','idle.csv','failure.png','vbox-pci.txt','dma.raw','dma.vdi','vbox-ahci.log',
+                                'physical-oom.log','physical-oom.json') + $blockFiles) {
                 $file=Join-Path $dir $name
                 if (Test-Path -LiteralPath $file -PathType Leaf) {
                     $artifactHashes[$name]=(Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -575,6 +581,7 @@ try {
                 artifacts=$artifactHashes
             }
             $receiptFile=Join-Path $dir 'acceptance.json'
+            if ($Case -eq 'signed') { $receipt.physical_oom_contract='host-shared-allocator-v1' }
             if ($PciChipset) { $receipt.pci_chipset=$PciChipset }
             if ($DeviceIrq) { $receipt.device_irqs=$true }
             if ($AhciDma) { $receipt.ahci_dma=$true }

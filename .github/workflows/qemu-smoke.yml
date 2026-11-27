@@ -141,6 +141,10 @@ jobs:
             build/kernel.elf
             build/initramfs.cpio
             build/db.esl
+            build/check/qemu-cpu${{ matrix.cpus }}*/physical-oom.json
+            build/check/qemu-cpu${{ matrix.cpus }}*/physical-oom.log
+            build/check/qemu-cpu${{ matrix.cpus }}*/esp.raw
+            build/check/qemu-cpu${{ matrix.cpus }}*/esp-bootx64.efi
             build/check/qemu-cpu${{ matrix.cpus }}/com1.log
             build/check/qemu-cpu${{ matrix.cpus }}/qemu-stderr.log
             build/check/qemu-cpu${{ matrix.cpus }}/smoke.json

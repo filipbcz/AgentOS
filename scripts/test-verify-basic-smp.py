@@ -49,7 +49,7 @@ class BasicSmpTests(unittest.TestCase):
     def test_real_evidence_contract_shape(self):
         for cpus in (4,8):
             log,qmp=records(cpus)
-            proof=basic.verify_progress(log,cpus,qmp)
+            proof=basic.verify_progress(log,cpus,qmp,historical_boot_oom=True)
             self.assertEqual(len(proof["cpus"]),cpus)
             self.assertEqual({c["apic"] for c in proof["cpus"]},basic.qmp_ids(qmp,cpus))
             self.assertTrue(proof["boot_roots"]["shutdown_verified"])
@@ -63,9 +63,9 @@ class BasicSmpTests(unittest.TestCase):
             rows=log.splitlines(keepends=True)
             for i,row in enumerate(rows):
                 with self.subTest(cpus=cpus,row=i),self.assertRaises(ValueError):
-                    basic.verify_progress("".join(rows[:i]+rows[i+1:]),cpus,qmp)
+                    basic.verify_progress("".join(rows[:i]+rows[i+1:]),cpus,qmp,historical_boot_oom=True)
                 with self.subTest(cpus=cpus,row=i),self.assertRaises(ValueError):
-                    basic.verify_progress("".join(rows[:i]+[row]+rows[i:]),cpus,qmp)
+                    basic.verify_progress("".join(rows[:i]+[row]+rows[i:]),cpus,qmp,historical_boot_oom=True)
             for old,new in (("PREEMPTIONS=0000000000000002","PREEMPTIONS=0000000000000001"),
                             ("PAGES=0000000000001000","PAGES=0000000000000000"),
                             ("TIMER-WAKES=0000000000000003","TIMER-WAKES=0000000000000000"),
@@ -74,17 +74,17 @@ class BasicSmpTests(unittest.TestCase):
                             ("AGENTOS TASK AP APIC=0000000000000009","AGENTOS TASK AP APIC=0000000000000007")):
                 self.assertIn(old,log)
                 with self.subTest(old=old),self.assertRaises(ValueError):
-                    basic.verify_progress(log.replace(old,new,1),cpus,qmp)
+                    basic.verify_progress(log.replace(old,new,1),cpus,qmp,historical_boot_oom=True)
             for field,value in (("apic-id",7),("thread-id",100),("cpu-index",0),("qom-path","/machine/cpu0"),
                                 ("apic-id",19 if cpus==4 else 41)):
                 changed=copy.deepcopy(qmp)
                 changed["cpus"][1][field]=value
                 with self.subTest(field=field),self.assertRaises(ValueError):
-                    basic.verify_progress(log,cpus,changed)
+                    basic.verify_progress(log,cpus,changed,historical_boot_oom=True)
             changed=copy.deepcopy(qmp)
             changed["cpus"].pop()
             with self.assertRaises(ValueError):
-                basic.verify_progress(log,cpus,changed)
+                basic.verify_progress(log,cpus,changed,historical_boot_oom=True)
 
     def test_explicit_ordinary_session_profile(self):
         for cpus in (4,8):

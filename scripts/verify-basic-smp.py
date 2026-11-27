@@ -110,7 +110,7 @@ def verify_image(root,efi,commit):
             "kernel_sha256":hashlib.sha256(kernel).hexdigest(),"initramfs_sha256":build["initramfs_sha256"],
             "db_cer_sha256":build["artifacts"]["db.cer"],"entries":sorted(entries),"signature_verified":True}
 
-def verify_progress(text,cpus,qmp,*,soak_interval=None):
+def verify_progress(text,cpus,qmp,*,soak_interval=None,physical_oom_dir=None,source_commit=None,historical_boot_oom=False):
     expected=qmp_ids(qmp,cpus)
     lines=text.splitlines()
     def records(prefix,pattern):
@@ -149,10 +149,20 @@ def verify_progress(text,cpus,qmp,*,soak_interval=None):
             "Actual BSP/AP timer roster differs from QOM APIC identities")
     by_cpu={int(m[2],16):{"role":m[1],"timer_wakes":int(m[3],16),"tasks":[]} for _,m in roster}
     frame_at,(held,before,after)=one("AGENTOS FRAME STRESS ",FRAME)
-    oom_at,(drained,rejected,restored)=one("AGENTOS OOM OK",OOM)
-    require(online<frame_at<oom_at<users and held==16*cpus and
-            before==after==drained==restored and before>0 and rejected==cpus,
-            "Incomplete existing boot frame accounting")
+    require(online<frame_at<users and held==16*cpus and before==after and before>0,
+            "Incomplete boot stress frame accounting")
+    frame_accounting={"held":held,"free_before":before,"free_after":after}
+    if historical_boot_oom:
+        require(physical_oom_dir is None and source_commit is None,"Historical boot inspection cannot claim current OOM proof")
+        # Historical archives retain the original per-guest-CPU proof.
+        oom_at,(drained,rejected,restored)=one("AGENTOS OOM OK",OOM)
+        require(frame_at<oom_at<users and before==drained==restored and rejected==cpus,
+                "Incomplete historic boot OOM accounting")
+        frame_accounting.update(boot_oom_rejected=rejected,restored=restored)
+    else:
+        require(physical_oom_dir is not None and source_commit is not None,"Missing separate OOM proof context")
+        frame_accounting["physical_oom"]=load("physical_oom_evidence.py").verify_boot(
+            text.encode("ascii"),ROOT,physical_oom_dir,source_commit)
     sched=records("AGENTOS SCHED ",SCHED)
     seen=set()
     for i,m in sched:
@@ -187,5 +197,4 @@ def verify_progress(text,cpus,qmp,*,soak_interval=None):
             all(by_cpu[f["apic"]]["role"]==("BSP" if f["terminal"]=="park" else "AP") for f in roots["families"]),
             "Boot root role mismatch or incomplete shutdown")
     return {"cpus":[{"apic":cpu,**by_cpu[cpu]} for cpu in sorted(expected)],
-            "boot_roots":roots,"frame_accounting":{"held":held,"free_before":before,"free_after":after,
-            "boot_oom_rejected":rejected,"restored":restored},"final_shutdown":True}
+            "boot_roots":roots,"frame_accounting":frame_accounting,"final_shutdown":True}

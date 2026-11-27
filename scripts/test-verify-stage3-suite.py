@@ -43,8 +43,10 @@ class SuiteTests(unittest.TestCase):
                 "case": case, "cpus": cpus, "shell": shell, "keyboard": keyboard,
                 "boot_log_level": level, "boot_log_output": output,
                 "source_commit": SHA,
-                "artifacts": {"idle.csv": IMAGE} if case == "signed" else {},
+                "artifacts": {name: IMAGE for name in ({"idle.csv"} | suite.receipt.PHYSICAL_OOM_ARTIFACTS)} if case == "signed" else {},
             }
+            if case == "signed":
+                self.observed[vm]["physical_oom_contract"] = suite.receipt.PHYSICAL_OOM_CONTRACT
         self.summary_file = self.runs / "stage3-acceptance.json"
         self.save()
         # Matrix fixtures isolate receipt/profile checks. The real Git gate
@@ -96,6 +98,14 @@ class SuiteTests(unittest.TestCase):
     def test_missing_timed_idle_evidence_fails(self):
         signed = next(run for run in self.observed.values() if run["case"] == "signed")
         signed["artifacts"].clear()
+        self.rejects()
+
+    def test_current_suite_does_not_accept_historical_oom_receipt(self):
+        signed = next(run for run in self.observed.values() if run["case"] == "signed")
+        signed.pop("physical_oom_contract")
+        self.rejects()
+        signed["physical_oom_contract"] = suite.receipt.PHYSICAL_OOM_CONTRACT
+        signed["artifacts"].pop("physical-oom.log")
         self.rejects()
 
     def test_unexpected_profile_does_not_substitute_for_required_profile(self):

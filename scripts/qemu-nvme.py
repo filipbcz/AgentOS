@@ -154,7 +154,7 @@ def wait_guest(process, capture, serial, marker, seconds):
     raise TimeoutError(f"Missing real guest marker {marker!r}")
 
 
-def phase(args, out, raw, vars_file, esp, mode, expected_details):
+def phase(args, out, raw, vars_file, esp, mode, expected_details, commit):
     name = "write" if mode == b"W" else "read"
     folder = out / name
     folder.mkdir()
@@ -222,7 +222,7 @@ def phase(args, out, raw, vars_file, esp, mode, expected_details):
                     data = wait_guest(process, capture, serial,
                                       b"AGENTOS SHELL READY\r\nagentos> ", args.timeout)
                     text = data.decode("ascii", errors="replace")
-                    smoke.boot_log.verify(data, "info", "both")
+                    smoke.boot_log.verify(data, "info", "both", physical_oom_dir=out, source_commit=commit)
                     apics = re.findall(r"(?m)^AGENTOS TASK (?:BSP|AP) APIC=([0-9a-f]{16}) "
                                        r"TIMER-WAKES=0000000000000003\r?$", text)
                     require(len(apics) == args.cpus and len(set(apics)) == args.cpus,
@@ -276,6 +276,7 @@ def run(args):
     out = Path(tempfile.mkdtemp(prefix="run-", dir=root))
     print(f"QEMU_NVME_DIR={out}", flush=True)
     try:
+        oom_proof = smoke.physical_oom.run(ROOT, out, commit)
         subprocess.run(["bash", "scripts/disk.sh", str(out), "build/agentos.efi", "info both"],
                        cwd=ROOT, check=True)
         esp = out / "esp.raw"
@@ -295,15 +296,15 @@ def run(args):
         create(initial)
         shutil.copyfile(initial, raw)
         expected, details = expected_disk(initial)
-        first = phase(args, out, raw, vars_file, esp, b"W", details)
+        first = phase(args, out, raw, vars_file, esp, b"W", details, commit)
         require(raw.read_bytes() == expected, "Full disk differs after write boot")
         shutil.copyfile(raw, out / "block-after.raw")
         require(der in vars_file.read_bytes(), "Cold reboot lost the enrolled signer")
-        second = phase(args, out, raw, vars_file, esp, b"R", details)
+        second = phase(args, out, raw, vars_file, esp, b"R", details, commit)
         require(raw.read_bytes() == expected, "Read boot modified the disk")
         require(first["bdf"] == second["bdf"], "NVMe PCI address changed between boots")
         shutil.copyfile(raw, out / "block-read-after.raw")
-        files = ("block.raw", "block-after.raw", "block-read-after.raw", "esp-bootx64.efi",
+        files = ("physical-oom.log", "physical-oom.json", "block.raw", "block-after.raw", "block-read-after.raw", "esp-bootx64.efi",
                  "OVMF_VARS.secboot.fd", "write/phase.json", "read/phase.json",
                  "write/com1.log", "read/com1.log", "write/stats-before.json",
                  "write/stats-after.json", "read/stats-before.json", "read/stats-after.json",
@@ -313,7 +314,7 @@ def run(args):
                  "write/nvme-trace.log", "read/nvme-trace.log",
                  "write/trace-events.txt", "read/trace-events.txt")
         result = {"schema": 1, "result": "pass", "source_commit": commit, "cpus": args.cpus,
-                  "emulator": subprocess.check_output(["qemu-system-x86_64", "--version"], text=True).splitlines()[0],
+                  "physical_oom": oom_proof, "emulator": subprocess.check_output(["qemu-system-x86_64", "--version"], text=True).splitlines()[0],
                   "signed_efi_sha256": build["artifacts"]["agentos.efi"], "details": details,
                   "ovmf_code_sha256": sha(args.ovmf_code), "phases": [first, second],
                   "artifacts": {name: sha(out / name) for name in files}}

@@ -94,6 +94,9 @@ def verify(root, manifest_path):
                         f"Acceptance receipt modified: {vm}")
         observed = receipt.verify_run(root, directory)
         if observed["case"] == "signed":
+            receipt.require(observed.get("physical_oom_contract") == receipt.PHYSICAL_OOM_CONTRACT and
+                            receipt.PHYSICAL_OOM_ARTIFACTS <= set(observed["artifacts"]),
+                            f"Missing separate physical OOM evidence: {vm}")
             receipt.require("idle.csv" in observed["artifacts"],
                             f"Missing verified host/guest idle measurement: {vm}")
         profile = (observed["case"], observed["cpus"], observed["shell"],
