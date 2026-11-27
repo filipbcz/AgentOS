@@ -954,7 +954,7 @@ impl ClockSet {
 /// before installing this provider.
 struct TscFallback {
     epoch: crate::tsc_epoch::Epoch<'static>,
-    local: fn() -> crate::tsc_epoch::Sample,
+    local: Option<fn() -> crate::tsc_epoch::Sample>,
 }
 
 // Sticky operational diagnosis. The clock gate serializes writes; a
@@ -967,9 +967,13 @@ static TSC_FAILURE_DETAIL: [AtomicU64; 4] = [
 ];
 
 impl TscFallback {
+    const fn empty() -> Self {
+        Self { epoch:crate::tsc_epoch::Epoch::empty(), local:None }
+    }
+
     fn sample(&mut self) -> Option<u128> {
         if self.epoch.failed() { return None; }
-        let sample=(self.local)();
+        let sample=(self.local?)();
         match self.epoch.observe(sample) {
             Ok(ns)=>Some(ns),
             Err(fault)=>{ self.invalidate(fault,Some(sample)); None }
@@ -994,7 +998,7 @@ impl TscFallback {
 struct ClockState {
     initialized: bool,
     physical: Option<ClockSet>,
-    fallback: Option<TscFallback>,
+    fallback: TscFallback,
 }
 
 struct SharedClock {
@@ -1008,7 +1012,7 @@ unsafe impl Sync for SharedClock {}
 impl SharedClock {
     const fn new() -> Self {
         Self { gate: AtomicBool::new(false), clocks: UnsafeCell::new(ClockState {
-                initialized: false, physical: None, fallback: None,
+                initialized: false, physical: None, fallback: TscFallback::empty(),
             }),
             maintenance: AtomicU64::new(0), event: AtomicU8::new(0) }
     }
@@ -1019,13 +1023,42 @@ impl SharedClock {
     fn with<R>(&self, operation: impl FnOnce(&mut ClockState) -> R) -> R {
         let flags: usize;
         unsafe { asm!("pushfq", "pop {}", "cli", out(reg) flags); }
+        let result = self.with_locked(operation);
+        if flags & (1 << 9) != 0 { unsafe { asm!("sti", options(nostack)); } }
+        result
+    }
+
+    // The actual shared serialization core; kernel callers always mask
+    // local IRQs via with(), before waiting for or holding this gate.
+    #[inline]
+    fn with_locked<R>(&self, operation: impl FnOnce(&mut ClockState) -> R) -> R {
         while self.gate.swap(true, Ordering::Acquire) {
             while self.gate.load(Ordering::Relaxed) { spin_loop(); }
         }
         let result = operation(unsafe { &mut *self.clocks.get() });
         self.gate.store(false, Ordering::Release);
-        if flags & (1 << 9) != 0 { unsafe { asm!("sti", options(nostack)); } }
         result
+    }
+
+    // Only invoked inside the owning gate. Build directly in its final
+    // initialized storage; the callback becomes visible last.
+    fn publish_tsc_locked(&self, state:&mut ClockState, bsp:u32, ids:&[u32],
+        members:impl IntoIterator<Item=(u32,&'static crate::tsc::Peer)>,
+        local:fn()->crate::tsc_epoch::Sample)->Result<(), &'static [u8]> {
+        use crate::tsc_epoch::InitError;
+        if !state.initialized || state.physical.is_some() || state.fallback.local.is_some() {
+            return Err(b"invalid TSC epoch publication state");
+        }
+        state.fallback.epoch.initialize(bsp,ids,members,local).map_err(|error| match error {
+            InitError::Roster=>b"incomplete qualified TSC roster" as &[u8],
+            InitError::Sample=>b"invalid initial normalized TSC sample",
+            InitError::AlreadyPublished=>b"invalid TSC epoch publication state",
+        })?;
+        state.fallback.local=Some(local);
+        // Sparse BSP maintenance retains the separate LAPIC stall guard,
+        // even during idle. This is not independent frequency evidence.
+        self.maintenance.store(1000, Ordering::Release);
+        Ok(())
     }
 }
 
@@ -1058,23 +1091,14 @@ pub unsafe fn init(pm: Option<PmTimer>, hp: Option<ReferenceClock>, hp_candidate
     })
 }
 
-/// A new TSC epoch is legal only before any physical epoch was published,
-/// with all enabled CPU qualification records sealed by the coordinator.
-/// No runtime PIT acquisition, synthesized reference, or rebase.
-pub(crate) unsafe fn publish_tsc(roster: crate::tsc_epoch::Roster<'static>,
-    local: fn() -> crate::tsc_epoch::Sample) -> Result<(), &'static [u8]> {
-    CLOCK.with(|state| {
-        if !state.initialized || state.physical.is_some() || state.fallback.is_some() {
-            return Err(b"invalid TSC epoch publication state" as &[u8]);
-        }
-        let epoch=crate::tsc_epoch::Epoch::new(roster,local())
-            .ok_or(b"invalid initial normalized TSC sample" as &[u8])?;
-        state.fallback=Some(TscFallback{epoch,local});
-        // Sparse BSP maintenance retains the separate LAPIC stall guard,
-        // even during idle. This is not independent frequency evidence.
-        CLOCK.maintenance.store(1000, Ordering::Release);
-        Ok(())
-    })
+/// A new TSC epoch is legal only before any physical epoch was published.
+/// Qualify every enabled CPU and initialize the epoch under the same gate
+/// used by all readers. No runtime PIT acquisition or rebase.
+#[inline(never)]
+pub(crate) unsafe fn publish_tsc(bsp:u32, ids:&[u32],
+    members:impl IntoIterator<Item=(u32,&'static crate::tsc::Peer)>,
+    local:fn()->crate::tsc_epoch::Sample)->Result<(), &'static [u8]> {
+    CLOCK.with(|state| CLOCK.publish_tsc_locked(state,bsp,ids,members,local))
 }
 
 /// Install the runtime provider after SMP CPU-local state is initialized.
@@ -1111,13 +1135,18 @@ pub(crate) struct ClockSnapshot {
 }
 
 pub(crate) fn snapshot() -> Option<ClockSnapshot> {
-    CLOCK.with(|state| {
-        if let Some(fallback) = state.fallback.as_mut() {
+    CLOCK.with(|state| CLOCK.snapshot_locked(state))
+}
+
+impl SharedClock {
+    fn snapshot_locked(&self,state:&mut ClockState)->Option<ClockSnapshot> {
+        if state.fallback.local.is_some() {
+            let fallback=&mut state.fallback;
             let was_failed=fallback.epoch.failed();
             let result=fallback.sample();
             if result.is_none() && !was_failed {
-                CLOCK.event.store(ClockEvent::TscUnavailable as u8, Ordering::Release);
-                CLOCK.maintenance.store(0, Ordering::Release);
+                self.event.store(ClockEvent::TscUnavailable as u8, Ordering::Release);
+                self.maintenance.store(0, Ordering::Release);
             }
             return result.map(|ns| ClockSnapshot {
                 millis:(ns/1_000_000).min(isize::MAX as u128) as u64,
@@ -1134,22 +1163,23 @@ pub(crate) fn snapshot() -> Option<ClockSnapshot> {
             || read.and_then(|f| f(generation)),
             |source| restart.map(|f| f(source)));
         let maintenance = clocks.maintenance_ms().unwrap_or(0);
-        if CLOCK.maintenance.load(Ordering::Relaxed) != maintenance {
-            CLOCK.maintenance.store(maintenance, Ordering::Release);
+        if self.maintenance.load(Ordering::Relaxed) != maintenance {
+            self.maintenance.store(maintenance, Ordering::Release);
         }
         if let Some(event) = clocks.take_event() {
-            CLOCK.event.store(event as u8, Ordering::Release);
+            self.event.store(event as u8, Ordering::Release);
         }
         let ns = result?;
         Some(clocks.view(ns))
-    })
+    }
 }
 
 /// Independent LAPIC progress can diagnose a frozen holdover even when
 /// TSC itself never advances far enough to age out its qualification.
 pub(crate) fn expire_stalled_holdover() {
     CLOCK.with(|state| {
-        if let Some(fallback)=state.fallback.as_mut() {
+        if state.fallback.local.is_some() {
+            let fallback=&mut state.fallback;
             if !fallback.epoch.failed() {
                 fallback.invalidate(crate::tsc_epoch::Fault::Stalled,None);
                 CLOCK.maintenance.store(0, Ordering::Release);
@@ -1203,3 +1233,7 @@ pub fn name(source: ReferenceClock) -> &'static [u8] {
         } else { b"SYSTEM CLOCK: ACPI PM24" },
     }
 }
+
+#[cfg(test)]
+#[path = "../scripts/tests/tsc-publication-cases.rs"]
+mod publication_tests;

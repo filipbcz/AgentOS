@@ -22,6 +22,14 @@ impl CpuRoster {
         Self { ids: [0; MAX_CPUS], order: [0; MAX_CPUS], count: 0 }
     }
 
+    // Discard an unpublished roster without constructing a whole replacement
+    // on the caller's stack. Never use this on a published CPU registry.
+    pub(crate) fn clear(&mut self) {
+        self.count = 0;
+        self.ids.fill(0);
+        self.order.fill(0);
+    }
+
     pub(crate) fn ids(&self) -> &[u32] { &self.ids[..self.count] }
 
     pub(crate) fn slot(&self, id: u32) -> Option<CpuSlot> {

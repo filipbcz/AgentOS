@@ -7,31 +7,43 @@ const MAX_ALIGNMENT_NS: u128 = 100_000;
 
 /// Exact immutable CPU qualification records; CPU state is kept alive
 /// throughout the boot session.
-pub(crate) struct Roster<'a> {
+struct Roster<'a> {
     cpus: CpuRoster,
     peers: [Option<&'a Peer>; MAX_CPUS],
     bsp: u32,
-    rate: QualifiedRate,
+    rate: Option<QualifiedRate>,
 }
 
 impl<'a> Roster<'a> {
-    pub(crate) fn qualify(bsp:u32, ids:&[u32],
-        members:impl IntoIterator<Item=(u32,&'a Peer)>) -> Option<Self> {
-        let cpus=CpuRoster::from_ids(ids.iter().copied())?;
-        let bsp_slot=cpus.slot(bsp)?.index();
-        let mut peers:[Option<&Peer>;MAX_CPUS]=[None;MAX_CPUS];
+    const fn empty() -> Self {
+        Self { cpus:CpuRoster::new(), peers:[None;MAX_CPUS], bsp:0, rate:None }
+    }
+
+    fn clear(&mut self) {
+        self.rate=None;
+        self.bsp=0;
+        self.cpus.clear();
+        self.peers.fill(None);
+    }
+
+    // Fill the destination owned by the clock. The caller resets it on
+    // every error; no reader can see it before a complete epoch is ready.
+    fn qualify(&mut self, bsp:u32, ids:&[u32],
+        members:impl IntoIterator<Item=(u32,&'a Peer)>) -> Option<()> {
+        for &id in ids { self.cpus.insert(id)?; }
+        let bsp_slot=self.cpus.slot(bsp)?.index();
         for (id,peer) in members {
-            let index=cpus.slot(id)?.index();
-            if peers[index].is_some() || peers.iter().flatten().any(|p| core::ptr::eq(*p,peer)) {
+            let index=self.cpus.slot(id)?.index();
+            if self.peers[index].is_some() || self.peers.iter().flatten().any(|p| core::ptr::eq(*p,peer)) {
                 return None;
             }
-            peers[index]=Some(peer);
+            self.peers[index]=Some(peer);
         }
-        let bsp_peer=peers[bsp_slot]?;
+        let bsp_peer=self.peers[bsp_slot]?;
         let rate=bsp_peer.qualification()?;
         let hz=rate.hz() as u128;
-        for (index,peer) in peers.iter().enumerate() {
-            if (index<cpus.ids().len())!=peer.is_some() { return None; }
+        for (index,peer) in self.peers.iter().enumerate() {
+            if (index<self.cpus.ids().len())!=peer.is_some() { return None; }
             if let Some(peer)=peer {
                 let local=peer.qualification()?;
                 let a=peer.alignment()?;
@@ -44,10 +56,12 @@ impl<'a> Roster<'a> {
                 }
             }
         }
-        for peer in peers.iter().flatten() {
+        for peer in self.peers.iter().flatten() {
             if !peer.seal() { return None; }
         }
-        Some(Self{cpus,peers,bsp,rate})
+        self.bsp=bsp;
+        self.rate=Some(rate);
+        Some(())
     }
 
     fn bracket(&self,s:Sample)->Result<TscBracket,Fault> {
@@ -55,12 +69,13 @@ impl<'a> Roster<'a> {
         let peer=self.peers[index].ok_or(Fault::UnknownCpu)?;
         let a=peer.alignment().ok_or(Fault::UnqualifiedCpu)?;
         let local=peer.qualification().ok_or(Fault::UnqualifiedCpu)?;
-        if !crate::tsc::rates_match(self.rate,local) ||
+        let rate=self.rate.ok_or(Fault::UnqualifiedCpu)?;
+        if !crate::tsc::rates_match(rate,local) ||
             a.uncertainty_ticks as u128*1_000_000_000>
-                self.rate.hz() as u128*MAX_ALIGNMENT_NS {
+                rate.hz() as u128*MAX_ALIGNMENT_NS {
             return Err(Fault::UnqualifiedCpu);
         }
-        let w=Witness{cpu:s.id,hz:self.rate.hz(),
+        let w=Witness{cpu:s.id,hz:rate.hz(),
             ticks:a.normalize(s.raw).ok_or(Fault::Normalization)?,
             uncertainty_ticks:a.uncertainty_ticks};
         TscBracket::checked(w,w).map_err(|_|Fault::Normalization)
@@ -69,13 +84,17 @@ impl<'a> Roster<'a> {
 
 /// Prefer an already qualified physical epoch. A failed qualification
 /// cannot authorize a TSC clocksource.
-pub(crate) enum BootSource<'a> { Physical, Tsc(Roster<'a>) }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BootSource { Physical, Tsc }
 
-pub(crate) fn select<'a>(physical_ready:bool,
-    qualify:impl FnOnce()->Option<Roster<'a>>) -> Option<BootSource<'a>> {
-    if physical_ready { Some(BootSource::Physical) }
-    else { qualify().map(BootSource::Tsc) }
+pub(crate) fn select<E>(physical_ready:bool,
+    publish:impl FnOnce()->Result<(),E>) -> Result<BootSource,E> {
+    if physical_ready { Ok(BootSource::Physical) }
+    else { publish().map(|()| BootSource::Tsc) }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InitError { Roster, Sample, AlreadyPublished }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Sample { pub id:u32, pub raw:u64 }
@@ -109,33 +128,70 @@ impl Fault {
 
 /// Fixed origin and greatest proven lower bound. Overlapping alignment
 /// uncertainty can clamp a read, but cannot hide disjoint regression.
-pub(crate) struct Epoch<'a> {
-    roster:Roster<'a>,
+/// This small value is the commit point for the initialized history.
+struct Timeline {
     origin:TscBracket,
     latest:TscBracket,
+    published:u128,
+}
+
+pub(crate) struct Epoch<'a> {
+    roster:Roster<'a>,
+    timeline:Option<Timeline>,
     last_raw:[u64;MAX_CPUS],
     seen:[bool;MAX_CPUS],
-    published:u128,
     fault:Option<Fault>,
 }
 
 impl<'a> Epoch<'a> {
-    pub(crate) fn new(roster:Roster<'a>,first:Sample)->Option<Self> {
-        if first.id!=roster.bsp { return None; }
-        let initial=roster.bracket(first).ok()?;
-        let mut last_raw=[0;MAX_CPUS];
-        let mut seen=[false;MAX_CPUS];
-        for (id,peer) in roster.peers.iter().enumerate() {
+    pub(crate) const fn empty()->Self {
+        Self { roster:Roster::empty(), timeline:None, last_raw:[0;MAX_CPUS],
+            seen:[false;MAX_CPUS], fault:None }
+    }
+
+    fn reset_unpublished(&mut self) {
+        debug_assert!(self.timeline.is_none());
+        self.roster.clear();
+        self.last_raw.fill(0);
+        self.seen.fill(false);
+        self.fault=None;
+    }
+
+    /// A clock owner exclusively borrows its final storage until this
+    /// returns. Failed qualification or initial sampling leaves it empty;
+    /// an already published (even failed) epoch cannot be rebased.
+    pub(crate) fn initialize(&mut self, bsp:u32, ids:&[u32],
+        members:impl IntoIterator<Item=(u32,&'a Peer)>,
+        first:impl FnOnce()->Sample)->Result<(),InitError> {
+        if self.timeline.is_some() { return Err(InitError::AlreadyPublished); }
+        self.reset_unpublished();
+        if self.roster.qualify(bsp,ids,members).is_none() {
+            self.reset_unpublished();
+            return Err(InitError::Roster);
+        }
+        // As before, sample the BSP only after the complete roster is sealed.
+        if self.initialize_history(first()).is_none() {
+            self.reset_unpublished();
+            return Err(InitError::Sample);
+        }
+        Ok(())
+    }
+
+    fn initialize_history(&mut self, first:Sample)->Option<()> {
+        if first.id!=self.roster.bsp { return None; }
+        let initial=self.roster.bracket(first).ok()?;
+        for (index,peer) in self.roster.peers.iter().enumerate() {
             if let Some(peer)=peer {
-                last_raw[id]=peer.last_verified_raw();
-                seen[id]=true;
+                self.last_raw[index]=peer.last_verified_raw();
+                self.seen[index]=true;
             }
         }
-        let index=roster.cpus.slot(first.id)?.index();
-        if first.raw<last_raw[index] {return None;}
-        last_raw[index]=first.raw;
-        seen[index]=true;
-        Some(Self{roster,origin:initial,latest:initial,last_raw,seen,published:0,fault:None})
+        let index=self.roster.cpus.slot(first.id)?.index();
+        if first.raw<self.last_raw[index] {return None;}
+        self.last_raw[index]=first.raw;
+        self.seen[index]=true;
+        self.timeline=Some(Timeline{origin:initial,latest:initial,published:0});
+        Some(())
     }
 
     pub(crate) fn invalidate(&mut self,fault:Fault)->Fault {
@@ -146,17 +202,20 @@ impl<'a> Epoch<'a> {
 
     pub(crate) fn observe(&mut self,s:Sample)->Result<u128,Fault> {
         if let Some(fault)=self.fault { return Err(fault); }
+        // An unpublished epoch cannot serve any time or establish a fault
+        // in a future, independently qualified epoch.
+        let Some(timeline)=self.timeline.as_mut() else { return Err(Fault::UnqualifiedCpu); };
         let result=(|| {
             let current=self.roster.bracket(s)?;
             let index=self.roster.cpus.slot(s.id).ok_or(Fault::UnknownCpu)?.index();
             if self.seen[index] && s.raw<self.last_raw[index] {return Err(Fault::RawRegression);}
-            let latest=self.latest.advance(current).ok_or(Fault::GlobalRegression)?;
-            let elapsed=self.origin.elapsed(latest).ok_or(Fault::GlobalRegression)?.low;
+            let latest=timeline.latest.advance(current).ok_or(Fault::GlobalRegression)?;
+            let elapsed=timeline.origin.elapsed(latest).ok_or(Fault::GlobalRegression)?.low;
             self.last_raw[index]=s.raw;
             self.seen[index]=true;
-            self.latest=latest;
-            self.published=self.published.max(elapsed);
-            Ok(self.published)
+            timeline.latest=latest;
+            timeline.published=timeline.published.max(elapsed);
+            Ok(timeline.published)
         })();
         match result { Ok(time)=>Ok(time),Err(fault)=>Err(self.invalidate(fault)) }
     }

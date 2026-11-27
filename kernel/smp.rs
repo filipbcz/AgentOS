@@ -1388,12 +1388,11 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
         }
     }
     match crate::tsc_epoch::select(physical_ready,||
-        crate::tsc_epoch::Roster::qualify(bsp,ids,
-            cpus.iter().flatten().map(|cpu|{let cpu=*cpu;(cpu.expected_id,&cpu.tsc)})))
-        .ok_or(b"incomplete qualified TSC roster" as Error)? {
+        crate::system_clock::publish_tsc(bsp,ids,
+            cpus.iter().flatten().map(|cpu|{let cpu=*cpu;(cpu.expected_id,&cpu.tsc)}),
+            local_tsc_sample))? {
         crate::tsc_epoch::BootSource::Physical=>(),
-        crate::tsc_epoch::BootSource::Tsc(roster)=>{
-            crate::system_clock::publish_tsc(roster,local_tsc_sample)?;
+        crate::tsc_epoch::BootSource::Tsc=>{
             log.event(1,b"SYSTEM CLOCK: TSC (qualified invariant clocksource)");
         }
     }

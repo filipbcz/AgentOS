@@ -11,7 +11,7 @@ mod cpu_topology;
 use bringup_clock::BringupClock;
 use reference_clock::WaitError;
 use tsc::{Alignment,Peer};
-use tsc_epoch::{BootSource,Epoch,Fault,Roster,Sample,select};
+use tsc_epoch::{BootSource,Epoch,Fault,InitError,Sample,select};
 const HZ:u64=3_000_000_000;
 const BASE:u64=3_000_000_000;
 const BSP:u32=7;
@@ -43,9 +43,19 @@ fn peer(rate:Option<tsc::QualifiedRate>,alignment:Option<Alignment>)->Peer {
 fn fleet()->(Peer,Peer) {
     (peer(Some(proof(HZ)),Some(ZERO)),peer(Some(proof(HZ)),Some(OFFSET)))
 }
+fn initialized<'a>(bsp:u32,ids:&[u32],
+    members:impl IntoIterator<Item=(u32,&'a Peer)>, first:Sample)->Result<Epoch<'a>,InitError> {
+    let mut epoch=Epoch::empty();
+    epoch.initialize(bsp,ids,members,||first)?;
+    Ok(epoch)
+}
+fn qualify<'a>(bsp:u32,ids:&[u32],members:impl IntoIterator<Item=(u32,&'a Peer)>)
+    ->Result<(),InitError> {
+    let mut epoch=Epoch::empty();
+    epoch.initialize(bsp,ids,members,||Sample{id:bsp,raw:BASE})
+}
 fn epoch<'a>(bsp:&'a Peer,ap:&'a Peer)->Epoch<'a> {
-    let roster=Roster::qualify(BSP,&[BSP,AP],[(BSP,bsp),(AP,ap)]).unwrap();
-    Epoch::new(roster,Sample{id:BSP,raw:BASE}).unwrap()
+    initialized(BSP,&[BSP,AP],[(BSP,bsp),(AP,ap)],Sample{id:BSP,raw:BASE}).unwrap()
 }
 fn at(id:u32,normalized:u64)->Sample {
     Sample{id,raw:if id==AP { normalized+30_000 } else { normalized }}
@@ -64,44 +74,48 @@ fn startup_waits_use_elapsed_local_hardware_not_poll_count() {
 
 #[test]
 fn safe_selection_prefers_physical_and_requires_complete_proof() {
-    assert!(matches!(select(true,||panic!("physical source needs no TSC")),Some(BootSource::Physical)));
-    assert!(select(false,||None).is_none());
+    assert_eq!(select::<InitError>(true,||panic!("physical source needs no TSC")),Ok(BootSource::Physical));
+    assert_eq!(select(false,||Err(InitError::Roster)),Err(InitError::Roster));
     let (bsp,ap)=fleet();
-    assert!(matches!(select(false,||Roster::qualify(BSP,&[BSP,AP],[(BSP,&bsp),(AP,&ap)])),
-        Some(BootSource::Tsc(_))));
+    assert_eq!(select(false,||qualify(BSP,&[BSP,AP],[(BSP,&bsp),(AP,&ap)])),Ok(BootSource::Tsc));
     let unqualified=peer(None,Some(OFFSET));
-    assert!(select(false,||Roster::qualify(BSP,&[BSP,AP],[(BSP,&bsp),(AP,&unqualified)])).is_none());
+    assert_eq!(select(false,||qualify(BSP,&[BSP,AP],[(BSP,&bsp),(AP,&unqualified)])),Err(InitError::Roster));
 }
 
 #[test]
 fn incomplete_duplicate_or_misaligned_fleet_cannot_publish() {
     let (bsp,ap)=fleet();
-    assert!(Roster::qualify(BSP,&[BSP,AP],[(BSP,&bsp)]).is_none());
-    assert!(Roster::qualify(BSP,&[BSP,AP],[(BSP,&bsp),(BSP,&bsp)]).is_none());
-    assert!(Roster::qualify(BSP,&[BSP,AP],[(BSP,&bsp),(AP,&bsp)]).is_none());
-    assert!(Roster::qualify(BSP,&[BSP,BSP],[(BSP,&bsp)]).is_none());
-    assert!(Roster::qualify(BSP,&[AP],[(AP,&ap)]).is_none());
+    assert!(qualify(BSP,&[BSP,AP],[(BSP,&bsp)]).is_err());
+    assert!(qualify(BSP,&[BSP,AP],[(BSP,&bsp),(BSP,&bsp)]).is_err());
+    assert!(qualify(BSP,&[BSP,AP],[(BSP,&bsp),(AP,&bsp)]).is_err());
+    assert!(qualify(BSP,&[BSP,BSP],[(BSP,&bsp)]).is_err());
+    assert!(qualify(BSP,&[AP],[(AP,&ap)]).is_err());
     for p in [
         peer(None,Some(OFFSET)),
         peer(Some(proof(HZ)),None),
         peer(Some(proof(HZ+10_000_000)),Some(OFFSET)),
         peer(Some(proof(HZ)),Some(Alignment{uncertainty_ticks:300_001,..OFFSET})),
     ] {
-        assert!(Roster::qualify(BSP,&[BSP,AP],[(BSP,&bsp),(AP,&p)]).is_none());
+        assert!(qualify(BSP,&[BSP,AP],[(BSP,&bsp),(AP,&p)]).is_err());
     }
     let bad_bsp=peer(Some(proof(HZ)),Some(Alignment{offset:1,..ZERO}));
-    assert!(Roster::qualify(BSP,&[BSP],[(BSP,&bad_bsp)]).is_none());
-    assert!(Roster::qualify(BSP,&[BSP],[(BSP,&bsp)]).is_some());
-    assert!(Roster::qualify(BSP,&[BSP,AP],[(AP,&ap),(BSP,&bsp)]).is_some());
+    assert!(qualify(BSP,&[BSP],[(BSP,&bad_bsp)]).is_err());
+    assert!(qualify(BSP,&[BSP],[(BSP,&bsp)]).is_ok());
+    assert!(qualify(BSP,&[BSP,AP],[(AP,&ap),(BSP,&bsp)]).is_ok());
 }
 
 #[test]
 fn only_bsp_may_publish_new_epoch_and_first_sample_must_be_valid() {
     let (bsp,ap)=fleet();
-    let roster=Roster::qualify(BSP,&[BSP,AP],[(BSP,&bsp),(AP,&ap)]).unwrap();
-    assert!(Epoch::new(roster,at(AP,BASE)).is_none());
-    let roster=Roster::qualify(BSP,&[BSP,AP],[(BSP,&bsp),(AP,&ap)]).unwrap();
-    assert!(Epoch::new(roster,Sample{id:BSP,raw:1}).is_none());
+    let mut epoch=Epoch::empty();
+    assert_eq!(epoch.initialize(BSP,&[BSP,AP],[(BSP,&bsp),(AP,&ap)],||at(AP,BASE)),
+        Err(InitError::Sample));
+    assert_eq!(epoch.observe(at(BSP,BASE)),Err(Fault::UnqualifiedCpu));
+    assert_eq!(epoch.initialize(BSP,&[BSP,AP],[(BSP,&bsp),(AP,&ap)],||Sample{id:BSP,raw:1}),
+        Err(InitError::Sample));
+    assert_eq!(epoch.observe(at(BSP,BASE)),Err(Fault::UnqualifiedCpu));
+    assert_eq!(epoch.initialize(BSP,&[BSP,AP],[(BSP,&bsp),(AP,&ap)],||at(BSP,BASE)),Ok(()));
+    assert_eq!(epoch.observe(at(BSP,BASE+HZ)),Ok(1_000_000_000));
 }
 
 #[test]
@@ -210,21 +224,39 @@ fn wide_cpu_ids_use_independent_epoch_slots_and_full_witness_identity() {
     let high=peer(Some(proof(HZ)),Some(ZERO));
     let high_id=0xffff_fffe;
     let ids=[high_id,0,256];
-    assert!(Roster::qualify(0,&[0,256,256],[(0,&bsp),(256,&ap)]).is_none());
-    assert!(Roster::qualify(0,&ids,[(0,&bsp),(256,&ap),(512,&high)]).is_none());
-    assert!(Roster::qualify(0,&ids,[(0,&bsp),(256,&ap),(high_id,&ap)]).is_none());
-    let roster=Roster::qualify(0,&ids,[(high_id,&high),(256,&ap),(0,&bsp)]).unwrap();
-    let mut epoch=Epoch::new(roster,Sample{id:0,raw:BASE}).unwrap();
+    assert!(qualify(0,&[0,256,256],[(0,&bsp),(256,&ap)]).is_err());
+    assert!(qualify(0,&ids,[(0,&bsp),(256,&ap),(512,&high)]).is_err());
+    assert!(qualify(0,&ids,[(0,&bsp),(256,&ap),(high_id,&ap)]).is_err());
+    let mut epoch=initialized(0,&ids,[(high_id,&high),(256,&ap),(0,&bsp)],Sample{id:0,raw:BASE}).unwrap();
     let time=BASE+HZ;
     assert_eq!(epoch.observe(Sample{id:0,raw:time}),Ok(1_000_000_000));
     // CPU 256 is not CPU 0, even though their legacy low byte is identical.
     assert_eq!(epoch.observe(Sample{id:256,raw:time+30_000-100}),Ok(1_000_000_000));
     assert_eq!(epoch.observe(Sample{id:high_id,raw:time}),Ok(1_000_000_000));
     assert_eq!(epoch.observe(Sample{id:256,raw:time+30_000-101}),Err(Fault::RawRegression));
-    let roster=Roster::qualify(0,&ids,[(0,&bsp),(256,&ap),(high_id,&high)]).unwrap();
-    let mut epoch=Epoch::new(roster,Sample{id:0,raw:BASE}).unwrap();
+    let mut epoch=initialized(0,&ids,[(0,&bsp),(256,&ap),(high_id,&high)],Sample{id:0,raw:BASE}).unwrap();
     assert_eq!(epoch.observe(Sample{id:512,raw:time}),Err(Fault::UnknownCpu));
     let w=clock_quorum::Witness{cpu:0,ticks:time,hz:HZ,uncertainty_ticks:0};
     assert_eq!(clock_quorum::TscBracket::new(w,clock_quorum::Witness{cpu:256,..w}),None);
     assert_eq!(clock_quorum::TscBracket::new(w,clock_quorum::Witness{cpu:high_id,..w}),None);
+}
+
+#[test]
+fn failed_roster_discards_partial_members_and_published_epoch_cannot_rebase() {
+    let (bsp,ap)=fleet();
+    let high=peer(Some(proof(HZ)),Some(ZERO));
+    let high_id=0xffff_fffe;
+    let mut e=Epoch::empty();
+    assert_eq!(e.initialize(BSP,&[BSP,AP,high_id],
+        [(BSP,&bsp),(high_id,&high)],||panic!("incomplete roster sampled")),Err(InitError::Roster));
+    assert_eq!(e.observe(at(BSP,BASE)),Err(Fault::UnqualifiedCpu));
+    assert_eq!(e.initialize(BSP,&[BSP,AP],[(AP,&ap),(BSP,&bsp)],||at(BSP,BASE)),Ok(()));
+    assert_eq!(e.observe(at(BSP,BASE+HZ)),Ok(1_000_000_000));
+    assert_eq!(e.initialize(BSP,&[BSP],[(BSP,&bsp)],||panic!("published epoch sampled")),
+        Err(InitError::AlreadyPublished));
+    assert_eq!(e.observe(at(AP,BASE+2*HZ)),Ok(1_999_999_900));
+    assert_eq!(e.observe(Sample{id:high_id,raw:BASE+3*HZ}),Err(Fault::UnknownCpu));
+    assert_eq!(e.initialize(BSP,&[BSP],[(BSP,&bsp)],||panic!("failed epoch sampled")),
+        Err(InitError::AlreadyPublished));
+    assert_eq!(e.observe(at(BSP,BASE+4*HZ)),Err(Fault::UnknownCpu));
 }
