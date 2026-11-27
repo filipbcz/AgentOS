@@ -82,6 +82,7 @@ def run():
                                     "guest_started": False})
         return 1
 
+    sys.path.insert(0, str(ROOT / "scripts"))
     spec = importlib.util.spec_from_file_location("original_smoke", ROOT/"scripts/qemu-smoke.py")
     smoke = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(smoke)
