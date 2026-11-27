@@ -121,6 +121,17 @@ static int placementWork(void) {
     }
     return 0;
 }
+/* Exit 81 remains a failure. Record the exact branch and real observations
+ * before exiting, without changing the successful peer protocol or its bounds.
+ * A negative OBSERVED value is encoded as its signed syscall result in hex. */
+enum { peerClockError=1, peerDeadline=2, peerWorkLimit=3 };
+static int peerAbort(const struct PeerReport *p,unsigned reason,long last,long observed) {
+    const char *const names[]={" PID="," PARENT="," REASON="," START="," LAST="," OBSERVED="," DEADLINE="," WORK="};
+    const unsigned long v[]={p->report.sample.stats[6],gRoot,reason,p->report.sample.ms,
+                             (unsigned long)last,(unsigned long)observed,(unsigned long)gDeadline,p->work};
+    (void)record("PEER_ABORT",names,v,8);
+    return 81;
+}
 /* Only this ordinary fork child remains runnable. After the authenticated
  * start report, there are no blocking syscalls until STOP has been received.
  * The controller sends STOP only after collecting the supervisor candidate.
@@ -130,9 +141,12 @@ static int peerWork(int fd,unsigned slot,unsigned round,unsigned long apic) {
     if (!sample(&p.report.sample) || p.report.sample.stats[7]!=gRoot ||
         !send(fd,&p,sizeof(p))) return 80;
     unsigned long value=1;
+    long last=(long)p.report.sample.ms;
     for (unsigned i=0;i<peerIterations;++i) {
         long ms=now();
-        if (ms<0 || ms>gDeadline) return 81;
+        if (ms<0) return peerAbort(&p,peerClockError,last,ms);
+        if (ms>gDeadline) return peerAbort(&p,peerDeadline,last,ms);
+        last=ms;
         for (unsigned j=0;j<256;++j) {
             value=value*33+1;
             __asm__ volatile ("" : "+r"(value) :: "memory");
@@ -150,7 +164,7 @@ static int peerWork(int fd,unsigned slot,unsigned round,unsigned long apic) {
             !closeFd(&gChannels[slot][1]) || os_call(SYS_CHILD_AFTER,0,0,0)!=-10) return 83;
         return 0;
     }
-    return 81;
+    return peerAbort(&p,peerWorkLimit,last,now());
 }
 static int worker(unsigned slot,unsigned round) {
     for (unsigned i=0;i<gCount;++i)
