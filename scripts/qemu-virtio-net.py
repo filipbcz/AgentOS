@@ -71,7 +71,7 @@ def verify_kernel(data, cpus):
     apics = re.findall(r"(?m)^AGENTOS TASK (?:BSP|AP) APIC=([0-9a-f]{16}) "
                        r"TIMER-WAKES=0000000000000003\r?$",text)
     require(len(apics)==cpus and len(set(apics))==cpus,"Missing real per-CPU timer evidence")
-    smoke.processes.verify(text,[int(x,16) for x in apics])
+    smoke.processes.verify(text,[int(x,16) for x in apics],ipc_staged=True)
     smoke.supervisor.verify_absent(text)
     smoke.orphans.verify(text,cpus)
     smoke.cow.verify_absent(text)
