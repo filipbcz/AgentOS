@@ -227,7 +227,7 @@ def phase(args, out, raw, vars_file, esp, mode, expected_details):
                                        r"TIMER-WAKES=0000000000000003\r?$", text)
                     require(len(apics) == args.cpus and len(set(apics)) == args.cpus,
                             "Missing real per-CPU timer evidence after NVMe close")
-                    smoke.processes.verify(text, [int(x, 16) for x in apics], ipc_staged=True)
+                    smoke.processes.verify(text, [int(x, 16) for x in apics], ipc_staged=True, root_orphan_v1=True)
                     smoke.supervisor.verify_absent(text)
                     smoke.orphans.verify(text, args.cpus)
                     smoke.cow.verify_absent(text)

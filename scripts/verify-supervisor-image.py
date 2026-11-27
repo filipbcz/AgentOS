@@ -367,6 +367,9 @@ def verify_pair(root, cpus, no_hpet=False):
     path.unlink(missing_ok=True)
     identity=verify_identity(root)
     session=load(root,"verify-stage3-session.py")
+    processes=load(root,"verify-processes.py")
+    orphans=load(root,"verify-orphans.py")
+    manager=load(root,"verify-service-manager.py")
     records, inputs, receipts = {}, [], []
     for variant in ("control","test"):
         folder=root/"build/check"/f"qemu-cpu{cpus}{clock_suffix}-session-sv-{variant}"
@@ -393,6 +396,17 @@ def verify_pair(root, cpus, no_hpet=False):
         sent=(folder/"com1-input.bin").read_bytes()
         require(digest(log)==receipt.get("com1_sha256") and digest(sent)==receipt.get("com1_input_sha256"),
                 "Actual UART evidence differs from receipt: "+variant)
+        text=log.decode("ascii",errors="replace")
+        try:
+            boot_roots=processes.verify(text,session.bootCpuRoster(log,cpus),ipc_staged=True,
+                                        allow_ipc_workload=variant=="test",root_orphan_v1=True,
+                                        require_shutdown=True)
+            orphans.verify(text,cpus)
+            manager.verify(text,migration_staged=True,allow_migration_workload=variant=="test")
+        except (processes.VerificationError,orphans.VerificationError,manager.VerificationError) as error:
+            raise VerificationError("Invalid boot root/orphan evidence: "+str(error)) from error
+        require(receipt.get("boot_process_contract")=="root-orphan-v1" and
+                receipt.get("boot_roots")==boot_roots,"Missing explicitly verified boot root/orphan contract: "+variant)
         result=session.verify(log,sent,True,cpus,aRuntimeProcess=True,aSupervisorImage=variant,aMigrationStaged=True,aFaultStaged=True)
         require(receipt.get("migration_contract")=="foreground-v1" and receipt.get("migration")==result["runtime_migration"],
                 "Missing explicitly verified migration contract: "+variant)
@@ -401,7 +415,8 @@ def verify_pair(root, cpus, no_hpet=False):
         require(result==receipt.get("runtime_session"),"Runtime evidence differs from receipt: "+variant)
         require(log.endswith(b"[INFO] INTERACTIVE SHELL STOPPED\r\n"),"Incomplete real shutdown")
         records[variant]={"receipt_sha256":sha(folder/"smoke.json"),"efi_sha256":expected,
-                          "com1_sha256":digest(log),"com1_input_sha256":digest(sent),"runtime":result}
+                          "com1_sha256":digest(log),"com1_input_sha256":digest(sent),
+                          "boot_roots":boot_roots,"runtime":result}
         inputs.append(sent)
         receipts.append(receipt)
     # The independently verified foreground adoption scenario consumes

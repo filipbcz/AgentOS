@@ -582,7 +582,9 @@ def scenario(args):
                                 for hz,offset,error in qualified.values()),
                             "Inconsistent TSC fleet diagnostics")
                     receipt["qualified_tsc_cpus"]=qualified
-                smoke.processes.verify(text,apics,ipc_staged=True,allow_ipc_workload=variant=="test")
+                receipt["boot_roots"]=smoke.processes.verify(text,apics,ipc_staged=True,
+                    allow_ipc_workload=variant=="test",root_orphan_v1=True,require_shutdown=True)
+                receipt["boot_process_contract"]="root-orphan-v1"
                 if variant!="test":
                     smoke.supervisor.verify_absent(text)
                 # Staged proof is mandatory in the full runtime session below.

@@ -538,7 +538,8 @@ def boot(args):
     apics = [int(x, 16) for x in marker.findall(text)]
     if len(apics) != args.cpus or len(set(apics)) != args.cpus:
         raise RuntimeError(f"Missing per-CPU APIC timer evidence: {apics}")
-    processes.verify(text, apics, ipc_staged=True, allow_ipc_workload=supervisor_image=="test")
+    boot_roots=processes.verify(text, apics, ipc_staged=True, allow_ipc_workload=supervisor_image=="test",
+                                root_orphan_v1=True, require_shutdown=args.session)
     if supervisor_image!="test":
         supervisor.verify_absent(text)
     # The test image must pass the full authenticated runtime session below.
@@ -585,6 +586,8 @@ def boot(args):
         "interactive_com1_manager_session": args.session,
         "ps2_keyboard_session": args.session,
         "runtime_session": session_result,
+        "boot_process_contract": "root-orphan-v1",
+        "boot_roots": boot_roots,
         "migration_contract": "foreground-v1",
         "migration": migration_result,
         "fault_contract": "staged-v1",

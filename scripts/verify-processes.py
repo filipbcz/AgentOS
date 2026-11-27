@@ -4,6 +4,7 @@ This checks a captured log; it does not boot a VM or establish its provenance.
 The current kernel runs each CPU's process scenario sequentially.
 """
 import argparse
+import importlib.util
 import re
 import sys
 from pathlib import Path
@@ -50,7 +51,8 @@ def require(condition, message):
         raise VerificationError(message)
 
 
-def verify(text, apic_ids, *, ipc_staged=False, allow_ipc_workload=False):
+def verify(text, apic_ids, *, ipc_staged=False, allow_ipc_workload=False,
+           root_orphan_v1=False, require_shutdown=False):
     """Reject incomplete, malformed, contradictory or repeated process evidence."""
     expected_cpus = set(apic_ids)
     require(expected_cpus and len(expected_cpus) == len(apic_ids),
@@ -68,6 +70,14 @@ def verify(text, apic_ids, *, ipc_staged=False, allow_ipc_workload=False):
                 "Historical boot IPC evidence is forbidden in current images")
         require(allow_ipc_workload or "AGENTOS IPC TEST " not in text,
                 "IPC test executed in the ordinary distribution")
+    require(not root_orphan_v1 or ipc_staged,"Explicit root/orphan contract requires staged IPC")
+    require(not require_shutdown or root_orphan_v1,"Shutdown correlation requires explicit root/orphan contract")
+    if root_orphan_v1:
+        spec=importlib.util.spec_from_file_location(
+            "bootRootEvidence",Path(__file__).with_name("verify-boot-roots.py"))
+        module=importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.verify(text,apic_ids,require,require_shutdown=require_shutdown)
     order=RELOCATED_ORDER if ipc_staged else ORDER
     events = []
     orphan_open = None
