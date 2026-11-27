@@ -1,0 +1,78 @@
+name: QEMU ready-wait diagnostic (one matched pair)
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/tests/supervisor-runner.c'
+      - '.github/workflows/qemu-ready-wait-probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    if: github.event.pull_request.head.ref == 'dev/stage4-nvme'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install the ordinary pinned EFI and emulator dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            binutils cpio gcc-13 gnu-efi rustc python3 openssl \
+            sbsigntool efitools gdisk mtools qemu-system-x86 ovmf python3-virt-firmware
+      - name: Run blocked and runnable arms once on signed TCG HPET 2 CPU
+        run: |
+          set -euo pipefail
+          status=0
+          mkdir -p build/ready-wait-probe
+          for arm in blocked runnable; do
+            export AGENTOS_READY_WAIT_PROBE="$arm"
+            dest="build/ready-wait-probe/$arm"
+            mkdir -p "$dest"
+            if ! bash scripts/build.sh --supervisor-staging >"$dest/build.log" 2>&1; then
+              cat "$dest/build.log"
+              echo build-failed >"$dest/result.txt"
+              status=1
+              continue
+            fi
+            cp -a build/supervisor-staging "$dest/stage"
+            cp build/{build-provenance.json,agentos.efi,agentos.unsigned.efi,kernel.elf,initramfs.cpio,db.cer,db.esl} "$dest/"
+            rm -rf -- build/check/qemu-cpu2-session-sv-test
+            if python3 scripts/qemu-smoke.py --cpus 2 --session --runtime-process-regression \
+              --supervisor-image test --accel tcg \
+              --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd \
+              --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd --timeout 720 2>&1 | tee "$dest/guest.log"; then
+              rc=0
+            else
+              rc=$?
+            fi
+            printf '%s\n' "$rc" >"$dest/result.txt"
+            if [[ "$rc" != 0 ]]; then status=1; fi
+            if [[ -d build/check/qemu-cpu2-session-sv-test ]]; then
+              mkdir -p "$dest/guest"
+              for file in build/check/qemu-cpu2-session-sv-test/*; do
+                if [[ -f "$file" ]]; then cp "$file" "$dest/guest/"; fi
+              done
+            else
+              status=1
+            fi
+          done
+          for file in kernel.elf initramfs.cpio agentos.unsigned.efi db.cer db.esl stage/loader.o stage/layout.ld stage/pipe-receiver stage/supervisor.o; do
+            if ! cmp "build/ready-wait-probe/blocked/$file" "build/ready-wait-probe/runnable/$file"; then
+              echo "Non-comparable production or shared payload: $file"
+              status=1
+            fi
+          done
+          exit "$status"
+      - name: Preserve actual images, logs and failures from both arms
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ready-wait-probe-2cpu
+          path: build/ready-wait-probe/
+          if-no-files-found: error
+          retention-days: 14

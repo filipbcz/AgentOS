@@ -2,9 +2,11 @@
 import re
 
 
-def verify(data, shell, shell_cr3, prior_pids, apics, supervisor, require, pipe=None):
+def verify(data, shell, shell_cr3, prior_pids, apics, supervisor, require, pipe=None, probe=None):
     """Consume the bounded candidate protocol and every real child event."""
     require(len(apics) in (1,2), "Missing independently observed CPU roster")
+    require(probe in (None,"blocked","runnable"),"Invalid ready-wait diagnostic arm")
+    waits=[]
     offset=0
     seen=set(prior_pids)
     covered=set()
@@ -95,12 +97,41 @@ def verify(data, shell, shell_cr3, prior_pids, apics, supervisor, require, pipe=
             remaining.remove(pid)
             return root
 
+        def wait_transition(pid,kind):
+            nonlocal floor_ms,floor_total
+            if probe is None:
+                return
+            root,number,target,op,cpu,send_ms,send_total=fields(
+                "WAIT_SEND",("ROOT","ROUND","TARGET","KIND","APIC","MS","TOTAL"))
+            require((root,number,target,op)==(runner,rnd,pid,kind) and cpu in apics and
+                    floor_ms<=send_ms<=deadline and floor_total<=send_total,
+                    "Foreign or stale command send boundary")
+            entry=snap("WAIT_ENTER")
+            wake=snap("WAIT_RETURN")
+            received=snap("WAIT_RECEIVED")
+            require(progresses(placements[pid],entry) and progresses(entry,wake) and
+                    progresses(wake,received) and send_ms<=wake["ms"]<=received["ms"]<=deadline and
+                    send_total<=wake["total"]<=received["total"],
+                    "Missing or regressed wait transition")
+            actual,mode,op,polls,events,size=fields(
+                "WAIT_RESULT",("PID","MODE","KIND","POLLS","EVENTS","BYTES"))
+            require((actual,op,size)==(pid,kind,24) and
+                    ((probe=="blocked" and mode==1 and polls==0 and 0<events<2**32 and
+                      events&(events-1)==0) or
+                     (probe=="runnable" and mode==2 and 0<polls<=2000000 and events==0)),
+                    "Invalid wait method, authentication or iteration evidence")
+            waits.append({"round":rnd,"pid":pid,"kind":kind,"send_ms":send_ms,"send_total":send_total,
+                          "entry":entry,"return":wake,"received":received,"polls":polls})
+            floor_ms,floor_total=received["ms"],received["total"]
+            return received
+
         def attempt(pid,run):
             nonlocal floor_ms,floor_total
             placement=placements[pid]
             cpu=placement["apic"]
             require(fields("SELECT",("ROOT","PID","APIC","RUN"))==(runner,pid,cpu,int(run)),
                     "Duplicate CPU selection or incorrect candidate command")
+            live=wait_transition(pid,2 if run else 3)
             status=0
             roots=[]
             outcome=None
@@ -108,7 +139,8 @@ def verify(data, shell, shell_cr3, prior_pids, apics, supervisor, require, pipe=
                 first=line()
                 skipped=first.startswith("AGENTOS TEST SKIP ")
                 before=snap("SKIP" if skipped else "BEGIN",first)
-                require(progresses(placement,before) and floor_ms<=before["ms"]<=deadline-3000 and
+                require(progresses(placement,before) and (live is None or progresses(live,before)) and
+                        floor_ms<=before["ms"]<=deadline-3000 and
                         before["total"]>=floor_total,"Stale or regressed candidate snapshot")
                 if skipped:
                     require(before["apic"]!=cpu,"False placement miss")
@@ -175,8 +207,10 @@ def verify(data, shell, shell_cr3, prior_pids, apics, supervisor, require, pipe=
                     break
                 require(fields("PEER_ACTIVATE",("ROOT","ROUND","PEER"))==(runner,rnd,peer),
                         "Wrong or replayed peer activation")
+                live=wait_transition(peer,4)
                 before=snap("PEER_BEGIN")
-                require(progresses(placements[peer],before) and before["work"]==0 and
+                require(progresses(placements[peer],before) and (live is None or progresses(live,before)) and
+                        before["work"]==0 and
                         floor_ms<=before["ms"]<=deadline and before["total"]>=floor_total,
                         "Invalid peer start identity, counters or time")
                 floor_ms,floor_total=before["ms"],before["total"]
@@ -239,4 +273,5 @@ def verify(data, shell, shell_cr3, prior_pids, apics, supervisor, require, pipe=
     require(data.startswith(reply,offset),"Shell did not collect real runner exit")
     return offset+len(reply),{"absent":False,"runner_pid":runner,"shell_pid":shell,"runner_cr3":root,
         "runner_status":0,"cpus":len(apics),"covered_apics":sorted(covered),"rounds":rounds,
-        "intervals":intervals,"rejected":rejected,"elapsed_ms":end["ms"]-start["ms"]},seen-set(prior_pids)
+        "intervals":intervals,"rejected":rejected,"elapsed_ms":end["ms"]-start["ms"],
+        **({"ready_wait_probe":probe,"wait_transitions":waits} if probe else {})},seen-set(prior_pids)

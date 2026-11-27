@@ -146,6 +146,13 @@ sha256sum "$out/"*.efi
 # Both images reuse the same actual loader, kernel and customer binaries.
 # Only the optional host packaging step adds the standalone test client.
 if ((staging)); then
+    probe_flags=()
+    case "${AGENTOS_READY_WAIT_PROBE:-}" in
+        "") ;;
+        blocked) probe_flags=(-DREADY_WAIT_PROBE=1) ;;
+        runnable) probe_flags=(-DREADY_WAIT_PROBE=2) ;;
+        *) echo 'Invalid ready-wait diagnostic arm' >&2; exit 2 ;;
+    esac
     stage_out="$out/supervisor-staging"
     mkdir "$stage_out"
     gcc-13 -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
@@ -155,13 +162,13 @@ if ((staging)); then
     gcc-13 -c "$root/scripts/tests/supervisor-runner.S" -o runner-entry.o
     gcc-13 -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
         -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large \
-        -c "$root/scripts/tests/supervisor-runner.c" -o runner.o
+        "${probe_flags[@]}" -c "$root/scripts/tests/supervisor-runner.c" -o runner.o
     ld --no-undefined --build-id=none -z noexecstack -s -T "$root/user/user.ld" \
         -o supervisor-runner runner-entry.o runner.o supervisor.o
     python3 "$root/scripts/verify-user-abi.py" supervisor-runner
     gcc-13 -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
         -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large -DPIPE_WORKLOAD \
-        -c "$root/scripts/tests/supervisor-runner.c" -o pipe-runner.o
+        "${probe_flags[@]}" -c "$root/scripts/tests/supervisor-runner.c" -o pipe-runner.o
     gcc-13 -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
         -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large \
         -c "$root/scripts/tests/pipe-workload.c" -o pipe-workload.o

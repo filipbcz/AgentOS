@@ -140,7 +140,7 @@ def supervisor_phase(parent, first, cr3=0x600000):
 
 
 def supervisor_transcript(shell=9,runner=20,apics=(7,),moving=False,skipping=False,
-                          peer_moving=False,peer_missed=False,peer_unpaired=False,pipe=False):
+                          peer_moving=False,peer_missed=False,peer_unpaired=False,pipe=False,probe=None):
     """Synthetic evidence, not a guest execution or signature proof."""
     cpus=len(apics)
     count=1 if cpus==1 else 2*cpus
@@ -178,10 +178,22 @@ def supervisor_transcript(shell=9,runner=20,apics=(7,),moving=False,skipping=Fal
             exit_line(pid,status,0x500000+candidates.index(pid)*4096)
             note("REAP",ROOT=runner,PID=pid,STATUS=status)
             remaining.remove(pid)
+        def wait_trace(pid,kind,cpu,moves=0):
+            if probe is None:
+                return
+            prior_total=total-moves
+            note("WAIT_SEND",ROOT=runner,ROUND=rnd,TARGET=pid,KIND=kind,APIC=apics[0],MS=ms,TOTAL=prior_total)
+            note("WAIT_ENTER",PID=pid,PARENT=runner,APIC=placement[pid],CPUS=cpus,
+                 MOVES=0,TOTAL=prior_total,MS=ms)
+            snap("WAIT_RETURN",pid,runner,cpu,ms,moves)
+            snap("WAIT_RECEIVED",pid,runner,cpu,ms,moves)
+            note("WAIT_RESULT",PID=pid,MODE=1 if probe=="blocked" else 2,KIND=kind,
+                 POLLS=0 if probe=="blocked" else 3,EVENTS=4 if probe=="blocked" else 0,BYTES=24)
         def attempt(pid,run,first):
             nonlocal ms,total,next_pid
             cpu=placement[pid]
             note("SELECT",ROOT=runner,PID=pid,APIC=cpu,RUN=int(run))
+            wait_trace(pid,2 if run else 3,cpu)
             status=0
             if run and first and skipping:
                 total+=1
@@ -225,6 +237,7 @@ def supervisor_transcript(shell=9,runner=20,apics=(7,),moving=False,skipping=Fal
                     total+=1
                     moves=1
                     peer_cpu=next(a for a in apics if a!=peer_cpu)
+                wait_trace(peer,4,peer_cpu,moves)
                 snap("PEER_BEGIN",peer,runner,peer_cpu,ms,moves,0)
                 ms+=10
                 pid=next((pid for pid in remaining if pid!=peer and
@@ -454,6 +467,52 @@ class RuntimeTests(unittest.TestCase):
                 self.assertNotEqual(bad,data)
                 with self.assertRaises(session.VerificationError):
                     check(bad)
+
+    def test_wait_probe_requires_authentic_bounded_transitions(self):
+        from unittest.mock import patch
+        import os
+        for mode in ("blocked","runnable"):
+            for pipe in (False,True):
+                data=supervisor_transcript(apics=(7,19),peer_missed=True,pipe=pipe,probe=mode)
+                with patch.dict(os.environ,{"AGENTOS_READY_WAIT_PROBE":mode}):
+                    def check(log):
+                        return session.supervisor_prefix(log,9,0x300000,{1,2,9},"test",{7,19},pipe=pipe)
+                    offset,result,_=check(data)
+                    self.assertEqual(offset,len(data))
+                    self.assertEqual(result["covered_apics"],[7,19])
+                    transitions=result["wait_transitions"]
+                    first=transitions[0]
+                    self.assertEqual(first["entry"]["apic"],19)
+                    self.assertEqual(first["return"]["apic"],7)
+                    self.assertEqual(first["return"]["moves"],1)
+                    lines=data.splitlines(keepends=True)
+                    selected={kind:next(l for l in lines if l.startswith(b"AGENTOS TEST "+kind+b" "))
+                              for kind in (b"WAIT_SEND",b"WAIT_ENTER",b"WAIT_RETURN",b"WAIT_RECEIVED",b"WAIT_RESULT")}
+                    for line in selected.values():
+                        with self.assertRaises(session.VerificationError):
+                            check(data.replace(line,b"",1))
+                        with self.assertRaises(session.VerificationError):
+                            check(data.replace(line,line+line,1))
+                    for kind,old,new in (
+                        (b"WAIT_SEND",b"TARGET=0000000000000016",b"TARGET=0000000000000015"),
+                        (b"WAIT_RETURN",b"MOVES=0000000000000001",b"MOVES=0000000000000000"),
+                        (b"WAIT_RECEIVED",b"MOVES=0000000000000001",b"MOVES=0000000000000000"),
+                        (b"WAIT_RESULT",b"BYTES=0000000000000018",b"BYTES=0000000000000000"),
+                        (b"WAIT_RESULT",b"MODE="+(b"0000000000000001" if mode=="blocked" else b"0000000000000002"),
+                         b"MODE=0000000000000003"),
+                    ):
+                        line=selected[kind]
+                        bad=line.replace(old,new,1)
+                        self.assertNotEqual(line,bad)
+                        with self.assertRaises(session.VerificationError):
+                            check(data.replace(line,bad,1))
+                    line=selected[b"WAIT_RESULT"]
+                    import re
+                    with self.assertRaises(session.VerificationError):
+                        check(data.replace(line,re.sub(rb"POLLS=[0-9a-f]{16}",b"POLLS=00000000001e8481",line),1))
+                with patch.dict(os.environ,{"AGENTOS_READY_WAIT_PROBE":""}):
+                    with self.assertRaises(session.VerificationError):
+                        check(data)
 
     def test_reject_fake_locality_duplicate_cpu_pid_incomplete_and_replay(self):
         data=supervisor_transcript(apics=(7,19))
