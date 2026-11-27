@@ -86,10 +86,10 @@ def verify_interval(pRoot, pEvents, pSeenPids):
                     "Protection probe address is outside the user image")
         pSeenPids.add(pFault[0])
     require(pFields[-1] == (pRoot, 0, 0), "Demand scenario did not end cleanly")
-    children=[(pChildPid,pExit[1],0)]
+    children=[[pChildPid,pExit[1],0]]
     for pOffset in (6,9,12):
         pFault=pFields[pOffset+1]
-        children.append((pFault[0],pFault[2],270))
+        children.append([pFault[0],pFault[2],270])
     return {"base":list(pBase),"touch":list(pTouch),"children":children,
             "protection_errors":[4,20,6]}
 

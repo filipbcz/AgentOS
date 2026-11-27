@@ -1,5 +1,6 @@
 """Synthetic host rejection tests; never guest boot or signature evidence."""
 import importlib.util
+import json
 from pathlib import Path
 import struct
 import sys
@@ -446,6 +447,7 @@ class RuntimeTests(unittest.TestCase):
                 consumed,result,seen=verify(data,apics)
                 self.assertEqual(consumed,len(data))
                 self.assertEqual(result["covered_apics"],list(apics))
+                self.assertEqual(result,json.loads(json.dumps(result)))
                 self.assertEqual(len(result["intervals"]),len(apics))
                 for proof in result["intervals"]:
                     self.assertEqual(proof["child_statuses"],[0] if kind=="cow" else [0,270,270,270])
