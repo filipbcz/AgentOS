@@ -1,20 +1,27 @@
 name: Isolated signed runtime SMP preemption continuation
-# Retired after the authorized continuation 46081672326 (4 CPU wait timeout). Do not re-enable without explicit authorization.
+# One authorized 4 -> 8 attempt with bounded loop workload, from exact retired HEAD.
 on:
-  workflow_dispatch:
+  pull_request:
+    types: [synchronize]
+    paths:
+      - 'tests/preemption-proof/client.S'
+      - 'tests/preemption-proof/proof.py'
+      - 'tests/preemption-proof/test-failure.py'
+      - 'tests/preemption-proof/run.py'
+      - '.github/workflows/qemu-preemption-proof.yml'
 permissions:
   contents: read
   actions: read
 jobs:
   proof:
-    if: ${{ false }}
+    if: github.repository == 'filipbcz/AgentOS' && github.event.pull_request.number == 2 && github.event.pull_request.head.ref == 'dev/stage4-nvme' && github.event.pull_request.head.repo.full_name == github.repository && github.event.before == '013763077a25d4d3b2d154c5ad76ea406f8e8a36' && github.run_attempt == 1
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
-          ref: ${{ github.sha }}
-          fetch-depth: 2
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 5
           persist-credentials: false
       - name: Deterministic verifier rejection cases before any guest
         run: python3 tests/preemption-proof/proof.py

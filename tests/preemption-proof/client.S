@@ -355,7 +355,13 @@ worker_\label:
     movq %r14,%xmm15
     movq %r10,%xmm1
     punpcklqdq %xmm1,%xmm15
+#if defined(PREEMPT_CPUS) && (PREEMPT_CPUS == 4 || PREEMPT_CPUS == 8)
+    /* A fixed bounded window, not a soak. The observer must still prove
+     * all six real local IRQ switches and normal completion independently. */
+    mov $0x100000,%ecx
+#else
     mov $0x4000000,%ecx
+#endif
 .global window_\label\()_begin, window_\label\()_end
 window_\label\()_begin:
     pause

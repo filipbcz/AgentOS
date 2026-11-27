@@ -130,8 +130,12 @@ def historical_two_proof():
     # JSON or a new boot. Read and replay its actual bytes before every guest.
     digest=lambda data:hashlib.sha256(data).hexdigest()
     require(sha(PRIOR_ZIP)==PRIOR_ZIP_SHA,"Wrong archived 2 CPU ZIP")
-    require(capture("git","hash-object",HERE/"proof.py")=="350f83d57395fa63de5649447abfa9302c388d39",
-            "Historical IRQ verifier changed")
+    old_blob="350f83d57395fa63de5649447abfa9302c388d39"
+    old_source=cmd("git","show",PRIOR_COMMIT+":tests/preemption-proof/proof.py",stdout=sp.PIPE).stdout
+    require(hashlib.sha1(b"blob "+str(len(old_source)).encode()+b"\0"+old_source).hexdigest()==old_blob,
+            "Wrong immutable historical IRQ verifier")
+    historical_verifier={"__name__":"__historical_preemption__"}
+    exec(compile(old_source,"historical-proof.py","exec"),historical_verifier)
     with zipfile.ZipFile(PRIOR_ZIP) as archive:
         names=archive.namelist()
         require(len(names)==len(set(names)) and archive.testzip() is None,"Invalid archived ZIP")
@@ -170,6 +174,7 @@ def historical_two_proof():
                 result["com1_sha256"]==digest(log) and result["trace_sha256"]==digest(trace_bytes) and
                 result["trace"]==trace and arm["ready"]==ready and arm["command"]==ARM.hex() and
                 ready["armed_ns"]<=arm["arm_ns"]<=arm["sent_ns"]==result["bounds"][0]<=result["bounds"][1] and
+                result["chains"]==historical_verifier["verify_smp"](rows,request,ready,result["identities"],result["bounds"]) and
                 result["chains"]==proof.verify_smp(rows,request,ready,result["identities"],result["bounds"]),
                 "Archived two-CPU replay failed")
         # Check the original real UART lifecycle against the authenticated
@@ -208,7 +213,7 @@ def historical_two_proof():
                     trace_sha256=digest(trace_bytes),com1_sha256=digest(log),
                     kernel_sha256=sha(OUT/"kernel.elf"),cpio_sha256=sha(OUT/"initramfs.cpio"),
                     client_sha256=digest(raw(CLIENT)),stops=len(rows),
-                    replayed_apics=sorted(result["chains"]),lifecycle=True)
+                    replayed_apics=sorted(result["chains"]),lifecycle=True,original_verifier_blob=old_blob)
 
 def prior_proof():
     historical=historical_two_proof()
@@ -230,13 +235,59 @@ def prior_proof():
             result["result"]=="pass" and result["cpus"]==previous and result["guests"]==1 and
             result["commit"]==receipt["commit"] and result["tree"]==receipt["tree"] and
             result["shutdown"] is True and request["cpus"]==previous and
+            receipt["iterations"]==request["iterations"]==proof.SHORT_ITERATIONS and
+            request["windows"]==receipt["windows"] and request["runtime_bytes"]==receipt["runtime_bytes"] and
+            request["qmp"]==json.loads((dest/"qmp-roster.json").read_text()) and result["trace"]==trace and
             trace["error"] is None and trace["complete"] is True and len(rows)==trace["stops"] and
             result["com1_sha256"]==sha(dest/"com1.log") and
             result["trace_sha256"]==sha(dest/"irq-trace.jsonl") and
             result["chains"]==proof.verify_smp(rows,request,ready,result["identities"],result["bounds"]),
             "Previous 4 CPU profile has no complete raw proof")
+    # Independently replay the normal lifecycle from the preceding actual
+    # foreground log, not merely the observer's complete flag.
+    smoke=load("qemu-smoke.py")
+    log=(dest/"com1.log").read_bytes()
+    arm=json.loads((dest/"arm.json").read_text())
+    offset=arm["offset"]
+    foreground=log[offset:]
+    require(arm["ready"]==ready and arm["command"]==ARM.hex() and
+            ready["armed_ns"]<=arm["arm_ns"]<=arm["sent_ns"]==result["bounds"][0]<=result["bounds"][1] and
+            0<offset<len(log) and foreground.startswith(b"run /preempt-runner\r\n") and
+            b"exit status 0\r\nagentos> " in foreground and (dest/"com1-input.bin").read_bytes()==ARM+b"exit\r" and
+            log.endswith(b"[INFO] INTERACTIVE SHELL STOPPED\r\n") and
+            b"FRAMES=OK" in foreground and smoke.session.SESSION_STOP.search(log) and
+            int(smoke.session.SESSION_STOP.search(log)[1],16)==1,
+            "Previous 4 CPU normal foreground/manager shutdown missing")
+    def pid(mark):
+        found=re.findall(rb"(?m)^"+mark+rb" PID=([0-9a-f]{16})\r$",foreground)
+        require(len(found)==1,"Missing previous lifecycle "+str(mark))
+        return int(found[0],16)
+    root=pid(b"REG ROOT")
+    earlier={int(m[1],16) for m in smoke.session.EXIT.finditer(log[:offset])}
+    ids=result["identities"]
+    require(root==result["root"] and root>result["shell"] and root not in earlier and
+            pid(b"REG COMPLETE")==root and set(ids)==set(proof.smp_tags(previous)) and
+            len({v[0] for v in ids.values()})==len(ids) and len({v[2] for v in ids.values()})==len(ids),
+            "Previous 4 CPU root/worker identities differ")
+    for label,(worker,parent,cr3) in ids.items():
+        mark=b"REG "+label.encode()
+        require(worker>root and worker not in earlier and parent==root and pid(mark)==worker and
+                all(pid(mark+b" "+v)==worker for v in (b"BEGIN",b"OK",b"REAP")),
+                "Previous 4 CPU worker lifecycle missing")
+        exits=[m for m in smoke.session.EXIT.finditer(foreground) if int(m[1],16)==worker]
+        require(len(exits)==1 and int(exits[0][2],16)==cr3 and int(exits[0][3],16)==0 and
+                foreground.index(mark+b" BEGIN PID=")<foreground.index(mark+b" OK PID=")<exits[0].start()<
+                foreground.index(mark+b" REAP PID="),"Previous 4 CPU worker exit/reap mismatch")
+    exits=[m for m in smoke.session.EXIT.finditer(foreground) if int(m[1],16)==root]
+    require(len(exits)==1 and int(exits[0][3],16)==0 and
+            foreground.index(b"REG COMPLETE PID=")<exits[0].start(),"Previous 4 CPU root exit mismatch")
+    smoke.boot_log.verify(log,"info","both",physical_oom_dir=dest,source_commit=receipt["commit"])
+    apics=smoke.session.bootCpuRoster(log[:offset],previous,aBasicSmp=True)
+    smoke.processes.verify(log.decode("ascii"),sorted(apics),ipc_staged=True,root_orphan_v1=True,require_shutdown=True)
+    smoke.orphans.verify(log.decode("ascii"),previous,basic_smp=True)
     return {"cpus":previous,"result_sha256":sha(dest/"result.json"),
-            "trace_sha256":sha(dest/"irq-trace.jsonl"),"historical_two":historical}
+            "trace_sha256":sha(dest/"irq-trace.jsonl"),"com1_sha256":sha(dest/"com1.log"),
+            "replayed_apics":sorted(result["chains"]),"lifecycle":True,"historical_two":historical}
 
 def preflight():
     require(not DEST.exists(),"Stale proof directory; no repeat")
@@ -252,7 +303,9 @@ def preflight():
         receipt["stage"]="verifier"
         receipt["selftest"]=capture(sys.executable,HERE/"proof.py")
         require("PREEMPTION VERIFIER POSITIVE + 13 NEGATIVE OK" in receipt["selftest"] and
-                "SMP VERIFIER POSITIVE + 9 NEGATIVE OK" in receipt["selftest"],"Missing verifier test")
+                "SMP VERIFIER POSITIVE + 9 NEGATIVE OK" in receipt["selftest"] and
+                all(f"SHORT WINDOW VERIFIER {n} CPU POSITIVE + 3 NEGATIVE OK" in receipt["selftest"] for n in (4,8)),
+                "Missing verifier test")
         print(receipt["selftest"],flush=True)
         receipt["stage"]="startup_host"
         cmd(sys.executable,HERE/"test-startup.py","--receipt",DEST/"startup-host.json")
@@ -307,6 +360,8 @@ def preflight():
         user=symbols(DEST/"client.symbols.elf")
         windows={}
         tags=proof.smp_tags(CPUS)
+        iterations=proof.smp_iterations(dict(cpus=CPUS,iterations=proof.SHORT_ITERATIONS))
+        receipt["iterations"]=iterations
         require(set(name for name in user if name.startswith("window_"))==
                 {"window_"+label+"_"+end for label in tags for end in ("begin","end")},
                 "Unexpected actual compiled worker windows")
@@ -316,7 +371,8 @@ def preflight():
             off=0x1000+lo-0x8000400000
             require(elf[off:off+7].hex()=="f39048ffc975f9","Unexpected loop instructions")
             setup=(bytes.fromhex("49ba")+struct.pack("<Q",a)+bytes.fromhex("49be")+struct.pack("<Q",b)+
-                   bytes.fromhex("66490f6ec266490f6ece660f6cc1664d0f6efe66490f6eca66440f6cf9b900000004"))
+                   bytes.fromhex("66490f6ec266490f6ece660f6cc1664d0f6efe66490f6eca66440f6cf9b9")+
+                   struct.pack("<I",iterations))
             require(elf[off-len(setup):off]==setup,"Wrong actual GPR/XMM sentinel setup "+label)
             windows[label]=[lo,lo+2,lo+5]
         require(len({pc for pcs in windows.values() for pc in pcs})==3*len(tags),"Worker windows overlap")
@@ -341,6 +397,15 @@ def preflight():
                 failure["cases"]["unchanged_success"]["status"]==0 and
                 all(old==new for old,new in failure["disassembly"]["windows"].values()),
                 "Missing successful exact diagnostic host execution/disassembly")
+        identity=failure["workload_identity"]
+        require(identity["parent_blob"]=="b16abb4394a894990654bf959cbc2fdcba770af0" and
+                identity["old_iterations"]==proof.ITERATIONS and identity["new_iterations"]==iterations and
+                identity["actual_sha256"]==sha(DEST/CLIENT) and identity["historical_two_sha256"]==PRIOR_CLIENT_SHA and
+                set(identity["exact_immediate_offsets"])=={"window_"+label+"_begin" for label in tags} and
+                set(identity["unchanged"])=={"1","2"} and
+                all(v["parent_sha256"]==v["current_sha256"] for v in identity["unchanged"].values()),
+                "Missing exact workload/unchanged 1/2 CPU identity")
+        receipt["workload_identity"]=identity
         receipt["failure_host_sha256"]=sha(DEST/"failure-host.json")
         receipt["stage"]="signed_stage"
         # Reuse the independently verified loader object/layout from the
@@ -407,6 +472,7 @@ def preflight():
 def guest():
     receipt=json.loads((DEST/"preflight.json").read_text())
     require(receipt.get("result")=="pass" and receipt.get("guests")==0 and receipt["cpus"]==CPUS and
+            receipt["iterations"]==proof.smp_iterations(dict(cpus=CPUS,iterations=proof.SHORT_ITERATIONS)) and
             receipt["prior_proof"]==prior_proof() and
             receipt["commit"]==capture("git","rev-parse","HEAD") and receipt["inputs"]==inputs() and
             receipt["arm"]==ARM.hex() and receipt["startup_host_sha256"]==sha(DEST/"startup-host.json") and
@@ -469,7 +535,8 @@ def guest():
         require(apics==actual_apics,"QOM/COM1 APIC mismatch")
         qmp.screenshot(DEST/"shell-screen.ppm")
         smoke.console.verify(DEST/"shell-screen.ppm",aLevel="info",aOutput="both")
-        request=dict(base=base,cpus=CPUS,qmp=qmp_record,windows=receipt["windows"],runtime_bytes=receipt["runtime_bytes"],
+        request=dict(base=base,cpus=CPUS,iterations=receipt["iterations"],qmp=qmp_record,
+                     windows=receipt["windows"],runtime_bytes=receipt["runtime_bytes"],
                      destination=str(DEST))
         save("trace-request.json",request)
         environment=dict(os.environ,AGENTOS_PREEMPT_REQUEST=str(DEST/"trace-request.json"))
@@ -534,7 +601,7 @@ def guest():
         require(len(rows)==trace["stops"] and ready["armed_ns"]<=arm_ns<=sent_ns<=finish_ns,"Invalid trace bounds")
         chains=proof.verify_smp(rows,request,ready,ids,(sent_ns,finish_ns))
         require(trace["complete"] is True,"Observer did not complete all APICs")
-        result.update(result="pass",identities=ids,chains=chains,trace=trace,
+        result.update(result="pass",iterations=receipt["iterations"],identities=ids,chains=chains,trace=trace,
                       bounds=[sent_ns,finish_ns],shell=shell,root=root,shutdown=True,
                       com1_sha256=sha(serial),trace_sha256=sha(DEST/"irq-trace.jsonl"))
     except Exception as exc:

@@ -13,11 +13,16 @@ from pathlib import Path
 import re
 import signal
 import subprocess as sp
+import struct
 
 HERE=Path(__file__).resolve().parent
 ROOT=HERE.parent.parent
 BASE="ea20b720deef8560a2d1853ec08c59326898ae19"
 OLD_CLIENT="17f5bbda2a659dc127fa2c172d08c635b7263607"
+PARENT="013763077a25d4d3b2d154c5ad76ea406f8e8a36"
+PARENT_CLIENT="b16abb4394a894990654bf959cbc2fdcba770af0"
+OLD_ITERATIONS=0x4000000
+NEW_ITERATIONS=0x100000
 MASK=(1<<64)-1
 GETPID,WRITE,EXIT,TRY,YIELD,MONO,WAIT,CHILD,FORK=(
     0x10001,0x10002,0x10003,0x10005,0x10006,0x10010,0x10011,0x10013,0x10014)
@@ -76,6 +81,8 @@ def compare(old,new,dest):
         return args
     reverse={v:k for k,v in ns.items() if k.startswith("diag_")}
     branches=[]
+    immediates=[]
+    begin={addr:name for name,addr in bs.items() if name.startswith('window_') and name.endswith('_begin')}
     for (bp,bo,ba),(np,no,na) in zip(before,after):
         require(bo==no,f"Changed instruction {bp:x}/{np:x}: {bo} != {no}")
         if bo.startswith("j") or bo=="call":
@@ -89,13 +96,72 @@ def compare(old,new,dest):
             else:
                 require(bt in bidx and nt in nidx and bidx[bt]==nidx[nt],"Changed ordinary branch destination")
         else:
-            require(normalize(ba)==normalize(na),f"Changed ordinary operand {bp:x}/{np:x}: {ba} != {na}")
+            if bp+5 in begin and bo=="mov":
+                name=begin[bp+5]
+                require(np+5==ns[name] and ba=="ecx,0x4000000" and na=="ecx,0x100000",
+                        "Unexpected iteration immediate at "+name)
+                immediates.append(name)
+            else:
+                require(normalize(ba)==normalize(na),f"Changed ordinary operand {bp:x}/{np:x}: {ba} != {na}")
+    require(set(immediates)==set(begin.values()) and len(immediates)==len(begin),
+            "Missing exact iteration changes in disassembly")
     require(fail_count>0,"No actual redirected failure branches")
     require(all(addr==ns[name] for name,addr in bs.items() if name.startswith("window_")),
             "Changed actual measured loop addresses")
-    return dict(instructions=len(before),redirected=branches,old_main_bytes=be-bs["_start"],
+    return dict(instructions=len(before),redirected=branches,iteration_changes=sorted(immediates),old_main_bytes=be-bs["_start"],
                 new_main_bytes=ne-ns["_start"],
                 windows={name:[addr,ns[name]] for name,addr in bs.items() if name.startswith("window_")})
+
+def compile_client(source,cpus,dest,name):
+    obj=dest/(name+".o")
+    elf=dest/(name+".elf")
+    stripped=dest/(name+".stripped.elf")
+    defines=[] if cpus==1 else [f"-DPREEMPT_CPUS={cpus}"]
+    command("gcc-13","-I",HERE,*defines,"-c",source,"-o",obj)
+    command("ld","--no-undefined","--build-id=none","-z","noexecstack","-T",ROOT/"user/user.ld","-o",elf,obj)
+    command("objcopy","--strip-all",elf,stripped)
+    return elf,stripped
+
+def workload_identity(actual,cpus,dest):
+    require(command("git","rev-parse",PARENT+":tests/preemption-proof/client.S").decode().strip()==PARENT_CLIENT,
+            "Wrong immediate parent client blob")
+    parent_source=dest/"parent-client.S"
+    parent_source.write_bytes(command("git","show",PARENT+":tests/preemption-proof/client.S"))
+    parent,previous=compile_client(parent_source,cpus,dest,"parent-profile")
+    stripped=dest/"actual-profile.stripped.elf"
+    command("objcopy","--strip-all",actual,stripped)
+    require(stripped.read_bytes()==(dest/"preempt-runner").read_bytes(),"Actual staged ELF differs from compiled client")
+    # Whole stripped ELF comparison against the immediate parent: patch
+    # precisely the imm32 after B9, and nothing else. This is stronger than
+    # normalized instruction comparison (also covers diagnostic code/data).
+    old=bytearray(previous.read_bytes())
+    syms=symbols(parent)
+    actual_syms=symbols(actual)
+    offsets={}
+    for name,addr in syms.items():
+        if not (name.startswith("window_") and name.endswith("_begin")): continue
+        require(actual_syms[name]==addr,"Moved measurement window")
+        offset=0x1000+addr-0x8000400000-5
+        require(old[offset:offset+5]==b"\xb9"+struct.pack("<I",OLD_ITERATIONS),
+                "Wrong historical loop initializer")
+        old[offset+1:offset+5]=struct.pack("<I",NEW_ITERATIONS)
+        offsets[name]=offset+1
+    require(len(offsets)==2*cpus and bytes(old)==stripped.read_bytes(),
+            "Changed bytes beyond exact loop immediates")
+    unchanged={}
+    for n in (1,2):
+        _,before=compile_client(parent_source,n,dest,f"parent-{n}cpu")
+        _,after=compile_client(HERE/"client.S",n,dest,f"current-{n}cpu")
+        require(before.read_bytes()==after.read_bytes(),"Changed 1/2 CPU client bytes")
+        unchanged[str(n)]={"parent_sha256":sha(before),"current_sha256":sha(after)}
+    # The original two-CPU proof predates failure diagnostics. Verify its
+    # compiled bytes separately; never substitute the current 2 CPU variant.
+    _,historical=compile_client(dest/"baseline-client.S",2,dest,"historical-2cpu")
+    require(sha(historical)=="46ad9dd1b253614a5083c885774124f2ba43daeb4ef4575db290b011917a239c",
+            "Historical compiled 2 CPU client differs from archived proof")
+    return dict(parent_blob=PARENT_CLIENT,old_iterations=OLD_ITERATIONS,new_iterations=NEW_ITERATIONS,
+                exact_immediate_offsets=offsets,parent_sha256=sha(previous),actual_sha256=sha(stripped),
+                unchanged=unchanged,historical_two_sha256=sha(historical))
 
 # Linux x86_64 user_regs_struct. The child is our own newly executed test ELF,
 # not a guest or an arbitrary process. No native syscall reaches Linux:
@@ -282,7 +348,7 @@ def main():
     source=dest/"baseline-client.S"
     receipt=dict(result="fail",guests=0,cpus=a.cpus)
     try:
-        require(command("git","rev-parse","HEAD^").decode().strip()==BASE,"Wrong pinned source parent")
+        require(command("git","rev-parse","HEAD^").decode().strip()==PARENT,"Wrong pinned source parent")
         require(command("git","rev-parse",BASE+":tests/preemption-proof/client.S").decode().strip()==OLD_CLIENT,
                 "Wrong historical client blob")
         source.write_bytes(command("git","show",BASE+":tests/preemption-proof/client.S"))
@@ -292,6 +358,7 @@ def main():
         receipt.update(baseline_blob=OLD_CLIENT,baseline_sha256=sha(old),actual_sha256=sha(a.elf),
                        source_sha256=sha(HERE/"client.S"),test_sha256=sha(Path(__file__)))
         receipt["disassembly"]=compare(old,a.elf,dest)
+        receipt["workload_identity"]=workload_identity(a.elf,a.cpus,dest)
         receipt["cases"]=tests(old,a.elf.resolve(),a.cpus)
         receipt["result"]="pass"
         print("ACTUAL CLIENT FAILURE PATHS AND UNCHANGED SUCCESS PASS",flush=True)

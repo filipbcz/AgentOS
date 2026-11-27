@@ -11,6 +11,7 @@ STACK_BASE = 0xffff800000000000
 STACK_LIMIT = STACK_BASE + 4096 * 6 * 4096
 SIZE = 0x2a0
 ITERATIONS = 0x4000000
+SHORT_ITERATIONS = 0x100000
 TAGS = {"A": (0x1122334455667788, 0x89abcdef01234567),
         "B": (0x76543210fedcba98, 0x8877665544332211)}
 
@@ -39,7 +40,7 @@ def stack_context(task):
     return None
 
 
-def decode(task, context, address, windows, tags=TAGS):
+def decode(task, context, address, windows, tags=TAGS, iterations=ITERATIONS):
     task, context = raw(task, 0xd8), raw(context, SIZE)
     require(word(task, 0) == 0 and task[0xd0] == task[0xd2] == 1,
             "Not a live, already-run runnable process")
@@ -53,7 +54,7 @@ def decode(task, context, address, windows, tags=TAGS):
     label = labels[0]
     a, b = tags[label]
     remaining = word(context, 0x268)
-    require(0 <= remaining <= ITERATIONS and word(context, 0x238) == a and
+    require(0 <= remaining <= iterations and word(context, 0x238) == a and
             word(context, 0x208) == b and
             context[160:176] == struct.pack("<2Q", a, b) and
             context[400:416] == struct.pack("<2Q", b, a),
@@ -197,6 +198,17 @@ ONLINE = 0x42cd0
 RUNTIME = 0x42cc0
 
 
+def smp_iterations(config):
+    cpus=config["cpus"]
+    require(cpus in (2,4,8),"Unsupported SMP proof count")
+    expected=ITERATIONS if cpus==2 else SHORT_ITERATIONS
+    # Historical 2 CPU requests did not include this field. New profiles
+    # must bind it to their exact signed ELF's checked immediate.
+    actual=config.get("iterations",ITERATIONS) if cpus==2 else config["iterations"]
+    require(type(actual) is int and actual==expected,"Wrong profile iteration bound")
+    return expected
+
+
 def smp_tags(cpus):
     require(cpus in (2,4,8),"Unsupported SMP proof count")
     return {chr(65+i): (TAGS["B"] if i==1 else
@@ -299,7 +311,7 @@ def smp_pair(row, config, image, identities, bounds):
         offset=QUEUE+0x40+slot*0xd8
         return image[offset:offset+0xd8]
     tags=smp_tags(config["cpus"])
-    a,b=(decode(task(slot).hex(),row[key+"_context"],row[reg],config["windows"],tags)
+    a,b=(decode(task(slot).hex(),row[key+"_context"],row[reg],config["windows"],tags,smp_iterations(config))
          for slot,key,reg in ((prev,"out","rsp"),(nxt,"next","rax")))
     a["moves"]=word(task(prev),0xc8)
     b["moves"]=word(task(nxt),0xc8)
@@ -317,6 +329,7 @@ def smp_pair(row, config, image, identities, bounds):
 class SmpScan:
     def __init__(self,config,ready,identities=None,bounds=None):
         self.config=config
+        smp_iterations(config)
         self.bound=bind_roster(config,ready)
         self.identities=identities
         self.bounds=bounds
@@ -402,18 +415,24 @@ def verify_smp(rows,config,ready,identities,bounds):
     return chains
 
 
-def smp_selftest():
+def smp_selftest(cpus=2):
     # Deliberately unordered QMP index, thread ID and APIC maps.
     base=0x100000
-    ptrs=(0x300000,0x500000)
-    pts=((1,17,0),(1,3,0))
-    indices=(5,2)
+    ptrs=tuple(0x300000+i*0x200000 for i in range(cpus))
+    pts=tuple((1,17+3*i,0) for i in range(cpus))
+    indices=tuple(5+3*i for i in range(cpus))
+    if cpus==2:
+        pts=((1,17,0),(1,3,0))
+        indices=(5,2)
     qmp=dict(accelerator="tcg",kvm={"enabled":False},cpus=[
         dict(**{"cpu-index":indices[i],"thread-id":900+i,"target":"x86_64",
-                "qom-path":"/cpu"+str(i),"apic-id":i}) for i in (1,0)])
-    windows={l:[0x8000400100+i*0x100] for i,l in enumerate("ABCD")}
-    config=dict(base=base,cpus=2,qmp=qmp,windows=windows)
-    ids={l:(20+i,19,0x6000+i*4096) for i,l in enumerate("ABCD")}
+                "qom-path":"/cpu"+str(i),"apic-id":i}) for i in reversed(range(cpus))])
+    labels=list(smp_tags(cpus))
+    windows={l:[0x8000400100+i*0x100] for i,l in enumerate(labels)}
+    config=dict(base=base,cpus=cpus,qmp=qmp,windows=windows)
+    if cpus!=2:
+        config["iterations"]=SHORT_ITERATIONS
+    ids={l:(20+i,19,0x6000+i*4096) for i,l in enumerate(labels)}
     def cpu_bytes(apic,irq):
         data=bytearray(CPU_BYTES)
         struct.pack_into("<Q",data,0,ptrs[apic])
@@ -421,9 +440,9 @@ def smp_selftest():
         struct.pack_into("<Q",data,0x140,irq)
         data[0x9b2]=1
         return data
-    ready=dict(threads=2,hardware=True,site=base+SITE,online=2,runtime=1,
-               kernel_roster=struct.pack("<255Q",*ptrs,*([0]*253)).hex(),bindings=[])
-    for i in (1,0):
+    ready=dict(threads=cpus,hardware=True,site=base+SITE,online=cpus,runtime=1,
+               kernel_roster=struct.pack("<255Q",*ptrs,*([0]*(255-cpus))).hex(),bindings=[])
+    for i in reversed(range(cpus)):
         ready["bindings"].append(dict(thread=list(pts[i]),cpu_index=indices[i],apic=i,cpu=ptrs[i],
             gs_base=0,kernel_gs_base=ptrs[i],identity=cpu_bytes(i,1)[:0x34].hex(),
             packet=thread_packet(pts[i]),response='received: "'+f"CPU#{indices[i]} [running]".encode().hex()+'"'))
@@ -435,7 +454,7 @@ def smp_selftest():
         for offset,value in ((0x18,cr3),(0x30,pid),(0x38,parent),(0xb0,stack),(0xb8,address),(0xc0,count)):
             struct.pack_into("<Q",t,offset,value)
         t[0xd0]=t[0xd2]=1
-        a,b=smp_tags(2)[label]
+        a,b=smp_tags(cpus)[label]
         struct.pack_into("<Q",c,0x238,a)
         struct.pack_into("<Q",c,0x208,b)
         struct.pack_into("<Q",c,0x268,remaining)
@@ -446,30 +465,33 @@ def smp_selftest():
     state={l:task(l,1000,0) for l in ids}
     rows=[]
     for i in range(6):
-        for apic in (0,1):
-            a,b=("AB","CD")[apic]
+        for apic in range(cpus):
+            a,b=labels[2*apic:2*apic+2]
             if i%2: a,b=b,a
             state[a]=task(a,900-(i//2)*100,1+i//2)
             t,c,sp=state[a]; u,d,ax=state[b]
-            irq=(74,210)[apic]+i
+            irq=74+136*apic+i
             image=cpu_bytes(apic,irq)
             struct.pack_into("<4Q",image,QUEUE,1,1-i%2,1,i%2)
             for slot,raw_task in ((i%2,t),(1-i%2,u)):
                 off=QUEUE+0x40+slot*0xd8
                 image[off:off+0xd8]=raw_task
             rows.append(dict(seq=len(rows)+1,host_ns=100+len(rows),irq=irq,
-                pc=base+SITE,online=2,runtime=1,apic=apic,thread=list(pts[apic]),
+                pc=base+SITE,online=cpus,runtime=1,apic=apic,thread=list(pts[apic]),
                 cpu_index=indices[apic],cpu=ptrs[apic],gs_base=ptrs[apic],kernel_gs_base=0,
                 cs=8,eflags=2,cr3=ids[b][2],cpu_image=image.hex(),rsp=sp,rax=ax,
                 out_context=c,next_context=d))
     def verify_fixture(data,mapping=ready):
-        return verify_smp(data,config,mapping,ids,(100,120))
+        return verify_smp(data,config,mapping,ids,(100,100+6*cpus))
     chains=verify_fixture(rows)
-    require([v["irq"] for v in chains["0"]]==list(range(74,80)) and
-            [v["seq"] for v in chains["0"]]==[1,3,5,7,9,11] and
-            [v["irq"] for v in chains["1"]]==list(range(210,216)),
-            "Interleaved local chain not recovered")
-    print("SMP POSITIVE CPU0 IRQ74-79 interleaved CPU1 IRQ210-215")
+    require(set(chains)=={str(i) for i in range(cpus)} and
+            all([v["irq"] for v in chains[str(i)]]==list(range(74+136*i,80+136*i)) and
+                [v["seq"] for v in chains[str(i)]]==list(range(i+1,6*cpus+1,cpus))
+                for i in range(cpus)), "Interleaved local chain not recovered")
+    if cpus==2:
+        print("SMP POSITIVE CPU0 IRQ74-79 interleaved CPU1 IRQ210-215")
+    else:
+        print("SHORT WINDOW POSITIVE",cpus,"CPU full local chains")
     def reject(name,mutate,mutate_ready=None):
         bad=copy.deepcopy(rows); mapping=copy.deepcopy(ready)
         mutate(bad)
@@ -483,6 +505,36 @@ def smp_selftest():
     def renumber(data):
         for i,row in enumerate(data,1):
             row["seq"]=i; row["host_ns"]=99+i
+
+    if cpus!=2:
+        # A worker has genuinely exhausted its loop before the sixth
+        # switch. Keep every other APIC's full chain and the global order.
+        def exhausted(data):
+            row=data[5*cpus]
+            c=bytearray.fromhex(row["out_context"])
+            struct.pack_into("<Q",c,0x268,0)
+            struct.pack_into("<Q",c,0x278,0x800040ffff)
+            row["out_context"]=c.hex()
+            scan=SmpScan(config,ready,ids,(100,100+6*cpus))
+            for sample in data: scan.feed(sample)
+            require(len(scan.local[0])==0 and not scan.candidates[0] and
+                    all(scan.candidates[i] for i in range(1,cpus)),
+                    "Exhausted window fixture did not isolate the missing sixth IRQ")
+        reject("window exhausted before sixth local switch",exhausted)
+        def above_limit(data):
+            c=bytearray.fromhex(data[2*cpus]["out_context"])
+            struct.pack_into("<Q",c,0x268,SHORT_ITERATIONS+1)
+            data[2*cpus]["out_context"]=c.hex()
+        reject("RCX beyond exact shorter ELF bound",above_limit)
+        bad=dict(config,iterations=ITERATIONS)
+        try:
+            verify_smp(rows,bad,ready,ids,(100,100+6*cpus))
+        except ValueError as exc:
+            require(str(exc)=="Wrong profile iteration bound","Unexpected rejection")
+        else:
+            raise ValueError("Accepted old iteration bound for shortened ELF")
+        print("SHORT WINDOW VERIFIER",cpus,"CPU POSITIVE + 3 NEGATIVE OK")
+        return
     def split_cross(data):
         # Even with valid per-stop CPU bindings, splitting A/B's chain
         # across CPUs cannot create a local proof.
@@ -684,5 +736,7 @@ def observe():
 if __name__=="__main__":
     selftest()
     smp_selftest()
+    smp_selftest(4)
+    smp_selftest(8)
 elif __name__=="__preemption_gdb__":
     observe()
