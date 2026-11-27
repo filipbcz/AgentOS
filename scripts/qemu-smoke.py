@@ -283,7 +283,7 @@ def run_session(process, capture, qmp, destination, runtime_process_regression=F
                             b" STATUS="+f"{status:016x}".encode()+b"\r\n")
                     return record in view
                 wait_session(process,capture,serial,collected,f"actual PID1 collection at adoption gate {step}",30)
-                capture.send(session.ADOPTION_BYTES[step-1:step])
+                capture.send(session.ADOPTION_BYTES[2*(step-1):2*step])
         reply=(session.SUPERVISOR_MISSING if supervisor_image=="control"
                else b"exit status 0\r\nagentos> ")
         wait_session(process,capture,serial,lambda data: reply in data[offset:],

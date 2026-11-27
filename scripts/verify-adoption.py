@@ -10,9 +10,9 @@ SNAP_FIELDS=("role","step","pid","parent","apic","cpus","moves","total","token",
 SNAP=re.compile(MARKER+rb"SNAP"+b"".join(b" "+f.upper().encode()+b"=("+HEX+b")" for f in SNAP_FIELDS))
 ACTION=re.compile(MARKER+rb"(PARENT_REAP|WAIT|GO|DONE) STEP=("+HEX+rb") PID=("+HEX+rb")")
 ORDER=(("snap",4,0),("snap",0,0),("snap",1,0),("snap",2,0),
-       ("PARENT_REAP",0),("WAIT",1),("GO",1),("snap",1,1),
-       ("snap",2,1),("WAIT",2),("GO",2),("snap",1,2),
-       ("WAIT",3),("GO",3),("snap",0,4),("snap",3,0),
+       ("PARENT_REAP",0),("WAIT",1),("input",1),("GO",1),("snap",1,1),
+       ("snap",2,1),("WAIT",2),("input",2),("GO",2),("snap",1,2),
+       ("WAIT",3),("input",3),("GO",3),("snap",0,4),("snap",3,0),
        ("PARENT_REAP",4),("snap",3,1),("DONE",3))
 
 
@@ -38,6 +38,9 @@ def verify(data, root, shell, shell_cr3, prior, apics, require):
     exits={}
     reaps={}
     for at,line in enumerate(prefix[:-2].split(b"\r\n")):
+        if line in (b"A",b"B",b"C"):
+            actions.append((("input",line[0]-ord("A")+1),at,0))
+            continue
         match=SNAP.fullmatch(line)
         if match:
             s=dict(zip(SNAP_FIELDS,values(match)))
@@ -114,8 +117,9 @@ def verify(data, root, shell, shell_cr3, prior, apics, require):
             "Missing non-consuming pre-adoption zombie evidence or intermediate collection")
     for step,pid in ((1,zombie),(2,pulse),(3,live)):
         wait,wait_pid=positions["WAIT",step]
+        gate_input,_=positions["input",step]
         go,go_pid=positions["GO",step]
-        require(wait_pid==go_pid==pid and exits[pid][0]<reaps[pid][0]<go and wait<go,
+        require(wait_pid==go_pid==pid and exits[pid][0]<reaps[pid][0]<gate_input<go and wait<gate_input,
                 "Host advanced without actual PID1 collection of the expected child")
     require(positions["GO",1][0]<exits[pulse][0] and
             positions["GO",2][0]<exits[live][0] and

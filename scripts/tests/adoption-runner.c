@@ -155,9 +155,12 @@ static int collectParent(long parent) {
            os_call(SYS_CHILD_AFTER,0,0,0)==-10;
 }
 static int gate(unsigned step,long pid) {
-    char pByte=0;
+    // Ordinary canonical TTY input is delivered only after Enter.
+    // Read the complete two-byte record, including its LF.
+    char pLine[3];
     return pairRecord("WAIT",step,(unsigned long)pid) &&
-           os_call(SYS_READ,0,(long)&pByte,1)==1 && pByte==(char)('A'+step-1) &&
+           os_call(SYS_READ,0,(long)pLine,sizeof(pLine))==2 &&
+           pLine[0]==(char)('A'+step-1) && pLine[1]=='\n' &&
            pairRecord("GO",step,(unsigned long)pid);
 }
 static int exchange(unsigned role,unsigned step) {

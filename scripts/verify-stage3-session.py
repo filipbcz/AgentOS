@@ -38,7 +38,7 @@ MEMORY_INPUT = b"".join((command+"\r").encode("ascii") for command in MEMORY_COM
 SUPERVISOR_MISSING = b"run: spawn failed (-2)\r\nagentos> "
 ADOPTION_COMMAND = "run /adoption-runner"
 ADOPTION_INPUT = (ADOPTION_COMMAND+"\r").encode("ascii")
-ADOPTION_BYTES = b"ABC"
+ADOPTION_BYTES = b"A\rB\rC\r"
 ADOPTION_MARKER = b"AGENTOS ADOPTION TEST "
 REAP_MARKER = b"AGENTOS MANAGER REAP "
 
