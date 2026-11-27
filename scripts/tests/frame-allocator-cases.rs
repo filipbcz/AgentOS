@@ -446,3 +446,254 @@ fn physicalExhaustionRecoveryFourHostWorkers() { exerciseSharedPhysicalExhaustio
 #[cfg(all(target_os="linux", target_arch="x86_64"))]
 #[test]
 fn physicalExhaustionRecoveryEightHostWorkers() { exerciseSharedPhysicalExhaustion(8); }
+
+// Independent positive overlap proof. These are host threads sharing the
+// production spinlock core, not guest CPUs or evidence of IRQ preemption.
+#[cfg(all(target_os="linux", target_arch="x86_64"))]
+#[test]
+fn concurrentLiveFrameOwnershipAndRecovery() {
+    use core::ffi::c_void;
+    use std::{collections::HashSet, io::Write, panic::{catch_unwind, AssertUnwindSafe},
+              sync::atomic::{AtomicBool, AtomicUsize, Ordering}, thread,
+              time::{Duration, Instant}};
+    extern "C" {
+        fn mmap(addr:*mut c_void,len:usize,prot:i32,flags:i32,fd:i32,offset:i64)->*mut c_void;
+        fn munmap(addr:*mut c_void,len:usize)->i32;
+    }
+    const PAGES: usize = 1024;
+    const BATCH: usize = 8;
+    const BATCHES: usize = 512;
+    const INTERVAL: usize = 32;
+    const PHASES: usize = BATCHES / INTERVAL;
+
+    struct Region(*mut c_void);
+    impl Drop for Region {
+        fn drop(&mut self) { unsafe { munmap(self.0,PAGES*PAGE); } }
+    }
+
+    // with_locked deliberately has no unwind guard in the kernel. Catch
+    // unexpected test/allocator panics INSIDE its operation, so an error can
+    // leave the real lock normally and cancel the other workers' rendezvous.
+    fn guarded<R>(aShared: &SharedFrames, aRun: impl FnOnce(&mut Frames<'static>) -> R)
+        -> Result<R,&'static str>
+    {
+        aShared.with_locked(|pFrames| catch_unwind(AssertUnwindSafe(|| aRun(pFrames))))
+            .map_err(|_| "allocator operation panicked")
+    }
+
+    // Each phase has its own two one-use barriers. A missing/failed worker
+    // cannot strand its peers: cancellation and an independent host deadline
+    // are checked on every wait. Never called inside the allocator lock.
+    fn rendezvous(aArrived: &AtomicUsize, aWorkers: usize, aCancelled: &AtomicBool)
+        -> Result<(),&'static str>
+    {
+        if aCancelled.load(Ordering::Acquire) { return Err("worker cancelled"); }
+        if aArrived.fetch_add(1,Ordering::AcqRel)>=aWorkers {
+            aCancelled.store(true,Ordering::Release);
+            return Err("duplicate barrier arrival");
+        }
+        let pDeadline=Instant::now()+Duration::from_secs(30);
+        loop {
+            if aCancelled.load(Ordering::Acquire) { return Err("worker cancelled"); }
+            if aArrived.load(Ordering::Acquire)==aWorkers { return Ok(()); }
+            if Instant::now()>=pDeadline {
+                aCancelled.store(true,Ordering::Release);
+                return Err("live-frame barrier deadline");
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn tagMatches(aAddress: usize, aTag: usize) -> bool {
+        let pPage=aAddress as *const usize;
+        unsafe { pPage.read_volatile()==aTag &&
+                 pPage.add(PAGE/size_of::<usize>()-1).read_volatile()==!aTag }
+    }
+
+    fn exercise(aWorkers: usize) {
+        let pMemory=unsafe { mmap(ptr::null_mut(),PAGES*PAGE,3,0x22|0x40,-1,0) };
+        assert_ne!(pMemory as usize,usize::MAX,"mmap MAP_32BIT");
+        let pRegion=Region(pMemory);
+        let pBase=pRegion.0 as usize;
+        assert!(pBase>=0x100000 && pBase%PAGE==0 && pBase+PAGES*PAGE<=1usize<<31);
+
+        // Real UEFI allocator metadata and a conventional RAM hole, using
+        // mapped host pages as the addresses dereferenced by Frames.
+        let mut pMap=[0u8;80];
+        for (pDesc,pFirst,pPages) in [(0usize,0usize,512usize),(40,513,511)] {
+            pMap[pDesc..pDesc+4].copy_from_slice(&7u32.to_le_bytes());
+            pMap[pDesc+8..pDesc+16].copy_from_slice(&((pBase+pFirst*PAGE) as u64).to_le_bytes());
+            pMap[pDesc+24..pDesc+32].copy_from_slice(&(pPages as u64).to_le_bytes());
+        }
+        let pFrames: Frames<'static>=unsafe { Frames::from_uefi(&pMap,40) }.unwrap();
+        let pShared=SharedFrames::new(pFrames);
+        let (pInitialBitmap,pInitialRefs,pInitialCount,pBaseline,pBitmap,pRefs)=
+            guarded(&pShared,|pFrames| {
+                let pInitialBitmap=pFrames.free.to_vec();
+                let pInitialRefs=pFrames.refs.to_vec();
+                let pInitialCount=pFrames.available();
+                let pBaseline=pFrames.snapshot().expect("real bitmap snapshot");
+                (pInitialBitmap,pInitialRefs,pInitialCount,pBaseline,
+                 pFrames.free.to_vec(),pFrames.refs.to_vec())
+            }).unwrap();
+        let pBaselineCount=pBaseline.count;
+        assert!(pBaselineCount>aWorkers*BATCH);
+
+        // A nonzero entry is the unique live owner/tag of that mapped page.
+        // Publish/clear under the real allocator lock, without an extra
+        // mutex that could serialize the allocation operations being tested.
+        // Reject a duplicate BEFORE dereferencing it or attempting release.
+        let pOwners:Vec<_>=(0..PAGES).map(|_|AtomicUsize::new(0)).collect();
+        let pAllocated:[AtomicUsize;PHASES]=core::array::from_fn(|_|AtomicUsize::new(0));
+        let pChecked:[AtomicUsize;PHASES]=core::array::from_fn(|_|AtomicUsize::new(0));
+        let pObserved:[AtomicUsize;PHASES]=core::array::from_fn(|_|AtomicUsize::new(0));
+        let pCancelled=AtomicBool::new(false);
+        let pResults=thread::scope(|pScope| {
+            let mut pHandles=Vec::with_capacity(aWorkers);
+            for pWorker in 0..aWorkers {
+                let (pShared,pOwners,pBitmap,pAllocated,pChecked,pObserved,pCancelled)=
+                    (&pShared,&pOwners,&pBitmap,&pAllocated,&pChecked,&pObserved,&pCancelled);
+                match thread::Builder::new().spawn_scoped(pScope,move || {
+                    let pResult=catch_unwind(AssertUnwindSafe(|| -> Result<_,&'static str> {
+                        let mut pReleased=0;
+                        for pBatch in 0..BATCHES {
+                            if pCancelled.load(Ordering::Acquire) { return Err("worker cancelled"); }
+                            let mut pOwned=Vec::with_capacity(BATCH);
+                            for pSlot in 0..BATCH {
+                                let pTag=1+(pWorker*BATCHES+pBatch)*BATCH+pSlot;
+                                let (pFrame,pIndex)=guarded(pShared,|pFrames| {
+                                    let pFrame=pFrames.alloc().ok_or("unexpected allocation failure")?;
+                                    let pAddress=pFrame.address();
+                                    let pOffset=pAddress.checked_sub(pBase).ok_or("frame below mapped RAM")?;
+                                    if pOffset%PAGE!=0 || pOffset/PAGE>=PAGES {
+                                        return Err("frame outside mapped RAM");
+                                    }
+                                    let pIndex=pOffset/PAGE;
+                                    let pNumber=pAddress/PAGE;
+                                    let pMask=1usize<<(pNumber%WORD_BITS);
+                                    if pBitmap.get(pNumber/WORD_BITS).map_or(true,|pWord| *pWord&pMask==0) ||
+                                       pFrames.references(pAddress)!=Some(1) ||
+                                       pFrames.free.get(pNumber/WORD_BITS).map_or(true,|pWord| *pWord&pMask!=0) {
+                                        return Err("allocated frame not exclusively owned from baseline");
+                                    }
+                                    if pOwners[pIndex].compare_exchange(0,pTag,Ordering::AcqRel,Ordering::Acquire).is_err() {
+                                        return Err("duplicate live physical frame");
+                                    }
+                                    Ok((pFrame,pIndex))
+                                })??;
+                                let pPage=pFrame.address() as *mut usize;
+                                unsafe { pPage.write_volatile(pTag);
+                                         pPage.add(PAGE/size_of::<usize>()-1).write_volatile(!pTag); }
+                                pOwned.push((pFrame,pIndex,pTag));
+                            }
+
+                            let pPhase=pBatch/INTERVAL;
+                            let pSynchronized=pBatch%INTERVAL==0;
+                            if pSynchronized {
+                                rendezvous(&pAllocated[pPhase],aWorkers,pCancelled)?;
+                                // All owners have finished writing and none may
+                                // release until the second barrier. Verify the
+                                // complete live union, not merely arrival counts.
+                                if pWorker==0 {
+                                    let pLive:Vec<_>=pOwners.iter().enumerate().filter_map(|(pIndex,pOwner)| {
+                                        let pTag=pOwner.load(Ordering::Acquire);
+                                        (pTag!=0).then_some((pBase+pIndex*PAGE,pTag))
+                                    }).collect();
+                                    let mut pTags=pLive.iter().map(|&(_,pTag)|pTag).collect::<Vec<_>>();
+                                    pTags.sort_unstable();
+                                    let pExpected=(0..aWorkers).flat_map(|pId|
+                                        (0..BATCH).map(move |pSlot|1+(pId*BATCHES+pBatch)*BATCH+pSlot))
+                                        .collect::<Vec<_>>();
+                                    if pTags!=pExpected ||
+                                       pLive.iter().map(|&(pAddress,_)|pAddress).collect::<HashSet<_>>().len()!=aWorkers*BATCH {
+                                        return Err("incomplete or duplicated simultaneous live set");
+                                    }
+                                    if !guarded(pShared,|pFrames| {
+                                        pFrames.available().checked_add(pLive.len())==Some(pBaselineCount) &&
+                                        pLive.iter().all(|&(pAddress,_)|pFrames.references(pAddress)==Some(1))
+                                    })? || !pLive.iter().all(|&(pAddress,pTag)|tagMatches(pAddress,pTag)) {
+                                        return Err("live-set reference, count or tag mismatch");
+                                    }
+                                    pObserved[pPhase].store(pLive.len(),Ordering::Release);
+                                }
+                            }
+                            if !pOwned.iter().all(|(pFrame,_,pTag)|tagMatches(pFrame.address(),*pTag)) {
+                                return Err("worker first/last word tag corrupted");
+                            }
+                            if pSynchronized { rendezvous(&pChecked[pPhase],aWorkers,pCancelled)?; }
+
+                            for (pFrame,pIndex,pTag) in pOwned.into_iter().rev() {
+                                guarded(pShared,|pFrames| {
+                                    if pFrames.references(pFrame.address())!=Some(1) ||
+                                       pOwners[pIndex].compare_exchange(pTag,0,Ordering::AcqRel,Ordering::Acquire).is_err() {
+                                        return Err("release without exclusive ownership");
+                                    }
+                                    pFrames.release(pFrame);
+                                    Ok(())
+                                })??;
+                                pReleased+=1;
+                            }
+                        }
+                        Ok((thread::current().id(),pReleased))
+                    }));
+                    let pResult=pResult.unwrap_or(Err("host worker panicked"));
+                    if pResult.is_err() {
+                        // A failed fixture is never treated as restored. Do
+                        // not try to free a suspect duplicate; discard the
+                        // mapping only AFTER every worker has joined.
+                        pCancelled.store(true,Ordering::Release);
+                    }
+                    pResult
+                }) {
+                    Ok(pHandle)=>pHandles.push(pHandle),
+                    Err(_)=>{pCancelled.store(true,Ordering::Release);break;}
+                }
+            }
+            pHandles.into_iter().map(|pHandle|pHandle.join().unwrap_or(Err("host worker join failed")))
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(pResults.len(),aWorkers,"failed to start the full host roster");
+        let pResults=pResults.into_iter().collect::<Result<Vec<_>,_>>().expect("live-frame workers failed");
+        assert!(!pCancelled.load(Ordering::Acquire));
+        assert_eq!(pResults.iter().map(|(pId,_)|*pId).collect::<HashSet<_>>().len(),aWorkers);
+        assert!(pResults.iter().all(|&(_,pReleased)|pReleased==BATCH*BATCHES));
+        assert!(pOwners.iter().all(|pOwner|pOwner.load(Ordering::Acquire)==0));
+        let pSizes=pObserved.iter().map(|pCount|pCount.load(Ordering::Acquire)).collect::<Vec<_>>();
+        assert_eq!(pSizes,vec![aWorkers*BATCH;PHASES]);
+        assert!(pAllocated.iter().chain(pChecked.iter()).all(|pCount|pCount.load(Ordering::Acquire)==aWorkers));
+
+        // Full restoration after all joins, a genuine retained-frame
+        // negative case, then full restoration including the snapshot itself.
+        let (pBefore,pAfter,pRestored,pRejected,pRecovered,pFinal)=guarded(&pShared,|pFrames| {
+            let pRestored=pBaseline.matches(pFrames) && &*pFrames.free==pBitmap.as_slice() &&
+                          &*pFrames.refs==pRefs.as_slice() && pFrames.available()==pBaselineCount;
+            let pBefore=pFrames.available();
+            let pHeld=pFrames.alloc().expect("one real retained frame");
+            let pAfter=pFrames.available();
+            let pRejected=!pBaseline.matches(pFrames) && pBefore.checked_sub(1)==Some(pAfter) &&
+                          pFrames.references(pHeld.address())==Some(1) &&
+                          &*pFrames.free!=pBitmap.as_slice() && &*pFrames.refs!=pRefs.as_slice();
+            pFrames.release(pHeld);
+            let pRecovered=pBaseline.matches(pFrames) && &*pFrames.free==pBitmap.as_slice() &&
+                           &*pFrames.refs==pRefs.as_slice() && pFrames.available()==pBaselineCount;
+            pBaseline.release(pFrames);
+            let pFinal=&*pFrames.free==pInitialBitmap.as_slice() && &*pFrames.refs==pInitialRefs.as_slice() &&
+                       pFrames.available()==pInitialCount;
+            (pBefore,pAfter,pRestored,pRejected,pRecovered,pFinal)
+        }).unwrap();
+        assert!(pRestored && pRejected && pRecovered && pFinal,"bitmap/refcount/count restoration or retained-frame rejection failed");
+        // Direct stdout preserves the actual per-profile evidence even when
+        // the unchanged Rust test harness captures successful test output.
+        writeln!(std::io::stdout().lock(),
+                 "FRAME LIVE HOST workers={} phases={} distinct_min={} distinct_max={} released_min={} released_total={} retained_free={}->{} rejection={} restored={} snapshot_released={}",
+                 pResults.len(),pSizes.len(),pSizes.iter().min().unwrap(),pSizes.iter().max().unwrap(),
+                 pResults.iter().map(|&(_,pReleased)|pReleased).min().unwrap(),
+                 pResults.iter().map(|&(_,pReleased)|pReleased).sum::<usize>(),pBefore,pAfter,
+                 pRejected,pRestored && pRecovered,pFinal).unwrap();
+        drop(pShared);
+        drop(pRegion);
+    }
+
+    for pWorkers in [2,4,8,16] { exercise(pWorkers); }
+}
