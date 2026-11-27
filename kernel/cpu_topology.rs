@@ -39,8 +39,12 @@ impl CpuRoster {
         if id == u32::MAX || self.count == MAX_CPUS { return None; }
         let index = self.ids().binary_search(&id).err()?;
         let ordinal = u8::try_from(self.count).ok()?;
-        self.ids.copy_within(index..self.count, index+1);
-        self.order.copy_within(index..self.count, index+1);
+        // Shift both fields together, backwards to preserve overlapping entries.
+        // Keep this bounded scalar move independent of a C memmove runtime.
+        for position in (index..self.count).rev() {
+            self.ids[position + 1] = self.ids[position];
+            self.order[position + 1] = self.order[position];
+        }
         self.ids[index] = id;
         self.order[index] = ordinal;
         self.count += 1;
