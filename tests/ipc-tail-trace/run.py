@@ -87,7 +87,7 @@ def preflight_inputs():
         Path("/usr/share/OVMF/OVMF_CODE_4M.secboot.fd"),
         Path("/usr/share/OVMF/OVMF_VARS_4M.fd"),
         Path.home()/".local/share/agentos/stage1-test-keys/db.crt",
-        HERE/"run.py", HERE/"trace.py", ROOT/"scripts/qemu-smoke.py",
+        HERE/"run.py", HERE/"trace.py", HERE/"test_mailbox.py", ROOT/"scripts/qemu-smoke.py",
     ]
     return {str(p): sha(p) for p in paths}
 
@@ -159,6 +159,13 @@ def preflight():
                 identity["source_tree"] == receipt["tree"], "Staged identity is not this checkout")
         receipt["build_artifacts"] = build["artifacts"]
         receipt["staged_identity"] = identity
+        receipt["stage"] = "mailbox_host_test"
+        command = [sys.executable, str(HERE/"test_mailbox.py")]
+        result = subprocess.run(command, cwd=ROOT, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, timeout=30)
+        receipt["mailbox_host_test"] = {"command": command, "returncode": result.returncode,
+                                        "output": result.stdout}
+        require(result.returncode == 0, "Host mailbox callback regression failed")
         receipt["stage"] = "tracer_interface"
         source = (HERE/"trace.py").read_text()
         compile(source, str(HERE/"trace.py"), "exec")
@@ -214,6 +221,7 @@ def require_preflight():
             receipt.get("guest_started") is False and receipt.get("qemu_count") == 0 and
             receipt.get("commit") == capture("git", "rev-parse", "HEAD") and
             receipt.get("tree") == capture("git", "rev-parse", "HEAD^{tree}") and
+            receipt.get("mailbox_host_test", {}).get("returncode") == 0 and
             receipt.get("hashes") == EXPECTED and receipt.get("inputs") == preflight_inputs(),
             "Missing or stale successful preflight; diagnostic guest forbidden")
 

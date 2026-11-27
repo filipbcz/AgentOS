@@ -62,11 +62,13 @@ def word(address):
 def signed(value):
     return value if value < 1<<63 else value-(1<<64)
 
-def record(kind, **values):
+def record(event_name, /, **values):
     global events
+    require(not (values.keys() & {"event", "seq", "host_ns", "thread", "pc"}),
+            "trace payload shadows envelope")
     events += 1
-    counts[kind] = counts.get(kind, 0)+1
-    event = {"event": kind, "seq": events, "host_ns": time.monotonic_ns(),
+    counts[event_name] = counts.get(event_name, 0)+1
+    event = {"event": event_name, "seq": events, "host_ns": time.monotonic_ns(),
              "thread": list(gdb.selected_thread().ptid), "pc": reg("pc"),
              **values}
     out.write(json.dumps(event, sort_keys=True)+"\n")
