@@ -367,7 +367,7 @@ jobs:
           CPU_COUNT: ${{ matrix.cpus }}
         run: |
           set -euo pipefail
-          status=0
+          # The HPET pair is the prerequisite for the PM pair.
           for clock in hpet pm; do
             options=()
             if [[ "$clock" == pm ]]; then options=(--no-hpet); fi
@@ -375,11 +375,10 @@ jobs:
               python3 scripts/qemu-smoke.py --cpus "$CPU_COUNT" --session \
                 --runtime-process-regression --supervisor-image "$variant" "${options[@]}" \
                 --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd \
-                --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd --timeout 720 || status=1
+                --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd --timeout 720
             done
-            python3 scripts/verify-supervisor-image.py --cpus "$CPU_COUNT" "${options[@]}" || status=1
+            python3 scripts/verify-supervisor-image.py --cpus "$CPU_COUNT" "${options[@]}"
           done
-          test "$status" -eq 0
       - name: Preserve paired signed images and independent evidence
         if: always()
         uses: actions/upload-artifact@v4

@@ -4,12 +4,14 @@
 int run_supervisor(void);
 enum { maxPool=8, maxRounds=4, budgetMs=15000, workMs=100,
        runReserveMs=3000, skipStatus=75, movedStatus=76 };
-enum { workCommand=1, runCommand=2, stopCommand=3 };
+enum { workCommand=1, runCommand=2, stopCommand=3, peerCommand=4, peerStop=5, peerIterations=2000000 };
 struct Sample { unsigned long stats[8], ms; };
 struct Command { unsigned long kind, round, apic; };
 struct Report { unsigned long round, slot; struct Sample sample; };
 struct IncomingCommand { struct ipc_peer peer; struct Command body; };
 struct IncomingReport { struct ipc_peer peer; struct Report body; };
+struct PeerReport { struct Report report; unsigned long work; };
+struct IncomingPeer { struct ipc_peer peer; struct PeerReport body; };
 static int gChannels[maxPool][2];
 static long gPids[maxPool], gDeadline;
 static unsigned long gRoot, gCpus;
@@ -45,6 +47,17 @@ static int snapshot(const char *kind,const struct Sample *s) {
     const char *const names[]={" PID="," PARENT="," APIC="," CPUS="," MOVES="," TOTAL="," MS="};
     const unsigned long v[]={s->stats[6],s->stats[7],s->stats[1],s->stats[2],s->stats[3],s->stats[4],s->ms};
     return record(kind,names,v,7);
+}
+static int peerSnapshot(const char *kind,const struct PeerReport *p) {
+    const struct Sample *s=&p->report.sample;
+    const char *const names[]={" PID="," PARENT="," APIC="," CPUS="," MOVES="," TOTAL="," MS="," WORK="};
+    const unsigned long v[]={s->stats[6],s->stats[7],s->stats[1],s->stats[2],s->stats[3],s->stats[4],s->ms,p->work};
+    return record(kind,names,v,8);
+}
+static int pairRecord(long pid,long peer) {
+    const char *const names[]={" ROOT="," PID="," PEER="};
+    const unsigned long v[]={gRoot,(unsigned long)pid,(unsigned long)peer};
+    return record("PAIR",names,v,3);
 }
 static int wave(unsigned round) {
     const char *const names[]={" ROOT="," ROUND="," COUNT="};
@@ -108,6 +121,37 @@ static int placementWork(void) {
     }
     return 0;
 }
+/* Only this ordinary fork child remains runnable. After the authenticated
+ * start report, there are no blocking syscalls until STOP has been received.
+ * The controller sends STOP only after collecting the supervisor candidate.
+ * Both the original guest deadline and a finite iteration cap apply. */
+static int peerWork(int fd,unsigned slot,unsigned round,unsigned long apic) {
+    struct PeerReport p={.report={.round=round,.slot=slot},.work=0};
+    if (!sample(&p.report.sample) || p.report.sample.stats[7]!=gRoot ||
+        !send(fd,&p,sizeof(p))) return 80;
+    unsigned long value=1;
+    for (unsigned i=0;i<peerIterations;++i) {
+        long ms=now();
+        if (ms<0 || ms>gDeadline) return 81;
+        for (unsigned j=0;j<256;++j) {
+            value=value*33+1;
+            __asm__ volatile ("" : "+r"(value) :: "memory");
+        }
+        ++p.work;
+        struct IncomingCommand in;
+        long n=os_call(SYS_IPC_TRY_RECV,fd,(long)&in,sizeof(in.body));
+        if (n==-11) continue;
+        if (n!=sizeof(in.body) || in.peer.pid!=gRoot || in.body.round!=round ||
+            in.body.kind!=peerStop || in.body.apic!=apic) return 82;
+        struct Command finish;
+        if (!sample(&p.report.sample) || p.report.sample.stats[7]!=gRoot ||
+            !send(fd,&p,sizeof(p)) || !receiveCommand(fd,round,&finish) ||
+            finish.kind!=stopCommand || finish.apic!=apic ||
+            !closeFd(&gChannels[slot][1]) || os_call(SYS_CHILD_AFTER,0,0,0)!=-10) return 83;
+        return 0;
+    }
+    return 81;
+}
 static int worker(unsigned slot,unsigned round) {
     for (unsigned i=0;i<gCount;++i)
         if (!closeFd(&gChannels[i][0]) || (i!=slot && !closeFd(&gChannels[i][1]))) return 70;
@@ -116,7 +160,9 @@ static int worker(unsigned slot,unsigned round) {
     if (!receiveCommand(fd,round,&c) || c.kind!=workCommand || !placementWork() ||
         !sample(&report.sample) || report.sample.stats[7]!=gRoot ||
         !send(fd,&report,sizeof(report)) || !receiveCommand(fd,round,&c) ||
-        !closeFd(&gChannels[slot][1]) || os_call(SYS_CHILD_AFTER,0,0,0)!=-10) return 71;
+        os_call(SYS_CHILD_AFTER,0,0,0)!=-10) return 71;
+    if (c.kind==peerCommand) return peerWork(fd,slot,round,c.apic);
+    if (!closeFd(&gChannels[slot][1])) return 71;
     if (c.kind==stopCommand) return 0;
     if (c.kind!=runCommand) return 72;
     struct Sample before,after;
@@ -144,6 +190,45 @@ static void cleanup(void) {
         (void)closeFd(&gChannels[i][0]); (void)closeFd(&gChannels[i][1]);
     }
 }
+static long collect(unsigned slot) {
+    long pid=gPids[slot];
+    long status=os_call(SYS_WAIT_CHILD_UNTIL,pid,gDeadline,0);
+    if (status<0) return status;
+    gPids[slot]=0;
+    return closeFd(&gChannels[slot][0]) && reaped(pid,status) ? status : -1;
+}
+static long selectAndCollect(unsigned slot,unsigned round,unsigned long apic,int run) {
+    long ms=now();
+    if (ms<0 || ms>gDeadline-(run?runReserveMs:0) ||
+        !selectCandidate(gPids[slot],apic,run) || !command(slot,round,run?runCommand:stopCommand,apic)) return -1;
+    return collect(slot);
+}
+static int readPeer(unsigned slot,unsigned round,struct PeerReport *report,const char *kind) {
+    struct IncomingPeer in;
+    if (!receive(gChannels[slot][0],gPids[slot],&in,sizeof(in.body)) ||
+        in.body.report.round!=round || in.body.report.slot!=slot ||
+        in.body.report.sample.stats[6]!=(unsigned long)gPids[slot] ||
+        in.body.report.sample.stats[7]!=gRoot || !peerSnapshot(kind,&in.body)) return 0;
+    *report=in.body; return 1;
+}
+static int runPair(unsigned slot,unsigned peer,unsigned round,const struct Sample ready[]) {
+    unsigned long apic=ready[slot].stats[1], peerApic=ready[peer].stats[1];
+    struct PeerReport before,after;
+    if (!pairRecord(gPids[slot],gPids[peer]) || !command(peer,round,peerCommand,peerApic) ||
+        !readPeer(peer,round,&before,"PEER_BEGIN") || before.work!=0) return 0;
+    int run=before.report.sample.stats[1]==peerApic;
+    long status=selectAndCollect(slot,round,apic,run);
+    if (status<0 || (!run && status!=0) || (run && status!=0 && status!=skipStatus && status!=movedStatus)) return 0;
+    if (!command(peer,round,peerStop,peerApic) || !readPeer(peer,round,&after,"PEER_END") ||
+        !command(peer,round,stopCommand,peerApic) || collect(peer)!=0) return 0;
+    if (after.work==0 || after.work>peerIterations ||
+        after.report.sample.ms<before.report.sample.ms ||
+        after.report.sample.stats[4]<before.report.sample.stats[4] ||
+        after.report.sample.stats[3]<before.report.sample.stats[3]) return 0;
+    if (run && status==0 && after.report.sample.stats[1]==peerApic &&
+        after.report.sample.stats[3]==before.report.sample.stats[3]) gApics[gCovered++]=apic;
+    return 1;
+}
 static int runWave(unsigned round) {
     struct Sample ready[maxPool];
     for (unsigned i=0;i<gCount;++i) {
@@ -168,25 +253,38 @@ static int runWave(unsigned round) {
             in.body.sample.stats[7]!=gRoot || !snapshot("READY",&in.body.sample)) return 0;
         ready[i]=in.body.sample;
     }
-    for (unsigned i=0;i<gCount;++i) {
-        unsigned long apic=ready[i].stats[1]; long pid=gPids[i];
-        int run=!covered(apic) && gCovered<gCpus;
-        long ms=now();
-        if (ms<0 || ms>gDeadline-(run?runReserveMs:0) || !selectCandidate(pid,apic,run) ||
-            !command(i,round,run?runCommand:stopCommand,apic)) return 0;
-        long status=os_call(SYS_WAIT_CHILD_UNTIL,pid,gDeadline,0);
-        if (status<0) return 0;
-        gPids[i]=0;
-        if (!closeFd(&gChannels[i][0]) || !reaped(pid,status)) return 0;
-        if (run && status==0) gApics[gCovered++]=apic;
-        else if ((!run && status!=0) || (run && status!=skipStatus && status!=movedStatus)) return 0;
+    if (gCpus==2) {
+        /* Keep the previous pool and wave bounds. Pair only live candidates
+         * on distinct observed CPUs; consume both, never use an idle peer. */
+        for (;;) {
+            unsigned slot=gCount,peer=gCount;
+            for (unsigned i=0;i<gCount && slot==gCount;++i)
+                if (gPids[i]>0 && !covered(ready[i].stats[1]))
+                    for (unsigned j=0;j<gCount;++j)
+                        if (gPids[j]>0 && ready[j].stats[1]!=ready[i].stats[1]) {
+                            slot=i; peer=j; break;
+                        }
+            if (slot==gCount) break;
+            if (!runPair(slot,peer,round,ready)) return 0;
+        }
+        for (unsigned i=0;i<gCount;++i)
+            if (gPids[i]>0 && selectAndCollect(i,round,ready[i].stats[1],0)!=0) return 0;
+    } else {
+        for (unsigned i=0;i<gCount;++i) {
+            unsigned long apic=ready[i].stats[1];
+            int run=!covered(apic) && gCovered<gCpus;
+            long status=selectAndCollect(i,round,apic,run);
+            if (status<0) return 0;
+            if (run && status==0) gApics[gCovered++]=apic;
+            else if ((!run && status!=0) || (run && status!=skipStatus && status!=movedStatus)) return 0;
+        }
     }
     return os_call(SYS_CHILD_AFTER,0,0,0)==-10;
 }
 int runSupervisorWorkload(void) {
     struct Sample before,after;
     if (!sample(&before) || before.stats[7]<=1 || before.stats[7]>=before.stats[6] ||
-        before.stats[2]>maxPool/2 || before.ms>0x7fffffffffffffffUL-budgetMs ||
+        before.stats[2]>2 || before.ms>0x7fffffffffffffffUL-budgetMs ||
         os_call(SYS_CHILD_AFTER,0,0,0)!=-10) return 66;
     gRoot=before.stats[6]; gCpus=before.stats[2]; gDeadline=(long)before.ms+budgetMs;
     gCount=gCpus==1?1:2*(unsigned)gCpus;

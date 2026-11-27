@@ -134,50 +134,103 @@ def supervisor_phase(parent, first, cr3=0x600000):
     return records
 
 
-def supervisor_transcript(shell=9,runner=20,apics=(7,),moving=False,skipping=False):
-    """Synthetic evidence including explicitly rejected complete attempts."""
+def supervisor_transcript(shell=9,runner=20,apics=(7,),moving=False,skipping=False,
+                          peer_moving=False,peer_missed=False):
+    """Synthetic evidence, not a guest execution or signature proof."""
     cpus=len(apics)
     count=1 if cpus==1 else 2*cpus
     total=0 if cpus==1 else 4
     records=[session.SUPERVISOR_COMMAND]
     def note(kind,**fields):
         records.append("AGENTOS TEST "+kind+"".join(f" {k}={v:016x}" for k,v in fields.items()))
-    def snap(kind,pid,parent,cpu,ms,moves=0):
-        note(kind,PID=pid,PARENT=parent,APIC=cpu,CPUS=cpus,MOVES=moves,TOTAL=total,MS=ms)
+    def snap(kind,pid,parent,cpu,ms,moves=0,work=None):
+        fields=dict(PID=pid,PARENT=parent,APIC=cpu,CPUS=cpus,MOVES=moves,TOTAL=total,MS=ms)
+        if work is not None:
+            fields["WORK"]=work
+        note(kind,**fields)
     def exit_line(pid,status,cr3):
         records.append(f"AGENTOS USER EXIT PID={pid:016x} CR3={cr3:016x} STATUS={status:016x}")
     snap("RUNNER",runner,shell,apics[0],1000)
-    note("WAVE",ROOT=runner,ROUND=1,COUNT=count)
-    for i in range(count):
-        note("CANDIDATE",ROOT=runner,ROUND=1,SLOT=i,PID=runner+1+i)
-    for i in range(count):
-        snap("READY",runner+1+i,runner,apics[i%cpus],1100+i)
     covered=set()
-    first=runner+1+count
-    ms=1200
-    for i in range(count):
-        pid,cpu=runner+1+i,apics[i%cpus]
-        run=cpu not in covered
-        note("SELECT",ROOT=runner,PID=pid,APIC=cpu,RUN=int(run))
-        status=0
-        if run and i==0 and skipping:
-            total+=1
-            snap("SKIP",pid,runner,apics[1],ms,1)
-            status=75
-        elif run:
-            snap("BEGIN",pid,runner,cpu,ms)
-            records.extend(supervisor_phase(pid,first))
-            first+=5
-            ms+=350
-            if i==0 and moving:
+    next_pid=runner+1
+    ms=1100
+    pair_number=0
+    for rnd in range(1,5):
+        if len(covered)==cpus:
+            break
+        note("WAVE",ROOT=runner,ROUND=rnd,COUNT=count)
+        candidates=list(range(next_pid,next_pid+count))
+        next_pid+=count
+        placement={pid:apics[i%cpus] for i,pid in enumerate(candidates)}
+        for i,pid in enumerate(candidates):
+            note("CANDIDATE",ROOT=runner,ROUND=rnd,SLOT=i,PID=pid)
+        for pid in candidates:
+            snap("READY",pid,runner,placement[pid],ms)
+            ms+=1
+        ms+=100
+        remaining=candidates.copy()
+        def collect(pid,status):
+            exit_line(pid,status,0x500000+candidates.index(pid)*4096)
+            note("REAP",ROOT=runner,PID=pid,STATUS=status)
+            remaining.remove(pid)
+        def attempt(pid,run,first):
+            nonlocal ms,total,next_pid
+            cpu=placement[pid]
+            note("SELECT",ROOT=runner,PID=pid,APIC=cpu,RUN=int(run))
+            status=0
+            if run and first and skipping:
                 total+=1
-                status=76
-            snap("ENDED",pid,runner,cpu,ms)
-            if status==0:
-                covered.add(cpu)
-        exit_line(pid,status,0x500000+i*4096)
-        note("REAP",ROOT=runner,PID=pid,STATUS=status)
-        ms+=10
+                snap("SKIP",pid,runner,next(a for a in apics if a!=cpu),ms,1)
+                status=75
+            elif run:
+                snap("BEGIN",pid,runner,cpu,ms)
+                records.extend(supervisor_phase(pid,next_pid))
+                next_pid+=5
+                ms+=350
+                if first and moving:
+                    total+=1
+                    status=76
+                snap("ENDED",pid,runner,cpu,ms)
+            collect(pid,status)
+            ms+=10
+            return status
+        if cpus==2:
+            while True:
+                pair=next(((pid,peer) for pid in remaining if placement[pid] not in covered
+                           for peer in remaining if placement[peer]!=placement[pid]),None)
+                if pair is None:
+                    break
+                pid,peer=pair
+                first=pair_number==0
+                pair_number+=1
+                note("PAIR",ROOT=runner,PID=pid,PEER=peer)
+                peer_cpu=placement[peer]
+                moves=0
+                if first and peer_missed:
+                    total+=1
+                    moves=1
+                    peer_cpu=placement[pid]
+                snap("PEER_BEGIN",peer,runner,peer_cpu,ms,moves,0)
+                ms+=10
+                run=peer_cpu==placement[peer]
+                status=attempt(pid,run,first)
+                if first and peer_moving:
+                    total+=1
+                    moves+=1
+                    peer_cpu=placement[pid]
+                snap("PEER_END",peer,runner,peer_cpu,ms,moves,200)
+                collect(peer,0)
+                ms+=10
+                if run and status==0 and not (first and peer_moving):
+                    covered.add(placement[pid])
+            for pid in remaining.copy():
+                attempt(pid,False,False)
+        else:
+            for pid in remaining.copy():
+                run=placement[pid] not in covered
+                status=attempt(pid,run,False)
+                if run and status==0:
+                    covered.add(placement[pid])
     snap("COMPLETE",runner,shell,apics[0],ms)
     exit_line(runner,0,0x700000)
     records.append("exit status 0")
@@ -270,7 +323,7 @@ class RuntimeTests(unittest.TestCase):
                                    serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant)
 
     def test_two_cpu_roster_and_rejected_complete_attempts(self):
-        for flags in ({},{"moving":True},{"skipping":True}):
+        for flags in ({},{"moving":True},{"skipping":True},{"peer_moving":True},{"peer_missed":True}):
             data=supervisor_transcript(apics=(7,19),**flags)
             offset,result,seen=self.verify(data,apics=(7,19))
             self.assertEqual(offset,len(data))
@@ -279,6 +332,8 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(len(result["rejected"]),int(bool(flags)))
             for interval in result["intervals"]:
                 self.assertEqual(interval["child_statuses"],[0,42,42,42,137])
+                self.assertNotEqual(interval["peer"]["apic"],interval["apic"])
+                self.assertGreater(interval["peer"]["after"]["work"],0)
                 for field in ("apic","moves","total"):
                     self.assertEqual(interval["before"][field],interval["after"][field])
             self.assertEqual(len(seen),len(set(seen)))
@@ -302,6 +357,34 @@ class RuntimeTests(unittest.TestCase):
                 self.verify(bad,apics=(7,19))
         with self.assertRaises(session.VerificationError):
             self.verify(data,apics=(7,23))
+
+    def test_peer_identity_work_time_stop_and_replay(self):
+        import re
+        data=supervisor_transcript(apics=(7,19))
+        lines=data.splitlines(keepends=True)
+        start=next(l for l in lines if l.startswith(b"AGENTOS TEST PEER_BEGIN "))
+        end=next(l for l in lines if l.startswith(b"AGENTOS TEST PEER_END "))
+        pair=next(l for l in lines if l.startswith(b"AGENTOS TEST PAIR "))
+        for bad in (
+            data.replace(start,b"",1),data.replace(end,b"",1),
+            data.replace(start,start+start,1),
+            data.replace(pair,pair.replace(b"PEER=0000000000000016",b"PEER=0000000000000015"),1),
+            data.replace(start,start.replace(b"PARENT=0000000000000014",b"PARENT=0000000000000009"),1),
+            data.replace(end,end.replace(b"PID=0000000000000016",b"PID=0000000000000015"),1),
+            data.replace(end,end.replace(b"WORK=00000000000000c8",b"WORK=0000000000000000"),1),
+            data.replace(end,end.replace(b"WORK=00000000000000c8",b"WORK=00000000001e8481"),1),
+            data.replace(end,re.sub(rb"MS=[0-9a-f]{16}",b"MS=0000000000000000",end),1),
+            data.replace(end,end.replace(b"APIC=0000000000000013",b"APIC=0000000000000007"),1),
+            data.replace(end,end.replace(b"MOVES=0000000000000000",b"MOVES=0000000000000001"),1),
+        ):
+            self.assertNotEqual(bad,data)
+            with self.assertRaises(session.VerificationError):
+                self.verify(bad,apics=(7,19))
+        for i in range(len(lines)):
+            with self.subTest(line=i), self.assertRaises(session.VerificationError):
+                self.verify(b"".join(lines[:i]+lines[i+1:]),apics=(7,19))
+        # Even a complete prior idle-peer transcript or early peer exit is
+        # not a substitute for the new continuously runnable peer bracket.
 
     def test_old_supervisor_interval_checks_still_apply(self):
         phase="\n".join(supervisor_phase(20,21))+"\n"

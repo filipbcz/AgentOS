@@ -27,10 +27,16 @@ def verify(data, shell, shell_cr3, prior_pids, apics, supervisor, require):
         return tuple(int(v,16) for v in match.groups())
 
     def snap(kind,record=None):
-        pid,parent,cpu,count,moves,total,ms=fields(kind,("PID","PARENT","APIC","CPUS","MOVES","TOTAL","MS"),record)
+        names=("PID","PARENT","APIC","CPUS","MOVES","TOTAL","MS")
+        is_peer=kind in ("PEER_BEGIN","PEER_END")
+        values=fields(kind,names+(("WORK",) if is_peer else ()),record)
+        pid,parent,cpu,count,moves,total,ms=values[:7]
         require(cpu in apics and count==len(apics) and 0<=moves<=total<2**63 and ms<2**63 and
                 (count!=1 or total==0),"Invalid scheduler snapshot")
-        return {"pid":pid,"parent":parent,"apic":cpu,"moves":moves,"total":total,"ms":ms}
+        result={"pid":pid,"parent":parent,"apic":cpu,"moves":moves,"total":total,"ms":ms}
+        if is_peer:
+            result["work"]=values[7]
+        return result
 
     def progresses(a,b):
         return (a["pid"],a["parent"])==(b["pid"],b["parent"]) and a["ms"]<=b["ms"] and \
@@ -75,13 +81,29 @@ def verify(data, shell, shell_cr3, prior_pids, apics, supervisor, require):
         floor_total=max(s["total"] for s in ready)
         wave_roots=[]
         earlier_child_roots=[]
-        for pid,placement in zip(candidates,ready):
+        remaining=list(candidates)
+        placements=dict(zip(candidates,ready))
+
+        def collect(pid,status,roots):
+            root=actual_exit(pid,status)
+            require(root not in wave_roots and root not in earlier_child_roots and
+                    all(r!=root and r!=shell_cr3 for r in roots),"Aliased live candidate/child address space")
+            wave_roots.append(root)
+            earlier_child_roots.extend(roots)
+            all_roots.extend([root,*roots])
+            require(fields("REAP",("ROOT","PID","STATUS"))==(runner,pid,status),"Missing actual candidate collection")
+            remaining.remove(pid)
+            return root
+
+        def attempt(pid,run):
+            nonlocal floor_ms,floor_total
+            placement=placements[pid]
             cpu=placement["apic"]
-            run=cpu not in covered
             require(fields("SELECT",("ROOT","PID","APIC","RUN"))==(runner,pid,cpu,int(run)),
                     "Duplicate CPU selection or incorrect candidate command")
             status=0
             roots=[]
+            outcome=None
             if run:
                 first=line()
                 skipped=first.startswith("AGENTOS TEST SKIP ")
@@ -91,7 +113,7 @@ def verify(data, shell, shell_cr3, prior_pids, apics, supervisor, require):
                 if skipped:
                     require(before["apic"]!=cpu,"False placement miss")
                     status=75
-                    rejected.append({"pid":pid,"reason":"placement","ready":placement,"before":before})
+                    outcome={"pid":pid,"reason":"placement","ready":placement,"before":before}
                     floor_ms,floor_total=before["ms"],before["total"]
                 else:
                     require(before["apic"]==cpu,"Workload started on wrong CPU")
@@ -122,20 +144,71 @@ def verify(data, shell, shell_cr3, prior_pids, apics, supervisor, require):
                     status=0 if local else 76
                     outcome.update({"pid":pid,"apic":cpu,"before":before,"after":after,
                                     "child_statuses":[records[i][3] for i in (0,2,4,6,9)]})
-                    if local:
-                        require(cpu not in covered,"Duplicate local CPU interval")
-                        covered.add(cpu)
-                        intervals.append(outcome)
-                    else:
-                        rejected.append({"reason":"migration",**outcome})
+                    if not local:
+                        outcome["reason"]="migration"
                     floor_ms,floor_total=after["ms"],after["total"]
-            root=actual_exit(pid,status)
-            require(root not in wave_roots and root not in earlier_child_roots and
-                    all(r!=root and r!=shell_cr3 for r in roots),"Aliased live candidate/child address space")
-            wave_roots.append(root)
-            earlier_child_roots.extend(roots)
-            all_roots.extend([root,*roots])
-            require(fields("REAP",("ROOT","PID","STATUS"))==(runner,pid,status),"Missing actual candidate collection")
+            root=collect(pid,status,roots)
+            return status,outcome,root
+
+        def accept(cpu,outcome):
+            require(cpu not in covered,"Duplicate local CPU interval")
+            covered.add(cpu)
+            intervals.append(outcome)
+
+        if len(apics)==2:
+            # The same deterministic pairing policy as the guest controller.
+            # Never accept an idle or absent peer, even for an otherwise local
+            # supervisor interval. Both candidate lifetimes must be consumed.
+            while True:
+                pair=next(((pid,peer) for pid in remaining if placements[pid]["apic"] not in covered
+                           for peer in remaining if placements[peer]["apic"]!=placements[pid]["apic"]),None)
+                if pair is None:
+                    break
+                pid,peer=pair
+                cpu,peer_cpu=placements[pid]["apic"],placements[peer]["apic"]
+                require(fields("PAIR",("ROOT","PID","PEER"))==(runner,pid,peer),"Wrong or replayed peer selection")
+                before=snap("PEER_BEGIN")
+                require(progresses(placements[peer],before) and before["work"]==0 and
+                        floor_ms<=before["ms"]<=deadline and before["total"]>=floor_total,
+                        "Invalid peer start identity, counters or time")
+                floor_ms,floor_total=before["ms"],before["total"]
+                run=before["apic"]==peer_cpu
+                status,outcome,root=attempt(pid,run)
+                after=snap("PEER_END")
+                require(progresses(before,after) and 0<after["work"]<=2000000 and
+                        floor_ms<=after["ms"]<=deadline and after["total"]>=floor_total,
+                        "Invalid peer work, stop identity, counters or time")
+                floor_ms,floor_total=after["ms"],after["total"]
+                peer_root=collect(peer,0,[])
+                require(peer_root!=root,"Peer aliases live supervisor candidate")
+                peer_proof={"pid":peer,"apic":peer_cpu,"before":before,"after":after,"cr3":peer_root}
+                if not run:
+                    rejected.append({"pid":pid,"reason":"peer-placement","peer":peer_proof})
+                    continue
+                outcome["peer"]=peer_proof
+                if status!=75:
+                    require(before["ms"]<=outcome["before"]["ms"]<=outcome["after"]["ms"]<=after["ms"] and
+                            before["total"]<=outcome["before"]["total"]<=outcome["after"]["total"]<=after["total"],
+                            "Peer does not bracket the full supervisor interval")
+                stationary=after["apic"]==peer_cpu and after["moves"]==before["moves"]
+                if status==0 and stationary:
+                    accept(cpu,outcome)
+                else:
+                    if status==0:
+                        outcome["reason"]="peer-migration"
+                    rejected.append(outcome)
+            for pid in remaining.copy():
+                attempt(pid,False)
+        else:
+            for pid in remaining.copy():
+                cpu=placements[pid]["apic"]
+                run=cpu not in covered
+                status,outcome,_=attempt(pid,run)
+                if run and status==0:
+                    accept(cpu,outcome)
+                elif run:
+                    rejected.append(outcome)
+        require(not remaining,"Uncollected wave candidate or peer")
     require(covered==apics and len(intervals)==len(apics),"Incomplete per-CPU supervisor coverage")
     end=snap("COMPLETE")
     require(progresses(start,end) and floor_ms<=end["ms"]<=deadline and end["total"]>=floor_total,
