@@ -215,8 +215,12 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
            aRuntimeProcess=False, aSupervisorImage=None):
     require(aSupervisorImage is None or (aRuntimeProcess and aSupervisorImage in ("control","test")),
             "Supervisor image scenario requires the existing foreground regression")
+    pWorkloadMarkers=(b"AGENTOS SUPERVISOR",b"AGENTOS SERVICE ",b"AGENTOS TEST ")
     require(aLog.count(b"AGENTOS TEST RUNNER ")==int(aSupervisorImage=="test"),
             "Unexpected runner invocation outside its foreground interval")
+    if aSupervisorImage!="test":
+        require(not any(marker in aLog for marker in pWorkloadMarkers),
+                "Acceptance supervisor ran in the ordinary distribution")
     pTimerCpus = timerCpuCount(aLog,aCpus)
     pRoots,pChildren,pEnds = (list(pPattern.finditer(aLog)) for pPattern in
                               (ROOT_START,SHELL_START,SESSION_STOP))
@@ -259,8 +263,9 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
             pConsumed,pSupervisor,pNewPids=supervisor_prefix(
                 pInteractive,pShell,int(pShellExits[0][2],16),
                 pPrior | pPrefixPids,aSupervisorImage,set(pApicList))
-            require(aLog.count(b"AGENTOS TEST ")==pInteractive[:pConsumed].count(b"AGENTOS TEST "),
-                    "Locality evidence replayed outside its foreground interval")
+            require(all(aLog.count(marker)==pInteractive[:pConsumed].count(marker)
+                        for marker in pWorkloadMarkers),
+                    "Supervisor evidence outside its authenticated foreground interval")
             pPrefixPids.update(pNewPids)
             pInteractive=pInteractive[pConsumed:]
     pClean = without_kernel_events(pInteractive)

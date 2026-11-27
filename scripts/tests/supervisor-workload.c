@@ -1,10 +1,10 @@
-#include "abi.h"
+#include "../../user/abi.h"
 
 /*
- * Stage-3 PID-1 service supervisor: synchronous, finite acceptance profile.
+ * Standalone finite supervisor acceptance workload, never linked into PID1.
  * Each child is a separate protected process. All exits (including forced
  * termination) are collected; no worker retains memory or descriptors after
- * completion. A true long-running service registry will build on this policy.
+ * completion. The persistent service registry is independent of this test.
  */
 enum {
     MAX_ATTEMPTS = 3,

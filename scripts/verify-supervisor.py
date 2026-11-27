@@ -1,4 +1,4 @@
-"""Strict independent COM1 evidence check for PID1 service supervision.
+"""Strict independent supervisor interval and distribution absence checks.
 
 The kernel's USER EXIT/KILL markers and the parent supervisor's SERVICE
 markers must agree on identity, status, attempt count and exact ordering.
@@ -57,7 +57,15 @@ def event(line):
     return None
 
 
+def verify_absent(text):
+    """Distribution-only check. This is NOT proof of runtime supervision."""
+    require(not any(marker in text for marker in
+                    ("AGENTOS SUPERVISOR","AGENTOS SERVICE ","AGENTOS TEST ")),
+            "Unexpected acceptance supervisor workload in ordinary distribution")
+
+
 def verify(text, cpus):
+    """Historical boot evidence only; current CI uses the staged runtime gate."""
     require(cpus in (1, 2), "Expected 1 or 2 CPUs")
     sections = []
     current = None

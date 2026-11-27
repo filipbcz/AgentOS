@@ -66,7 +66,7 @@ for app in init fault receiver service shell svc_ok svc_fail svc_hang orphan_par
     if [[ "$app" == svc_alive || "$app" == svc_flaky ]]; then entry=svc_worker; fi
     gcc-13 -c "$root/user/$entry.S" -o user.o
     objects=(user.o)
-    case "$app" in init) sources=(transfer client supervisor orphans forktest demand migration service_manager);; receiver) sources=(receive);; service) sources=(service);; shell) sources=(shell service_client);; manager) sources=(service_manager);; svc_alive|svc_flaky) sources=(svc_worker);; *) sources=();; esac
+    case "$app" in init) sources=(transfer client orphans forktest demand migration service_manager);; receiver) sources=(receive);; service) sources=(service);; shell) sources=(shell service_client);; manager) sources=(service_manager);; svc_alive|svc_flaky) sources=(svc_worker);; *) sources=();; esac
     for src in "${sources[@]}"; do
         defines=()
         if [[ "$app" == svc_flaky ]]; then defines=(-DAGENTOS_FLAKY); fi
@@ -148,6 +148,9 @@ sha256sum "$out/"*.efi
 if ((staging)); then
     stage_out="$out/supervisor-staging"
     mkdir "$stage_out"
+    gcc-13 -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
+        -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large \
+        -c "$root/scripts/tests/supervisor-workload.c" -o supervisor.o
     cp loader.o supervisor.o layout.ld "$stage_out/"
     gcc-13 -c "$root/scripts/tests/supervisor-runner.S" -o runner-entry.o
     gcc-13 -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \

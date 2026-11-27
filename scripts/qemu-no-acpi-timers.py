@@ -583,7 +583,9 @@ def scenario(args):
                             "Inconsistent TSC fleet diagnostics")
                     receipt["qualified_tsc_cpus"]=qualified
                 smoke.processes.verify(text,apics)
-                smoke.supervisor.verify(text,args.cpus)
+                if variant!="test":
+                    smoke.supervisor.verify_absent(text)
+                # Staged proof is mandatory in the full runtime session below.
                 smoke.orphans.verify(text,args.cpus)
                 smoke.cow.verify(text,args.cpus)
                 smoke.demand.verify(text,args.cpus)

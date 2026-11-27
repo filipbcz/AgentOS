@@ -73,7 +73,7 @@ class DemandEvidenceTests(unittest.TestCase):
             gProcess.verify(pLog, list(range(pCpus)))
             gCow.verify(pLog, pCpus)
             gOrphans.verify(pLog, pCpus)
-            gSupervisor.verify(pLog, pCpus)
+            gSupervisor.verify_absent(pLog)
 
     def testMissingAndDuplicatedEvidenceIsRejected(self):
         pLines = scenario().splitlines()

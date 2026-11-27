@@ -169,7 +169,8 @@ def reproduce(root, out, stage, write_maps):
     """Rebuild both complete unsigned EFI files from the one archived loader
     object and the actual CPIOs. This verifies all link-time changes, not just
     selected instruction bytes. Recompile the common object from the pinned
-    source and check the linked runner, without touching either signed image.
+    source and check the linked runner and the supervisor-free production
+    init, without touching either signed image.
     """
     with tempfile.TemporaryDirectory(prefix="agentos-relink-") as directory:
         work=Path(directory)
@@ -182,7 +183,19 @@ def reproduce(root, out, stage, write_maps):
                 "-c",str(root/"boot/loader.c"),"-o","loader.check.o")
         require((work/"loader.check.o").read_bytes()==(work/"loader.o").read_bytes(),
                 "Common loader object does not match the source")
-        command(work,"gcc-13",*CFLAGS,"-c",str(root/"user/supervisor.c"),"-o","supervisor.check.o")
+        # Independently reproduce the actual production /init from only its
+        # remaining modules. No acceptance workload object may enter this link.
+        command(work,"gcc-13","-c",str(root/"user/init.S"),"-o","init-entry.o")
+        init_objects=["init-entry.o"]
+        for name in ("transfer","client","orphans","forktest","demand","migration","service_manager"):
+            obj=name+".init.o"
+            command(work,"gcc-13",*CFLAGS,"-c",str(root/"user"/(name+".c")),"-o",obj)
+            init_objects.append(obj)
+        command(work,"ld","--no-undefined","--build-id=none","-z","noexecstack","-s",
+                "-T",str(root/"user/user.ld"),"-o","init",*init_objects)
+        require((work/"init").read_bytes()==cpio_entries((out/"initramfs.cpio").read_bytes())["init"][1],
+                "Embedded production init does not reproduce without supervisor workload")
+        command(work,"gcc-13",*CFLAGS,"-c",str(root/"scripts/tests/supervisor-workload.c"),"-o","supervisor.check.o")
         require((work/"supervisor.check.o").read_bytes()==(work/"supervisor.o").read_bytes(),
                 "Runner supervisor object differs from source")
         command(work,"gcc-13","-c",str(root/"scripts/tests/supervisor-runner.S"),"-o","runner-entry.o")

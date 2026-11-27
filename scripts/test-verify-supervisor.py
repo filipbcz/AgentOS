@@ -52,13 +52,20 @@ def scenario(parent=1, apic=0):
 
 
 class SupervisorEvidenceTests(unittest.TestCase):
-    def test_one_and_two_cpu_proves_both_verifiers_compatible(self):
-        log = scenario()
-        self.assertEqual(supervisor.verify(log, 1), 1)
-        processes.verify(log, [0])
-        log = scenario(1, 0) + scenario(10, 1)
-        self.assertEqual(supervisor.verify(log, 2), 2)
-        processes.verify(log, [0, 1])
+    def test_legacy_interval_evidence_and_current_distribution_are_distinct(self):
+        for cpus in (1,2):
+            legacy = scenario() + (scenario(10,1) if cpus==2 else "")
+            self.assertEqual(supervisor.verify(legacy,cpus),cpus)
+            with self.assertRaises(supervisor.VerificationError):
+                supervisor.verify_absent(legacy)
+            with self.assertRaises(processes.VerificationError):
+                processes.verify(legacy,list(range(cpus)))
+            current=fixtures.scenario()+(fixtures.scenario(1,10) if cpus==2 else "")
+            supervisor.verify_absent(current)
+            processes.verify(current,list(range(cpus)))
+            # Absence is not a substitute for historical or staged workload evidence.
+            with self.assertRaises(supervisor.VerificationError):
+                supervisor.verify(current,cpus)
 
     def rejected(self, log):
         with self.assertRaises(supervisor.VerificationError):
@@ -100,16 +107,20 @@ class SupervisorEvidenceTests(unittest.TestCase):
         with self.assertRaises(supervisor.VerificationError):
             supervisor.verify(log, 2)
 
-    def test_core_verifier_rejects_unclosed_or_wrong_parent_boundary(self):
+    def test_core_verifier_rejects_old_boot_and_isolated_workload_markers(self):
         log = scenario()
-        processes.verify(log, [0])
-        bad = log.replace("AGENTOS SUPERVISOR ENDED PARENT=0000000000000001", "")
-        with self.assertRaises(processes.VerificationError):
-            processes.verify(bad, [0])
-        bad = log.replace("SUPERVISOR BEGIN PARENT=0000000000000001",
-                          "SUPERVISOR BEGIN PARENT=0000000000000002")
-        with self.assertRaises(processes.VerificationError):
-            processes.verify(bad, [0])
+        for bad in (log,
+                    log.replace("AGENTOS SUPERVISOR ENDED PARENT=0000000000000001",""),
+                    log.replace("SUPERVISOR BEGIN PARENT=0000000000000001",
+                                "SUPERVISOR BEGIN PARENT=0000000000000002")):
+            with self.assertRaises(processes.VerificationError):
+                processes.verify(bad,[0])
+        for marker in ("AGENTOS SUPERVISOR BEGIN", "AGENTOS SERVICE REAP", "AGENTOS TEST RUNNER"):
+            for text in (marker+"\n"+fixtures.scenario(),fixtures.scenario()+marker+"\n"):
+                with self.assertRaises(processes.VerificationError):
+                    processes.verify(text,[0])
+                with self.assertRaises(supervisor.VerificationError):
+                    supervisor.verify_absent(text)
 
 
 if __name__ == "__main__":

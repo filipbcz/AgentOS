@@ -40,8 +40,6 @@ ORDER = ("fault", "survived", "received", "exit", "sent", "service", "exit",
          "reply", "exit", "check")
 SHELL_START = re.compile(r"AGENTOS SHELL START PID=([0-9a-f]{16})")
 MANAGER_SESSION = re.compile(r"AGENTOS MANAGER SESSION START PID=([0-9a-f]{16})")
-SUPERVISOR_BEGIN = re.compile(r"AGENTOS SUPERVISOR BEGIN PARENT=([0-9a-f]{16})")
-SUPERVISOR_END = re.compile(r"AGENTOS SUPERVISOR ENDED PARENT=([0-9a-f]{16})")
 ORPHAN_BEGIN = re.compile(r"AGENTOS ORPHAN BEGIN ROOT=([0-9a-f]{16})")
 ORPHAN_END = re.compile(r"AGENTOS ORPHAN ENDED ROOT=([0-9a-f]{16})")
 COW_BEGIN = re.compile(r"AGENTOS COW BEGIN ROOT=([0-9a-f]{16}) CHILD=0000000000000000")
@@ -61,8 +59,6 @@ def verify(text, apic_ids):
     require(expected_cpus and len(expected_cpus) == len(apic_ids),
             "Expected APIC IDs must be nonempty and unique")
     events = []
-    supervisor_open = None
-    supervised_parents = []
     orphan_open = None
     orphan_roots = []
     cow_open = None
@@ -71,10 +67,14 @@ def verify(text, apic_ids):
     pDemandRoots = []
     manager_open = False
     for number, line in enumerate(text.splitlines(), 1):
+        # Only the separate foreground verifier owns the relocated workload.
+        require(not any(marker in line for marker in
+                        ("AGENTOS SUPERVISOR", "AGENTOS SERVICE ", "AGENTOS TEST ")),
+                f"Acceptance supervisor executed during ordinary boot at line {number}")
         if line.startswith("AGENTOS MANAGER SESSION START"):
             match = MANAGER_SESSION.fullmatch(line)
             require(match is not None and int(match[1],16)>0 and not manager_open and
-                    supervisor_open is None and orphan_open is None and cow_open is None and pDemandOpen is None and
+                    orphan_open is None and cow_open is None and pDemandOpen is None and
                     sum(kind=="check" for kind,_,_ in events)==len(expected_cpus),
                     f"Operational root manager began before CPU process tests completed at {number}")
             manager_open=True
@@ -92,7 +92,7 @@ def verify(text, apic_ids):
         if line.startswith("AGENTOS DEMAND "):
             pBegin = gDemandBegin.fullmatch(line)
             pEnd = gDemandEnd.fullmatch(line)
-            require(supervisor_open is None and orphan_open is None and cow_open is None,
+            require(orphan_open is None and cow_open is None,
                     f"Demand phase overlaps prior stage at line {number}")
             if pBegin:
                 require(pDemandOpen is None and len(cow_roots) > len(pDemandRoots) and
@@ -118,7 +118,7 @@ def verify(text, apic_ids):
         if line.startswith("AGENTOS COW "):
             begin = COW_BEGIN.fullmatch(line)
             end = COW_END.fullmatch(line)
-            require(supervisor_open is None and orphan_open is None,
+            require(orphan_open is None,
                     f"COW phase overlaps prior stage at line {number}")
             if begin:
                 require(cow_open is None and len(orphan_roots) > len(cow_roots),
@@ -141,10 +141,11 @@ def verify(text, apic_ids):
         if line.startswith("AGENTOS ORPHAN "):
             begin = ORPHAN_BEGIN.fullmatch(line)
             end = ORPHAN_END.fullmatch(line)
-            require(supervisor_open is None, f"Orphan phase overlaps supervisor at {number}")
             if begin:
-                require(orphan_open is None and len(supervised_parents) > len(orphan_roots),
-                        f"Orphan phase is nested or precedes supervisor at line {number}")
+                require(orphan_open is None and events and events[-1][0]=="reply" and
+                        events[-1][1]["pid"]==int(begin[1],16) and
+                        len(orphan_roots)<sum(kind=="reply" for kind,_,_ in events),
+                        f"Orphan phase is nested or does not follow its authenticated IPC root at line {number}")
                 orphan_open = int(begin[1], 16)
                 require(orphan_open != 0, f"Zero orphan root at line {number}")
             elif end:
@@ -158,30 +159,6 @@ def verify(text, apic_ids):
         if orphan_open is not None:
             # verify-orphans.py independently validates the exact USER EXIT,
             # KILL, adoption and reaping subtrace inside these boundaries.
-            continue
-        if line.startswith("AGENTOS SUPERVISOR "):
-            begin = SUPERVISOR_BEGIN.fullmatch(line)
-            end = SUPERVISOR_END.fullmatch(line)
-            if begin:
-                require(supervisor_open is None,
-                        f"Nested supervisor boundary at line {number}")
-                require(events and events[-1][0] == "reply",
-                        f"Supervisor must follow authenticated IPC test at line {number}")
-                supervisor_open = int(begin[1], 16)
-                require(supervisor_open > 0,
-                        f"Zero supervisor PID at line {number}")
-            elif end:
-                require(supervisor_open is not None and
-                        supervisor_open == int(end[1], 16),
-                        f"Unmatched supervisor end at line {number}")
-                supervised_parents.append(supervisor_open)
-                supervisor_open = None
-            else:
-                raise VerificationError(f"Malformed supervisor boundary at line {number}")
-            continue
-        if supervisor_open is not None:
-            # The independently validated supervisor test owns this subtrace.
-            # We must not interpret its service-child exits as IPC child exits.
             continue
         if line.startswith("AGENTOS SHELL START"):
             require(orphan_open is None and cow_open is None,
@@ -203,7 +180,6 @@ def verify(text, apic_ids):
         else:
             raise VerificationError(f"Malformed process evidence at line {number}: {line}")
 
-    require(supervisor_open is None, "Unterminated supervisor interval")
     require(orphan_open is None, "Unterminated orphan interval")
     require(cow_open is None, "Unterminated COW interval")
     require(pDemandOpen is None, "Unterminated demand interval")
@@ -211,8 +187,6 @@ def verify(text, apic_ids):
             "Missing demand interval on one or more CPUs")
     require(not cow_roots or len(cow_roots) == len(expected_cpus),
             "Missing fork/COW interval on one or more CPUs")
-    require(not supervised_parents or len(supervised_parents) == len(expected_cpus),
-            "Missing supervisor interval on one or more CPUs")
     require(not orphan_roots or len(orphan_roots) == len(expected_cpus),
             "Missing orphan interval on one or more CPUs")
     require(len(events) == len(ORDER) * len(expected_cpus),
@@ -229,9 +203,6 @@ def verify(text, apic_ids):
         child, receiver, server = fault["pid"], received["pid"], service["pid"]
         context = f"APIC {cpu:016x}, parent {parent:016x}"
         pids = {parent, child, receiver, server}
-        if supervised_parents:
-            require(supervised_parents[len(seen_cpus)] == parent,
-                    f"Supervisor interval does not belong to this parent: {context}")
         if orphan_roots:
             require(orphan_roots[len(seen_cpus)] == parent,
                     f"Orphan interval does not belong to this parent: {context}")

@@ -133,7 +133,7 @@ printf 'Testing actual cross-CPU scheduler ownership, lifecycle and timed waits 
 "$pRustc" --edition 2021 --test "$pRoot/scripts/tests/scheduler-timed-host.rs" -o "$pOut/scheduler-timed-tests"
 "$pOut/scheduler-timed-tests"
 
-printf 'Testing PID1 supervision and forced-child cleanup with %s\n' "$pCc"
+printf 'Testing standalone supervisor workload and forced-child cleanup with %s\n' "$pCc"
 "$pCc" -std=c11 -O2 -Wall -Wextra -Werror -fno-stack-protector \
     "$pRoot/scripts/tests/supervisor-host.c" -o "$pOut/supervisor-tests"
 "$pOut/supervisor-tests"
@@ -251,7 +251,7 @@ for pApp in init fault receiver service shell svc_ok svc_fail svc_hang orphan_pa
     "$pCc" -c "$pRoot/user/$pEntry.S" -o "$pOut/$pApp-entry.o"
     pObjects=("$pOut/$pApp-entry.o")
     case "$pApp" in
-        init) pSources=(transfer client supervisor orphans forktest demand migration service_manager);;
+        init) pSources=(transfer client orphans forktest demand migration service_manager);;
         receiver) pSources=(receive);;
         service) pSources=(service);;
         shell) pSources=(shell service_client);;
@@ -271,6 +271,9 @@ for pApp in init fault receiver service shell svc_ok svc_fail svc_hang orphan_pa
         -o "$pOut/$pApp" "${pObjects[@]}"
     "$pPython" "$pRoot/scripts/verify-user-abi.py" "$pOut/$pApp"
 done
+"$pCc" -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
+    -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large \
+    -c "$pRoot/scripts/tests/supervisor-workload.c" -o "$pOut/supervisor.o"
 "$pCc" -c "$pRoot/scripts/tests/supervisor-runner.S" -o "$pOut/supervisor-runner-entry.o"
 "$pCc" -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
     -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large \

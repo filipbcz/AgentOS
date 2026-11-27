@@ -64,9 +64,6 @@ _start:
     call run_ipc
     test %eax, %eax
     jne finished
-    call run_supervisor
-    test %eax, %eax
-    jne finished
     call run_orphans
     test %eax, %eax
     jne finished

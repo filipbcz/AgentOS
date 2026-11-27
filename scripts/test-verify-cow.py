@@ -41,12 +41,12 @@ class CowEvidenceTests(unittest.TestCase):
         self.assertEqual(cow.verify(log,1),1)
         processes.verify(log,[0])
         orphans.verify(log,1)
-        supervisor.verify(log,1)
+        supervisor.verify_absent(log)
         log=scenario(1,0)+scenario(25,1)
         self.assertEqual(cow.verify(log,2),2)
         processes.verify(log,[0,1])
         orphans.verify(log,2)
-        supervisor.verify(log,2)
+        supervisor.verify_absent(log)
 
     def rejected(self,log):
         with self.assertRaises(cow.VerificationError):

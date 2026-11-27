@@ -511,7 +511,9 @@ def boot(args):
     if len(apics) != args.cpus or len(set(apics)) != args.cpus:
         raise RuntimeError(f"Missing per-CPU APIC timer evidence: {apics}")
     processes.verify(text, apics)
-    supervisor.verify(text, args.cpus)
+    if supervisor_image!="test":
+        supervisor.verify_absent(text)
+    # The test image must pass the full authenticated runtime session below.
     orphans.verify(text, args.cpus)
     cow.verify(text, args.cpus)
     demand.verify(text, args.cpus)

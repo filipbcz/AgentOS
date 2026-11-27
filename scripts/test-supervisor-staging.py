@@ -307,6 +307,15 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual([r["status"] for r in result["runtime_process_regression"]],[0,42,270])
             self.assertEqual(result["restarted_pids"],[31,32,33])
             self.assertEqual(result["runtime_supervisor"]["absent"],variant=="control")
+            # The entire normal boot (and every non-workload byte afterward)
+            # must be free of the relocated supervisor, even in the staged image.
+            markers=(b"AGENTOS SUPERVISOR BEGIN PARENT=0000000000000001\r\n",
+                     b"AGENTOS SERVICE DONE PARENT=0000000000000001\r\n",
+                     b"AGENTOS TEST PEER_BEGIN PID=0000000000000001\r\n")
+            for marker in markers:
+                for bad in (marker+log,log.replace(prefix,prefix+marker,1)):
+                    with self.assertRaises(session.VerificationError):
+                        session.verify(bad,serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant)
             for bad,bad_input in ((log,serial[1:]),(log.replace(b"FRAMES=OK",b"FRAMES=LEAK"),serial),
                                   (log.replace(b"VECTOR=000000000000000e",b"VECTOR=000000000000000d"),serial),
                                   (log.replace(b"TIMERS=0000000000000005",b"TIMERS=0000000000000100"),serial)):
