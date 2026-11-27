@@ -49,7 +49,10 @@ console = load("qemu_console_image", "verify-console-image.py")
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--cpus", type=int, choices=(1, 2), required=True)
+    cpu_profile=parser.add_mutually_exclusive_group(required=True)
+    cpu_profile.add_argument("--cpus", type=int, choices=(1, 2))
+    cpu_profile.add_argument("--basic-smp-cpus", type=int, choices=(4, 8),
+                             help="Explicit ordinary signed SMP session, not the staged 1/2 CPU gate")
     parser.add_argument("--memory-mib", type=int, choices=(256, 512), default=256)
     parser.add_argument("--no-hpet", action="store_true", help="Disable HPET in actual QEMU hardware")
     parser.add_argument("--accel", choices=("tcg","kvm"), default="tcg",
@@ -65,6 +68,9 @@ def main():
     parser.add_argument("--ovmf-code", type=Path, required=True)
     parser.add_argument("--ovmf-vars", type=Path, required=True)
     args = parser.parse_args()
+    args.basic_smp=args.basic_smp_cpus is not None
+    if args.basic_smp:
+        args.cpus=args.basic_smp_cpus
     if args.runtime_process_regression and not args.session:
         parser.error("--runtime-process-regression requires --session")
     if args.supervisor_image and not args.runtime_process_regression:
@@ -328,6 +334,15 @@ def run_session(process, capture, qmp, destination, runtime_process_regression=F
 
 
 def boot(args):
+    basic_smp=getattr(args,"basic_smp",False)
+    if basic_smp:
+        if (args.cpus not in (4,8) or not args.session or args.memory_mib!=256 or args.no_hpet or
+            args.accel!="tcg" or getattr(args,"runtime_process_regression",False) or
+            getattr(args,"supervisor_image",None) is not None or getattr(args,"guest_oom",False)):
+            raise ValueError("Basic SMP requires an ordinary 4/8 CPU, 256 MiB HPET TCG session; no staged workload")
+        basic=load("basic_smp_evidence","verify-basic-smp.py")
+    elif args.cpus not in (1,2):
+        raise ValueError("The existing smoke contract requires 1/2 CPUs")
     root = ROOT
     commit = subprocess.check_output(["git", "rev-parse", "--verify", "HEAD"],
                                      cwd=root, text=True).strip()
@@ -362,8 +377,17 @@ def boot(args):
         profile += "-sv-"+supervisor_image
     elif getattr(args, "runtime_process_regression", False):
         profile += "-runtime-process-regression"
+    if basic_smp:
+        profile += "-basic-smp"
     destination = root / "build/check" / profile
     destination.mkdir(parents=True, exist_ok=True)
+    if basic_smp:
+        for name in ("smoke.json","failure.json","basic-smp.json","qmp-basic-smp.json"):
+            (destination/name).unlink(missing_ok=True)
+        host=basic.host_capacity()
+        (destination/"host-capacity.json").write_text(json.dumps(host,indent=2,sort_keys=True)+"\n")
+        if image.get("profile")!="default":
+            raise ValueError("Basic SMP must use the ordinary distribution build")
     if supervisor_image is not None:
         for name in ("smoke.json", "failure.json"):
             (destination/name).unlink(missing_ok=True)
@@ -381,6 +405,8 @@ def boot(args):
                     "::EFI/BOOT/BOOTX64.EFI", str(copied)], check=True)
     if evidence.sha256(copied) != image_sha:
         raise RuntimeError("EFI on QEMU ESP differs from the signed build output")
+    if basic_smp:
+        identity=basic.verify_image(root,copied,commit)
     vm_vars = destination / "OVMF_VARS.secboot.fd"
     if vm_vars.exists():
         vm_vars.unlink()
@@ -452,6 +478,7 @@ def boot(args):
     last_size = -1
     run_succeeded = False
     actual_kvm = None
+    qmp_roster = None
     qmp = None
     (destination / "qemu-command.json").write_text(json.dumps(qemu,indent=2)+"\n")
     serial_capture = None
@@ -475,6 +502,9 @@ def boot(args):
                     actual_kvm=qmp.execute("query-kvm")
                     if bool(actual_kvm["enabled"]) != (args.accel=="kvm"):
                         raise RuntimeError("Unexpected actual accelerator")
+                    if basic_smp:
+                        qmp_roster=basic.capture_cpus(qmp,args.cpus,actual_kvm)
+                        (destination/"qmp-basic-smp.json").write_text(json.dumps(qmp_roster,indent=2,sort_keys=True)+"\n")
                     qmp.screenshot(destination / "shell-screen.ppm")
                     console.verify(destination / "shell-screen.ppm", aLevel="info", aOutput="both")
                     if args.session:
@@ -558,7 +588,7 @@ def boot(args):
     if supervisor_image!="test":
         supervisor.verify_absent(text)
     # The test image must pass the full authenticated runtime session below.
-    orphans.verify(text, args.cpus)
+    orphans.verify(text, args.cpus, basic_smp=basic_smp)
     # Staged memory evidence belongs exclusively to the strict foreground
     # verifier below. Every other profile must lack it entirely.
     if supervisor_image!="test":
@@ -572,7 +602,8 @@ def boot(args):
         session_result = session.verify(serial.read_bytes(), (destination / "com1-input.bin").read_bytes(),
                                         True, args.cpus,
                                         aRuntimeProcess=getattr(args,"runtime_process_regression",False),
-                                        aSupervisorImage=supervisor_image,aMigrationStaged=True,aFaultStaged=True,aOomLayout=oom_layout)
+                                        aSupervisorImage=supervisor_image,aMigrationStaged=True,aFaultStaged=True,aOomLayout=oom_layout,
+                                        aBasicSmp=basic_smp)
         if supervisor_image is not None:
             migration_result = session_result["runtime_migration"]
     bases = re.findall(r"(?m)^\[INFO\] KERNEL IMAGE BASE=([0-9a-f]{16})\r?$", text)
@@ -616,6 +647,22 @@ def boot(args):
         "com1_sha256": evidence.sha256(serial),
         "firmware_vars_sha256_after_boot": evidence.sha256(vm_vars),
     }
+    if basic_smp:
+        # Re-read the actual on-disk EFI after the completed guest, not merely
+        # the copy made before boot. The same public certificate verifies it.
+        after=destination/"esp-after.efi"
+        after.unlink(missing_ok=True)
+        subprocess.run(["mcopy","-i",f"{raw}@@1048576","::EFI/BOOT/BOOTX64.EFI",str(after)],check=True)
+        after_identity=basic.verify_image(root,after,commit)
+        if after_identity!=identity:
+            raise RuntimeError("Distribution EFI identity changed during basic SMP session")
+        progress=basic.verify_progress(text,args.cpus,qmp_roster)
+        if progress["boot_roots"]!=boot_roots:
+            raise RuntimeError("Basic SMP boot root replay differs")
+        receipt["basic_smp"]={"contract":"ordinary-smp-v1","host":host,"qmp":qmp_roster,
+                              "identity":identity,"progress":progress,
+                              "oversubscribed":args.cpus>host["effective_cpu_capacity"]}
+        (destination/"basic-smp.json").write_text(json.dumps(receipt["basic_smp"],indent=2,sort_keys=True)+"\n")
     if guest_oom:
         receipt["guest_oom_contract"]="bounded-demand-oom-v1"
         receipt["guest_oom"]=session_result["runtime_oom"]

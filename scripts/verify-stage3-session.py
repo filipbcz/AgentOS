@@ -221,8 +221,8 @@ def without_kernel_events(aBytes):
     return KERNEL_EVENT.sub(b"",aBytes)
 
 
-def bootCpuRoster(aLog, aCpus):
-    require(type(aCpus) is int and aCpus in (1,2), "Invalid configured CPU count")
+def bootCpuRoster(aLog, aCpus, *, aBasicSmp=False):
+    require(type(aCpus) is int and aCpus in ((4,8) if aBasicSmp else (1,2)), "Invalid configured CPU count")
     shell = SHELL_START.search(aLog)
     require(shell is not None, "Missing shell boundary for actual CPU roster")
     roster = re.findall(rb"(?m)^AGENTOS TASK (BSP|AP) APIC=("+HEX+
@@ -251,7 +251,10 @@ def migration_prefix(data, shell, shell_cr3, prior_pids, variant, apics):
     return len(echo)+consumed,result,pids
 
 
-def timerCpuCount(aLog, aCpus, *, aMigrationStaged=False):
+def timerCpuCount(aLog, aCpus, *, aMigrationStaged=False, aBasicSmp=False):
+    if aBasicSmp:
+        require(aMigrationStaged,"Basic SMP requires the current ordinary boot contract")
+        return len(bootCpuRoster(aLog,aCpus,aBasicSmp=True))
     require(aCpus is None or type(aCpus) is int and aCpus in (1,2),
             "Invalid configured CPU count for runtime timing")
     if aMigrationStaged:
@@ -296,7 +299,13 @@ def verify_idle(aBytes, aCpus=1, aClockMaintenanceMs=1000):
 
 def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceMs=1000,
            aRuntimeProcess=False, aSupervisorImage=None, aHistoricalBootMemory=False, aMigrationStaged=False,
-           aFaultStaged=False, aOomLayout=None):
+           aFaultStaged=False, aOomLayout=None, aBasicSmp=False):
+    if aBasicSmp:
+        require(aCpus in (4,8) and aInput is not None and aKeyboard and aMigrationStaged and aFaultStaged and
+                not aRuntimeProcess and aSupervisorImage is None and not aHistoricalBootMemory and aOomLayout is None,
+                "Basic SMP requires the explicit ordinary full session without staged or historical workloads")
+        require(aLog.endswith(b"[INFO] INTERACTIVE SHELL STOPPED\r\n"),
+                "Basic SMP requires final structured shutdown completion")
     require(aOomLayout is None or (aFaultStaged and aSupervisorImage in ("control","test")),
             "OOM requires the explicit paired staged contract")
     if aOomLayout is None:
@@ -331,7 +340,7 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
     if aSupervisorImage!="test":
         require(not any(marker in aLog for marker in pWorkloadMarkers),
                 "Acceptance workload ran in the ordinary distribution")
-    pTimerCpus = timerCpuCount(aLog,aCpus,aMigrationStaged=aMigrationStaged)
+    pTimerCpus = timerCpuCount(aLog,aCpus,aMigrationStaged=aMigrationStaged,aBasicSmp=aBasicSmp)
     pRoots,pChildren,pEnds = (list(pPattern.finditer(aLog)) for pPattern in
                               (ROOT_START,SHELL_START,SESSION_STOP))
     require(len(pRoots)==len(pChildren)==len(pEnds)==1,
