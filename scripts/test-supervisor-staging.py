@@ -524,13 +524,13 @@ class RuntimeTests(unittest.TestCase):
                                           b"".join((command+"\r\n").encode()+session.SUPERVISOR_MISSING
                                                    for command in session.MEMORY_COMMANDS)+
                                           (session.IPC_COMMAND+"\r\n").encode()+session.SUPERVISOR_MISSING),
-                               ("test",supervisor_transcript()+supervisor_transcript(runner=40,pipe=True)+
+                               ("test",supervisor_transcript(runner=24)+supervisor_transcript(runner=40,pipe=True)+
                                 supervisor_transcript(runner=60,memory="cow")+supervisor_transcript(runner=80,memory="demand")+
                                 supervisor_transcript(runner=90,ipc=True))):
             migration_echo=(session.MIGRATION_COMMAND+"\r\n").encode()
             migration_fixture=load("test-verify-migration.py")
             prefix=migration_echo+(session.SUPERVISOR_MISSING if variant=="control" else
-                                   migration_fixture.foreground((7,)))+prefix
+                                   migration_fixture.foreground((7,),root=19))+prefix
             prefix+=((session.ADOPTION_COMMAND+"\r\n").encode()+session.SUPERVISOR_MISSING
                      if variant=="control" else adoption_transcript())
             serial=common_input+(session.ADOPTION_BYTES if variant=="test" else b"")+session.transmitted_input(9,True)
