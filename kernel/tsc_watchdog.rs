@@ -2,7 +2,7 @@
 //! clock. Never substitutes TSC for that clock on disagreement: two
 //! disagreeing counters alone cannot identify which counter failed.
 //! Samples include actual readout uncertainty and the measured CPU offset.
-use crate::{clock_quorum::Witness, tsc::Alignment};
+use crate::{clock_quorum::Witness, tsc::Alignment, cpu_topology::{CpuRoster, CpuSlot, MAX_CPUS}};
 use core::{cell::UnsafeCell, hint::spin_loop,
     sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering}};
 
@@ -169,42 +169,28 @@ impl Member {
 }
 
 struct Fleet {
-    expected: [u64; 4],
-    members: [Member; 256],
+    cpus: CpuRoster,
+    members: [Member; MAX_CPUS],
 }
 impl Fleet {
     const fn new() -> Self {
-        Self { expected: [0; 4], members: [Member::new(); 256] }
+        Self { cpus: CpuRoster::new(), members: [Member::new(); MAX_CPUS] }
     }
 
-    fn register(&mut self, bsp: u32, ids: impl IntoIterator<Item = u8>) -> bool {
-        // The current APIC topology uses xAPIC IDs, not a dense CPU index.
-        // Publish only a complete, nonduplicated enabled CPU roster.
-        let mut mask = [0u64; 4];
-        for id in ids {
-            let index = id as usize;
-            let bit = 1u64 << (index % 64);
-            if mask[index/64] & bit != 0 { return false; }
-            mask[index/64] |= bit;
-        }
-        if bsp >= 256 || mask[bsp as usize / 64] & (1u64 << (bsp % 64)) == 0 {
-            return false;
-        }
-        self.expected = mask;
+    fn register(&mut self, bsp: u32, ids: impl IntoIterator<Item = u32>) -> bool {
+        let Some(cpus) = CpuRoster::from_ids(ids) else { return false; };
+        if cpus.slot(bsp).is_none() { return false; }
+        self.cpus = cpus;
         true
     }
 
-    fn contains(&self, cpu: u32) -> bool {
-        cpu < 256 && self.expected[cpu as usize / 64] & (1u64 << (cpu % 64)) != 0
+    fn revoke(&mut self, slot: CpuSlot) {
+        self.members[slot.index()].verified = None;
     }
 
-    fn revoke(&mut self, cpu: u32) {
-        if self.contains(cpu) { self.members[cpu as usize].verified = None; }
-    }
-
-    fn observe(&mut self, cpu: u32, alignment: Alignment, sample: Sample,
+    fn observe(&mut self, slot: CpuSlot, alignment: Alignment, sample: Sample,
                point: Option<Point>, health: Health, completed_window: bool) {
-        let member = &mut self.members[cpu as usize];
+        let member = &mut self.members[slot.index()];
         member.alignment = Some(alignment);
         member.last_raw = Some(sample.after);
         // Refresh only from a newly completed independent window. Merely
@@ -216,9 +202,10 @@ impl Fleet {
         }
     }
 
-    fn witness(&mut self, cpu: u8, alignment: Alignment, raw: u64, hz: u64) -> Option<Witness> {
-        if hz == 0 || !self.contains(cpu as u32) { return None; }
-        let local = &self.members[cpu as usize];
+    fn witness(&mut self, cpu: u32, alignment: Alignment, raw: u64, hz: u64) -> Option<Witness> {
+        if hz == 0 { return None; }
+        let index = self.cpus.slot(cpu)?.index();
+        let local = &self.members[index];
         if local.alignment != Some(alignment) || raw < local.last_raw? ||
            local.last_witness.map_or(false, |last| raw < last) { return None; }
         let ticks = alignment.normalize(raw)?;
@@ -227,22 +214,18 @@ impl Fleet {
         let uncertainty = guard.checked_add(alignment.uncertainty_ticks)?;
         let now_high = ticks.checked_add(uncertainty)?;
         let max_age = hz as u128 * MAX_GAP_NS as u128 / 1_000_000_000;
-        // Use only registered CPU IDs, including sparse APIC IDs. All
-        // verified observations must still be fresh on the common scale.
-        for (word, mut pending) in self.expected.into_iter().enumerate() {
-            while pending != 0 {
-                let index = word*64 + pending.trailing_zeros() as usize;
-                pending &= pending-1;
-                let point = self.members[index].verified?;
-                let low = u64::try_from(point.low).ok()?;
-                if low > now_high || (now_high-low) as u128 > max_age {
-                    return None;
-                }
+        // Check every registered CPU's independently verified lease.
+        // The members array is indexed only by dense roster slots.
+        for member in &self.members[..self.cpus.ids().len()] {
+            let point = member.verified?;
+            let low = u64::try_from(point.low).ok()?;
+            if low > now_high || (now_high-low) as u128 > max_age {
+                return None;
             }
         }
         // A later read may not move backward even within the same
         // qualification lease. This is evidence, never lease renewal.
-        self.members[cpu as usize].last_witness = Some(raw);
+        self.members[index].last_witness = Some(raw);
         Some(Witness { cpu, ticks, hz, uncertainty_ticks: uncertainty })
     }
 }
@@ -278,7 +261,7 @@ impl RuntimeMonitor {
 
     /// Once, on the BSP before runtime publication, only if every enabled
     /// CPU has an independently qualified rate and bounded startup offset.
-    pub fn start(&self, bsp: u32, hz: u64, ids: impl IntoIterator<Item = u8>) -> bool {
+    pub fn start(&self, bsp: u32, hz: u64, ids: impl IntoIterator<Item = u32>) -> bool {
         self.with_data(|data| {
             if hz == 0 || self.state.load(Ordering::Relaxed) != 0 ||
                !data.fleet.register(bsp, ids) { return false; }
@@ -316,7 +299,7 @@ impl RuntimeMonitor {
                       sample: Option<Sample>) -> Health {
         self.with_data(|data| {
             if !self.active() { return watchdog.health(); }
-            if !data.fleet.contains(cpu) { return watchdog.unverified(); }
+            let Some(slot) = data.fleet.cpus.slot(cpu) else { return watchdog.unverified(); };
             if let Some(generation) = generation {
                 if generation < data.generation { return watchdog.health(); }
                 if generation > data.generation {
@@ -326,10 +309,10 @@ impl RuntimeMonitor {
                 }
             }
             let Some(sample) = sample.filter(|_| generation.is_some()) else {
-                data.fleet.revoke(cpu);
+                data.fleet.revoke(slot);
                 return watchdog.unverified();
             };
-            let member = &mut data.fleet.members[cpu as usize];
+            let member = &mut data.fleet.members[slot.index()];
             if member.generation != data.generation {
                 // Restart reference interval measurements, not the raw
                 // monotonicity and startup alignment of the actual CPU.
@@ -344,7 +327,7 @@ impl RuntimeMonitor {
             let hz = self.hz.load(Ordering::Relaxed);
             let bsp = cpu == self.bsp.load(Ordering::Relaxed);
             let normalized = sample.point(rate, alignment);
-            let old_alignment = data.fleet.members[cpu as usize].alignment;
+            let old_alignment = data.fleet.members[slot.index()].alignment;
             let cross = if rate == 0 || rate.abs_diff(hz) as u128 * 1000 > rate.min(hz) as u128 ||
                            old_alignment.map_or(false, |old| old != alignment) {
                 Comparison::Disagree
@@ -361,7 +344,7 @@ impl RuntimeMonitor {
             let previous = watchdog.baseline.map(|p| p.ns);
             let health = watchdog.observe(sample, rate, cross);
             let completed_window = watchdog.baseline.map(|p| p.ns) != previous;
-            data.fleet.observe(cpu, alignment, sample, normalized, health, completed_window);
+            data.fleet.observe(slot, alignment, sample, normalized, health, completed_window);
             if health == Health::Rejected {
                 self.state.store(2, Ordering::Release);
             } else if bsp && normalized.is_some() &&
@@ -375,11 +358,11 @@ impl RuntimeMonitor {
     /// This reads only evidence already published by independent watchdog
     /// observations. The caller samples the local TSC outside this lock,
     /// with IRQs masked; witness acquisition never calls the system clock.
-    pub fn witness(&self, cpu: u8, alignment: Alignment, raw: u64) -> Option<Witness> {
+    pub fn witness(&self, cpu: u32, alignment: Alignment, raw: u64) -> Option<Witness> {
         self.witness_at(0, cpu, alignment, raw)
     }
 
-    pub fn witness_at(&self, generation: u64, cpu: u8,
+    pub fn witness_at(&self, generation: u64, cpu: u32,
                       alignment: Alignment, raw: u64) -> Option<Witness> {
         if !self.active() { return None; }
         self.with_data(|data| {

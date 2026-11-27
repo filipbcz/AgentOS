@@ -459,7 +459,7 @@ impl Diagnostic {
         out
     }
 
-    pub fn new(id: u8, peer: &Peer) -> Self {
+    pub fn new(id: u32, peer: &Peer) -> Self {
         let mut out = Self { data: [0; 96], len: 0 };
         if let Some(hz) = peer.rate() {
             if let Some(a) = peer.alignment() {

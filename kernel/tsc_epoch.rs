@@ -1,41 +1,37 @@
 //! Qualified, normalized invariant TSC as a monotonic clocksource.
 //! Boot calibration and CPU synchronization are independent of runtime
 //! conversion. No PIT programming or scheduler deadline is a time sample.
-use crate::{clock_quorum::{TscBracket,Witness}, tsc::{Peer,QualifiedRate}};
-
-const MAX_ID: usize = 256;
+use crate::{clock_quorum::{TscBracket,Witness}, tsc::{Peer,QualifiedRate},
+    cpu_topology::{CpuRoster, MAX_CPUS}};
 const MAX_ALIGNMENT_NS: u128 = 100_000;
 
 /// Exact immutable CPU qualification records; CPU state is kept alive
 /// throughout the boot session.
 pub(crate) struct Roster<'a> {
-    peers: [Option<&'a Peer>; MAX_ID],
-    bsp: u8,
+    cpus: CpuRoster,
+    peers: [Option<&'a Peer>; MAX_CPUS],
+    bsp: u32,
     rate: QualifiedRate,
 }
 
 impl<'a> Roster<'a> {
-    pub(crate) fn qualify(bsp:u8, ids:&[u8],
-        members:impl IntoIterator<Item=(u8,&'a Peer)>) -> Option<Self> {
-        let mut expected=[false;MAX_ID];
-        for &id in ids {
-            if expected[id as usize] { return None; }
-            expected[id as usize]=true;
-        }
-        if !expected[bsp as usize] { return None; }
-        let mut peers:[Option<&Peer>;MAX_ID]=[None;MAX_ID];
+    pub(crate) fn qualify(bsp:u32, ids:&[u32],
+        members:impl IntoIterator<Item=(u32,&'a Peer)>) -> Option<Self> {
+        let cpus=CpuRoster::from_ids(ids.iter().copied())?;
+        let bsp_slot=cpus.slot(bsp)?.index();
+        let mut peers:[Option<&Peer>;MAX_CPUS]=[None;MAX_CPUS];
         for (id,peer) in members {
-            if !expected[id as usize] || peers[id as usize].is_some() ||
-                peers.iter().flatten().any(|p| core::ptr::eq(*p,peer)) {
+            let index=cpus.slot(id)?.index();
+            if peers[index].is_some() || peers.iter().flatten().any(|p| core::ptr::eq(*p,peer)) {
                 return None;
             }
-            peers[id as usize]=Some(peer);
+            peers[index]=Some(peer);
         }
-        let bsp_peer=peers[bsp as usize]?;
+        let bsp_peer=peers[bsp_slot]?;
         let rate=bsp_peer.qualification()?;
         let hz=rate.hz() as u128;
-        for (id,peer) in peers.iter().enumerate() {
-            if expected[id]!=peer.is_some() { return None; }
+        for (index,peer) in peers.iter().enumerate() {
+            if (index<cpus.ids().len())!=peer.is_some() { return None; }
             if let Some(peer)=peer {
                 let local=peer.qualification()?;
                 let a=peer.alignment()?;
@@ -43,7 +39,7 @@ impl<'a> Roster<'a> {
                    a.uncertainty_ticks as u128*1_000_000_000>hz*MAX_ALIGNMENT_NS {
                     return None;
                 }
-                if id==bsp as usize && (a.offset!=0 || a.uncertainty_ticks!=0) {
+                if index==bsp_slot && (a.offset!=0 || a.uncertainty_ticks!=0) {
                     return None;
                 }
             }
@@ -51,11 +47,12 @@ impl<'a> Roster<'a> {
         for peer in peers.iter().flatten() {
             if !peer.seal() { return None; }
         }
-        Some(Self{peers,bsp,rate})
+        Some(Self{cpus,peers,bsp,rate})
     }
 
     fn bracket(&self,s:Sample)->Result<TscBracket,Fault> {
-        let peer=self.peers[s.id as usize].ok_or(Fault::UnknownCpu)?;
+        let index=self.cpus.slot(s.id).ok_or(Fault::UnknownCpu)?.index();
+        let peer=self.peers[index].ok_or(Fault::UnknownCpu)?;
         let a=peer.alignment().ok_or(Fault::UnqualifiedCpu)?;
         let local=peer.qualification().ok_or(Fault::UnqualifiedCpu)?;
         if !crate::tsc::rates_match(self.rate,local) ||
@@ -81,7 +78,7 @@ pub(crate) fn select<'a>(physical_ready:bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Sample { pub id:u8, pub raw:u64 }
+pub(crate) struct Sample { pub id:u32, pub raw:u64 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -116,8 +113,8 @@ pub(crate) struct Epoch<'a> {
     roster:Roster<'a>,
     origin:TscBracket,
     latest:TscBracket,
-    last_raw:[u64;MAX_ID],
-    seen:[bool;MAX_ID],
+    last_raw:[u64;MAX_CPUS],
+    seen:[bool;MAX_CPUS],
     published:u128,
     fault:Option<Fault>,
 }
@@ -126,17 +123,18 @@ impl<'a> Epoch<'a> {
     pub(crate) fn new(roster:Roster<'a>,first:Sample)->Option<Self> {
         if first.id!=roster.bsp { return None; }
         let initial=roster.bracket(first).ok()?;
-        let mut last_raw=[0;MAX_ID];
-        let mut seen=[false;MAX_ID];
+        let mut last_raw=[0;MAX_CPUS];
+        let mut seen=[false;MAX_CPUS];
         for (id,peer) in roster.peers.iter().enumerate() {
             if let Some(peer)=peer {
                 last_raw[id]=peer.last_verified_raw();
                 seen[id]=true;
             }
         }
-        if first.raw<last_raw[first.id as usize] {return None;}
-        last_raw[first.id as usize]=first.raw;
-        seen[first.id as usize]=true;
+        let index=roster.cpus.slot(first.id)?.index();
+        if first.raw<last_raw[index] {return None;}
+        last_raw[index]=first.raw;
+        seen[index]=true;
         Some(Self{roster,origin:initial,latest:initial,last_raw,seen,published:0,fault:None})
     }
 
@@ -150,7 +148,7 @@ impl<'a> Epoch<'a> {
         if let Some(fault)=self.fault { return Err(fault); }
         let result=(|| {
             let current=self.roster.bracket(s)?;
-            let index=s.id as usize;
+            let index=self.roster.cpus.slot(s.id).ok_or(Fault::UnknownCpu)?.index();
             if self.seen[index] && s.raw<self.last_raw[index] {return Err(Fault::RawRegression);}
             let latest=self.latest.advance(current).ok_or(Fault::GlobalRegression)?;
             let elapsed=self.origin.elapsed(latest).ok_or(Fault::GlobalRegression)?.low;

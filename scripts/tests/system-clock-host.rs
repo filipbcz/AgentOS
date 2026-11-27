@@ -13,6 +13,8 @@ mod tsc_watchdog;
 mod pit;
 #[path = "../../kernel/tsc_epoch.rs"]
 mod tsc_epoch;
+#[path = "../../kernel/cpu_topology.rs"]
+mod cpu_topology;
 #[path = "../../kernel/system_clock.rs"]
 mod system_clock;
 #[path = "../../kernel/timer.rs"]
@@ -385,7 +387,7 @@ impl TripleRig {
         rig
     }
 
-    fn witness(&self, cpu: u8) -> Witness {
+    fn witness(&self, cpu: u32) -> Witness {
         Witness { cpu, ticks: self.tsc_ticks, hz: TSC_HZ, uncertainty_ticks: TSC_ERROR }
     }
 

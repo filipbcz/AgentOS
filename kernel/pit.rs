@@ -118,7 +118,7 @@ impl QualificationFailure {
     /// PollLimit = start bracket, last timestamp, number of polls;
     /// FirstHigh = start bracket, terminal timestamp, poll index.
     /// RATE fields contain only already accepted individual observations.
-    pub(crate) fn report(self, cpu: u8, phase: &str, mut emit: impl FnMut(&[u8])) {
+    pub(crate) fn report(self, cpu: u32, phase: &str, mut emit: impl FnMut(&[u8])) {
         let line=tsc::Diagnostic::formatted(format_args!(
             "PIT TSC APIC={} PHASE={} WINDOW={} FAULT={:?}",
             cpu,phase,self.window,self.reason));
@@ -455,7 +455,7 @@ impl AcquisitionEvidence {
     pub(crate) fn iter(&self)->impl Iterator<Item=DiscardedWindow>+'_ {
         self.entries[..self.len].iter().flatten().copied()
     }
-    pub(crate) fn report(&self,cpu:u8,phase:&str,mut emit:impl FnMut(&[u8])) {
+    pub(crate) fn report(&self,cpu:u32,phase:&str,mut emit:impl FnMut(&[u8])) {
         for entry in self.iter() {
             let line=tsc::Diagnostic::formatted(format_args!(
                 "PIT TSC APIC={} PHASE={} WINDOW={} ATTEMPT={} TICKS={} RETRY={:?}",

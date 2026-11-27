@@ -9,7 +9,7 @@ const QUANTIZATION_NS: u128 = 100_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Witness {
-    pub cpu: u8,
+    pub cpu: u32,
     pub ticks: u64,
     pub hz: u64,
     pub uncertainty_ticks: u64,

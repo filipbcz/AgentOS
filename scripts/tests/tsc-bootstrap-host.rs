@@ -5,6 +5,8 @@
 #[path="../../kernel/clock_quorum.rs"] mod clock_quorum;
 #[path="../../kernel/bringup_clock.rs"] mod bringup_clock;
 #[path="../../kernel/tsc_epoch.rs"] mod tsc_epoch;
+#[path = "../../kernel/cpu_topology.rs"]
+mod cpu_topology;
 
 use bringup_clock::BringupClock;
 use reference_clock::WaitError;
@@ -12,8 +14,8 @@ use tsc::{Alignment,Peer};
 use tsc_epoch::{BootSource,Epoch,Fault,Roster,Sample,select};
 const HZ:u64=3_000_000_000;
 const BASE:u64=3_000_000_000;
-const BSP:u8=7;
-const AP:u8=201;
+const BSP:u32=7;
+const AP:u32=201;
 const ZERO:Alignment=Alignment{offset:0,uncertainty_ticks:0};
 const OFFSET:Alignment=Alignment{offset:-30_000,uncertainty_ticks:300};
 
@@ -45,7 +47,7 @@ fn epoch<'a>(bsp:&'a Peer,ap:&'a Peer)->Epoch<'a> {
     let roster=Roster::qualify(BSP,&[BSP,AP],[(BSP,bsp),(AP,ap)]).unwrap();
     Epoch::new(roster,Sample{id:BSP,raw:BASE}).unwrap()
 }
-fn at(id:u8,normalized:u64)->Sample {
+fn at(id:u32,normalized:u64)->Sample {
     Sample{id,raw:if id==AP { normalized+30_000 } else { normalized }}
 }
 #[test]
@@ -201,3 +203,28 @@ fn checked_bracket_preserves_exact_width_and_arithmetic_limits() {
     }
 }
 
+#[test]
+fn wide_cpu_ids_use_independent_epoch_slots_and_full_witness_identity() {
+    let bsp=peer(Some(proof(HZ)),Some(ZERO));
+    let ap=peer(Some(proof(HZ)),Some(OFFSET));
+    let high=peer(Some(proof(HZ)),Some(ZERO));
+    let high_id=0xffff_fffe;
+    let ids=[high_id,0,256];
+    assert!(Roster::qualify(0,&[0,256,256],[(0,&bsp),(256,&ap)]).is_none());
+    assert!(Roster::qualify(0,&ids,[(0,&bsp),(256,&ap),(512,&high)]).is_none());
+    assert!(Roster::qualify(0,&ids,[(0,&bsp),(256,&ap),(high_id,&ap)]).is_none());
+    let roster=Roster::qualify(0,&ids,[(high_id,&high),(256,&ap),(0,&bsp)]).unwrap();
+    let mut epoch=Epoch::new(roster,Sample{id:0,raw:BASE}).unwrap();
+    let time=BASE+HZ;
+    assert_eq!(epoch.observe(Sample{id:0,raw:time}),Ok(1_000_000_000));
+    // CPU 256 is not CPU 0, even though their legacy low byte is identical.
+    assert_eq!(epoch.observe(Sample{id:256,raw:time+30_000-100}),Ok(1_000_000_000));
+    assert_eq!(epoch.observe(Sample{id:high_id,raw:time}),Ok(1_000_000_000));
+    assert_eq!(epoch.observe(Sample{id:256,raw:time+30_000-101}),Err(Fault::RawRegression));
+    let roster=Roster::qualify(0,&ids,[(0,&bsp),(256,&ap),(high_id,&high)]).unwrap();
+    let mut epoch=Epoch::new(roster,Sample{id:0,raw:BASE}).unwrap();
+    assert_eq!(epoch.observe(Sample{id:512,raw:time}),Err(Fault::UnknownCpu));
+    let w=clock_quorum::Witness{cpu:0,ticks:time,hz:HZ,uncertainty_ticks:0};
+    assert_eq!(clock_quorum::TscBracket::new(w,clock_quorum::Witness{cpu:256,..w}),None);
+    assert_eq!(clock_quorum::TscBracket::new(w,clock_quorum::Witness{cpu:high_id,..w}),None);
+}

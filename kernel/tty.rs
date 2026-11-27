@@ -27,7 +27,7 @@ struct TerminalState {
     fKeyboard: Keyboard,
     fKeyboardConfig: Option<ps2::Saved>,
     fScreen: Option<Console>,
-    fCpu: u8,
+    fCpu: u32,
     fErrors: u8,
     fLastCr: bool,
     fEnabled: bool,
@@ -35,7 +35,7 @@ struct TerminalState {
 const _: () = assert!(core::mem::size_of::<Terminal>() <= 4096);
 
 impl Terminal {
-    pub unsafe fn new(aPlatform: &Platform, aCpu: u8, aSerialPresent: bool) -> Self {
+    pub unsafe fn new(aPlatform: &Platform, aCpu: u32, aSerialPresent: bool) -> Self {
         Self { fLocked: AtomicBool::new(false), fScreenPending: AtomicBool::new(false),
                fState: UnsafeCell::new(TerminalState::new(aPlatform, aCpu, aSerialPresent)) }
     }
@@ -107,7 +107,7 @@ impl Drop for TerminalGuard<'_> {
 }
 
 impl TerminalState {
-    pub unsafe fn new(aPlatform: &Platform, aCpu: u8, aSerialPresent: bool) -> Self {
+    pub unsafe fn new(aPlatform: &Platform, aCpu: u32, aSerialPresent: bool) -> Self {
         // An absent UART, missing GSI or unusable keyboard route must not
         // prevent attaching an independent console/input device.
         let pSerial = if aSerialPresent { Route::serial(aPlatform, aCpu, VECTOR).ok() } else { None };
@@ -115,11 +115,11 @@ impl TerminalState {
             Route::keyboard(aPlatform, aCpu, KEYBOARD_VECTOR).ok()
         } else { None };
         if aSerialPresent && pSerial.is_none() {
-            let _ = LOGGER.record(crate::logger::ticks(), aCpu as u32, Level::Error,
+            let _ = LOGGER.record(crate::logger::ticks(), aCpu, Level::Error,
                 b"UART IRQ unavailable; output only");
         }
         if aPlatform.ps2_controller && pKeyboard.is_none() {
-            let _ = LOGGER.record(crate::logger::ticks(), aCpu as u32, Level::Error,
+            let _ = LOGGER.record(crate::logger::ticks(), aCpu, Level::Error,
                 b"PS2 IRQ unavailable");
         }
         Self { fInput: LineInput::new(), fSerialPresent: aSerialPresent, fRoute: pSerial,
@@ -151,13 +151,13 @@ impl TerminalState {
             self.fKeyboardConfig = ps2::enable();
             if self.fKeyboardConfig.is_some() { route.enable(); }
             else {
-                let _ = LOGGER.record(crate::logger::ticks(), self.fCpu as u32, Level::Error,
+                let _ = LOGGER.record(crate::logger::ticks(), self.fCpu, Level::Error,
                     b"PS2 initialization failed");
             }
         }
         self.fEnabled = true;
         if !self.hasInput() {
-            let _ = LOGGER.record(crate::logger::ticks(), self.fCpu as u32, Level::Error,
+            let _ = LOGGER.record(crate::logger::ticks(), self.fCpu, Level::Error,
                 b"TTY has no input device");
         }
     }
@@ -169,7 +169,7 @@ impl TerminalState {
         if let Some(route) = &self.fKeyboardRoute { route.disable(); }
         if let Some(config) = self.fKeyboardConfig.take() {
             if !ps2::restore(config) {
-                let _ = LOGGER.record(crate::logger::ticks(), self.fCpu as u32, Level::Error, b"PS2 restore failed");
+                let _ = LOGGER.record(crate::logger::ticks(), self.fCpu, Level::Error, b"PS2 restore failed");
                 // Controller recovery failure must be visible even when the
                 // canonical input device is being torn down.
                 self.diagnostic(b"AGENTOS PS2 RESTORE FAILED\r\n");
@@ -190,7 +190,7 @@ impl TerminalState {
         if self.fErrors == 0 { return false; }
         self.fErrors = 0;
         self.fInput.invalidate();
-        let _ = LOGGER.record(crate::logger::ticks(), self.fCpu as u32, Level::Error, b"UART RX error");
+        let _ = LOGGER.record(crate::logger::ticks(), self.fCpu, Level::Error, b"UART RX error");
         true
     }
 
@@ -227,7 +227,7 @@ impl TerminalState {
             pWritten += 1;
         }
         if serial_failed {
-            let _ = LOGGER.record(crate::logger::ticks(), self.fCpu as u32, Level::Error,
+            let _ = LOGGER.record(crate::logger::ticks(), self.fCpu, Level::Error,
                 b"UART TX failed; GOP fallback active");
         }
         Ok(pWritten)
@@ -271,7 +271,7 @@ impl TerminalState {
             Err(()) => {
                 self.fKeyboard.reset();
                 self.fInput.invalidate();
-                let _ = LOGGER.record(crate::logger::ticks(), self.fCpu as u32, Level::Error, b"PS2 RX error");
+                let _ = LOGGER.record(crate::logger::ticks(), self.fCpu, Level::Error, b"PS2 RX error");
             }
         });
     }

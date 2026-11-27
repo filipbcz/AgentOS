@@ -51,13 +51,13 @@ mod acpi { pub struct Platform { pub ps2_controller: bool } }
 mod ioapic {
     pub struct Route(bool);
     impl Route {
-        pub unsafe fn serial(_: &crate::acpi::Platform, _: u8, _: u32) -> Result<Self, &'static [u8]> {
+        pub unsafe fn serial(_: &crate::acpi::Platform, _: u32, _: u32) -> Result<Self, &'static [u8]> {
             super::ports(|p| {
                 p.fSerialRouteAttempts += 1;
                 if p.fSerialRouteMissing { Err(b"missing GSI" as &[u8]) } else { Ok(Self(true)) }
             })
         }
-        pub unsafe fn keyboard(_: &crate::acpi::Platform, _: u8, _: u32) -> Result<Self, &'static [u8]> {
+        pub unsafe fn keyboard(_: &crate::acpi::Platform, _: u32, _: u32) -> Result<Self, &'static [u8]> {
             super::ports(|p| {
                 p.fKeyboardRouteAttempts += 1;
                 if p.fKeyboardRouteMissing { Err(b"missing GSI" as &[u8]) } else { Ok(Self(false)) }

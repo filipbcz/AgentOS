@@ -5,6 +5,8 @@
 #[path="../../kernel/tsc.rs"] mod tsc;
 #[path="../../kernel/clock_quorum.rs"] mod clock_quorum;
 #[path="../../kernel/tsc_watchdog.rs"] mod tsc_watchdog;
+#[path = "../../kernel/cpu_topology.rs"]
+mod cpu_topology;
 #[path="../../kernel/timer.rs"] mod timer;
 use tsc::Alignment;
 use tsc_watchdog::{Health, RuntimeMonitor, Sample, Watchdog};
@@ -263,4 +265,37 @@ fn new_reference_generation_does_not_hide_raw_counter_regression() {
     assert_eq!(monitor.observe_at(Some(1),0,HZ,ZERO,&mut bsp,Some(regressed)),Health::Rejected);
     assert!(!monitor.active());
     assert_eq!(monitor.witness_at(1,0,ZERO,raw+1),None);
+}
+
+#[test]
+fn full_id_fleet_never_aliases_leases_for_equal_low_bytes() {
+    let monitor=RuntimeMonitor::new();
+    let high=0xffff_fffe;
+    assert!(!monitor.start(0,HZ,[0,256,256]));
+    assert!(!monitor.start(0,HZ,[0,u32::MAX]));
+    assert!(!monitor.start(1,HZ,[0,256,high]));
+    assert!(monitor.start(0,HZ,[high,256,0]));
+    let mut bsp=Watchdog::new();
+    let mut ap=Watchdog::new();
+    let mut remote=Watchdog::new();
+    for i in 0..=3 {
+        let ns=i*500_000_000;
+        monitor.observe(0,HZ,ZERO,&mut bsp,Some(sample(ns,0)));
+        monitor.observe(256,HZ,AP,&mut ap,Some(sample(ns+10_000,10_000)));
+        if i<3 {
+            monitor.observe(high,HZ,ZERO,&mut remote,Some(sample(ns+20_000,0)));
+        }
+    }
+    let raw=sample(1_500_100_000,0).after;
+    assert_eq!(monitor.witness(0,ZERO,raw),None);
+    monitor.observe(high,HZ,ZERO,&mut remote,Some(sample(1_500_020_000,0)));
+    assert_eq!(monitor.witness(0,ZERO,raw).unwrap().cpu,0);
+    assert_eq!(monitor.witness(256,AP,raw+10_000).unwrap().cpu,256);
+    assert_eq!(monitor.witness(high,ZERO,raw).unwrap().cpu,high);
+    assert_eq!(monitor.witness(512,ZERO,raw),None);
+    assert_eq!(monitor.witness(256,ZERO,raw),None);
+    // Revocation of any one slot invalidates the complete machine witness.
+    assert_eq!(monitor.observe(256,HZ,AP,&mut ap,None),Health::Unverified);
+    assert_eq!(monitor.witness(0,ZERO,raw),None);
+    assert_eq!(monitor.witness(high,ZERO,raw),None);
 }

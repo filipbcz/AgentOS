@@ -1,4 +1,4 @@
-use crate::{BootInfo, reference_clock::PmTimer};
+use crate::{BootInfo, cpu_topology::CpuTopology, reference_clock::PmTimer};
 use core::slice;
 
 fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
@@ -99,8 +99,7 @@ pub struct Platform {
     pub lapic: usize,
     pub pm_timer: Option<PmTimer>,
     pub hpet: usize,
-    pub ids: [u8; 255],
-    pub count: usize,
+    pub topology: CpuTopology,
     pub legacy_pic: bool,
     pub legacy_pit_probe: bool,
     pub ps2_controller: bool,
@@ -195,9 +194,16 @@ pub(crate) fn timer_mmio_page_ok(map: &[u8], stride: usize, address: usize) -> b
 }
 
 impl Platform {
+    pub(crate) fn new() -> Self {
+        Self { pci: PciWindows::new(), lapic: 0, pm_timer: None, hpet: 0, topology: CpuTopology::new(), legacy_pic: false, legacy_pit_probe: false, ps2_controller: true,
+        io_apics: [IoApic { address: 0, gsi: 0 }; 8], io_count: 0,
+        serial_irq: IsaInterrupt { gsi: 4, low: false, level: false }, serial_override: false,
+        keyboard_irq: IsaInterrupt { gsi: 1, low: false, level: false }, keyboard_override: false }
+    }
+
     pub fn pm_timer_mmio(&self) -> Option<usize> { self.pm_timer.and_then(PmTimer::mmio) }
 
-    fn madt(&mut self, bytes: &[u8]) -> Option<()> {
+    pub(crate) fn madt(&mut self, bytes: &[u8]) -> Option<()> {
         self.lapic = u32_at(bytes, 36)? as usize;
         self.legacy_pic = u32_at(bytes, 40)? & 1 != 0;
         let mut rest = bytes.get(44..)?;
@@ -205,8 +211,11 @@ impl Platform {
             let length = *rest.get(1)? as usize;
             if length < 2 { return None; }
             let e = rest.get(..length)?;
-            let id = match e[0] {
-                0 if u32_at(e, 4)? & 1 != 0 => Some(e[3] as u32),
+            match e[0] {
+                0 => {
+                    if e.len() != 8 { return None; }
+                    self.topology.add(u32::from(e[3]), u32_at(e, 4)?, true)?;
+                }
                 1 => {
                     let address = u32_at(e, 4)? as usize;
                     let gsi = u32_at(e, 8)?;
@@ -214,7 +223,6 @@ impl Platform {
                         self.io_apics[..self.io_count].iter().any(|io| io.address == address || io.gsi == gsi) { return None; }
                     *self.io_apics.get_mut(self.io_count)? = IoApic { address, gsi };
                     self.io_count += 1;
-                    None
                 }
                 2 if e.get(2) == Some(&0) && (e.get(3) == Some(&4) || e.get(3) == Some(&1)) => {
                     let keyboard = e[3] == 1;
@@ -225,20 +233,19 @@ impl Platform {
                                              level: (flags >> 2) & 3 == 3 };
                     if keyboard { self.keyboard_irq = irq; self.keyboard_override = true; }
                     else { self.serial_irq = irq; self.serial_override = true; }
-                    None
                 }
-                9 if u32_at(e, 8)? & 1 != 0 => Some(u32_at(e, 4)?),
-                5 => { self.lapic = u64_at(e, 4)? as usize; None }
-                _ => None,
-            };
-            if let Some(id) = id {
-                if id >= 255 || self.ids[..self.count].contains(&(id as u8)) { return None; }
-                *self.ids.get_mut(self.count)? = id as u8;
-                self.count += 1;
+                9 => {
+                    if e.len() != 16 { return None; }
+                    let flags = u32_at(e, 8)?;
+                    if flags & 3 != 0 && e[2..4] != [0, 0] { return None; }
+                    self.topology.add(u32_at(e, 4)?, flags, false)?;
+                }
+                5 => { self.lapic = u64_at(e, 4)? as usize; }
+                _ => (),
             }
             rest = &rest[length..];
         }
-        (self.count > 0 && self.lapic != 0 && self.lapic % 4096 == 0).then_some(())
+        (!self.topology.enabled().ids().is_empty() && self.lapic != 0 && self.lapic % 4096 == 0).then_some(())
     }
 }
 
@@ -256,10 +263,7 @@ pub unsafe fn discover(info: &BootInfo, map: &[u8]) -> Option<Platform> {
     };
     if &root[..4] != (if width == 8 { b"XSDT" } else { b"RSDT" }) ||
         (root.len()-36) % width != 0 { return None; }
-    let mut p = Platform { pci: PciWindows::new(), lapic: 0, pm_timer: None, hpet: 0, ids: [0; 255], count: 0, legacy_pic: false, legacy_pit_probe: false, ps2_controller: true,
-        io_apics: [IoApic { address: 0, gsi: 0 }; 8], io_count: 0,
-        serial_irq: IsaInterrupt { gsi: 4, low: false, level: false }, serial_override: false,
-        keyboard_irq: IsaInterrupt { gsi: 1, low: false, level: false }, keyboard_override: false };
+    let mut p = Platform::new();
     let mut fadt_table = None;
     let mut hpet_seen = false;
     for entry in root[36..].chunks_exact(width) {

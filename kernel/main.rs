@@ -7,6 +7,7 @@ mod stack;
 mod paging;
 mod exceptions;
 mod acpi;
+mod cpu_topology;
 mod pci;
 mod pci_irq;
 mod dma;
@@ -217,6 +218,7 @@ pub unsafe extern "sysv64" fn kernel_main(info: &BootInfo) -> ! {
             else { Ok(()) }
         }) {
         log.event(0, b"SMP FAILED");
+        log.event(0, reason);
         serial(b"SMP FAILED: "); serial(reason); serial(b"\r\n"); halt();
     }
     // All direct boot calibration and INIT/SIPI reference users have
