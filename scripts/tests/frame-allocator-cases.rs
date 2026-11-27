@@ -309,3 +309,140 @@ fn zeroedRangeClearsOnlyItsOwnedPagesAndClearsReusedContents() {
         assert_eq!(f.available(),4);
     });
 }
+
+// Exhaustion uses real mapped backing RAM, the production UEFI allocator,
+// snapshot, alloc/release/probe and the exact SharedFrames spinlock core.
+// The independent workers are host threads, NOT guest CPUs; CLI/STI and
+// guest MMU behavior are deliberately outside this host regression.
+#[cfg(all(target_os="linux", target_arch="x86_64"))]
+fn exerciseSharedPhysicalExhaustion(aWorkers: usize) {
+    use core::ffi::c_void;
+    use std::{collections::HashSet, sync::Barrier, thread};
+    extern "C" {
+        fn mmap(addr:*mut c_void,len:usize,prot:i32,flags:i32,fd:i32,offset:i64)->*mut c_void;
+        fn munmap(addr:*mut c_void,len:usize)->i32;
+    }
+    const PAGES: usize = 1024;
+    struct Region(*mut c_void);
+    impl Drop for Region {
+        fn drop(&mut self) { unsafe { munmap(self.0,PAGES*PAGE); } }
+    }
+    let pMemory=unsafe { mmap(core::ptr::null_mut(),PAGES*PAGE,3,0x22|0x40,-1,0) };
+    assert_ne!(pMemory as usize,usize::MAX,"mmap MAP_32BIT");
+    let pRegion=Region(pMemory);
+    let pBase=pRegion.0 as usize;
+    assert!(pBase>=0x100000 && pBase%PAGE==0 && pBase+PAGES*PAGE<=1usize<<31);
+
+    // Two conventional regions separated by a hole; real allocator metadata
+    // must live in the first region and not be offered as free frames.
+    let mut pMap=[0u8;80];
+    for (pDesc,pFirst,pPages) in [(0usize,0usize,512usize),(40,513,511)] {
+        pMap[pDesc..pDesc+4].copy_from_slice(&7u32.to_le_bytes());
+        pMap[pDesc+8..pDesc+16].copy_from_slice(&((pBase+pFirst*PAGE) as u64).to_le_bytes());
+        pMap[pDesc+24..pDesc+32].copy_from_slice(&(pPages as u64).to_le_bytes());
+    }
+    let pFrames: Frames<'static>=unsafe { Frames::from_uefi(&pMap,40) }.unwrap();
+    let pShared=SharedFrames::new(pFrames);
+    let (pInitialBitmap,pInitialRefs,pInitialCount,pBaseline,pBitmap,pRefs,pExpected)=
+        pShared.with_locked(|pFrames| {
+            let pInitialBitmap=pFrames.free.to_vec();
+            let pInitialRefs=pFrames.refs.to_vec();
+            let pInitialCount=pFrames.available();
+            let pBaseline=pFrames.snapshot().expect("real bitmap snapshot");
+            let pBitmap=pFrames.free.to_vec();
+            let pRefs=pFrames.refs.to_vec();
+            let pExpected=pBitmap.iter().enumerate().flat_map(|(pWord,&pBits)|
+                (0..WORD_BITS).filter(move |&pBit| pBits&(1usize<<pBit)!=0)
+                    .map(move |pBit| (pWord*WORD_BITS+pBit)*PAGE)).collect::<HashSet<_>>();
+            assert!(pExpected.len()>256 && pExpected.len()==pBaseline.count);
+            assert!(!pExpected.contains(&(pBase+512*PAGE)));
+            (pInitialBitmap,pInitialRefs,pInitialCount,pBaseline,pBitmap,pRefs,pExpected)
+        });
+
+    let mut pHeld=pShared.with_locked(|pFrames| {
+        let mut pHeld=Vec::with_capacity(pExpected.len());
+        let mut pObserved=HashSet::new();
+        while let Some(pFrame)=pFrames.alloc() {
+            assert!(pExpected.contains(&pFrame.address()));
+            assert!(pObserved.insert(pFrame.address()),"duplicate allocated frame");
+            assert_eq!(pFrames.references(pFrame.address()),Some(1));
+            pHeld.push(pFrame);
+        }
+        assert_eq!(pObserved,pExpected);
+        assert_eq!(pFrames.available(),0);
+        assert!(pFrames.free.iter().all(|&pWord|pWord==0));
+        pHeld
+    });
+
+    let pBarrier=Barrier::new(aWorkers);
+    let pRejections=thread::scope(|pScope| {
+        let pHandles:Vec<_>=(0..aWorkers).map(|_|pScope.spawn(|| {
+            pBarrier.wait();
+            let pResult=pShared.with_locked(|pFrames| {
+                let pBefore=pFrames.available();
+                let pPlain=pFrames.alloc();
+                let pZeroed=pFrames.alloc_zeroed();
+                let pRejected=pPlain.is_none() && pZeroed.is_none();
+                for pFrame in [pPlain,pZeroed].into_iter().flatten() {
+                    pFrames.release(pFrame);
+                }
+                (pBefore,pRejected,pFrames.available())
+            });
+            (thread::current().id(),pResult)
+        })).collect();
+        pHandles.into_iter().map(|pHandle|pHandle.join().unwrap()).collect::<Vec<_>>()
+    });
+    assert_eq!(pRejections.len(),aWorkers);
+    assert_eq!(pRejections.iter().map(|(pId,_)|*pId).collect::<HashSet<_>>().len(),aWorkers);
+    assert!(pRejections.iter().all(|(_,pResult)|*pResult==(0,true,0)));
+
+    pShared.with_locked(|pFrames| {
+        assert_eq!(pFrames.available(),0);
+        assert!(pFrames.free.iter().all(|&pWord|pWord==0));
+        // Preserve the old recovery's single-page partial-allocation rollback
+        // and actual byte-level zeroing of a poisoned, reissued physical page.
+        let pSpare=pHeld.pop().unwrap();
+        let pAddress=pSpare.address();
+        unsafe { ptr::write_bytes(pAddress as *mut u8,0xa5,PAGE); }
+        pFrames.release(pSpare);
+        assert!(!pFrames.probe());
+        assert_eq!(pFrames.available(),1);
+        let pReused=pFrames.alloc_zeroed().expect("one restored frame");
+        assert_eq!(pReused.address(),pAddress);
+        assert_eq!(pFrames.available(),0);
+        assert!(unsafe { slice::from_raw_parts(pAddress as *const u8,PAGE) }
+            .iter().all(|&pByte|pByte==0));
+        pFrames.release(pReused);
+        for pFrame in pHeld { pFrames.release(pFrame); }
+        assert!(pBaseline.matches(pFrames));
+        assert_eq!(&*pFrames.free,pBitmap.as_slice());
+        assert_eq!(&*pFrames.refs,pRefs.as_slice());
+        assert!(pFrames.probe());
+        assert!(pBaseline.matches(pFrames));
+        assert_eq!(&*pFrames.refs,pRefs.as_slice());
+        pBaseline.release(pFrames);
+        assert_eq!(&*pFrames.free,pInitialBitmap.as_slice());
+        assert_eq!(&*pFrames.refs,pInitialRefs.as_slice());
+        assert_eq!(pFrames.available(),pInitialCount);
+    });
+    // All worker threads have joined and the allocator is no longer used
+    // before the host mapping is unmapped.
+    drop(pShared);
+    drop(pRegion);
+}
+
+#[cfg(all(target_os="linux", target_arch="x86_64"))]
+#[test]
+fn physicalExhaustionRecoveryOneHostWorker() { exerciseSharedPhysicalExhaustion(1); }
+
+#[cfg(all(target_os="linux", target_arch="x86_64"))]
+#[test]
+fn physicalExhaustionRecoveryTwoHostWorkers() { exerciseSharedPhysicalExhaustion(2); }
+
+#[cfg(all(target_os="linux", target_arch="x86_64"))]
+#[test]
+fn physicalExhaustionRecoveryFourHostWorkers() { exerciseSharedPhysicalExhaustion(4); }
+
+#[cfg(all(target_os="linux", target_arch="x86_64"))]
+#[test]
+fn physicalExhaustionRecoveryEightHostWorkers() { exerciseSharedPhysicalExhaustion(8); }

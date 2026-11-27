@@ -56,12 +56,21 @@ impl SharedFrames {
     pub fn with<R>(&self, operation: impl FnOnce(&mut Frames<'static>) -> R) -> R {
         let flags: usize;
         unsafe { asm!("pushfq", "pop {}", "cli", out(reg) flags); }
+        let result = self.with_locked(operation);
+        if flags & (1 << 9) != 0 { unsafe { asm!("sti", options(nostack)); } }
+        result
+    }
+
+    // Serialization is independent of the architecture's local IRQ state.
+    // Kernel callers always enter through with(), which prevents preemption
+    // while waiting for or holding the same allocator lock.
+    #[inline]
+    fn with_locked<R>(&self, operation: impl FnOnce(&mut Frames<'static>) -> R) -> R {
         while self.locked.swap(true, Ordering::Acquire) {
             while self.locked.load(Ordering::Relaxed) { spin_loop(); }
         }
         let result = operation(unsafe { &mut *self.frames.get() });
         self.locked.store(false, Ordering::Release);
-        if flags & (1 << 9) != 0 { unsafe { asm!("sti", options(nostack)); } }
         result
     }
 }
