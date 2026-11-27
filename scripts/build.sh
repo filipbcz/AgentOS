@@ -177,7 +177,7 @@ if ((staging)); then
     for app in pipe-runner pipe-receiver; do
         python3 "$root/scripts/verify-user-abi.py" "$app"
     done
-    for app in cow demand ipc; do
+    for app in cow demand ipc fault; do
         define="-D${app^^}_WORKLOAD"
         gcc-13 -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
             -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large "$define" \
@@ -210,9 +210,16 @@ if ((staging)); then
     ld --no-undefined --build-id=none -z noexecstack -s -T "$root/user/user.ld" \
         -o migration-runner migration-runner-entry.o migration-workload.o
     python3 "$root/scripts/verify-user-abi.py" migration-runner
-    cp supervisor-runner pipe-runner pipe-receiver cow-runner demand-runner adoption-runner ipc-runner ipc-service migration-runner "$stage_out/"
-    touch -d @0 supervisor-runner pipe-runner pipe-receiver cow-runner demand-runner adoption-runner ipc-runner ipc-service migration-runner
-    printf '%s\n' "${files[@]}" supervisor-runner pipe-runner pipe-receiver cow-runner demand-runner adoption-runner ipc-runner ipc-service migration-runner | cpio --quiet --reproducible --owner=0:0 -o -H newc > initramfs.cpio
+    gcc-13 -c "$root/scripts/tests/fault-probe.S" -o fault-probe-entry.o
+    gcc-13 -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
+        -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large -DFAULT_PROBE \
+        -c "$root/scripts/tests/fault-workload.c" -o fault-probe.o
+    ld --no-undefined --build-id=none -z noexecstack -s -T "$root/user/user.ld" \
+        -o fault-probe fault-probe-entry.o fault-probe.o
+    python3 "$root/scripts/verify-user-abi.py" fault-probe
+    cp supervisor-runner pipe-runner pipe-receiver cow-runner demand-runner adoption-runner ipc-runner ipc-service migration-runner fault-runner fault-probe "$stage_out/"
+    touch -d @0 supervisor-runner pipe-runner pipe-receiver cow-runner demand-runner adoption-runner ipc-runner ipc-service migration-runner fault-runner fault-probe
+    printf '%s\n' "${files[@]}" supervisor-runner pipe-runner pipe-receiver cow-runner demand-runner adoption-runner ipc-runner ipc-service migration-runner fault-runner fault-probe | cpio --quiet --reproducible --owner=0:0 -o -H newc > initramfs.cpio
     cp initramfs.cpio "$stage_out/test.cpio"
     gcc-13 -c "$root/boot/payload.S" -o payload.o
     ld -nostdlib --build-id=none -znocombreloc -T layout.ld -shared -Bsymbolic \

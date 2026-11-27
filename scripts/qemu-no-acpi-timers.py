@@ -594,9 +594,11 @@ def scenario(args):
                 smoke.service_manager.verify(text,migration_staged=True,allow_migration_workload=variant=="test")
                 receipt["runtime_session"]=smoke.session.verify(data,(dest/"com1-input.bin").read_bytes(),
                     True,args.cpus,aClockMaintenanceMs=1000,aRuntimeProcess=variant is not None,
-                    aSupervisorImage=variant,aMigrationStaged=True)
+                    aSupervisorImage=variant,aMigrationStaged=True,aFaultStaged=True)
                 receipt["migration_contract"]="foreground-v1"
                 receipt["migration"]=receipt["runtime_session"].get("runtime_migration",{"absent":True})
+                receipt["fault_contract"]="staged-v1"
+                receipt["fault"]=receipt["runtime_session"].get("runtime_fault",{"absent":True})
                 receipt["com1_input_sha256"]=smoke.evidence.sha256(dest/"com1-input.bin")
                 receipt["system_clock"]=clocks[0]
                 receipt["boot_verified"]=True

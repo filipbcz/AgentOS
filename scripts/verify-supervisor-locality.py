@@ -3,7 +3,7 @@ import re
 
 
 def verify(data, shell, shell_cr3, prior_pids, apics, supervisor, require, pipe=None,
-           memory=None, memory_kind=None, ipc=None):
+           memory=None, memory_kind=None, ipc=None, fault=None):
     """Consume the bounded candidate protocol and every real child event."""
     require(len(apics) in (1,2), "Missing independently observed CPU roster")
     waits=[]
@@ -151,6 +151,8 @@ def verify(data, shell, shell_cr3, prior_pids, apics, supervisor, require, pipe=
                         outcome,roots=memory.verify_interval(line,pid,before,seen,supervisor,require,memory_kind)
                     elif ipc is not None:
                         outcome,roots=ipc.verify_interval(line,pid,before,seen,supervisor,require)
+                    elif fault is not None:
+                        outcome,roots=fault.verify_interval(line,pid,before,seen,supervisor,require)
                     else:
                         begin=supervisor.BEGIN.fullmatch(line())
                         require(begin is not None and int(begin[1],16)==pid,"Supervisor parent mismatch")
@@ -181,6 +183,8 @@ def verify(data, shell, shell_cr3, prior_pids, apics, supervisor, require, pipe=
                         pipe.verify_bracket(outcome,before,after,apics,local,require)
                     elif ipc is not None:
                         ipc.verify_bracket(outcome,before,after,apics,local,require)
+                    elif fault is not None:
+                        fault.verify_bracket(outcome,before,after,apics,local,require)
                     elif memory is None:
                         outcome["child_statuses"]=[records[i][3] for i in (0,2,4,6,9)]
                     outcome.update({"pid":pid,"apic":cpu,"before":before,"after":after})
@@ -188,6 +192,8 @@ def verify(data, shell, shell_cr3, prior_pids, apics, supervisor, require, pipe=
                         outcome["reason"]="migration"
                     floor_ms,floor_total=after["ms"],after["total"]
             root=collect(pid,status,roots)
+            if fault is not None and outcome is not None:
+                outcome["parent_cr3"]=root
             return status,outcome,root
 
         def accept(cpu,outcome):

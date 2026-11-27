@@ -41,6 +41,8 @@ MEMORY_INPUT = b"".join((command+"\r").encode("ascii") for command in MEMORY_COM
 IPC_COMMAND = "run /ipc-runner"
 IPC_INPUT = (IPC_COMMAND+"\r").encode("ascii")
 IPC_MARKER = b"AGENTOS IPC TEST "
+FAULT_COMMAND = "run /fault-runner"
+FAULT_INPUT = (FAULT_COMMAND+"\r").encode("ascii")
 SUPERVISOR_MISSING = b"run: spawn failed (-2)\r\nagentos> "
 ADOPTION_COMMAND = "run /adoption-runner"
 ADOPTION_INPUT = (ADOPTION_COMMAND+"\r").encode("ascii")
@@ -87,11 +89,11 @@ def runtime_process_prefix(data, shell, shell_cr3, prior_pids):
     return offset,records
 
 
-def supervisor_prefix(data, shell, shell_cr3, prior_pids, variant, apics, *, pipe=False, memory=None, ipc=False):
+def supervisor_prefix(data, shell, shell_cr3, prior_pids, variant, apics, *, pipe=False, memory=None, ipc=False, fault=False):
     """Consume only a verified per-CPU foreground workload (or real ENOENT)."""
     require(variant in ("control", "test"), "Invalid supervisor image variant")
-    require(memory in (None,"cow","demand") and sum((bool(memory),pipe,ipc))<=1,"Invalid workload kind")
-    command=("run /"+memory+"-runner" if memory else PIPE_COMMAND if pipe else IPC_COMMAND if ipc else SUPERVISOR_COMMAND)
+    require(memory in (None,"cow","demand") and sum((bool(memory),pipe,ipc,fault))<=1,"Invalid workload kind")
+    command=("run /"+memory+"-runner" if memory else PIPE_COMMAND if pipe else IPC_COMMAND if ipc else FAULT_COMMAND if fault else SUPERVISOR_COMMAND)
     echo = (command+"\r\n").encode("ascii")
     require(data.startswith(echo), "Missing supervisor command echo")
     offset = len(echo)
@@ -108,6 +110,8 @@ def supervisor_prefix(data, shell, shell_cr3, prior_pids, variant, apics, *, pip
         filenames+=("verify-memory-workload.py",)
     elif ipc:
         filenames+=("verify-ipc-workload.py",)
+    elif fault:
+        filenames+=("verify-fault-workload.py",)
     for filename in filenames:
         spec=importlib.util.spec_from_file_location(filename,Path(__file__).with_name(filename))
         module=importlib.util.module_from_spec(spec)
@@ -116,7 +120,8 @@ def supervisor_prefix(data, shell, shell_cr3, prior_pids, variant, apics, *, pip
     consumed,result,pids=modules[1].verify(data[offset:],shell,shell_cr3,prior_pids,apics,modules[0],require,
                                            pipe=modules[2] if pipe else None,
                                            memory=modules[2] if memory else None,memory_kind=memory,
-                                           ipc=modules[2] if ipc else None)
+                                           ipc=modules[2] if ipc else None,
+                                           fault=modules[2] if fault else None)
     return offset+consumed,result,pids
 
 
@@ -286,7 +291,10 @@ def verify_idle(aBytes, aCpus=1, aClockMaintenanceMs=1000):
 
 
 def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceMs=1000,
-           aRuntimeProcess=False, aSupervisorImage=None, aHistoricalBootMemory=False, aMigrationStaged=False):
+           aRuntimeProcess=False, aSupervisorImage=None, aHistoricalBootMemory=False, aMigrationStaged=False,
+           aFaultStaged=False):
+    require(not aFaultStaged or (aMigrationStaged and not aHistoricalBootMemory),
+            "Mixed historical and staged syscall/fault contracts")
     require(aSupervisorImage is None or (aRuntimeProcess and aSupervisorImage in ("control","test")),
             "Supervisor image scenario requires the existing foreground regression")
     require(re.search(rb"AGENTOS PIPE (?!TEST )",aLog) is None,
@@ -308,7 +316,7 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
         pWorkloadMarkers+=(b"AGENTOS COW ",b"AGENTOS DEMAND ")
         require(re.search(rb"AGENTOS IPC (?!TEST )",aLog) is None,
                 "Historical boot IPC evidence is forbidden in current signed images")
-    require(aLog.count(b"AGENTOS TEST RUNNER ")==5*int(aSupervisorImage=="test"),
+    require(aLog.count(b"AGENTOS TEST RUNNER ")==(5+int(aFaultStaged))*int(aSupervisorImage=="test"),
             "Unexpected runner invocation outside its foreground interval")
     if aSupervisorImage!="test":
         require(not any(marker in aLog for marker in pWorkloadMarkers),
@@ -340,6 +348,7 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
     pMemory={}
     pAdoption=None
     pIpc=None
+    pFault=None
     pMigration=None
     pPrefixPids=set()
     if aRuntimeProcess:
@@ -390,6 +399,13 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
             pWorkloadLog+=pInteractive[:pConsumed]
             pPrefixPids.update(pNewPids)
             pInteractive=pInteractive[pConsumed:]
+            if aFaultStaged:
+                pConsumed,pFault,pNewPids=supervisor_prefix(
+                    pInteractive,pShell,int(pShellExits[0][2],16),
+                    pPrior | pPrefixPids,aSupervisorImage,bootCpuRoster(aLog,aCpus),fault=True)
+                pWorkloadLog+=pInteractive[:pConsumed]
+                pPrefixPids.update(pNewPids)
+                pInteractive=pInteractive[pConsumed:]
             pConsumed,pAdoption,pNewPids=adoption_prefix(
                 pInteractive,pRoot,pShell,int(pShellExits[0][2],16),
                 pPrior | pPrefixPids,aSupervisorImage,set(pApicList))
@@ -413,7 +429,10 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
         if aSupervisorImage is not None:
             if aMigrationStaged:
                 pPrefix+=MIGRATION_INPUT
-            pPrefix+=SUPERVISOR_INPUT+PIPE_INPUT+MEMORY_INPUT+IPC_INPUT+ADOPTION_INPUT
+            pPrefix+=SUPERVISOR_INPUT+PIPE_INPUT+MEMORY_INPUT+IPC_INPUT
+            if aFaultStaged:
+                pPrefix+=FAULT_INPUT
+            pPrefix+=ADOPTION_INPUT
             if aSupervisorImage=="test":
                 pPrefix+=ADOPTION_BYTES
         require(aInput==pPrefix+transmitted_input(pShell,aKeyboard),"Captured transmitted UART bytes differ from scenario")
@@ -450,6 +469,14 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
     require(pExit is not None and int(pExit[1],16)==pRoot and int(pExit[2],16)>0 and
             int(pExit[2],16)%4096==0 and int(pExit[3],16)==0,"PID1 did not exit cleanly")
     if aSupervisorImage=="test":
+        if aFaultStaged:
+            roots={pFault["runner_cr3"]}
+            for interval in pFault["intervals"]+pFault["rejected"]:
+                roots.update(interval[k] for k in ("parent_cr3","child_cr3") if k in interval)
+                if "peer" in interval:
+                    roots.add(interval["peer"]["cr3"])
+            require(int(pExit[2],16) not in roots,
+                    "Foreground syscall/fault address space aliased the live PID1")
         if aMigrationStaged:
             require(int(pExit[2],16) not in ({pMigration["cr3"]} | {x["cr3"] for x in pMigration["worker_exits"]}),
                     "Foreground migration aliased the live PID1 address space")
@@ -468,6 +495,8 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
         result["runtime_demand"]=pMemory["demand"]
         result["runtime_adoption"]=pAdoption
         result["runtime_ipc"]=pIpc
+        if aFaultStaged:
+            result["runtime_fault"]=pFault
         if aMigrationStaged:
             result["runtime_migration"]=pMigration
     return result
@@ -483,6 +512,7 @@ def main():
     pParser.add_argument("--runtime-process-regression",action="store_true")
     pParser.add_argument("--supervisor-image",choices=("control","test"))
     pParser.add_argument("--migration-staged",action="store_true",help="Use the explicit foreground migration contract")
+    pParser.add_argument("--fault-staged",action="store_true",help="Require the separate syscall/fault locality workload")
     pArgs = pParser.parse_args()
     if pArgs.plan_pid is not None:
         require(not pArgs.runtime_process_regression and pArgs.supervisor_image is None,"Separate process regression uses the QEMU test driver")
@@ -497,7 +527,8 @@ def main():
     try:
         pResult = verify(pArgs.log.read_bytes(),pArgs.input.read_bytes() if pArgs.input else None,
                          pArgs.keyboard,pArgs.cpus,aRuntimeProcess=pArgs.runtime_process_regression,
-                         aSupervisorImage=pArgs.supervisor_image,aMigrationStaged=pArgs.migration_staged)
+                         aSupervisorImage=pArgs.supervisor_image,aMigrationStaged=pArgs.migration_staged,
+                         aFaultStaged=pArgs.fault_staged)
     except (OSError,VerificationError) as pError:
         print(f"Stage-3 interactive verification failed: {pError}",file=sys.stderr)
         return 1

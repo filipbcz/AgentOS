@@ -261,7 +261,8 @@ def run_session(process, capture, qmp, destination, runtime_process_regression=F
                                 (session.PIPE_COMMAND,session.PIPE_INPUT),
                                 *((command,(command+"\r").encode("ascii"))
                                   for command in session.MEMORY_COMMANDS),
-                                (session.IPC_COMMAND,session.IPC_INPUT)):
+                                (session.IPC_COMMAND,session.IPC_INPUT),
+                                (session.FAULT_COMMAND,session.FAULT_INPUT)):
             offset = serial.stat().st_size
             print(f"QEMU {supervisor_image} signed image: {command!r}", flush=True)
             capture.send(request)
@@ -555,7 +556,7 @@ def boot(args):
         session_result = session.verify(serial.read_bytes(), (destination / "com1-input.bin").read_bytes(),
                                         True, args.cpus,
                                         aRuntimeProcess=getattr(args,"runtime_process_regression",False),
-                                        aSupervisorImage=supervisor_image,aMigrationStaged=True)
+                                        aSupervisorImage=supervisor_image,aMigrationStaged=True,aFaultStaged=True)
         if supervisor_image is not None:
             migration_result = session_result["runtime_migration"]
     bases = re.findall(r"(?m)^\[INFO\] KERNEL IMAGE BASE=([0-9a-f]{16})\r?$", text)
@@ -586,6 +587,8 @@ def boot(args):
         "runtime_session": session_result,
         "migration_contract": "foreground-v1",
         "migration": migration_result,
+        "fault_contract": "staged-v1",
+        "fault": session_result["runtime_fault"] if supervisor_image is not None else {"absent":True},
         "gop_sha256": evidence.sha256(destination / "shell-screen.ppm"),
         "host_elapsed_seconds": round(time.monotonic()-start, 3),
         "signed_efi_sha256": image_sha,

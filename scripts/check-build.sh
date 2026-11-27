@@ -296,7 +296,7 @@ done
 for pApp in pipe-runner pipe-receiver; do
     "$pPython" "$pRoot/scripts/verify-user-abi.py" "$pOut/$pApp"
 done
-for pApp in cow demand ipc; do
+for pApp in cow demand ipc fault; do
     "$pCc" -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
         -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large "-D${pApp^^}_WORKLOAD" \
         -c "$pRoot/scripts/tests/supervisor-runner.c" -o "$pOut/$pApp-runner.o"
@@ -328,5 +328,12 @@ done
 "$pLd" --no-undefined --build-id=none -z noexecstack -s -T "$pRoot/user/user.ld" \
     -o "$pOut/migration-runner" "$pOut/migration-runner-entry.o" "$pOut/migration-workload.o"
 "$pPython" "$pRoot/scripts/verify-user-abi.py" "$pOut/migration-runner"
+"$pCc" -c "$pRoot/scripts/tests/fault-probe.S" -o "$pOut/fault-probe-entry.o"
+"$pCc" -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
+    -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large -DFAULT_PROBE \
+    -c "$pRoot/scripts/tests/fault-workload.c" -o "$pOut/fault-probe.o"
+"$pLd" --no-undefined --build-id=none -z noexecstack -s -T "$pRoot/user/user.ld" \
+    -o "$pOut/fault-probe" "$pOut/fault-probe-entry.o" "$pOut/fault-probe.o"
+"$pPython" "$pRoot/scripts/verify-user-abi.py" "$pOut/fault-probe"
 printf 'Host tests and kernel/user ELF links passed: %s\n' "$pOut"
 printf 'EFI assembly/signing, pinned-toolchain reproducibility and VM execution remain separate checks.\n'

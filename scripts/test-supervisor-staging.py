@@ -78,11 +78,14 @@ class ImageTests(unittest.TestCase):
         self.ipc_runner=b"ipc runner fixture"
         self.ipc_service=b"ipc service fixture"
         self.migration_runner=b"migration runner fixture"
+        self.fault_runner=b"fault runner fixture"
+        self.fault_probe=b"fault probe fixture"
         self.additions=[(images.RUNNER,self.runner),(images.PIPE_RUNNER,self.pipe_runner),
                         (images.PIPE_RECEIVER,self.pipe_receiver),(images.COW_RUNNER,self.cow_runner),
                         (images.DEMAND_RUNNER,self.demand_runner),(images.ADOPTION_RUNNER,self.adoption_runner),
                         (images.IPC_RUNNER,self.ipc_runner),(images.IPC_SERVICE,self.ipc_service),
-                        (images.MIGRATION_RUNNER,self.migration_runner)]
+                        (images.MIGRATION_RUNNER,self.migration_runner),
+                        (images.FAULT_RUNNER,self.fault_runner),(images.FAULT_PROBE,self.fault_probe)]
         self.staged=archive([*self.entries,*self.additions])
         self.kernel=b"kernel fixture"
 
@@ -92,12 +95,23 @@ class ImageTests(unittest.TestCase):
         return images.verify_contents(images.signed_payload(a,fake_certificate(a)),
             images.signed_payload(b,fake_certificate(b)),self.kernel,control,staged,
             self.runner if runner is None else runner,self.pipe_runner,self.pipe_receiver,
-            self.cow_runner,self.demand_runner,self.adoption_runner,self.ipc_runner,self.ipc_service,self.migration_runner)
+            self.cow_runner,self.demand_runner,self.adoption_runner,self.ipc_runner,self.ipc_service,self.migration_runner,self.fault_runner,self.fault_probe)
 
     def test_exact_archive_addition(self):
         result=self.check(self.control,self.staged)
         self.assertEqual(set(result),{name for name,_ in self.entries})
         self.assertNotIn(images.RUNNER,result)
+
+    def test_fault_payloads_and_marker_cannot_leak(self):
+        for name,data in ((images.FAULT_RUNNER,b"elf"),(images.FAULT_PROBE,b"elf"),
+                          ("nested/fault-probe",b"elf"),("renamed",b"AGENTOS TEST FAULT PROBE")):
+            with self.subTest(name=name),self.assertRaises(images.VerificationError):
+                images.verify_distribution(archive([*self.entries,(name,data)]))
+        for name in (images.FAULT_RUNNER,images.FAULT_PROBE):
+            for changed in ([(n,v) for n,v in self.additions if n!=name],
+                            [(n,b"wrong" if n==name else v) for n,v in self.additions]):
+                with self.assertRaises(images.VerificationError):
+                    self.check(self.control,archive([*self.entries,*changed]))
 
     def test_migration_payload_and_marker_cannot_leak(self):
         for name,data in ((images.MIGRATION_RUNNER,b"elf"),("nested/migration-runner",b"elf"),
@@ -251,13 +265,31 @@ def ipc_phase(pid,child,cpu,cpus,total,ms):
     return records
 
 
+def fault_phase(pid,child,cpu,cpus,total,ms):
+    """Synthetic rejection fixture, never a VM proof."""
+    records=[]
+    def event(kind,**fields):
+        records.append("AGENTOS TEST FAULT "+kind+"".join(
+            f" {name}={value & ((1<<64)-1):016x}" for name,value in fields.items()))
+    va=0x10000000000-8
+    event("BEFORE",PID=pid,VA=va,VALUE=pid,INVALID=-14,CROSS=-14,UNKNOWN=-38,EMPTY=-10)
+    event("PROBE",PID=child,PARENT=pid,APIC=cpu,CPUS=cpus,MOVES=0,TOTAL=total,
+          MS=ms+2,VA=va,VALUE=-1)
+    records.append(f"AGENTOS USER FAULT PID={child:016x} PARENT={pid:016x} "
+                   "CR3=0000000000600000 VECTOR=000000000000000e ERROR=0000000000000005 "
+                   "ADDRESS=0000000002000000")
+    event("COLLECT",PID=pid,CHILD=child,START=ms+1,UNTIL=ms+5001,END=ms+3,
+          STATUS=270,AGAIN=-10,EMPTY=-10,VA=va,VALUE=pid)
+    return records
+
+
 def supervisor_transcript(shell=9,runner=20,apics=(7,),moving=False,skipping=False,
-                          peer_moving=False,peer_missed=False,peer_unpaired=False,pipe=False,probe="runnable",memory=None,ipc=False):
+                          peer_moving=False,peer_missed=False,peer_unpaired=False,pipe=False,probe="runnable",memory=None,ipc=False,fault=False):
     """Synthetic evidence, not a guest execution or signature proof."""
     cpus=len(apics)
     count=1 if cpus==1 else 2*cpus
     total=0 if cpus==1 else 4
-    records=["run /"+memory+"-runner" if memory else session.PIPE_COMMAND if pipe else session.IPC_COMMAND if ipc else session.SUPERVISOR_COMMAND]
+    records=["run /"+memory+"-runner" if memory else session.PIPE_COMMAND if pipe else session.IPC_COMMAND if ipc else session.FAULT_COMMAND if fault else session.SUPERVISOR_COMMAND]
     def note(kind,**fields):
         records.append("AGENTOS TEST "+kind+"".join(f" {k}={v:016x}" for k,v in fields.items()))
     def snap(kind,pid,parent,cpu,ms,moves=0,work=None):
@@ -323,6 +355,9 @@ def supervisor_transcript(shell=9,runner=20,apics=(7,),moving=False,skipping=Fal
                     next_pid+=1
                 elif ipc:
                     records.extend(ipc_phase(pid,next_pid,cpu,cpus,total,ms))
+                    next_pid+=1
+                elif fault:
+                    records.extend(fault_phase(pid,next_pid,cpu,cpus,total,ms))
                     next_pid+=1
                 elif memory:
                     child=next_pid
@@ -518,7 +553,7 @@ class RuntimeTests(unittest.TestCase):
             b"exit status 42\r\nagentos> run /fault\r\n"
             b"AGENTOS USER FAULT PID=0000000000000012 PARENT=0000000000000009 CR3=0000000000500000 VECTOR=000000000000000e ERROR=0000000000000005 ADDRESS=0000000002000000\r\n"
             b"exit status 270\r\nagentos> ")
-        common_input=session.runtime_input()+session.MIGRATION_INPUT+session.SUPERVISOR_INPUT+session.PIPE_INPUT+session.MEMORY_INPUT+session.IPC_INPUT+session.ADOPTION_INPUT
+        common_input=session.runtime_input()+session.MIGRATION_INPUT+session.SUPERVISOR_INPUT+session.PIPE_INPUT+session.MEMORY_INPUT+session.IPC_INPUT+session.FAULT_INPUT+session.ADOPTION_INPUT
         for variant,prefix in (("control",(session.SUPERVISOR_COMMAND+"\r\n").encode()+session.SUPERVISOR_MISSING+
                                           (session.PIPE_COMMAND+"\r\n").encode()+session.SUPERVISOR_MISSING+
                                           b"".join((command+"\r\n").encode()+session.SUPERVISOR_MISSING
@@ -531,6 +566,8 @@ class RuntimeTests(unittest.TestCase):
             migration_fixture=load("test-verify-migration.py")
             prefix=migration_echo+(session.SUPERVISOR_MISSING if variant=="control" else
                                    migration_fixture.foreground((7,),root=19))+prefix
+            prefix+=((session.FAULT_COMMAND+"\r\n").encode()+session.SUPERVISOR_MISSING
+                     if variant=="control" else supervisor_transcript(runner=94,fault=True))
             prefix+=((session.ADOPTION_COMMAND+"\r\n").encode()+session.SUPERVISOR_MISSING
                      if variant=="control" else adoption_transcript())
             serial=common_input+(session.ADOPTION_BYTES if variant=="test" else b"")+session.transmitted_input(9,True)
@@ -540,9 +577,10 @@ class RuntimeTests(unittest.TestCase):
                 cleanup=(b"AGENTOS USER KILL PID=000000000000006a PARENT=0000000000000001 STATUS=0000000000000089\r\n"
                          b"AGENTOS MANAGER REAP ROOT=0000000000000001 PID=000000000000006a STATUS=0000000000000089\r\n")
                 log=log.replace(ending,cleanup+ending,1)
-            result=session.verify(log,serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant,aMigrationStaged=True)
+            result=session.verify(log,serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant,aMigrationStaged=True,aFaultStaged=True)
             self.assertEqual(result["runtime_adoption"]["absent"],variant=="control")
             self.assertEqual(result["runtime_ipc"]["absent"],variant=="control")
+            self.assertEqual(result["runtime_fault"]["absent"],variant=="control")
             self.assertEqual(result["runtime_migration"].get("absent",False),variant=="control")
             if variant=="test":
                 self.assertEqual(result["runtime_adoption"]["shutdown_collection"],{"pid":106,"status":137})
@@ -552,7 +590,7 @@ class RuntimeTests(unittest.TestCase):
                                         b"PID=000000000000006a STATUS=0000000000000000",1)):
                     self.assertNotEqual(bad,log)
                     with self.assertRaises(session.VerificationError):
-                        session.verify(bad,serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant,aMigrationStaged=True)
+                        session.verify(bad,serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant,aMigrationStaged=True,aFaultStaged=True)
             self.assertEqual([r["status"] for r in result["runtime_process_regression"]],[0,42,270])
             self.assertEqual(result["restarted_pids"],[111,112,113])
             self.assertEqual(result["runtime_supervisor"]["absent"],variant=="control")
@@ -572,34 +610,35 @@ class RuntimeTests(unittest.TestCase):
                      b"AGENTOS ADOPTION TEST SNAP ROLE=0000000000000001\r\n",
                      b"AGENTOS IPC TEST TIMER_BEFORE PID=0000000000000001\r\n",
                      b"AGENTOS IPC SERVICE PID=0000000000000001\r\n",
+                     b"AGENTOS TEST FAULT PROBE PID=0000000000000001\r\n",
                      b"AGENTOS MANAGER REAP ROOT=0000000000000001 PID=000000000000006a STATUS=0000000000000089\r\n")
             for marker in markers:
                 for bad in (marker+log,log.replace(prefix,prefix+marker,1)):
                     with self.assertRaises(session.VerificationError):
-                        session.verify(bad,serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant,aMigrationStaged=True)
+                        session.verify(bad,serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant,aMigrationStaged=True,aFaultStaged=True)
             for bad in (log.replace(b"run /migration-runner\r\n",b"",1),
                         log.replace(b"APIC=0000000000000007 TIMER-WAKES=",b"APIC=0000000000000008 TIMER-WAKES=",1)
                         if variant=="test" else log.replace(b"TIMER-WAKES=0000000000000003",b"TIMER-WAKES=0000000000000002",1)):
                 with self.assertRaises(session.VerificationError):
-                    session.verify(bad,serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant,aMigrationStaged=True)
+                    session.verify(bad,serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant,aMigrationStaged=True,aFaultStaged=True)
             for bad,bad_input in ((log,serial[1:]),(log.replace(b"FRAMES=OK",b"FRAMES=LEAK"),serial),
                                   (log.replace(b"VECTOR=000000000000000e",b"VECTOR=000000000000000d"),serial),
                                   (log.replace(b"TIMERS=0000000000000005",b"TIMERS=0000000000000100"),serial)):
                 with self.assertRaises(session.VerificationError):
-                    session.verify(bad,bad_input,True,1,aRuntimeProcess=True,aSupervisorImage=variant,aMigrationStaged=True)
+                    session.verify(bad,bad_input,True,1,aRuntimeProcess=True,aSupervisorImage=variant,aMigrationStaged=True,aFaultStaged=True)
             with self.assertRaises(session.VerificationError):
                 session.verify(log,serial,True,1,aRuntimeProcess=True,
-                               aSupervisorImage="test" if variant=="control" else "control",aMigrationStaged=True)
+                               aSupervisorImage="test" if variant=="control" else "control",aMigrationStaged=True,aFaultStaged=True)
             with self.assertRaises(session.VerificationError):
                 session.verify(log,serial,True,1,aRuntimeProcess=True)
             if variant=="test":
                 with self.assertRaises(session.VerificationError):
                     session.verify(log.replace(supervisor_transcript(runner=40,pipe=True),b"",1),
-                                   serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant,aMigrationStaged=True)
+                                   serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant,aMigrationStaged=True,aFaultStaged=True)
                 duplicate=log.replace(b"PID=000000000000006f CR3=",b"PID=0000000000000014 CR3=",1)
                 self.assertNotEqual(duplicate,log)
                 with self.assertRaises(session.VerificationError):
-                    session.verify(duplicate,serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant,aMigrationStaged=True)
+                    session.verify(duplicate,serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant,aMigrationStaged=True,aFaultStaged=True)
 
     def test_adoption_requires_original_status_owner_distinct_passes_and_actual_cpu(self):
         for apics in ((7,),(7,19)):
@@ -691,6 +730,87 @@ class RuntimeTests(unittest.TestCase):
                          (len(missing),{"absent":True},set()))
         with self.assertRaises(session.VerificationError):
             session.supervisor_prefix(missing,9,0x300000,{1,2,9},"test",{7},ipc=True)
+
+    def test_fault_requires_real_child_syscalls_private_sentinel_and_cpu_bracket(self):
+        import re
+        for apics in ((7,),(7,19)):
+            data=supervisor_transcript(apics=apics,fault=True)
+            def verify(log,roster=apics,variant="test"):
+                return session.supervisor_prefix(log,9,0x300000,{1,2,9},variant,set(roster),fault=True)
+            consumed,result,pids=verify(data)
+            self.assertEqual(consumed,len(data))
+            self.assertEqual(result["covered_apics"],list(apics))
+            self.assertEqual(result,json.loads(json.dumps(result)))
+            for interval in result["intervals"]:
+                self.assertEqual(interval["child"]["apic"],interval["apic"])
+                self.assertEqual(interval["syscall_results"],[-14,-14,-38])
+                self.assertEqual(interval["sentinel"]["before"],interval["sentinel"]["after"])
+                self.assertEqual(interval["sentinel"]["child"],(1<<64)-1)
+                self.assertEqual(interval["collected_status"],270)
+                self.assertEqual(interval["wait_deadline_ms"]-interval["wait_start_ms"],5000)
+                self.assertEqual(interval["second_wait"],-10)
+                self.assertNotEqual(interval["parent_cr3"],interval["child_cr3"])
+                self.assertIn(interval["child_pid"],pids)
+            lines=data.splitlines(keepends=True)
+            for i,row in enumerate(lines):
+                if row.startswith((b"AGENTOS TEST FAULT ",b"AGENTOS USER FAULT ")):
+                    for bad in (b"".join(lines[:i]+lines[i+1:]),b"".join(lines[:i]+[row]+lines[i:])):
+                        with self.subTest(apics=apics,record=i),self.assertRaises(session.VerificationError):
+                            verify(bad)
+            for prefix,name,value in (
+                (b"AGENTOS TEST FAULT BEFORE ",b"INVALID",0),
+                (b"AGENTOS TEST FAULT BEFORE ",b"CROSS",0),
+                (b"AGENTOS TEST FAULT BEFORE ",b"UNKNOWN",0),
+                (b"AGENTOS TEST FAULT BEFORE ",b"VALUE",0),
+                (b"AGENTOS TEST FAULT PROBE ",b"PARENT",1),
+                (b"AGENTOS TEST FAULT PROBE ",b"APIC",31),
+                (b"AGENTOS TEST FAULT PROBE ",b"VALUE",0),
+                (b"AGENTOS TEST FAULT PROBE ",b"MOVES",1),
+                (b"AGENTOS TEST FAULT PROBE ",b"TOTAL",100),
+                (b"AGENTOS USER FAULT ",b"PARENT",1),
+                (b"AGENTOS USER FAULT ",b"CR3",0x300000),
+                (b"AGENTOS USER FAULT ",b"VECTOR",13),
+                (b"AGENTOS USER FAULT ",b"ERROR",4),
+                (b"AGENTOS USER FAULT ",b"ADDRESS",0),
+                (b"AGENTOS TEST FAULT COLLECT ",b"STATUS",0),
+                (b"AGENTOS TEST FAULT COLLECT ",b"AGAIN",0),
+                (b"AGENTOS TEST FAULT COLLECT ",b"UNTIL",1),
+                (b"AGENTOS TEST FAULT COLLECT ",b"VALUE",0),
+            ):
+                row=next(v for v in lines if v.startswith(prefix))
+                bad=re.sub(name+rb"=[0-9a-f]{16}",name+f"={value:016x}".encode(),row)
+                self.assertNotEqual(bad,row)
+                with self.subTest(apics=apics,name=name),self.assertRaises(session.VerificationError):
+                    verify(data.replace(row,bad,1))
+            # The parent candidate's real EXIT root must differ from the
+            # child's fault root, not merely from the shell.
+            parent=result["intervals"][0]["pid"]
+            row=next(v for v in lines if v.startswith(f"AGENTOS USER EXIT PID={parent:016x} ".encode()))
+            bad=re.sub(rb"CR3=[0-9a-f]{16}",b"CR3=0000000000600000",row)
+            with self.assertRaises(session.VerificationError):
+                verify(data.replace(row,bad,1))
+            if len(apics)==2:
+                with self.assertRaises(session.VerificationError):
+                    verify(supervisor_transcript(apics=(7,),fault=True))
+                _,moved,_=verify(supervisor_transcript(apics=apics,moving=True,fault=True))
+                self.assertTrue(any(v["reason"]=="migration" for v in moved["rejected"]))
+                for interval in moved["intervals"]:
+                    self.assertEqual(interval["before"]["total"],interval["after"]["total"])
+                # Falsely promote the genuinely moved candidate by changing
+                # its actual exit status: the parser must still demand 76.
+                rejected=next(v for v in moved["rejected"] if v["reason"]=="migration")
+                moving_log=supervisor_transcript(apics=apics,moving=True,fault=True)
+                row=next(v for v in moving_log.splitlines(keepends=True)
+                         if v.startswith(f"AGENTOS USER EXIT PID={rejected['pid']:016x} ".encode()))
+                with self.assertRaises(session.VerificationError):
+                    verify(moving_log.replace(row,row.replace(b"STATUS=000000000000004c",
+                                                             b"STATUS=0000000000000000"),1))
+        missing=(session.FAULT_COMMAND+"\r\n").encode()+session.SUPERVISOR_MISSING
+        self.assertEqual(verify(missing,roster=(7,),variant="control"),(len(missing),{"absent":True},set()))
+        with self.assertRaises(session.VerificationError):
+            verify(missing,roster=(7,))
+        with self.assertRaises(session.VerificationError):
+            verify(supervisor_transcript(apics=(7,),fault=True),roster=(7,),variant="control")
 
     def test_memory_full_locality_and_descendant_evidence(self):
         for kind in ("cow","demand"):

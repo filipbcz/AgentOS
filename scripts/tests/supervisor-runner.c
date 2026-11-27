@@ -5,6 +5,8 @@
 int run_pipe_transfer(long deadline);
 #elif defined(IPC_WORKLOAD)
 int run_ipc(long deadline);
+#elif defined(FAULT_WORKLOAD)
+int run_fault(long deadline);
 #elif defined(COW_WORKLOAD)
 int run_forktest(void);
 #elif defined(DEMAND_WORKLOAD)
@@ -254,6 +256,8 @@ static int worker(unsigned slot,unsigned round) {
     int result=run_pipe_transfer(gDeadline);
 #elif defined(IPC_WORKLOAD)
     int result=run_ipc(gDeadline);
+#elif defined(FAULT_WORKLOAD)
+    int result=run_fault(gDeadline);
 #elif defined(COW_WORKLOAD)
     int result=run_forktest();
 #elif defined(DEMAND_WORKLOAD)
