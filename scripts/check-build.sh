@@ -281,5 +281,22 @@ done
 "$pLd" --no-undefined --build-id=none -z noexecstack -s -T "$pRoot/user/user.ld" \
     -o "$pOut/supervisor-runner" "$pOut/supervisor-runner-entry.o" "$pOut/supervisor-runner.o" "$pOut/supervisor.o"
 "$pPython" "$pRoot/scripts/verify-user-abi.py" "$pOut/supervisor-runner"
+"$pCc" -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
+    -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large -DPIPE_WORKLOAD \
+    -c "$pRoot/scripts/tests/supervisor-runner.c" -o "$pOut/pipe-runner.o"
+"$pCc" -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
+    -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large \
+    -c "$pRoot/scripts/tests/pipe-workload.c" -o "$pOut/pipe-workload.o"
+"$pLd" --no-undefined --build-id=none -z noexecstack -s -T "$pRoot/user/user.ld" \
+    -o "$pOut/pipe-runner" "$pOut/supervisor-runner-entry.o" "$pOut/pipe-runner.o" "$pOut/pipe-workload.o"
+"$pCc" -c "$pRoot/user/receiver.S" -o "$pOut/pipe-receiver-entry.o"
+"$pCc" -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
+    -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large \
+    -c "$pRoot/scripts/tests/pipe-receive.c" -o "$pOut/pipe-receive.o"
+"$pLd" --no-undefined --build-id=none -z noexecstack -s -T "$pRoot/user/user.ld" \
+    -o "$pOut/pipe-receiver" "$pOut/pipe-receiver-entry.o" "$pOut/pipe-receive.o"
+for pApp in pipe-runner pipe-receiver; do
+    "$pPython" "$pRoot/scripts/verify-user-abi.py" "$pOut/$pApp"
+done
 printf 'Host tests and kernel/user ELF links passed: %s\n' "$pOut"
 printf 'EFI assembly/signing, pinned-toolchain reproducibility and VM execution remain separate checks.\n'

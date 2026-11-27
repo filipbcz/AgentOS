@@ -31,6 +31,8 @@ READY = b"AGENTOS SHELL READY\r\nagentos> "
 RUNTIME_PROGRAMS = (("run /svc_ok",0),("run /svc_fail",42),("run /fault",270))
 SUPERVISOR_COMMAND = "run /supervisor-runner"
 SUPERVISOR_INPUT = (SUPERVISOR_COMMAND+"\r").encode("ascii")
+PIPE_COMMAND = "run /pipe-runner"
+PIPE_INPUT = (PIPE_COMMAND+"\r").encode("ascii")
 SUPERVISOR_MISSING = b"run: spawn failed (-2)\r\nagentos> "
 
 def runtime_input():
@@ -72,10 +74,10 @@ def runtime_process_prefix(data, shell, shell_cr3, prior_pids):
     return offset,records
 
 
-def supervisor_prefix(data, shell, shell_cr3, prior_pids, variant, apics):
+def supervisor_prefix(data, shell, shell_cr3, prior_pids, variant, apics, *, pipe=False):
     """Consume only a verified per-CPU foreground workload (or real ENOENT)."""
     require(variant in ("control", "test"), "Invalid supervisor image variant")
-    echo = (SUPERVISOR_COMMAND+"\r\n").encode("ascii")
+    echo = ((PIPE_COMMAND if pipe else SUPERVISOR_COMMAND)+"\r\n").encode("ascii")
     require(data.startswith(echo), "Missing supervisor command echo")
     offset = len(echo)
     if variant == "control":
@@ -84,12 +86,16 @@ def supervisor_prefix(data, shell, shell_cr3, prior_pids, variant, apics):
         return offset+len(SUPERVISOR_MISSING), {"absent": True}, set()
 
     modules=[]
-    for filename in ("verify-supervisor.py","verify-supervisor-locality.py"):
+    filenames=("verify-supervisor.py","verify-supervisor-locality.py")
+    if pipe:
+        filenames+=("verify-pipe-transfer.py",)
+    for filename in filenames:
         spec=importlib.util.spec_from_file_location(filename,Path(__file__).with_name(filename))
         module=importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         modules.append(module)
-    consumed,result,pids=modules[1].verify(data[offset:],shell,shell_cr3,prior_pids,apics,modules[0],require)
+    consumed,result,pids=modules[1].verify(data[offset:],shell,shell_cr3,prior_pids,apics,modules[0],require,
+                                           pipe=modules[2] if pipe else None)
     return offset+consumed,result,pids
 
 
@@ -215,8 +221,8 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
            aRuntimeProcess=False, aSupervisorImage=None):
     require(aSupervisorImage is None or (aRuntimeProcess and aSupervisorImage in ("control","test")),
             "Supervisor image scenario requires the existing foreground regression")
-    pWorkloadMarkers=(b"AGENTOS SUPERVISOR",b"AGENTOS SERVICE ",b"AGENTOS TEST ")
-    require(aLog.count(b"AGENTOS TEST RUNNER ")==int(aSupervisorImage=="test"),
+    pWorkloadMarkers=(b"AGENTOS SUPERVISOR",b"AGENTOS SERVICE ",b"AGENTOS TEST ",b"AGENTOS PIPE TEST ")
+    require(aLog.count(b"AGENTOS TEST RUNNER ")==2*int(aSupervisorImage=="test"),
             "Unexpected runner invocation outside its foreground interval")
     if aSupervisorImage!="test":
         require(not any(marker in aLog for marker in pWorkloadMarkers),
@@ -244,6 +250,7 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
     pInteractive=pInteractive[len(READY):]
     pRuntimeRecords=[]
     pSupervisor=None
+    pPipe=None
     pPrefixPids=set()
     if aRuntimeProcess:
         # Account for every earlier actual PID, not just the current shell.
@@ -263,9 +270,15 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
             pConsumed,pSupervisor,pNewPids=supervisor_prefix(
                 pInteractive,pShell,int(pShellExits[0][2],16),
                 pPrior | pPrefixPids,aSupervisorImage,set(pApicList))
-            require(all(aLog.count(marker)==pInteractive[:pConsumed].count(marker)
+            pSupervisorLog=pInteractive[:pConsumed]
+            pPrefixPids.update(pNewPids)
+            pInteractive=pInteractive[pConsumed:]
+            pConsumed,pPipe,pNewPids=supervisor_prefix(
+                pInteractive,pShell,int(pShellExits[0][2],16),
+                pPrior | pPrefixPids,aSupervisorImage,set(pApicList),pipe=True)
+            require(all(aLog.count(marker)==(pSupervisorLog+pInteractive[:pConsumed]).count(marker)
                         for marker in pWorkloadMarkers),
-                    "Supervisor evidence outside its authenticated foreground interval")
+                    "Test evidence outside its authenticated foreground interval")
             pPrefixPids.update(pNewPids)
             pInteractive=pInteractive[pConsumed:]
     pClean = without_kernel_events(pInteractive)
@@ -279,7 +292,7 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
     if aInput is not None:
         pPrefix=runtime_input() if aRuntimeProcess else b""
         if aSupervisorImage is not None:
-            pPrefix+=SUPERVISOR_INPUT
+            pPrefix+=SUPERVISOR_INPUT+PIPE_INPUT
         require(aInput==pPrefix+transmitted_input(pShell,aKeyboard),"Captured transmitted UART bytes differ from scenario")
     pRestart = pInteractive.find(b"service restart flaky\r\n")
     require(pRestart>=0,"No explicit service RESTART command")
@@ -316,6 +329,7 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
         result["runtime_process_regression"]=pRuntimeRecords
     if aSupervisorImage is not None:
         result["runtime_supervisor"]=pSupervisor
+        result["runtime_pipe"]=pPipe
     return result
 
 

@@ -19,6 +19,8 @@ import tempfile
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parent.parent
 RUNNER = "supervisor-runner"
+PIPE_RUNNER = "pipe-runner"
+PIPE_RECEIVER = "pipe-receiver"
 SECTIONS = (".text", ".sdata", ".data", ".dynamic", ".dynsym", ".rela",
             ".reloc", ".kernel", ".initrd")
 CFLAGS = ("-std=c11", "-Os", "-Wall", "-Wextra", "-Werror", "-ffreestanding",
@@ -144,18 +146,23 @@ def cpio_entries(data):
         at=next_at
 
 
-def verify_contents(control, test, kernel, control_cpio, test_cpio, runner):
+def verify_contents(control, test, kernel, control_cpio, test_cpio, runner, pipe_runner, pipe_receiver):
     for sections, archive in ((control,control_cpio),(test,test_cpio)):
         require(sections[".kernel"][1]==kernel and sections[".initrd"][1]==archive,
                 "Actual embedded kernel/initramfs differs from build files")
     distribution, staged = cpio_entries(control_cpio), cpio_entries(test_cpio)
-    require({"init","shell","svc_ok","svc_fail","svc_hang","fault"}<=set(distribution) and
-            RUNNER not in distribution and set(staged)==set(distribution)|{RUNNER},
-            "Staged archive must add exactly one runner, absent from distribution")
+    additions={RUNNER:runner,PIPE_RUNNER:pipe_runner,PIPE_RECEIVER:pipe_receiver}
+    require({"init","shell","svc_ok","svc_fail","svc_hang","fault","data/transfer.bin"}<=set(distribution) and
+            not set(additions)&set(distribution) and set(staged)==set(distribution)|set(additions),
+            "Staged archive must add exactly the separate test ELFs")
+    require(distribution["data/transfer.bin"][1]==bytes((i*73+i//251*19)%256 for i in range(8193)),
+            "Shared transfer fixture differs from expected bytes")
     require(all(staged[name]==entry for name,entry in distribution.items()),
             "A common CPIO entry changed")
-    require(staged[RUNNER][0][1]&0o170000==0o100000 and
-            staged[RUNNER][0][1]&0o111!=0 and staged[RUNNER][1]==runner,"Embedded runner differs from linked ELF")
+    for name,payload in additions.items():
+        require(staged[name][0][1]&0o170000==0o100000 and
+                staged[name][0][1]&0o111!=0 and staged[name][1]==payload,
+                "Embedded test ELF differs from linked ELF: "+name)
     return {name: {"size":len(entry[1]), "sha256":digest(entry[1])}
             for name,entry in sorted(distribution.items())}
 
@@ -203,6 +210,15 @@ def reproduce(root, out, stage, write_maps):
         command(work,"ld","--no-undefined","--build-id=none","-z","noexecstack","-s",
                 "-T",str(root/"user/user.ld"),"-o",RUNNER,"runner-entry.o","runner.o","supervisor.o")
         require((work/RUNNER).read_bytes()==(stage/RUNNER).read_bytes(),"Runner relink differs")
+        command(work,"gcc-13",*CFLAGS,"-DPIPE_WORKLOAD","-c",str(root/"scripts/tests/supervisor-runner.c"),"-o","pipe-runner.o")
+        command(work,"gcc-13",*CFLAGS,"-c",str(root/"scripts/tests/pipe-workload.c"),"-o","pipe-workload.o")
+        command(work,"gcc-13","-c",str(root/"user/receiver.S"),"-o","pipe-receiver-entry.o")
+        command(work,"gcc-13",*CFLAGS,"-c",str(root/"scripts/tests/pipe-receive.c"),"-o","pipe-receive.o")
+        for name,objects in ((PIPE_RUNNER,("runner-entry.o","pipe-runner.o","pipe-workload.o")),
+                             (PIPE_RECEIVER,("pipe-receiver-entry.o","pipe-receive.o"))):
+            command(work,"ld","--no-undefined","--build-id=none","-z","noexecstack","-s",
+                    "-T",str(root/"user/user.ld"),"-o",name,*objects)
+            require((work/name).read_bytes()==(stage/name).read_bytes(),"Test ELF relink differs: "+name)
         for variant,archive,expected in (
                 ("control",out/"initramfs.cpio",out/"agentos.unsigned.efi"),
                 ("test",stage/"test.cpio",stage/"test.unsigned.efi")):
@@ -241,11 +257,12 @@ def verify_identity(root=ROOT, *, write=False):
     test_signed=(stage/"test.efi").read_bytes()
     control=signed_payload(control_unsigned,control_signed)
     test=signed_payload(test_unsigned,test_signed)
-    kernel,control_cpio,test_cpio,runner=(p.read_bytes() for p in
-        (out/"kernel.elf",out/"initramfs.cpio",stage/"test.cpio",stage/RUNNER))
+    kernel,control_cpio,test_cpio,runner,pipe_runner,pipe_receiver=(p.read_bytes() for p in
+        (out/"kernel.elf",out/"initramfs.cpio",stage/"test.cpio",stage/RUNNER,stage/PIPE_RUNNER,stage/PIPE_RECEIVER))
     require(build["initramfs_sha256"]==digest(control_cpio),"Distribution receipt archive mismatch")
-    common=verify_contents(control,test,kernel,control_cpio,test_cpio,runner)
-    load(root,"verify-user-abi.py").verify(runner)
+    common=verify_contents(control,test,kernel,control_cpio,test_cpio,runner,pipe_runner,pipe_receiver)
+    for elf in (runner,pipe_runner,pipe_receiver):
+        load(root,"verify-user-abi.py").verify(elf)
     reproduce(root,out,stage,write)
 
     def describe(unsigned,signed,sections):
@@ -260,6 +277,7 @@ def verify_identity(root=ROOT, *, write=False):
             "loader_object_sha256":sha(stage/"loader.o"),"layout_sha256":sha(stage/"layout.ld"),
             "supervisor_object_sha256":sha(stage/"supervisor.o"),"kernel_sha256":digest(kernel),
             "common_entries":common,"runner_sha256":digest(runner),
+            "pipe_runner_sha256":digest(pipe_runner),"pipe_receiver_sha256":digest(pipe_receiver),
             "map_sha256":{v:sha(stage/(v+".map")) for v in ("control","test")},
             "control":describe(control_unsigned,control_signed,control),
             "test":describe(test_unsigned,test_signed,test)}

@@ -256,13 +256,15 @@ def run_session(process, capture, qmp, destination, runtime_process_regression=F
             wait_session(process, capture, serial,
                          lambda data: reply in data[offset:], command, 30)
     if supervisor_image is not None:
-        offset = serial.stat().st_size
-        print(f"QEMU {supervisor_image} signed image: {session.SUPERVISOR_COMMAND!r}", flush=True)
-        capture.send(session.SUPERVISOR_INPUT)
-        reply = (session.SUPERVISOR_MISSING if supervisor_image=="control"
-                 else b"exit status 0\r\nagentos> ")
-        wait_session(process, capture, serial,
-                     lambda data: reply in data[offset:], session.SUPERVISOR_COMMAND, 30)
+        for command,request in ((session.SUPERVISOR_COMMAND,session.SUPERVISOR_INPUT),
+                                (session.PIPE_COMMAND,session.PIPE_INPUT)):
+            offset = serial.stat().st_size
+            print(f"QEMU {supervisor_image} signed image: {command!r}", flush=True)
+            capture.send(request)
+            reply = (session.SUPERVISOR_MISSING if supervisor_image=="control"
+                     else b"exit status 0\r\nagentos> ")
+            wait_session(process, capture, serial,
+                         lambda data: reply in data[offset:], command, 30)
     for step in session.steps(shell, True):
         if step["screenshot"]:
             qmp.screenshot(destination / "keyboard-before.ppm")

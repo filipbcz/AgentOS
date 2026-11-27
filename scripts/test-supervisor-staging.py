@@ -65,9 +65,14 @@ def fake_certificate(unsigned):
 class ImageTests(unittest.TestCase):
     def setUp(self):
         self.entries=[(n,n.encode()) for n in ("init","shell","svc_ok","svc_fail","svc_hang","fault")]
+        self.entries.append(("data/transfer.bin",bytes((i*73+i//251*19)%256 for i in range(8193))))
         self.control=archive(self.entries)
         self.runner=b"isolated test fixture"
-        self.staged=archive([*self.entries,(images.RUNNER,self.runner)])
+        self.pipe_runner=b"pipe sender fixture"
+        self.pipe_receiver=b"pipe receiver fixture"
+        self.additions=[(images.RUNNER,self.runner),(images.PIPE_RUNNER,self.pipe_runner),
+                        (images.PIPE_RECEIVER,self.pipe_receiver)]
+        self.staged=archive([*self.entries,*self.additions])
         self.kernel=b"kernel fixture"
 
     def check(self, control, staged, runner=None):
@@ -75,7 +80,7 @@ class ImageTests(unittest.TestCase):
         b=pe(self.kernel,staged)
         return images.verify_contents(images.signed_payload(a,fake_certificate(a)),
             images.signed_payload(b,fake_certificate(b)),self.kernel,control,staged,
-            self.runner if runner is None else runner)
+            self.runner if runner is None else runner,self.pipe_runner,self.pipe_receiver)
 
     def test_exact_archive_addition(self):
         result=self.check(self.control,self.staged)
@@ -84,9 +89,9 @@ class ImageTests(unittest.TestCase):
 
     def test_missing_extra_changed_runner_or_common_entry(self):
         for a,b in ((self.staged,self.staged),(self.control,self.control),
-                    (self.control,archive([*self.entries,(images.RUNNER,self.runner),("extra",b"x")])),
-                    (self.control,archive([("init",b"changed"),*self.entries[1:],(images.RUNNER,self.runner)])),
-                    (self.control,archive([*self.entries[1:],(images.RUNNER,self.runner)]))):
+                    (self.control,archive([*self.entries,*self.additions,("extra",b"x")])),
+                    (self.control,archive([("init",b"changed"),*self.entries[1:],*self.additions])),
+                    (self.control,archive([*self.entries[1:],*self.additions]))):
             with self.subTest(a=len(a),b=len(b)), self.assertRaises(images.VerificationError):
                 self.check(a,b)
         with self.assertRaises(images.VerificationError):
@@ -135,12 +140,12 @@ def supervisor_phase(parent, first, cr3=0x600000):
 
 
 def supervisor_transcript(shell=9,runner=20,apics=(7,),moving=False,skipping=False,
-                          peer_moving=False,peer_missed=False):
+                          peer_moving=False,peer_missed=False,pipe=False):
     """Synthetic evidence, not a guest execution or signature proof."""
     cpus=len(apics)
     count=1 if cpus==1 else 2*cpus
     total=0 if cpus==1 else 4
-    records=[session.SUPERVISOR_COMMAND]
+    records=[session.PIPE_COMMAND if pipe else session.SUPERVISOR_COMMAND]
     def note(kind,**fields):
         records.append("AGENTOS TEST "+kind+"".join(f" {k}={v:016x}" for k,v in fields.items()))
     def snap(kind,pid,parent,cpu,ms,moves=0,work=None):
@@ -184,8 +189,17 @@ def supervisor_transcript(shell=9,runner=20,apics=(7,),moving=False,skipping=Fal
                 status=75
             elif run:
                 snap("BEGIN",pid,runner,cpu,ms)
-                records.extend(supervisor_phase(pid,next_pid))
-                next_pid+=5
+                if pipe:
+                    child=next_pid
+                    for phase,at in (("BEGIN",ms+1),("ENDED",ms+50)):
+                        records.append(f"AGENTOS PIPE TEST {phase} PID={child:016x} PARENT={pid:016x} APIC={cpu:016x} CPUS={cpus:016x} MOVES=0000000000000000 TOTAL={total:016x} MS={at:016x}")
+                    records.append(f"AGENTOS PIPE TEST RECEIVED PID={child:016x} BYTES=00002001 FNV32=1490a95f EOF=00000002")
+                    exit_line(child,0,0x600000)
+                    records.append(f"AGENTOS PIPE TEST SENT PID={pid:016x} CHILD={child:016x} BYTES=0000000000002001 DIRECT=000000000000000c DUP=000000000000000b WRITES=0000000000000018 SHORT=0000000000000001")
+                    next_pid+=1
+                else:
+                    records.extend(supervisor_phase(pid,next_pid))
+                    next_pid+=5
                 ms+=350
                 if first and moving:
                     total+=1
@@ -290,7 +304,7 @@ class RuntimeTests(unittest.TestCase):
         fixture=load("test-verify-stage3-session.py")
         base=(b"AGENTOS TASK BSP APIC=0000000000000007 TIMER-WAKES=0000000000000003\r\n"
               +fixture.transcript(True))
-        for old,new in ((10,30),(11,31),(12,32),(13,33)):
+        for old,new in ((10,50),(11,51),(12,52),(13,53)):
             base=base.replace(f"PID={old:016x}".encode(),f"PID={new:016x}".encode())
         fg=(b"run /svc_ok\r\n"
             b"AGENTOS USER EXIT PID=0000000000000010 CR3=0000000000500000 STATUS=0000000000000000\r\n"
@@ -299,14 +313,16 @@ class RuntimeTests(unittest.TestCase):
             b"exit status 42\r\nagentos> run /fault\r\n"
             b"AGENTOS USER FAULT PID=0000000000000012 PARENT=0000000000000009 CR3=0000000000500000 VECTOR=000000000000000e ERROR=0000000000000005 ADDRESS=0000000002000000\r\n"
             b"exit status 270\r\nagentos> ")
-        serial=session.runtime_input()+session.SUPERVISOR_INPUT+session.transmitted_input(9,True)
-        for variant,prefix in (("control",(session.SUPERVISOR_COMMAND+"\r\n").encode()+session.SUPERVISOR_MISSING),
-                               ("test",supervisor_transcript())):
+        serial=session.runtime_input()+session.SUPERVISOR_INPUT+session.PIPE_INPUT+session.transmitted_input(9,True)
+        for variant,prefix in (("control",(session.SUPERVISOR_COMMAND+"\r\n").encode()+session.SUPERVISOR_MISSING+
+                                          (session.PIPE_COMMAND+"\r\n").encode()+session.SUPERVISOR_MISSING),
+                               ("test",supervisor_transcript()+supervisor_transcript(runner=40,pipe=True))):
             log=base.replace(session.READY,session.READY+fg+prefix,1)
             result=session.verify(log,serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant)
             self.assertEqual([r["status"] for r in result["runtime_process_regression"]],[0,42,270])
-            self.assertEqual(result["restarted_pids"],[31,32,33])
+            self.assertEqual(result["restarted_pids"],[51,52,53])
             self.assertEqual(result["runtime_supervisor"]["absent"],variant=="control")
+            self.assertEqual(result["runtime_pipe"]["absent"],variant=="control")
             # The entire normal boot (and every non-workload byte afterward)
             # must be free of the relocated supervisor, even in the staged image.
             markers=(b"AGENTOS SUPERVISOR BEGIN PARENT=0000000000000001\r\n",
@@ -328,8 +344,38 @@ class RuntimeTests(unittest.TestCase):
                 session.verify(log,serial,True,1,aRuntimeProcess=True)
             if variant=="test":
                 with self.assertRaises(session.VerificationError):
-                    session.verify(log.replace(b"PID=000000000000001f CR3=",b"PID=0000000000000014 CR3="),
+                    session.verify(log.replace(b"PID=0000000000000033 CR3=",b"PID=0000000000000014 CR3="),
                                    serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant)
+
+    def test_pipe_full_locality_and_receiver_evidence(self):
+        for apics in ((7,),(7,19)):
+            data=supervisor_transcript(apics=apics,pipe=True)
+            def check(value):
+                return session.supervisor_prefix(value,9,0x300000,{1,2,9},"test",set(apics),pipe=True)
+            offset,receipt,_=check(data)
+            self.assertEqual(offset,len(data))
+            self.assertEqual(receipt["covered_apics"],list(apics))
+            for interval in receipt["intervals"]:
+                self.assertEqual(interval["bytes"],8193)
+                self.assertEqual(interval["fnv32"],0x1490a95f)
+                self.assertEqual(interval["eof_reads"],2)
+                self.assertEqual(interval["partial_writes"],1)
+                self.assertEqual(interval["child_statuses"],[0])
+            lines=data.splitlines(keepends=True)
+            for i in range(len(lines)):
+                with self.subTest(apics=apics,line=i),self.assertRaises(session.VerificationError):
+                    check(b"".join(lines[:i]+lines[i+1:]))
+            for old,new in ((b"FNV32=1490a95f",b"FNV32=1490a950"),
+                            (b"BYTES=00002001",b"BYTES=00002000"),
+                            (b"EOF=00000002",b"EOF=00000001"),
+                            (b"DUP=000000000000000b",b"DUP=0000000000000000"),
+                            (b"SHORT=0000000000000001",b"SHORT=0000000000000000"),
+                            (b"CR3=0000000000600000",b"CR3=0000000000500000")):
+                with self.subTest(old=old),self.assertRaises(session.VerificationError):
+                    check(data.replace(old,new,1))
+        data=supervisor_transcript(apics=(7,19),pipe=True,moving=True)
+        _,receipt,_=session.supervisor_prefix(data,9,0x300000,{1,2,9},"test",{7,19},pipe=True)
+        self.assertTrue(any(r["reason"]=="migration" for r in receipt["rejected"]))
 
     def test_two_cpu_roster_and_rejected_complete_attempts(self):
         for flags in ({},{"moving":True},{"skipping":True},{"peer_moving":True},{"peer_missed":True}):

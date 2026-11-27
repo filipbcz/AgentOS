@@ -1,7 +1,11 @@
 /* Test-only workload, invoked by the ordinary shell. */
 #include "../../user/abi.h"
 
+#ifdef PIPE_WORKLOAD
+int run_pipe_transfer(long deadline);
+#else
 int run_supervisor(void);
+#endif
 enum { maxPool=8, maxRounds=4, budgetMs=15000, workMs=100,
        runReserveMs=3000, skipStatus=75, movedStatus=76 };
 enum { workCommand=1, runCommand=2, stopCommand=3, peerCommand=4, peerStop=5, peerIterations=2000000 };
@@ -183,7 +187,11 @@ static int worker(unsigned slot,unsigned round) {
     if (!sample(&before) || before.stats[7]!=gRoot || before.ms>(unsigned long)(gDeadline-runReserveMs)) return 73;
     if (before.stats[1]!=c.apic) return snapshot("SKIP",&before)?skipStatus:74;
     if (!snapshot("BEGIN",&before)) return 74;
+#ifdef PIPE_WORKLOAD
+    int result=run_pipe_transfer(gDeadline);
+#else
     int result=run_supervisor();
+#endif
     if (result) return result;
     if (os_call(SYS_CHILD_AFTER,0,0,0)!=-10 || !sample(&after) || after.stats[7]!=gRoot ||
         after.stats[6]!=before.stats[6] || !snapshot("ENDED",&after)) return 68;

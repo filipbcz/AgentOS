@@ -159,9 +159,26 @@ if ((staging)); then
     ld --no-undefined --build-id=none -z noexecstack -s -T "$root/user/user.ld" \
         -o supervisor-runner runner-entry.o runner.o supervisor.o
     python3 "$root/scripts/verify-user-abi.py" supervisor-runner
-    cp supervisor-runner "$stage_out/"
-    touch -d @0 supervisor-runner
-    printf '%s\n' "${files[@]}" supervisor-runner | cpio --quiet --reproducible --owner=0:0 -o -H newc > initramfs.cpio
+    gcc-13 -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
+        -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large -DPIPE_WORKLOAD \
+        -c "$root/scripts/tests/supervisor-runner.c" -o pipe-runner.o
+    gcc-13 -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
+        -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large \
+        -c "$root/scripts/tests/pipe-workload.c" -o pipe-workload.o
+    ld --no-undefined --build-id=none -z noexecstack -s -T "$root/user/user.ld" \
+        -o pipe-runner runner-entry.o pipe-runner.o pipe-workload.o
+    gcc-13 -c "$root/user/receiver.S" -o pipe-receiver-entry.o
+    gcc-13 -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
+        -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large \
+        -c "$root/scripts/tests/pipe-receive.c" -o pipe-receive.o
+    ld --no-undefined --build-id=none -z noexecstack -s -T "$root/user/user.ld" \
+        -o pipe-receiver pipe-receiver-entry.o pipe-receive.o
+    for app in pipe-runner pipe-receiver; do
+        python3 "$root/scripts/verify-user-abi.py" "$app"
+    done
+    cp supervisor-runner pipe-runner pipe-receiver "$stage_out/"
+    touch -d @0 supervisor-runner pipe-runner pipe-receiver
+    printf '%s\n' "${files[@]}" supervisor-runner pipe-runner pipe-receiver | cpio --quiet --reproducible --owner=0:0 -o -H newc > initramfs.cpio
     cp initramfs.cpio "$stage_out/test.cpio"
     gcc-13 -c "$root/boot/payload.S" -o payload.o
     ld -nostdlib --build-id=none -znocombreloc -T layout.ld -shared -Bsymbolic \

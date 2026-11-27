@@ -2,7 +2,7 @@
 import re
 
 
-def verify(data, shell, shell_cr3, prior_pids, apics, supervisor, require):
+def verify(data, shell, shell_cr3, prior_pids, apics, supervisor, require, pipe=None):
     """Consume the bounded candidate protocol and every real child event."""
     require(len(apics) in (1,2), "Missing independently observed CPU roster")
     offset=0
@@ -117,33 +117,39 @@ def verify(data, shell, shell_cr3, prior_pids, apics, supervisor, require):
                     floor_ms,floor_total=before["ms"],before["total"]
                 else:
                     require(before["apic"]==cpu,"Workload started on wrong CPU")
-                    begin=supervisor.BEGIN.fullmatch(line())
-                    require(begin is not None and int(begin[1],16)==pid,"Supervisor parent mismatch")
-                    previous=max(seen)
-                    records=[]
-                    try:
-                        for _ in supervisor.EXPECTED_ORDER:
-                            text=line()
-                            item=supervisor.event(text)
-                            require(item is not None,"Unexpected supervisor event")
-                            records.append(item)
-                            m=supervisor.EXIT.fullmatch(text)
-                            if m:
-                                roots.append(int(m[2],16))
-                        end=supervisor.END.fullmatch(line())
-                        require(end is not None and int(end[1],16)==pid,"Supervisor end mismatch")
-                        outcome=supervisor.verify_interval(pid,records,seen)
-                    except supervisor.VerificationError as error:
-                        require(False,"Foreground supervisor: "+str(error))
-                    children=[outcome["healthy_pid"],*outcome["failed_pids"],outcome["killed_pid"]]
-                    require(children==sorted(children) and min(children)>previous,"Replayed supervisor child PID")
+                    if pipe is not None:
+                        outcome,roots=pipe.verify_interval(line,pid,before,seen,supervisor,require)
+                    else:
+                        begin=supervisor.BEGIN.fullmatch(line())
+                        require(begin is not None and int(begin[1],16)==pid,"Supervisor parent mismatch")
+                        previous=max(seen)
+                        records=[]
+                        try:
+                            for _ in supervisor.EXPECTED_ORDER:
+                                text=line()
+                                item=supervisor.event(text)
+                                require(item is not None,"Unexpected supervisor event")
+                                records.append(item)
+                                m=supervisor.EXIT.fullmatch(text)
+                                if m:
+                                    roots.append(int(m[2],16))
+                            end=supervisor.END.fullmatch(line())
+                            require(end is not None and int(end[1],16)==pid,"Supervisor end mismatch")
+                            outcome=supervisor.verify_interval(pid,records,seen)
+                        except supervisor.VerificationError as error:
+                            require(False,"Foreground supervisor: "+str(error))
+                        children=[outcome["healthy_pid"],*outcome["failed_pids"],outcome["killed_pid"]]
+                        require(children==sorted(children) and min(children)>previous,"Replayed supervisor child PID")
                     after=snap("ENDED")
                     require(progresses(before,after) and after["ms"]<=deadline and
                             after["ms"]-before["ms"]>=outcome["duration_ms"],"Incomplete or regressed supervisor bracket")
                     local=all(before[k]==after[k] for k in ("apic","moves","total"))
                     status=0 if local else 76
-                    outcome.update({"pid":pid,"apic":cpu,"before":before,"after":after,
-                                    "child_statuses":[records[i][3] for i in (0,2,4,6,9)]})
+                    if pipe is not None:
+                        pipe.verify_bracket(outcome,before,after,apics,local,require)
+                    else:
+                        outcome["child_statuses"]=[records[i][3] for i in (0,2,4,6,9)]
+                    outcome.update({"pid":pid,"apic":cpu,"before":before,"after":after})
                     if not local:
                         outcome["reason"]="migration"
                     floor_ms,floor_total=after["ms"],after["total"]
