@@ -308,5 +308,12 @@ for pApp in cow demand; do
         -o "$pOut/$pApp-runner" "$pOut/supervisor-runner-entry.o" "$pOut/$pApp-runner.o" "$pOut/$pApp-workload.o"
     "$pPython" "$pRoot/scripts/verify-user-abi.py" "$pOut/$pApp-runner"
 done
+"$pCc" -c "$pRoot/scripts/tests/adoption-runner.S" -o "$pOut/adoption-entry.o"
+"$pCc" -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
+    -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large \
+    -c "$pRoot/scripts/tests/adoption-runner.c" -o "$pOut/adoption-runner.o"
+"$pLd" --no-undefined --build-id=none -z noexecstack -s -T "$pRoot/user/user.ld" \
+    -o "$pOut/adoption-runner" "$pOut/adoption-entry.o" "$pOut/adoption-runner.o"
+"$pPython" "$pRoot/scripts/verify-user-abi.py" "$pOut/adoption-runner"
 printf 'Host tests and kernel/user ELF links passed: %s\n' "$pOut"
 printf 'EFI assembly/signing, pinned-toolchain reproducibility and VM execution remain separate checks.\n'

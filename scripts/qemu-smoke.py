@@ -267,6 +267,27 @@ def run_session(process, capture, qmp, destination, runtime_process_regression=F
                      else b"exit status 0\r\nagentos> ")
             wait_session(process, capture, serial,
                          lambda data: reply in data[offset:], command, 30)
+        offset=serial.stat().st_size
+        print(f"QEMU {supervisor_image} signed image: {session.ADOPTION_COMMAND!r}",flush=True)
+        capture.send(session.ADOPTION_INPUT)
+        if supervisor_image=="test":
+            for step,status in ((1,57),(2,58),(3,59)):
+                wait=re.compile(rb"AGENTOS ADOPTION TEST WAIT STEP="+f"{step:016x}".encode()+
+                                rb" PID=([0-9a-f]{16})\r\n")
+                def collected(data):
+                    view=data[offset:]
+                    match=wait.search(view)
+                    if not match:
+                        return False
+                    record=(b"AGENTOS MANAGER REAP ROOT=0000000000000001 PID="+match[1]+
+                            b" STATUS="+f"{status:016x}".encode()+b"\r\n")
+                    return record in view
+                wait_session(process,capture,serial,collected,f"actual PID1 collection at adoption gate {step}",30)
+                capture.send(session.ADOPTION_BYTES[step-1:step])
+        reply=(session.SUPERVISOR_MISSING if supervisor_image=="control"
+               else b"exit status 0\r\nagentos> ")
+        wait_session(process,capture,serial,lambda data: reply in data[offset:],
+                     session.ADOPTION_COMMAND,30)
     for step in session.steps(shell, True):
         if step["screenshot"]:
             qmp.screenshot(destination / "keyboard-before.ppm")

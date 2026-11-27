@@ -189,9 +189,16 @@ if ((staging)); then
             -o "$app-runner" runner-entry.o "$app-runner.o" "$app-workload.o"
         python3 "$root/scripts/verify-user-abi.py" "$app-runner"
     done
-    cp supervisor-runner pipe-runner pipe-receiver cow-runner demand-runner "$stage_out/"
-    touch -d @0 supervisor-runner pipe-runner pipe-receiver cow-runner demand-runner
-    printf '%s\n' "${files[@]}" supervisor-runner pipe-runner pipe-receiver cow-runner demand-runner | cpio --quiet --reproducible --owner=0:0 -o -H newc > initramfs.cpio
+    gcc-13 -c "$root/scripts/tests/adoption-runner.S" -o adoption-entry.o
+    gcc-13 -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
+        -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large \
+        -c "$root/scripts/tests/adoption-runner.c" -o adoption-runner.o
+    ld --no-undefined --build-id=none -z noexecstack -s -T "$root/user/user.ld" \
+        -o adoption-runner adoption-entry.o adoption-runner.o
+    python3 "$root/scripts/verify-user-abi.py" adoption-runner
+    cp supervisor-runner pipe-runner pipe-receiver cow-runner demand-runner adoption-runner "$stage_out/"
+    touch -d @0 supervisor-runner pipe-runner pipe-receiver cow-runner demand-runner adoption-runner
+    printf '%s\n' "${files[@]}" supervisor-runner pipe-runner pipe-receiver cow-runner demand-runner adoption-runner | cpio --quiet --reproducible --owner=0:0 -o -H newc > initramfs.cpio
     cp initramfs.cpio "$stage_out/test.cpio"
     gcc-13 -c "$root/boot/payload.S" -o payload.o
     ld -nostdlib --build-id=none -znocombreloc -T layout.ld -shared -Bsymbolic \

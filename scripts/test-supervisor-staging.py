@@ -74,9 +74,10 @@ class ImageTests(unittest.TestCase):
         self.pipe_receiver=b"pipe receiver fixture"
         self.cow_runner=b"cow runner fixture"
         self.demand_runner=b"demand runner fixture"
+        self.adoption_runner=b"adoption runner fixture"
         self.additions=[(images.RUNNER,self.runner),(images.PIPE_RUNNER,self.pipe_runner),
                         (images.PIPE_RECEIVER,self.pipe_receiver),(images.COW_RUNNER,self.cow_runner),
-                        (images.DEMAND_RUNNER,self.demand_runner)]
+                        (images.DEMAND_RUNNER,self.demand_runner),(images.ADOPTION_RUNNER,self.adoption_runner)]
         self.staged=archive([*self.entries,*self.additions])
         self.kernel=b"kernel fixture"
 
@@ -86,7 +87,7 @@ class ImageTests(unittest.TestCase):
         return images.verify_contents(images.signed_payload(a,fake_certificate(a)),
             images.signed_payload(b,fake_certificate(b)),self.kernel,control,staged,
             self.runner if runner is None else runner,self.pipe_runner,self.pipe_receiver,
-            self.cow_runner,self.demand_runner)
+            self.cow_runner,self.demand_runner,self.adoption_runner)
 
     def test_exact_archive_addition(self):
         result=self.check(self.control,self.staged)
@@ -134,6 +135,20 @@ class ImageTests(unittest.TestCase):
                             [(n,b"wrong" if n==name else v) for n,v in self.additions]):
                 with self.subTest(name=name),self.assertRaises(images.VerificationError):
                     self.check(self.control,archive([*self.entries,*changed]))
+
+    def test_adoption_client_and_code_forbidden_in_distribution_and_required_staged(self):
+        for name in (images.ADOPTION_RUNNER,"other/adoption-runner"):
+            extra=(name,b"adoption fixture")
+            with self.subTest(name=name),self.assertRaises(images.VerificationError):
+                self.check(archive([*self.entries,extra]),archive([*self.entries,extra,*self.additions]))
+        changed=[(name,payload+b"AGENTOS ADOPTION TEST " if name=="init" else payload)
+                 for name,payload in self.entries]
+        with self.assertRaises(images.VerificationError):
+            self.check(archive(changed),archive([*changed,*self.additions]))
+        for changed in ([(n,v) for n,v in self.additions if n!=images.ADOPTION_RUNNER],
+                        [(n,b"wrong" if n==images.ADOPTION_RUNNER else v) for n,v in self.additions]):
+            with self.assertRaises(images.VerificationError):
+                self.check(self.control,archive([*self.entries,*changed]))
 
     def test_archive_duplicates_aliases_truncation_and_junk(self):
         for bad in (archive([*self.entries,self.entries[0]]),archive([("./init",b"alias")]),
@@ -328,6 +343,54 @@ def supervisor_transcript(shell=9,runner=20,apics=(7,),moving=False,skipping=Fal
     return ("\r\n".join(records)+"\r\nagentos> ").encode("ascii")
 
 
+def adoption_transcript(shell=9,runner=100,apics=(7,)):
+    """Synthetic rejection fixture only; the guest must provide real records."""
+    parent,zombie,live,pulse,shutdown_parent,shutdown=range(runner+1,runner+7)
+    records=[session.ADOPTION_COMMAND]
+    def fields(prefix,**kv):
+        records.append(prefix+"".join(f" {k.upper()}={v:016x}" for k,v in kv.items()))
+    def snap(role,step,pid,owner,aux=0):
+        fields("AGENTOS ADOPTION TEST SNAP",role=role,step=step,pid=pid,parent=owner,
+               apic=apics[role%len(apics)],cpus=len(apics),moves=0,total=0,
+               token=1<<32 if (role,step)==(0,0) else 0x9b1735ac82000000 | role<<8 | step,aux=aux)
+    def exit_line(pid,status):
+        fields("AGENTOS USER EXIT",pid=pid,cr3=0x800000+pid*4096,status=status)
+    def reap(pid,status):
+        fields("AGENTOS MANAGER REAP",root=1,pid=pid,status=status)
+    def action(kind,step,pid):
+        fields("AGENTOS ADOPTION TEST "+kind,step=step,pid=pid)
+    snap(4,0,runner,shell)
+    exit_line(zombie,57)
+    snap(0,0,parent,runner,zombie)
+    snap(1,0,live,parent)
+    snap(2,0,pulse,parent)
+    exit_line(parent,0)
+    action("PARENT_REAP",0,parent)
+    action("WAIT",1,zombie)
+    reap(zombie,57)
+    action("GO",1,zombie)
+    snap(1,1,live,1)
+    snap(2,1,pulse,1)
+    exit_line(pulse,58)
+    action("WAIT",2,pulse)
+    reap(pulse,58)
+    action("GO",2,pulse)
+    snap(1,2,live,1)
+    exit_line(live,59)
+    action("WAIT",3,live)
+    reap(live,59)
+    action("GO",3,live)
+    snap(0,4,shutdown_parent,runner)
+    snap(3,0,shutdown,shutdown_parent)
+    exit_line(shutdown_parent,0)
+    action("PARENT_REAP",4,shutdown_parent)
+    snap(3,1,shutdown,1)
+    action("DONE",3,shutdown)
+    exit_line(runner,0)
+    records.append("exit status 0")
+    return ("\r\n".join(records)+"\r\nagentos> ").encode("ascii")
+
+
 class RuntimeTests(unittest.TestCase):
     def verify(self,data,variant="test",prior=None,apics=(7,)):
         return session.supervisor_prefix(data,9,0x300000,{1,2,9} if prior is None else prior,variant,set(apics))
@@ -390,15 +453,33 @@ class RuntimeTests(unittest.TestCase):
             b"exit status 42\r\nagentos> run /fault\r\n"
             b"AGENTOS USER FAULT PID=0000000000000012 PARENT=0000000000000009 CR3=0000000000500000 VECTOR=000000000000000e ERROR=0000000000000005 ADDRESS=0000000002000000\r\n"
             b"exit status 270\r\nagentos> ")
-        serial=session.runtime_input()+session.SUPERVISOR_INPUT+session.PIPE_INPUT+session.MEMORY_INPUT+session.transmitted_input(9,True)
+        common_input=session.runtime_input()+session.SUPERVISOR_INPUT+session.PIPE_INPUT+session.MEMORY_INPUT+session.ADOPTION_INPUT
         for variant,prefix in (("control",(session.SUPERVISOR_COMMAND+"\r\n").encode()+session.SUPERVISOR_MISSING+
                                           (session.PIPE_COMMAND+"\r\n").encode()+session.SUPERVISOR_MISSING+
                                           b"".join((command+"\r\n").encode()+session.SUPERVISOR_MISSING
                                                    for command in session.MEMORY_COMMANDS)),
                                ("test",supervisor_transcript()+supervisor_transcript(runner=40,pipe=True)+
                                 supervisor_transcript(runner=60,memory="cow")+supervisor_transcript(runner=80,memory="demand"))):
+            prefix+=((session.ADOPTION_COMMAND+"\r\n").encode()+session.SUPERVISOR_MISSING
+                     if variant=="control" else adoption_transcript())
+            serial=common_input+(session.ADOPTION_BYTES if variant=="test" else b"")+session.transmitted_input(9,True)
             log=base.replace(session.READY,session.READY+fg+prefix,1)
+            if variant=="test":
+                ending=b"AGENTOS MANAGER ENDED ROOT="
+                cleanup=(b"AGENTOS USER KILL PID=000000000000006a PARENT=0000000000000001 STATUS=0000000000000089\r\n"
+                         b"AGENTOS MANAGER REAP ROOT=0000000000000001 PID=000000000000006a STATUS=0000000000000089\r\n")
+                log=log.replace(ending,cleanup+ending,1)
             result=session.verify(log,serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant)
+            self.assertEqual(result["runtime_adoption"]["absent"],variant=="control")
+            if variant=="test":
+                self.assertEqual(result["runtime_adoption"]["shutdown_collection"],{"pid":106,"status":137})
+                self.assertEqual(result,json.loads(json.dumps(result)))
+                for bad in (log.replace(cleanup,b"",1),log.replace(cleanup,cleanup+cleanup,1),
+                            log.replace(b"PID=000000000000006a STATUS=0000000000000089",
+                                        b"PID=000000000000006a STATUS=0000000000000000",1)):
+                    self.assertNotEqual(bad,log)
+                    with self.assertRaises(session.VerificationError):
+                        session.verify(bad,serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant)
             self.assertEqual([r["status"] for r in result["runtime_process_regression"]],[0,42,270])
             self.assertEqual(result["restarted_pids"],[111,112,113])
             self.assertEqual(result["runtime_supervisor"]["absent"],variant=="control")
@@ -414,7 +495,9 @@ class RuntimeTests(unittest.TestCase):
                      b"AGENTOS PIPE RECEIVED PID=0000000000000001\r\n",
                      b"AGENTOS PIPE SENT PID=0000000000000001\r\n",
                      b"AGENTOS COW BEGIN ROOT=0000000000000001\r\n",
-                     b"AGENTOS DEMAND BASE ROOT=0000000000000001\r\n")
+                     b"AGENTOS DEMAND BASE ROOT=0000000000000001\r\n",
+                     b"AGENTOS ADOPTION TEST SNAP ROLE=0000000000000001\r\n",
+                     b"AGENTOS MANAGER REAP ROOT=0000000000000001 PID=000000000000006a STATUS=0000000000000089\r\n")
             for marker in markers:
                 for bad in (marker+log,log.replace(prefix,prefix+marker,1)):
                     with self.assertRaises(session.VerificationError):
@@ -437,6 +520,42 @@ class RuntimeTests(unittest.TestCase):
                 self.assertNotEqual(duplicate,log)
                 with self.assertRaises(session.VerificationError):
                     session.verify(duplicate,serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant)
+
+    def test_adoption_requires_original_status_owner_distinct_passes_and_actual_cpu(self):
+        for apics in ((7,),(7,19)):
+            data=adoption_transcript(apics=apics)
+            def verify(log):
+                return session.adoption_prefix(log,1,9,0x300000,{1,2,9},"test",set(apics))
+            consumed,result,pids=verify(data)
+            self.assertEqual(consumed,len(data))
+            self.assertEqual(pids,set(range(100,107)))
+            self.assertEqual([v["status"] for v in result["normal_collections"]],[57,58,59])
+            self.assertEqual({s["apic"] for s in result["snapshots"]},set(apics))
+            self.assertEqual(result,json.loads(json.dumps(result)))
+            lines=data.splitlines(keepends=True)
+            for i,row in enumerate(lines):
+                if row.startswith((b"AGENTOS ADOPTION TEST ",b"AGENTOS MANAGER REAP ",b"AGENTOS USER EXIT ")):
+                    with self.subTest(apics=apics,removed=i),self.assertRaises(session.VerificationError):
+                        verify(b"".join(lines[:i]+lines[i+1:]))
+            for old,new in (
+                (b"PARENT=0000000000000001",b"PARENT=0000000000000065"),
+                (b"ROOT=0000000000000001 PID=0000000000000066",b"ROOT=0000000000000002 PID=0000000000000066"),
+                (b"STATUS=0000000000000039",b"STATUS=0000000000000089"),
+                (b"APIC=0000000000000007",b"APIC=0000000000000008"),
+                (b"TOKEN=9b1735ac82000101",b"TOKEN=9b1735ac82000102"),
+                (b"CR3=0000000000866000",b"CR3=0000000000300000"),
+            ):
+                self.assertIn(old,data)
+                with self.subTest(old=old),self.assertRaises(session.VerificationError):
+                    verify(data.replace(old,new,1))
+            # Moving the first collection after GO would turn the proof into
+            # a delay-based guess rather than observed manager progress.
+            reap=next(row for row in lines if row.startswith(b"AGENTOS MANAGER REAP "))
+            go=next(row for row in lines if row.startswith(b"AGENTOS ADOPTION TEST GO "))
+            with self.assertRaises(session.VerificationError):
+                verify(data.replace(reap,b"",1).replace(go,go+reap,1))
+            with self.assertRaises(session.VerificationError):
+                verify(data.replace(reap,reap+reap,1))
 
     def test_memory_full_locality_and_descendant_evidence(self):
         for kind in ("cow","demand"):

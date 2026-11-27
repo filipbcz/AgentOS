@@ -472,11 +472,33 @@ static long event_mask(void) {
     return (long)mask;
 }
 
-/* PID 1 also owns abandoned grandchildren. A service may spawn a child
- * and then crash before collecting it; the kernel adopts that child, but
- * does not reap it on behalf of userland. Scan only PID1-owned children,
- * leave registered services to their policy, and fail-stop unknown orphans.
- * An already exited adopted child is reaped without overwriting its status.
+/* Adopted descendants belong to PID 1, but do not become registered
+ * services. An adoption is not a request to terminate a process.
+ */
+static int registered_child(long child) {
+    for (unsigned id=0;id<SVC_COUNT;id++)
+        if (registry[id].pid==child) return 1;
+    return 0;
+}
+
+/* Record the actual consumed exit status, not a kill request or a guessed
+ * result. Unmanaged children have no registry entry to retain diagnostics.
+ * Emit one complete record for each successful collection, even if the
+ * shell is active. This is ordinary process-lifecycle accounting.
+ */
+static int unmanaged_exit(long child,long status) {
+    char line[]="AGENTOS MANAGER REAP ROOT=0000000000000000 PID=0000000000000000 STATUS=0000000000000000\r\n";
+    format_hex(line+sizeof("AGENTOS MANAGER REAP ROOT=")-1,(unsigned long)owner_pid,16);
+    format_hex(line+sizeof("AGENTOS MANAGER REAP ROOT=0000000000000000 PID=")-1,(unsigned long)child,16);
+    format_hex(line+sizeof("AGENTOS MANAGER REAP ROOT=0000000000000000 PID=0000000000000000 STATUS=")-1,
+               (unsigned long)status,16);
+    return put(line,sizeof(line)-1);
+}
+
+/* Normal event-driven pass: never kill or block on a living child. The
+ * existing WAIT_EVENTS_UNTIL child-exit notification wakes the manager
+ * when that child actually exits; adoption of an existing zombie also
+ * makes it visible to that wait. Registered services keep their policy.
  */
 static int reap_unmanaged(void) {
     long cursor=0;
@@ -485,17 +507,32 @@ static int reap_unmanaged(void) {
         if (child==-10) return 1;
         if (child<=cursor) return 0;
         cursor=child;
-        int registered=0;
-        for (unsigned id=0;id<SVC_COUNT;id++)
-            if (registry[id].pid==child) { registered=1; break; }
-        if (registered) continue;
+        if (registered_child(child)) continue;
+        long status=os_call(SYS_TRY_WAIT,child,0,0);
+        if (status==-11) continue;
+        if (status<0 || !unmanaged_exit(child,status)) return 0;
+    }
+}
+
+/* Explicit shutdown only, after registered services have been stopped in
+ * dependency order. Preserve the original finite per-child owner wait and
+ * any natural status that wins the race with KILL. A descendant adopted
+ * during this traversal has a newer PID than its terminating parent.
+ */
+static int stop_unmanaged(void) {
+    long cursor=0;
+    for (;;) {
+        long child=os_call(SYS_CHILD_AFTER,cursor,0,0);
+        if (child==-10) return 1;
+        if (child<=cursor || registered_child(child)) return 0;
+        cursor=child;
         long status=os_call(SYS_TRY_WAIT,child,0,0);
         if (status==-11) {
             long stopped=os_call(SYS_KILL,child,0,0);
             if (stopped!=0 && stopped!=1) return 0;
             status=waitForChildExit(child);
         }
-        if (status<0) return 0;
+        if (status<0 || !unmanaged_exit(child,status)) return 0;
     }
 }
 
@@ -517,7 +554,7 @@ static int stop_all(void) {
     for (unsigned id=0;id<SVC_COUNT;id++) registry[id].desired=0;
     for (unsigned id=0;id<SVC_COUNT;id++)
         if (!stop_subtree(id,seen)) return 0;
-    return reap_unmanaged();
+    return stop_unmanaged();
 }
 
 int runServiceManager(void) {

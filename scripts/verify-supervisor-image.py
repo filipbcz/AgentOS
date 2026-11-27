@@ -23,6 +23,7 @@ PIPE_RUNNER = "pipe-runner"
 PIPE_RECEIVER = "pipe-receiver"
 COW_RUNNER = "cow-runner"
 DEMAND_RUNNER = "demand-runner"
+ADOPTION_RUNNER = "adoption-runner"
 SECTIONS = (".text", ".sdata", ".data", ".dynamic", ".dynsym", ".rela",
             ".reloc", ".kernel", ".initrd")
 CFLAGS = ("-std=c11", "-Os", "-Wall", "-Wextra", "-Werror", "-ffreestanding",
@@ -153,12 +154,12 @@ def verify_distribution(archive):
     distribution=cpio_entries(archive)
     required={"stage","init","fault","service","shell","svc_ok","svc_fail","svc_hang",
               "orphan_parent","manager","svc_alive","svc_flaky","data","data/transfer.bin"}
-    forbidden={"receiver","forktest","demand",RUNNER,PIPE_RUNNER,PIPE_RECEIVER,COW_RUNNER,DEMAND_RUNNER}
+    forbidden={"receiver","forktest","demand",RUNNER,PIPE_RUNNER,PIPE_RECEIVER,COW_RUNNER,DEMAND_RUNNER,ADOPTION_RUNNER}
     require(required<=set(distribution) and
             not any(name.rsplit("/",1)[-1] in forbidden for name in distribution),
             "Distribution is missing boot files or contains a historical/staged test ELF")
     require(not any(marker in payload for _,payload in distribution.values()
-                    for marker in (b"AGENTOS PIPE ",b"AGENTOS COW ",b"AGENTOS DEMAND ")),
+                    for marker in (b"AGENTOS PIPE ",b"AGENTOS COW ",b"AGENTOS DEMAND ",b"AGENTOS ADOPTION TEST ")),
             "Distribution contains historical or staged pipe/COW/demand workload code")
     require(distribution["data/transfer.bin"][1]==bytes((i*73+i//251*19)%256 for i in range(8193)),
             "Shared transfer fixture differs from expected bytes")
@@ -166,13 +167,13 @@ def verify_distribution(archive):
 
 
 def verify_contents(control, test, kernel, control_cpio, test_cpio, runner, pipe_runner, pipe_receiver,
-                    cow_runner, demand_runner):
+                    cow_runner, demand_runner, adoption_runner):
     for sections, archive in ((control,control_cpio),(test,test_cpio)):
         require(sections[".kernel"][1]==kernel and sections[".initrd"][1]==archive,
                 "Actual embedded kernel/initramfs differs from build files")
     distribution, staged = verify_distribution(control_cpio), cpio_entries(test_cpio)
     additions={RUNNER:runner,PIPE_RUNNER:pipe_runner,PIPE_RECEIVER:pipe_receiver,
-               COW_RUNNER:cow_runner,DEMAND_RUNNER:demand_runner}
+               COW_RUNNER:cow_runner,DEMAND_RUNNER:demand_runner,ADOPTION_RUNNER:adoption_runner}
     require(set(staged)==set(distribution)|set(additions),
             "Staged archive must add exactly the separate test ELFs")
     require(all(staged[name]==entry for name,entry in distribution.items()),
@@ -248,6 +249,12 @@ def reproduce(root, out, stage, write_maps):
                     runner_name+".o",app+"-workload.o")
             require((work/runner_name).read_bytes()==(stage/runner_name).read_bytes(),
                     "Memory test ELF relink differs: "+runner_name)
+        command(work,"gcc-13","-c",str(root/"scripts/tests/adoption-runner.S"),"-o","adoption-entry.o")
+        command(work,"gcc-13",*CFLAGS,"-c",str(root/"scripts/tests/adoption-runner.c"),"-o","adoption-runner.o")
+        command(work,"ld","--no-undefined","--build-id=none","-z","noexecstack","-s",
+                "-T",str(root/"user/user.ld"),"-o",ADOPTION_RUNNER,"adoption-entry.o","adoption-runner.o")
+        require((work/ADOPTION_RUNNER).read_bytes()==(stage/ADOPTION_RUNNER).read_bytes(),
+                "Adoption runner relink differs")
         for variant,archive,expected in (
                 ("control",out/"initramfs.cpio",out/"agentos.unsigned.efi"),
                 ("test",stage/"test.cpio",stage/"test.unsigned.efi")):
@@ -286,12 +293,12 @@ def verify_identity(root=ROOT, *, write=False):
     test_signed=(stage/"test.efi").read_bytes()
     control=signed_payload(control_unsigned,control_signed)
     test=signed_payload(test_unsigned,test_signed)
-    kernel,control_cpio,test_cpio,runner,pipe_runner,pipe_receiver,cow_runner,demand_runner=(p.read_bytes() for p in
+    kernel,control_cpio,test_cpio,runner,pipe_runner,pipe_receiver,cow_runner,demand_runner,adoption_runner=(p.read_bytes() for p in
         (out/"kernel.elf",out/"initramfs.cpio",stage/"test.cpio",stage/RUNNER,stage/PIPE_RUNNER,
-         stage/PIPE_RECEIVER,stage/COW_RUNNER,stage/DEMAND_RUNNER))
+         stage/PIPE_RECEIVER,stage/COW_RUNNER,stage/DEMAND_RUNNER,stage/ADOPTION_RUNNER))
     require(build["initramfs_sha256"]==digest(control_cpio),"Distribution receipt archive mismatch")
-    common=verify_contents(control,test,kernel,control_cpio,test_cpio,runner,pipe_runner,pipe_receiver,cow_runner,demand_runner)
-    for elf in (runner,pipe_runner,pipe_receiver,cow_runner,demand_runner):
+    common=verify_contents(control,test,kernel,control_cpio,test_cpio,runner,pipe_runner,pipe_receiver,cow_runner,demand_runner,adoption_runner)
+    for elf in (runner,pipe_runner,pipe_receiver,cow_runner,demand_runner,adoption_runner):
         load(root,"verify-user-abi.py").verify(elf)
     reproduce(root,out,stage,write)
 
@@ -309,6 +316,7 @@ def verify_identity(root=ROOT, *, write=False):
             "common_entries":common,"runner_sha256":digest(runner),
             "pipe_runner_sha256":digest(pipe_runner),"pipe_receiver_sha256":digest(pipe_receiver),
             "cow_runner_sha256":digest(cow_runner),"demand_runner_sha256":digest(demand_runner),
+            "adoption_runner_sha256":digest(adoption_runner),
             "map_sha256":{v:sha(stage/(v+".map")) for v in ("control","test")},
             "control":describe(control_unsigned,control_signed,control),
             "test":describe(test_unsigned,test_signed,test)}
@@ -360,9 +368,15 @@ def verify_pair(root, cpus, no_hpet=False):
                           "com1_sha256":digest(log),"com1_input_sha256":digest(sent),"runtime":result}
         inputs.append(sent)
         receipts.append(receipt)
-    require(inputs[0]==inputs[1] and all(receipts[0].get(k)==receipts[1].get(k) for k in
-            ("ovmf_code_sha256","memory_mib","accelerator","qemu_version","system_clock")),
-            "Paired sessions did not use matching platform and input")
+    # The independently verified foreground adoption scenario consumes
+    # exactly three raw gate bytes only in the staged image. All ordinary
+    # shell commands and every other input byte must still be identical.
+    gate=session.ADOPTION_INPUT+session.ADOPTION_BYTES
+    require(inputs[1].count(gate)==1 and
+            inputs[0]==inputs[1].replace(gate,session.ADOPTION_INPUT,1) and
+            all(receipts[0].get(k)==receipts[1].get(k) for k in
+                ("ovmf_code_sha256","memory_mib","accelerator","qemu_version","system_clock")),
+            "Paired sessions differ beyond the authenticated adoption gate bytes")
     result={"source_commit":identity["source_commit"],"cpus":cpus,
             "identity_sha256":sha(root/"build/supervisor-staging/identity.json"),"sessions":records}
     path.write_text(json.dumps(result,sort_keys=True,indent=2)+"\n",encoding="utf-8")

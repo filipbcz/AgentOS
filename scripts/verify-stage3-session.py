@@ -36,6 +36,11 @@ PIPE_INPUT = (PIPE_COMMAND+"\r").encode("ascii")
 MEMORY_COMMANDS = ("run /cow-runner", "run /demand-runner")
 MEMORY_INPUT = b"".join((command+"\r").encode("ascii") for command in MEMORY_COMMANDS)
 SUPERVISOR_MISSING = b"run: spawn failed (-2)\r\nagentos> "
+ADOPTION_COMMAND = "run /adoption-runner"
+ADOPTION_INPUT = (ADOPTION_COMMAND+"\r").encode("ascii")
+ADOPTION_BYTES = b"ABC"
+ADOPTION_MARKER = b"AGENTOS ADOPTION TEST "
+REAP_MARKER = b"AGENTOS MANAGER REAP "
 
 def runtime_input():
     return b"".join((command+"\r").encode("ascii") for command,_ in RUNTIME_PROGRAMS)
@@ -104,6 +109,21 @@ def supervisor_prefix(data, shell, shell_cr3, prior_pids, variant, apics, *, pip
                                            pipe=modules[2] if pipe else None,
                                            memory=modules[2] if memory else None,memory_kind=memory)
     return offset+consumed,result,pids
+
+
+def adoption_prefix(data, root, shell, shell_cr3, prior_pids, variant, apics):
+    echo=(ADOPTION_COMMAND+"\r\n").encode("ascii")
+    require(data.startswith(echo),"Missing ordinary adoption foreground command")
+    if variant=="control":
+        require(data.startswith(SUPERVISOR_MISSING,len(echo)),
+                "Distribution did not reject the absent adoption client")
+        return len(echo)+len(SUPERVISOR_MISSING),{"absent":True},set()
+    require(variant=="test","Invalid adoption image variant")
+    spec=importlib.util.spec_from_file_location("adoption_evidence",Path(__file__).with_name("verify-adoption.py"))
+    module=importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    consumed,result,pids=module.verify(data[len(echo):],root,shell,shell_cr3,prior_pids,apics,require)
+    return len(echo)+consumed,result,pids
 
 
 class VerificationError(ValueError):
@@ -230,7 +250,7 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
             "Supervisor image scenario requires the existing foreground regression")
     require(re.search(rb"AGENTOS PIPE (?!TEST )",aLog) is None,
             "Historical boot pipe transfer is not permitted in either signed image")
-    pWorkloadMarkers=(b"AGENTOS SUPERVISOR",b"AGENTOS SERVICE ",b"AGENTOS TEST ",b"AGENTOS PIPE TEST ")
+    pWorkloadMarkers=(b"AGENTOS SUPERVISOR",b"AGENTOS SERVICE ",b"AGENTOS TEST ",b"AGENTOS PIPE TEST ",ADOPTION_MARKER)
     if aHistoricalBootMemory:
         # Explicit historical receipt inspection only, after its independent
         # old boot-memory validators have run. Never selected by QEMU or the
@@ -272,6 +292,7 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
     pSupervisor=None
     pPipe=None
     pMemory={}
+    pAdoption=None
     pPrefixPids=set()
     if aRuntimeProcess:
         # Account for every earlier actual PID, not just the current shell.
@@ -307,8 +328,16 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
                 pWorkloadLog+=pInteractive[:pConsumed]
                 pPrefixPids.update(pNewPids)
                 pInteractive=pInteractive[pConsumed:]
+            pConsumed,pAdoption,pNewPids=adoption_prefix(
+                pInteractive,pRoot,pShell,int(pShellExits[0][2],16),
+                pPrior | pPrefixPids,aSupervisorImage,set(pApicList))
+            pWorkloadLog+=pInteractive[:pConsumed]
+            pPrefixPids.update(pNewPids)
+            pInteractive=pInteractive[pConsumed:]
             require(all(aLog.count(marker)==pWorkloadLog.count(marker) for marker in pWorkloadMarkers),
                     "Test evidence outside its authenticated foreground interval")
+    require(aLog.count(REAP_MARKER)==(4 if aSupervisorImage=="test" else 0),
+            "Missing, duplicated or out-of-scenario unmanaged collection")
     pClean = without_kernel_events(pInteractive)
     pExpected = b"".join(
         pStep["pattern"].encode("ascii") for pStep in steps(pShell,aKeyboard))
@@ -320,7 +349,9 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
     if aInput is not None:
         pPrefix=runtime_input() if aRuntimeProcess else b""
         if aSupervisorImage is not None:
-            pPrefix+=SUPERVISOR_INPUT+PIPE_INPUT+MEMORY_INPUT
+            pPrefix+=SUPERVISOR_INPUT+PIPE_INPUT+MEMORY_INPUT+ADOPTION_INPUT
+            if aSupervisorImage=="test":
+                pPrefix+=ADOPTION_BYTES
         require(aInput==pPrefix+transmitted_input(pShell,aKeyboard),"Captured transmitted UART bytes differ from scenario")
     pRestart = pInteractive.find(b"service restart flaky\r\n")
     require(pRestart>=0,"No explicit service RESTART command")
@@ -343,12 +374,20 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
             "Initial START/STOP has no actual worker termination evidence")
     pTail = pPhase[pShellExits[0].end():]
     pShutdown = (f"AGENTOS MANAGER SHUTD ROOT={pRoot:016x} COUNT=00000003\r\n"
-                 f"AGENTOS USER KILL PID={pCorePid:016x} PARENT={pRoot:016x} STATUS=0000000000000089\r\n"
-                 f"AGENTOS MANAGER ENDED ROOT={pRoot:016x} COUNT=00000003\r\n").encode()
+                 f"AGENTOS USER KILL PID={pCorePid:016x} PARENT={pRoot:016x} STATUS=0000000000000089\r\n")
+    if aSupervisorImage=="test":
+        child=pAdoption["shutdown_pid"]
+        pShutdown+=(f"AGENTOS USER KILL PID={child:016x} PARENT={pRoot:016x} STATUS=0000000000000089\r\n"
+                    f"AGENTOS MANAGER REAP ROOT={pRoot:016x} PID={child:016x} STATUS=0000000000000089\r\n")
+        pAdoption["shutdown_collection"]={"pid":child,"status":137}
+    pShutdown=(pShutdown+f"AGENTOS MANAGER ENDED ROOT={pRoot:016x} COUNT=00000003\r\n").encode()
     require(pTail.startswith(pShutdown),"Remaining core was not stopped in ordered manager shutdown")
     pExit = EXIT.fullmatch(pTail[len(pShutdown):])
     require(pExit is not None and int(pExit[1],16)==pRoot and int(pExit[2],16)>0 and
             int(pExit[2],16)%4096==0 and int(pExit[3],16)==0,"PID1 did not exit cleanly")
+    if aSupervisorImage=="test":
+        require(int(pExit[2],16) not in {x["cr3"] for x in pAdoption["natural_exits"]},
+                "Adoption descendant aliased the living PID1 address space")
     require(aLog[pEnds[0].end():] in (b"[INFO] INTERACTIVE SHELL STOPPED\r\n",b""),
             "Unexpected data after kernel session completion")
     result={"root_pid":pRoot,"shell_pid":pShell,"core_pid":pCorePid,
@@ -360,6 +399,7 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
         result["runtime_pipe"]=pPipe
         result["runtime_cow"]=pMemory["cow"]
         result["runtime_demand"]=pMemory["demand"]
+        result["runtime_adoption"]=pAdoption
     return result
 
 
