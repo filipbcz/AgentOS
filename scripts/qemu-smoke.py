@@ -64,6 +64,7 @@ def main():
     parser.add_argument("--supervisor-image", choices=("control","test"),
                         help="Host-only paired signed image regression")
     parser.add_argument("--guest-oom",action="store_true",help="Explicit bounded 256 MiB HPET TCG signed pair only")
+    parser.add_argument("--smp-soak",action="store_true",help="Explicit separate signed 60-second runtime test, only with --basic-smp-cpus")
     parser.add_argument("--timeout", type=int, default=720)
     parser.add_argument("--ovmf-code", type=Path, required=True)
     parser.add_argument("--ovmf-vars", type=Path, required=True)
@@ -248,12 +249,22 @@ def wait_session(process, capture, serial, predicate, description, seconds=30):
 
 
 def run_session(process, capture, qmp, destination, runtime_process_regression=False,
-                supervisor_image=None, guest_oom=False):
+                supervisor_image=None, guest_oom=False, smp_soak=False):
     serial = destination / "com1.log"
     children = list(session.SHELL_START.finditer(serial.read_bytes()))
     if len(children) != 1:
         raise RuntimeError("Cannot identify the real managed shell")
     shell = int(children[0][1], 16)
+    if smp_soak:
+        offset=serial.stat().st_size
+        print("QEMU separate sustained SMP: run /smp-soak",flush=True)
+        capture.send(session.SMP_SOAK_INPUT)
+        reply=re.compile(rb"exit status ([0-9]+)\r\nagentos> ")
+        wait_session(process,capture,serial,lambda data:reply.search(data[offset:]),
+                     "bounded sustained SMP workload",150)
+        status=reply.search(serial.read_bytes()[offset:])
+        if status is None or status[1]!=b"0":
+            raise RuntimeError("SMP soak runner did not exit normally")
     if runtime_process_regression:
         for command, status in session.RUNTIME_PROGRAMS:
             offset = serial.stat().st_size
@@ -335,6 +346,9 @@ def run_session(process, capture, qmp, destination, runtime_process_regression=F
 
 def boot(args):
     basic_smp=getattr(args,"basic_smp",False)
+    smp_soak=getattr(args,"smp_soak",False)
+    if smp_soak and not basic_smp:
+        raise ValueError("SMP soak requires the explicit 4/8 CPU session profile")
     if basic_smp:
         if (args.cpus not in (4,8) or not args.session or args.memory_mib!=256 or args.no_hpet or
             args.accel!="tcg" or getattr(args,"runtime_process_regression",False) or
@@ -364,6 +378,11 @@ def boot(args):
         if supervisor_image=="test":
             image_path = "build/supervisor-staging/test.efi"
             image_sha = identity["test"]["signed_sha256"]
+    if smp_soak:
+        soak_image=load("smp_soak_image","smp-soak-image.py")
+        image_path="build/smp-soak-staging/test.efi"
+        identity=soak_image.verify_image(root,root/image_path,commit)
+        image_sha=identity["signed_sha256"]
     profile = f"qemu-cpu{args.cpus}"
     if args.memory_mib != 256:
         profile += f"-ram{args.memory_mib}"
@@ -379,6 +398,8 @@ def boot(args):
         profile += "-runtime-process-regression"
     if basic_smp:
         profile += "-basic-smp"
+    if smp_soak:
+        profile += "-soak"
     destination = root / "build/check" / profile
     destination.mkdir(parents=True, exist_ok=True)
     if basic_smp:
@@ -406,7 +427,8 @@ def boot(args):
     if evidence.sha256(copied) != image_sha:
         raise RuntimeError("EFI on QEMU ESP differs from the signed build output")
     if basic_smp:
-        identity=basic.verify_image(root,copied,commit)
+        identity=(soak_image.verify_image(root,copied,commit) if smp_soak
+                  else basic.verify_image(root,copied,commit))
     vm_vars = destination / "OVMF_VARS.secboot.fd"
     if vm_vars.exists():
         vm_vars.unlink()
@@ -509,7 +531,7 @@ def boot(args):
                     console.verify(destination / "shell-screen.ppm", aLevel="info", aOutput="both")
                     if args.session:
                         run_session(process, serial_capture, qmp, destination,
-                                    getattr(args, "runtime_process_regression", False), supervisor_image,guest_oom)
+                                    getattr(args, "runtime_process_regression", False), supervisor_image,guest_oom,smp_soak)
                     run_succeeded = True
                     break
                 if process.poll() is not None:
@@ -585,7 +607,7 @@ def boot(args):
         raise RuntimeError(f"Missing per-CPU APIC timer evidence: {apics}")
     boot_roots=processes.verify(text, apics, ipc_staged=True, allow_ipc_workload=supervisor_image=="test",
                                 root_orphan_v1=True, require_shutdown=args.session)
-    if supervisor_image!="test":
+    if supervisor_image!="test" and not smp_soak:
         supervisor.verify_absent(text)
     # The test image must pass the full authenticated runtime session below.
     orphans.verify(text, args.cpus, basic_smp=basic_smp)
@@ -598,14 +620,22 @@ def boot(args):
     service_manager.verify(text, migration_staged=True, allow_migration_workload=supervisor_image=="test")
     migration_result = {"absent":True}
     session_result = None
+    soak_interval=None
     if args.session:
         session_result = session.verify(serial.read_bytes(), (destination / "com1-input.bin").read_bytes(),
                                         True, args.cpus,
                                         aRuntimeProcess=getattr(args,"runtime_process_regression",False),
                                         aSupervisorImage=supervisor_image,aMigrationStaged=True,aFaultStaged=True,aOomLayout=oom_layout,
-                                        aBasicSmp=basic_smp)
+                                        aBasicSmp=basic_smp,aSmpSoak=smp_soak)
         if supervisor_image is not None:
             migration_result = session_result["runtime_migration"]
+        if smp_soak:
+            # Only the exact authenticated foreground interval may contain the
+            # new test markers. All original absence checks remain mandatory.
+            lo,hi=session_result["runtime_smp_soak"]["interval_bytes"]
+            raw_log=serial.read_bytes()
+            supervisor.verify_absent((raw_log[:lo]+raw_log[hi:]).decode("ascii"))
+            soak_interval=raw_log[lo:hi].decode("ascii").replace("\r\n","\n")
     bases = re.findall(r"(?m)^\[INFO\] KERNEL IMAGE BASE=([0-9a-f]{16})\r?$", text)
     if len(bases) != 1:
         raise RuntimeError(f"Expected one actual runtime kernel image address: {bases}")
@@ -653,16 +683,21 @@ def boot(args):
         after=destination/"esp-after.efi"
         after.unlink(missing_ok=True)
         subprocess.run(["mcopy","-i",f"{raw}@@1048576","::EFI/BOOT/BOOTX64.EFI",str(after)],check=True)
-        after_identity=basic.verify_image(root,after,commit)
+        after_identity=(soak_image.verify_image(root,after,commit) if smp_soak
+                        else basic.verify_image(root,after,commit))
         if after_identity!=identity:
             raise RuntimeError("Distribution EFI identity changed during basic SMP session")
-        progress=basic.verify_progress(text,args.cpus,qmp_roster)
+        progress=basic.verify_progress(text,args.cpus,qmp_roster,soak_interval=soak_interval)
         if progress["boot_roots"]!=boot_roots:
             raise RuntimeError("Basic SMP boot root replay differs")
-        receipt["basic_smp"]={"contract":"ordinary-smp-v1","host":host,"qmp":qmp_roster,
+        receipt["basic_smp"]={"contract":"staged-smp-soak-v1" if smp_soak else "ordinary-smp-v1","host":host,"qmp":qmp_roster,
                               "identity":identity,"progress":progress,
                               "oversubscribed":args.cpus>host["effective_cpu_capacity"]}
         (destination/"basic-smp.json").write_text(json.dumps(receipt["basic_smp"],indent=2,sort_keys=True)+"\n")
+    if smp_soak:
+        receipt["smp_soak_contract"]="sustained-smp-v1"
+        receipt["smp_soak"]=session_result["runtime_smp_soak"]
+        (destination/"smp-soak.json").write_text(json.dumps(receipt["smp_soak"],indent=2,sort_keys=True)+"\n")
     if guest_oom:
         receipt["guest_oom_contract"]="bounded-demand-oom-v1"
         receipt["guest_oom"]=session_result["runtime_oom"]

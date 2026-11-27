@@ -47,6 +47,7 @@ OOM_COMMAND = "run /oom-runner"
 OOM_INPUT = (OOM_COMMAND+"\r").encode("ascii")
 OOM_MARKER = b"AGENTOS TEST OOM "
 PAGE_OOM = b"AGENTOS PAGE OOM"
+SMP_SOAK_INPUT = b"run /smp-soak\r"
 SUPERVISOR_MISSING = b"run: spawn failed (-2)\r\nagentos> "
 ADOPTION_COMMAND = "run /adoption-runner"
 ADOPTION_INPUT = (ADOPTION_COMMAND+"\r").encode("ascii")
@@ -299,7 +300,8 @@ def verify_idle(aBytes, aCpus=1, aClockMaintenanceMs=1000):
 
 def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceMs=1000,
            aRuntimeProcess=False, aSupervisorImage=None, aHistoricalBootMemory=False, aMigrationStaged=False,
-           aFaultStaged=False, aOomLayout=None, aBasicSmp=False):
+           aFaultStaged=False, aOomLayout=None, aBasicSmp=False,aSmpSoak=False):
+    require(not aSmpSoak or aBasicSmp,"SMP soak requires explicit 4/8 CPU session")
     if aBasicSmp:
         require(aCpus in (4,8) and aInput is not None and aKeyboard and aMigrationStaged and aFaultStaged and
                 not aRuntimeProcess and aSupervisorImage is None and not aHistoricalBootMemory and aOomLayout is None,
@@ -338,7 +340,8 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
     require(aLog.count(b"AGENTOS TEST RUNNER ")==(5+int(aFaultStaged))*int(aSupervisorImage=="test"),
             "Unexpected runner invocation outside its foreground interval")
     if aSupervisorImage!="test":
-        require(not any(marker in aLog for marker in pWorkloadMarkers),
+        require(not any(marker in aLog for marker in pWorkloadMarkers
+                        if not (aSmpSoak and marker==b"AGENTOS TEST ")),
                 "Acceptance workload ran in the ordinary distribution")
     pTimerCpus = timerCpuCount(aLog,aCpus,aMigrationStaged=aMigrationStaged,aBasicSmp=aBasicSmp)
     pRoots,pChildren,pEnds = (list(pPattern.finditer(aLog)) for pPattern in
@@ -370,7 +373,30 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
     pFault=None
     pOom=None
     pMigration=None
+    pSoak=None
     pPrefixPids=set()
+    if aSmpSoak:
+        pPrior={int(m[1],16) for m in re.finditer(
+            rb"AGENTOS USER (?:EXIT|FAULT|PARK|KILL) PID=("+HEX+rb")",
+            aLog[:pChildren[0].end()])}
+        pPrior.update((pRoot,pShell,pCorePid))
+        spec=importlib.util.spec_from_file_location("smp_soak",Path(__file__).with_name("verify-smp-soak.py"))
+        verifier=importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(verifier)
+        try:
+            pConsumed,pSoak,pNewPids=verifier.verify_prefix(
+                pInteractive,pShell,int(pShellExits[0][2],16),pPrior,
+                bootCpuRoster(aLog,aCpus,aBasicSmp=True))
+        except verifier.VerificationError as e:
+            raise VerificationError(f"Invalid sustained SMP evidence: {e}") from e
+        pSoakLog=pInteractive[:pConsumed]
+        require(all(aLog.count(marker)==pSoakLog.count(marker) for marker in pWorkloadMarkers),
+                "Acceptance evidence outside authenticated SMP interval")
+        pStart=pChildren[0].end()+len(READY)
+        require(aLog[pStart:pStart+pConsumed]==pSoakLog,"SMP interval boundary differs from actual log")
+        pSoak["interval_bytes"]=[pStart,pStart+pConsumed]
+        pPrefixPids.update(pNewPids)
+        pInteractive=pInteractive[pConsumed:]
     if aRuntimeProcess:
         # Account for every earlier actual PID, not just the current shell.
         pPrior={int(m[1],16) for m in re.finditer(
@@ -458,7 +484,7 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
     if aRuntimeProcess:
         require(aInput is not None,"Separate process regression requires actual transmitted bytes")
     if aInput is not None:
-        pPrefix=runtime_input() if aRuntimeProcess else b""
+        pPrefix=(SMP_SOAK_INPUT if aSmpSoak else runtime_input() if aRuntimeProcess else b"")
         if aSupervisorImage is not None:
             if aMigrationStaged:
                 pPrefix+=MIGRATION_INPUT
@@ -503,6 +529,9 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
     pExit = EXIT.fullmatch(pTail[len(pShutdown):])
     require(pExit is not None and int(pExit[1],16)==pRoot and int(pExit[2],16)>0 and
             int(pExit[2],16)%4096==0 and int(pExit[3],16)==0,"PID1 did not exit cleanly")
+    if aSmpSoak:
+        require(int(pExit[2],16) not in ({pSoak["root_cr3"]}|set(pSoak["worker_cr3"].values())),
+                "SMP worker or foreground address space aliased the live PID1")
     if aSupervisorImage=="test":
         if aOomLayout is not None:
             require(int(pExit[2],16) not in {pOom[k] for k in ("root_cr3","pressure_cr3","survivor_cr3")},
@@ -524,6 +553,8 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
             "Unexpected data after kernel session completion")
     result={"root_pid":pRoot,"shell_pid":pShell,"core_pid":pCorePid,
             "restarted_pids":sorted(int(pMatch[1],16) for pMatch in pExits),"idle":pIdle}
+    if aSmpSoak:
+        result["runtime_smp_soak"]=pSoak
     if aRuntimeProcess:
         result["runtime_process_regression"]=pRuntimeRecords
     if aSupervisorImage is not None:

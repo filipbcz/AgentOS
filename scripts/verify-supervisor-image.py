@@ -165,12 +165,13 @@ def verify_distribution(archive):
     forbidden={"receiver","forktest","demand","service","ipc-test.h","client.c","service.c",
                RUNNER,PIPE_RUNNER,PIPE_RECEIVER,COW_RUNNER,DEMAND_RUNNER,ADOPTION_RUNNER,IPC_RUNNER,IPC_SERVICE,MIGRATION_RUNNER,"migration.c","migration-workload.c",
                FAULT_RUNNER,FAULT_PROBE,"fault-workload.c","fault-probe.S",
-               OOM_RUNNER,OOM_PRESSURE,OOM_SURVIVOR,"oom-workload.c","oom-entry.S"}
+               OOM_RUNNER,OOM_PRESSURE,OOM_SURVIVOR,"oom-workload.c","oom-entry.S",
+               "smp-soak","smp-soak.c","smp-soak-entry.S"}
     require(required<=set(distribution) and
             not any(name.rsplit("/",1)[-1] in forbidden for name in distribution),
             "Distribution is missing boot files or contains a historical/staged test ELF")
     require(not any(marker in payload for _,payload in distribution.values()
-                    for marker in (b"AGENTOS PIPE ",b"AGENTOS COW ",b"AGENTOS DEMAND ",b"AGENTOS ADOPTION TEST ",b"AGENTOS IPC ",b"AGENTOS MIGRATION",b"AGENTOS TEST FAULT ",b"AGENTOS TEST OOM ")),
+                    for marker in (b"AGENTOS PIPE ",b"AGENTOS COW ",b"AGENTOS DEMAND ",b"AGENTOS ADOPTION TEST ",b"AGENTOS IPC ",b"AGENTOS MIGRATION",b"AGENTOS TEST FAULT ",b"AGENTOS TEST OOM ",b"AGENTOS TEST SMP SOAK ")),
             "Distribution contains historical or staged pipe/COW/demand/IPC/migration/syscall/fault workload code")
     require(distribution["data/transfer.bin"][1]==bytes((i*73+i//251*19)%256 for i in range(8193)),
             "Shared transfer fixture differs from expected bytes")

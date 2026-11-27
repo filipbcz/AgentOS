@@ -110,7 +110,7 @@ def verify_image(root,efi,commit):
             "kernel_sha256":hashlib.sha256(kernel).hexdigest(),"initramfs_sha256":build["initramfs_sha256"],
             "db_cer_sha256":build["artifacts"]["db.cer"],"entries":sorted(entries),"signature_verified":True}
 
-def verify_progress(text,cpus,qmp):
+def verify_progress(text,cpus,qmp,*,soak_interval=None):
     expected=qmp_ids(qmp,cpus)
     lines=text.splitlines()
     def records(prefix,pattern):
@@ -132,8 +132,15 @@ def verify_progress(text,cpus,qmp):
     ready=unique("AGENTOS SHELL READY")
     done=unique("[INFO] INTERACTIVE SHELL STOPPED")
     require(done==len(lines)-1 and online<users<ready<done,"Incomplete boot/session lifecycle")
-    require(not any(marker in text for marker in ("SMP FAILED:","SHELL FAILED","FATAL VECTOR",
-                "AGENTOS TEST ","AGENTOS PAGE OOM","AGENTOS MIGRATION","AGENTOS USER FAULT")),
+    outside=text
+    if soak_interval is not None:
+        require(soak_interval.startswith("run /smp-soak\n") and text.count(soak_interval)==1 and
+                "AGENTOS TEST SMP SOAK " in soak_interval and
+                re.search(r"AGENTOS TEST (?!SMP SOAK )",soak_interval) is None,
+                "Missing explicit authenticated SMP interval")
+        outside=text.replace(soak_interval,"",1)
+    require("AGENTOS TEST " not in outside and not any(marker in text for marker in ("SMP FAILED:","SHELL FAILED","FATAL VECTOR",
+                "AGENTOS PAGE OOM","AGENTOS MIGRATION","AGENTOS USER FAULT")),
             "Unexpected failure or acceptance workload in ordinary session")
     roster=records("AGENTOS TASK ",TASK)
     require(len(roster)==cpus and sum(m[1]=="BSP" for _,m in roster)==1 and
