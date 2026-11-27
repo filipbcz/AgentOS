@@ -131,9 +131,10 @@ def verify_prefix(data,shell,shell_cr3,prior,variant,apics,layout):
     pid,c,status,again,empty=test("SURVIVOR_COLLECT","PID CHILD STATUS AGAIN EMPTY")
     require((pid,c,status,again,empty)==(root,survivor,0,(-10)&MASK,(-10)&MASK),
             "incorrect survivor collection")
-    pid,rec,pages,before,after,db,da,total,value,inverse,t=test(
-        "RECOVERY","PID BASE PAGES BEFORE AFTER DEMAND_BEFORE DEMAND_AFTER SUM VALUE INVERSE MS")
-    require(pid==root and rec%PAGE==0 and (1<<39)<=rec<rec+16*PAGE<=(1<<40)-5*PAGE and
+    pid,rec,pages,before,after,db,da=test(
+        "RECOVERY_1","PID BASE PAGES BEFORE AFTER DEMAND_BEFORE DEMAND_AFTER")
+    owner,total,value,inverse,t=test("RECOVERY_2","PID SUM VALUE INVERSE MS")
+    require(pid==owner==root and rec%PAGE==0 and (1<<39)<=rec<rec+16*PAGE<=(1<<40)-5*PAGE and
             pages==16 and 0<before==db and after==da and after>=before+16 and
             total==136 and finish<=t<=until,"missing new resident fault-in and verified data")
     sentinel(root,value,inverse)

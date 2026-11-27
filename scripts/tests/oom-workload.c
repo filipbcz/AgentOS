@@ -235,9 +235,11 @@ int runOom(void) {
     t=now();
     if (!vmStats(after) || after[2]<before[2]+recoveryPages ||
         after[5]<before[5]+recoveryPages || !keepOk(id.pid) || t<0 || t>until ||
-        !REPORT("RECOVERY","PID BASE PAGES BEFORE AFTER DEMAND_BEFORE DEMAND_AFTER SUM VALUE INVERSE MS",
+        /* Each record fits one ordinary terminal write (including CRLF). */
+        !REPORT("RECOVERY_1","PID BASE PAGES BEFORE AFTER DEMAND_BEFORE DEMAND_AFTER",
                 id.pid,(unsigned long)gRecovery,recoveryPages,before[2],after[2],
-                before[5],after[5],sum,gKeep[0],inverse(),t)) goto cleanup;
+                before[5],after[5]) ||
+        !REPORT("RECOVERY_2","PID SUM VALUE INVERSE MS",id.pid,sum,gKeep[0],inverse(),t)) goto cleanup;
     result=0;
 cleanup:
     if (cfd>=0) (void)os_call(SYS_CLOSE,cfd,0,0);

@@ -50,8 +50,9 @@ def transcript(root=97,shell=9,apic=7,cpus=1):
     test("SURVIVOR_AFTER",PID=s,PARENT=root,APIC=apic,CPUS=cpus,**sent(s))
     record(b"AGENTOS USER EXIT",PID=s,CR3=sc,STATUS=0)
     test("SURVIVOR_COLLECT",PID=root,CHILD=s,STATUS=0,AGAIN=-10,EMPTY=-10)
-    test("RECOVERY",PID=root,BASE=0x8000410000,PAGES=16,BEFORE=5,AFTER=21,
-         DEMAND_BEFORE=5,DEMAND_AFTER=21,SUM=136,**sent(root),MS=1501)
+    test("RECOVERY_1",PID=root,BASE=0x8000410000,PAGES=16,BEFORE=5,AFTER=21,
+         DEMAND_BEFORE=5,DEMAND_AFTER=21)
+    test("RECOVERY_2",PID=root,SUM=136,**sent(root),MS=1501)
     record(b"AGENTOS USER EXIT",PID=root,CR3=rc,STATUS=0)
     return b"\r\n".join(rows)+b"\r\nexit status 0\r\nagentos> "
 
@@ -100,7 +101,13 @@ class OomTests(unittest.TestCase):
             (b"PROGRESS",b"RESIDENT",3),(b"PROGRESS",b"DEMAND",0),
             (b"COLLECT",b"STATUS",0),(b"COLLECT",b"AGAIN",0),
             (b"SURVIVOR_AFTER",b"INVERSE",0),(b"SURVIVOR_COLLECT",b"EMPTY",0),
-            (b"RECOVERY",b"AFTER",5),(b"RECOVERY",b"SUM",0),
+            (b"RECOVERY_1",b"PID",98),(b"RECOVERY_1",b"BASE",BASE+1),
+            (b"RECOVERY_1",b"PAGES",15),(b"RECOVERY_1",b"BEFORE",0),
+            (b"RECOVERY_1",b"AFTER",5),(b"RECOVERY_1",b"DEMAND_BEFORE",4),
+            (b"RECOVERY_1",b"DEMAND_AFTER",20),
+            (b"RECOVERY_2",b"PID",98),(b"RECOVERY_2",b"SUM",0),
+            (b"RECOVERY_2",b"VALUE",0),(b"RECOVERY_2",b"INVERSE",0),
+            (b"RECOVERY_2",b"MS",1499),(b"RECOVERY_2",b"MS",21001),
             (oom.OOM,b"PID",98),(oom.OOM,b"ADDRESS",BASE+oom.SIZE),
             (b"AGENTOS USER FAULT",b"ERROR",4),(b"AGENTOS USER FAULT",b"ADDRESS",BASE),
             (b"AGENTOS USER FAULT",b"PARENT",1),(b"AGENTOS USER FAULT",b"CR3",0x300000)
@@ -114,6 +121,33 @@ class OomTests(unittest.TestCase):
                 self.verify(bad)
         with self.assertRaises(oom.VerificationError):
             self.verify(data,prior={97})
+
+    def test_recovery_record_boundaries(self):
+        data=transcript()
+        first=next(row for row in data.splitlines(keepends=True) if row.startswith(oom.MARKER+b"RECOVERY_1 "))
+        second=next(row for row in data.splitlines(keepends=True) if row.startswith(oom.MARKER+b"RECOVERY_2 "))
+        import re
+        # Every value has the full 16-digit width, even at U64_MAX.
+        for row,expected in ((first,203),(second,139)):
+            widest=re.sub(rb"=[0-9a-f]{16}",b"=ffffffffffffffff",row)
+            self.assertTrue(widest.endswith(b"\r\n"))
+            self.assertEqual(len(row),len(widest))
+            self.assertEqual(len(widest),expected)
+            self.assertLessEqual(len(widest),256)
+        pair=first+second
+        self.assertEqual(data.count(pair),1)
+        foreign=second.replace(b"PID=0000000000000061",b"PID=0000000000000062",1)
+        self.assertNotEqual(foreign,second)
+        # Missing/duplicate records also covered generically above. Explicitly
+        # reject reordered, interleaved, old-format, foreign and partial reports.
+        for bad in (first,second,first+second+second,second+first,first+foreign,
+                    first+b"unexpected\r\n"+second,
+                    first+second[:-3]+b"\r\n",first+second[:-2],
+                    first+second+b"unexpected\r\n",
+                    first.replace(b"RECOVERY_1",b"RECOVERY",1).rstrip(b"\r\n")+
+                    b" SUM="+second.split(b" SUM=",1)[1]):
+            with self.subTest(bad=bad),self.assertRaises(oom.VerificationError):
+                self.verify(data.replace(pair,bad,1))
 
     def test_control_only(self):
         data=oom.COMMAND.encode()+b"\r\n"+oom.MISSING
