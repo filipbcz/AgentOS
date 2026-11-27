@@ -38,8 +38,8 @@ jobs:
             binutils cpio gcc-13 gnu-efi rustc python3 openssl \
             sbsigntool efitools gdisk mtools qemu-system-x86 ovmf \
             python3-virt-firmware gdb
-      - name: Build the ordinary signed production EFI once
-        run: bash scripts/build.sh
+      - name: Build ordinary and separately signed supervisor images once
+        run: bash scripts/build.sh --supervisor-staging
       - name: Record host accelerator capabilities
         run: |
           qemu-system-x86_64 --version
@@ -79,6 +79,22 @@ jobs:
               --profile "$profile" --ovmf-code "$code" --ovmf-vars "$vars" --timeout 180 || status=1
           done
           exit "$status"
+      - name: Verify local supervisor workloads on the matched signed staged image
+        env:
+          CPU_COUNT: ${{ matrix.cpus }}
+        run: |
+          set -euo pipefail
+          code=/usr/share/OVMF/OVMF_CODE_4M.secboot.fd
+          vars=/usr/share/OVMF/OVMF_VARS_4M.fd
+          python3 scripts/qemu-smoke.py --cpus "$CPU_COUNT" --session \
+            --runtime-process-regression --supervisor-image test \
+            --ovmf-code "$code" --ovmf-vars "$vars" --timeout 720
+          python3 scripts/qemu-smoke.py --cpus "$CPU_COUNT" --accel kvm --no-hpet --session \
+            --runtime-process-regression --supervisor-image test \
+            --ovmf-code "$code" --ovmf-vars "$vars" --timeout 180
+          python3 scripts/qemu-no-acpi-timers.py --cpus "$CPU_COUNT" --accel kvm \
+            --profile deferred --supervisor-image test \
+            --ovmf-code "$code" --ovmf-vars "$vars" --timeout 180
       - name: Preserve real platform, boot and failure evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -108,3 +124,40 @@ jobs:
             build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session/*.bin
             build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session/*.ppm
             build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session/*.efi
+            build/agentos.unsigned.efi
+            build/kernel.elf
+            build/initramfs.cpio
+            build/db.cer
+            build/supervisor-staging/
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-test/*.json
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-test/*.log
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-test/*.bin
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-test/*.ppm
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-test/*.efi
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-test/*.txt
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-test/OVMF_VARS.secboot.fd
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-test/esp.raw
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-kvm-session-sv-test/*.json
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-kvm-session-sv-test/*.log
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-kvm-session-sv-test/*.bin
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-kvm-session-sv-test/*.ppm
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-kvm-session-sv-test/*.efi
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-kvm-session-sv-test/*.txt
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-kvm-session-sv-test/OVMF_VARS.secboot.fd
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-kvm-session-sv-test/esp.raw
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session-sv-test/*.json
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session-sv-test/*.log
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session-sv-test/*.bin
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session-sv-test/*.ppm
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session-sv-test/*.efi
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session-sv-test/*.txt
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session-sv-test/OVMF_VARS.secboot.fd
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session-sv-test/esp.raw
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session/*.json
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session/*.log
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session/*.bin
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session/*.ppm
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session/*.efi
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session/*.txt
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session/OVMF_VARS.secboot.fd
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session/esp.raw

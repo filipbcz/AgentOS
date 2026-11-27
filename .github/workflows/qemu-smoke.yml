@@ -368,14 +368,18 @@ jobs:
         run: |
           set -euo pipefail
           status=0
-          for variant in control test; do
-            python3 scripts/qemu-smoke.py --cpus "$CPU_COUNT" --session \
-              --runtime-process-regression --supervisor-image "$variant" \
-              --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd \
-              --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd --timeout 720 || status=1
+          for clock in hpet pm; do
+            options=()
+            if [[ "$clock" == pm ]]; then options=(--no-hpet); fi
+            for variant in control test; do
+              python3 scripts/qemu-smoke.py --cpus "$CPU_COUNT" --session \
+                --runtime-process-regression --supervisor-image "$variant" "${options[@]}" \
+                --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd \
+                --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd --timeout 720 || status=1
+            done
+            python3 scripts/verify-supervisor-image.py --cpus "$CPU_COUNT" "${options[@]}" || status=1
           done
           test "$status" -eq 0
-          python3 scripts/verify-supervisor-image.py --cpus "$CPU_COUNT"
       - name: Preserve paired signed images and independent evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -408,3 +412,19 @@ jobs:
             build/check/qemu-cpu${{ matrix.cpus }}-session-sv-test/secureboot-vars.txt
             build/check/qemu-cpu${{ matrix.cpus }}-session-sv-test/OVMF_VARS.secboot.fd
             build/check/qemu-cpu${{ matrix.cpus }}-session-sv-test/esp.raw
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session-sv-control/*.log
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session-sv-control/*.json
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session-sv-control/*.bin
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session-sv-control/*.ppm
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session-sv-control/esp-bootx64.efi
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session-sv-control/secureboot-vars.txt
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session-sv-control/OVMF_VARS.secboot.fd
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session-sv-control/esp.raw
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session-sv-test/*.log
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session-sv-test/*.json
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session-sv-test/*.bin
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session-sv-test/*.ppm
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session-sv-test/esp-bootx64.efi
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session-sv-test/secureboot-vars.txt
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session-sv-test/OVMF_VARS.secboot.fd
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session-sv-test/esp.raw

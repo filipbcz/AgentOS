@@ -2,20 +2,198 @@
 #include "../../user/abi.h"
 
 int run_supervisor(void);
+enum { maxPool=8, maxRounds=4, budgetMs=15000, workMs=100,
+       runReserveMs=3000, skipStatus=75, movedStatus=76 };
+enum { workCommand=1, runCommand=2, stopCommand=3 };
+struct Sample { unsigned long stats[8], ms; };
+struct Command { unsigned long kind, round, apic; };
+struct Report { unsigned long round, slot; struct Sample sample; };
+struct IncomingCommand { struct ipc_peer peer; struct Command body; };
+struct IncomingReport { struct ipc_peer peer; struct Report body; };
+static int gChannels[maxPool][2];
+static long gPids[maxPool], gDeadline;
+static unsigned long gRoot, gCpus;
+static unsigned gCount, gCovered;
+static unsigned long gApics[maxPool];
+_Static_assert(sizeof(struct Sample)==72,"scheduler sample layout");
 
+static long now(void) { return os_call(SYS_MONOTONIC_MS,0,0,0); }
+static int sample(struct Sample *s) {
+    long pid=os_call(SYS_GETPID,0,0,0);
+    if (pid<=0 || os_call(SYS_SCHED_STATS,(long)s->stats,64,0)!=0) return 0;
+    long ms=now();
+    s->ms=(unsigned long)ms;
+    return ms>=0 && (!gDeadline || ms<=gDeadline) && s->stats[0]==1 &&
+        s->stats[1]<=0xffffffffUL && s->stats[2]>0 &&
+        (!gCpus || s->stats[2]==gCpus) && s->stats[6]==(unsigned long)pid &&
+        s->stats[3]<=s->stats[4] && s->stats[4]<0x7fffffffffffffffUL &&
+        (s->stats[2]!=1 || (!s->stats[3] && !s->stats[4] && !s->stats[5]));
+}
+static void append(char *line,unsigned *n,const char *text) {
+    while (*text) line[(*n)++]=*text++;
+}
+static int record(const char *kind,const char *const names[],const unsigned long values[],unsigned count) {
+    char line[256]; unsigned n=0;
+    append(line,&n,"AGENTOS TEST "); append(line,&n,kind);
+    for (unsigned i=0;i<count;++i) {
+        append(line,&n,names[i]); format_hex(line+n,values[i],16); n+=16;
+    }
+    append(line,&n,"\r\n");
+    return n<=sizeof(line) && os_call(SYS_WRITE,1,(long)line,n)==n;
+}
+static int snapshot(const char *kind,const struct Sample *s) {
+    const char *const names[]={" PID="," PARENT="," APIC="," CPUS="," MOVES="," TOTAL="," MS="};
+    const unsigned long v[]={s->stats[6],s->stats[7],s->stats[1],s->stats[2],s->stats[3],s->stats[4],s->ms};
+    return record(kind,names,v,7);
+}
+static int wave(unsigned round) {
+    const char *const names[]={" ROOT="," ROUND="," COUNT="};
+    const unsigned long v[]={gRoot,round,gCount};
+    return record("WAVE",names,v,3);
+}
+static int candidate(unsigned round,unsigned slot,long pid) {
+    const char *const names[]={" ROOT="," ROUND="," SLOT="," PID="};
+    const unsigned long v[]={gRoot,round,slot,(unsigned long)pid};
+    return record("CANDIDATE",names,v,4);
+}
+static int selectCandidate(long pid,unsigned long apic,int run) {
+    const char *const names[]={" ROOT="," PID="," APIC="," RUN="};
+    const unsigned long v[]={gRoot,(unsigned long)pid,apic,(unsigned long)run};
+    return record("SELECT",names,v,4);
+}
+static int reaped(long pid,long status) {
+    const char *const names[]={" ROOT="," PID="," STATUS="};
+    const unsigned long v[]={gRoot,(unsigned long)pid,(unsigned long)status};
+    return record("REAP",names,v,3);
+}
+static int closeFd(int *fd) {
+    if (*fd<0) return 1;
+    int ok=os_call(SYS_CLOSE,*fd,0,0)==0;
+    *fd=-1; return ok;
+}
+static int send(int fd,const void *body,unsigned size) {
+    return os_call(SYS_IPC_TRY_SEND,fd,(long)body,size)==size;
+}
+static int receive(int fd,unsigned long pid,void *incoming,unsigned size) {
+    if (fd<0 || fd>=32) return 0;
+    unsigned long mask=1UL<<fd;
+    long events=os_call(SYS_WAIT_EVENTS_UNTIL,mask,gDeadline,0);
+    return events==(long)mask && os_call(SYS_IPC_TRY_RECV,fd,(long)incoming,size)==size &&
+        ((struct ipc_peer *)incoming)->pid==pid;
+}
+static int receiveCommand(int fd,unsigned round,struct Command *command) {
+    struct IncomingCommand in;
+    if (!receive(fd,gRoot,&in,sizeof(in.body)) || in.body.round!=round) return 0;
+    *command=in.body; return 1;
+}
+static int command(unsigned slot,unsigned round,unsigned kind,unsigned long apic) {
+    const struct Command c={kind,round,apic};
+    return send(gChannels[slot][0],&c,sizeof(c));
+}
+static int placementWork(void) {
+    long start=now();
+    if (start<0 || start>gDeadline-workMs) return 0;
+    unsigned long value=1;
+    /* Ordinary runnable CPU work, never a forced move. Both wall-clock and
+     * iteration limits apply, even if the guest clock ceases advancing. */
+    for (unsigned i=0;i<200000;++i) {
+        long ms=now();
+        if (ms<start || ms>gDeadline) return 0;
+        if (ms>=start+workMs) return 1;
+        for (unsigned j=0;j<256;++j) {
+            value=value*33+1;
+            __asm__ volatile ("" : "+r"(value) :: "memory");
+        }
+        if (os_call(SYS_YIELD,0,0,0)!=0) return 0;
+    }
+    return 0;
+}
+static int worker(unsigned slot,unsigned round) {
+    for (unsigned i=0;i<gCount;++i)
+        if (!closeFd(&gChannels[i][0]) || (i!=slot && !closeFd(&gChannels[i][1]))) return 70;
+    int fd=gChannels[slot][1]; struct Command c;
+    struct Report report={.round=round,.slot=slot};
+    if (!receiveCommand(fd,round,&c) || c.kind!=workCommand || !placementWork() ||
+        !sample(&report.sample) || report.sample.stats[7]!=gRoot ||
+        !send(fd,&report,sizeof(report)) || !receiveCommand(fd,round,&c) ||
+        !closeFd(&gChannels[slot][1]) || os_call(SYS_CHILD_AFTER,0,0,0)!=-10) return 71;
+    if (c.kind==stopCommand) return 0;
+    if (c.kind!=runCommand) return 72;
+    struct Sample before,after;
+    if (!sample(&before) || before.stats[7]!=gRoot || before.ms>(unsigned long)(gDeadline-runReserveMs)) return 73;
+    if (before.stats[1]!=c.apic) return snapshot("SKIP",&before)?skipStatus:74;
+    if (!snapshot("BEGIN",&before)) return 74;
+    int result=run_supervisor();
+    if (result) return result;
+    if (os_call(SYS_CHILD_AFTER,0,0,0)!=-10 || !sample(&after) || after.stats[7]!=gRoot ||
+        after.stats[6]!=before.stats[6] || !snapshot("ENDED",&after)) return 68;
+    /* Spawn is local to the owning queue. No published migration anywhere
+     * in this complete bracket implies locality of every direct child too. */
+    return after.stats[1]==before.stats[1] && after.stats[3]==before.stats[3] &&
+        after.stats[4]==before.stats[4] ? 0 : movedStatus;
+}
+static int covered(unsigned long apic) {
+    for (unsigned i=0;i<gCovered;++i) if (gApics[i]==apic) return 1;
+    return 0;
+}
+static void cleanup(void) {
+    long ms=now(), until=ms>=0 && ms<0x7fffffffffffffffL-1000 ? ms+1000 : -1;
+    for (unsigned i=0;i<gCount;++i) if (gPids[i]>0) (void)os_call(SYS_KILL,gPids[i],0,0);
+    for (unsigned i=0;i<gCount;++i) {
+        if (gPids[i]>0 && until>=0) (void)os_call(SYS_WAIT_CHILD_UNTIL,gPids[i],until,0);
+        (void)closeFd(&gChannels[i][0]); (void)closeFd(&gChannels[i][1]);
+    }
+}
+static int runWave(unsigned round) {
+    struct Sample ready[maxPool];
+    for (unsigned i=0;i<gCount;++i) {
+        gChannels[i][0]=gChannels[i][1]=-1; gPids[i]=0;
+    }
+    if (!wave(round)) return 0;
+    for (unsigned i=0;i<gCount;++i)
+        if (os_call(SYS_IPC_PAIR,(long)gChannels[i],0,0)!=0) return 0;
+    for (unsigned i=0;i<gCount;++i) {
+        long pid=os_call(SYS_FORK,0,0,0);
+        if (pid==0) { (void)os_call(SYS_EXIT,worker(i,round),0,0); __builtin_trap(); }
+        if (pid<0) return 0;
+        gPids[i]=pid;
+        if (!candidate(round,i,pid)) return 0;
+    }
+    for (unsigned i=0;i<gCount;++i)
+        if (!closeFd(&gChannels[i][1]) || !command(i,round,workCommand,0)) return 0;
+    for (unsigned i=0;i<gCount;++i) {
+        struct IncomingReport in;
+        if (!receive(gChannels[i][0],gPids[i],&in,sizeof(in.body)) ||
+            in.body.round!=round || in.body.slot!=i || in.body.sample.stats[6]!=(unsigned long)gPids[i] ||
+            in.body.sample.stats[7]!=gRoot || !snapshot("READY",&in.body.sample)) return 0;
+        ready[i]=in.body.sample;
+    }
+    for (unsigned i=0;i<gCount;++i) {
+        unsigned long apic=ready[i].stats[1]; long pid=gPids[i];
+        int run=!covered(apic) && gCovered<gCpus;
+        long ms=now();
+        if (ms<0 || ms>gDeadline-(run?runReserveMs:0) || !selectCandidate(pid,apic,run) ||
+            !command(i,round,run?runCommand:stopCommand,apic)) return 0;
+        long status=os_call(SYS_WAIT_CHILD_UNTIL,pid,gDeadline,0);
+        if (status<0) return 0;
+        gPids[i]=0;
+        if (!closeFd(&gChannels[i][0]) || !reaped(pid,status)) return 0;
+        if (run && status==0) gApics[gCovered++]=apic;
+        else if ((!run && status!=0) || (run && status!=skipStatus && status!=movedStatus)) return 0;
+    }
+    return os_call(SYS_CHILD_AFTER,0,0,0)==-10;
+}
 int runSupervisorWorkload(void) {
-    unsigned long pStats[8]={0};
-    long pPid=os_call(SYS_GETPID,0,0,0);
-    if (pPid<=0 || os_call(SYS_SCHED_STATS,(long)pStats,sizeof(pStats),0)!=0 ||
-        pStats[0]!=1 || pStats[6]!=(unsigned long)pPid || pStats[7]<=1 ||
-        pStats[7]>=(unsigned long)pPid || os_call(SYS_CHILD_AFTER,0,0,0)!=-10)
-        return 66;
-    char pLine[]="AGENTOS TEST RUNNER PID=0000000000000000 PARENT=0000000000000000\r\n";
-    format_hex(pLine+sizeof("AGENTOS TEST RUNNER PID=")-1,pStats[6],16);
-    format_hex(pLine+sizeof("AGENTOS TEST RUNNER PID=0000000000000000 PARENT=")-1,pStats[7],16);
-    if (os_call(SYS_WRITE,1,(long)pLine,sizeof(pLine)-1)!=sizeof(pLine)-1) return 67;
-    int pResult=run_supervisor();
-    if (pResult!=0) return pResult;
-    /* No direct child, including a zombie, may remain after collection. */
-    return os_call(SYS_CHILD_AFTER,0,0,0)==-10 ? 0 : 68;
+    struct Sample before,after;
+    if (!sample(&before) || before.stats[7]<=1 || before.stats[7]>=before.stats[6] ||
+        before.stats[2]>maxPool/2 || before.ms>0x7fffffffffffffffUL-budgetMs ||
+        os_call(SYS_CHILD_AFTER,0,0,0)!=-10) return 66;
+    gRoot=before.stats[6]; gCpus=before.stats[2]; gDeadline=(long)before.ms+budgetMs;
+    gCount=gCpus==1?1:2*(unsigned)gCpus;
+    if (!snapshot("RUNNER",&before)) return 67;
+    for (unsigned round=1;round<=maxRounds && gCovered<gCpus;++round)
+        if (!runWave(round)) { cleanup(); return 77; }
+    if (gCovered!=gCpus || !sample(&after) || after.stats[6]!=gRoot ||
+        after.stats[7]!=before.stats[7] || os_call(SYS_CHILD_AFTER,0,0,0)!=-10) return 78;
+    return snapshot("COMPLETE",&after)?0:79;
 }

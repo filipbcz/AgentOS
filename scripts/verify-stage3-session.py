@@ -72,8 +72,8 @@ def runtime_process_prefix(data, shell, shell_cr3, prior_pids):
     return offset,records
 
 
-def supervisor_prefix(data, shell, shell_cr3, prior_pids, variant):
-    """Consume only a verified foreground workload (or real ENOENT)."""
+def supervisor_prefix(data, shell, shell_cr3, prior_pids, variant, apics):
+    """Consume only a verified per-CPU foreground workload (or real ENOENT)."""
     require(variant in ("control", "test"), "Invalid supervisor image variant")
     echo = (SUPERVISOR_COMMAND+"\r\n").encode("ascii")
     require(data.startswith(echo), "Missing supervisor command echo")
@@ -83,63 +83,14 @@ def supervisor_prefix(data, shell, shell_cr3, prior_pids, variant):
                 "Distribution did not reject the absent test runner")
         return offset+len(SUPERVISOR_MISSING), {"absent": True}, set()
 
-    spec = importlib.util.spec_from_file_location(
-        "runtime_supervisor", Path(__file__).with_name("verify-supervisor.py"))
-    verifier = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(verifier)
-
-    def read_line():
-        nonlocal offset
-        end = data.find(b"\r\n", offset)
-        require(end >= offset, "Truncated supervisor interval")
-        line = data[offset:end]
-        require(line.isascii(), "Non-ASCII supervisor record")
-        offset = end+2
-        return line.decode("ascii")
-
-    identity = re.fullmatch(r"AGENTOS TEST RUNNER PID=("+verifier.HEX16+
-                            r") PARENT=("+verifier.HEX16+r")", read_line())
-    require(identity is not None, "Missing runner scheduler identity")
-    runner, parent = (int(v,16) for v in identity.groups())
-    require(parent==shell and runner>shell and runner not in prior_pids,
-            "Foreign parent or reused supervisor PID")
-    begin = verifier.BEGIN.fullmatch(read_line())
-    require(begin is not None and int(begin[1],16)==runner,
-            "Supervisor begin identity mismatch")
-    seen = set(prior_pids) | {runner}
-    records, child_roots = [], []
-    try:
-        for _ in verifier.EXPECTED_ORDER:
-            line = read_line()
-            item = verifier.event(line)
-            require(item is not None, "Unexpected supervisor record")
-            records.append(item)
-            match = verifier.EXIT.fullmatch(line)
-            if match:
-                child_roots.append(int(match[2],16))
-        end = verifier.END.fullmatch(read_line())
-        require(end is not None and int(end[1],16)==runner,
-                "Supervisor end identity mismatch")
-        outcome = verifier.verify_interval(runner, records, seen)
-    except verifier.VerificationError as error:
-        raise VerificationError("Foreground supervisor: "+str(error)) from error
-
-    actual = EXIT.match(data, offset)
-    require(actual is not None, "Missing actual supervisor exit")
-    pid, cr3, status = (int(v,16) for v in actual.groups())
-    require(pid==runner and status==0 and cr3>0 and cr3%4096==0 and cr3!=shell_cr3,
-            "Supervisor did not exit normally in its private address space")
-    require(all(root != cr3 and root != shell_cr3 for root in child_roots),
-            "Supervisor child reused a live parent or shell address space")
-    children = [outcome["healthy_pid"], *outcome["failed_pids"], outcome["killed_pid"]]
-    require(all(child > runner for child in children) and children == sorted(children),
-            "Unexpected child PID allocation order")
-    reply = b"exit status 0\r\nagentos> "
-    require(data.startswith(reply, actual.end()), "Shell did not collect real runner exit")
-    outcome.update({"absent":False,"runner_pid":runner,"shell_pid":parent,
-                    "runner_cr3":cr3,"runner_status":status,
-                    "child_statuses":[records[i][3] for i in (0,2,4,6,9)]})
-    return actual.end()+len(reply), outcome, {runner,*children}
+    modules=[]
+    for filename in ("verify-supervisor.py","verify-supervisor-locality.py"):
+        spec=importlib.util.spec_from_file_location(filename,Path(__file__).with_name(filename))
+        module=importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        modules.append(module)
+    consumed,result,pids=modules[1].verify(data[offset:],shell,shell_cr3,prior_pids,apics,modules[0],require)
+    return offset+consumed,result,pids
 
 
 class VerificationError(ValueError):
@@ -264,9 +215,8 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
            aRuntimeProcess=False, aSupervisorImage=None):
     require(aSupervisorImage is None or (aRuntimeProcess and aSupervisorImage in ("control","test")),
             "Supervisor image scenario requires the existing foreground regression")
-    if aSupervisorImage is not None:
-        require(aLog.count(b"AGENTOS TEST RUNNER ")==int(aSupervisorImage=="test"),
-                "Unexpected runner invocation outside its foreground interval")
+    require(aLog.count(b"AGENTOS TEST RUNNER ")==int(aSupervisorImage=="test"),
+            "Unexpected runner invocation outside its foreground interval")
     pTimerCpus = timerCpuCount(aLog,aCpus)
     pRoots,pChildren,pEnds = (list(pPattern.finditer(aLog)) for pPattern in
                               (ROOT_START,SHELL_START,SESSION_STOP))
@@ -302,9 +252,15 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
         pInteractive=pInteractive[pConsumed:]
         pPrefixPids={r["pid"] for r in pRuntimeRecords}
         if aSupervisorImage is not None:
+            pApicList=[int(m[1],16) for m in re.finditer(
+                rb"(?m)^AGENTOS TASK (?:BSP|AP) APIC=("+HEX+rb") TIMER-WAKES=0000000000000003\r?$",
+                aLog[:pChildren[0].start()])]
+            require(len(pApicList)==len(set(pApicList))==aCpus,"Missing actual boot CPU roster")
             pConsumed,pSupervisor,pNewPids=supervisor_prefix(
                 pInteractive,pShell,int(pShellExits[0][2],16),
-                pPrior | pPrefixPids,aSupervisorImage)
+                pPrior | pPrefixPids,aSupervisorImage,set(pApicList))
+            require(aLog.count(b"AGENTOS TEST ")==pInteractive[:pConsumed].count(b"AGENTOS TEST "),
+                    "Locality evidence replayed outside its foreground interval")
             pPrefixPids.update(pNewPids)
             pInteractive=pInteractive[pConsumed:]
     pClean = without_kernel_events(pInteractive)

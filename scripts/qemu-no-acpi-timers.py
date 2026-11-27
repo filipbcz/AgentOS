@@ -364,7 +364,7 @@ def run(cmd, **kwargs):
     return subprocess.run(cmd,check=True,cwd=ROOT,**kwargs)
 
 
-def prepare_fixture(dest, signed_hash, args):
+def prepare_fixture(dest, signed_hash, args, image_path):
     keys=Path.home()/".local/share/agentos/stage1-test-keys"
     fixture=dest/"timer-fixture.efi"
     obj,elf,unsigned=(dest/n for n in ("timer-fixture.o","timer-fixture.so","timer-fixture.unsigned.efi"))
@@ -381,14 +381,14 @@ def prepare_fixture(dest, signed_hash, args):
          "-j",".dynsym","-j",".rela","-j",".reloc","--target=efi-app-x86_64",str(elf),str(unsigned)])
     run(["sbsign","--key",str(keys/"db.key"),"--cert",str(keys/"db.crt"),
          "--output",str(fixture),str(unsigned)])
-    for path in (fixture, ROOT/"build/agentos.efi"):
+    for path in (fixture, image_path):
         run(["sbverify","--cert",str(keys/"db.crt"),str(path)])
     # Separate isolated test ESP. The ordinary profile booted the same
     # AgentOS bytes from BOOTX64.EFI; this profile loads them via UEFI.
     raw=dest/"esp.raw"
     run(["bash","scripts/disk.sh",str(dest),str(fixture),"info both"])
     fat=f"{raw}@@1048576"
-    run(["mcopy","-i",fat,str(ROOT/"build/agentos.efi"),"::EFI/BOOT/AGENTOS.EFI"])
+    run(["mcopy","-i",fat,str(image_path),"::EFI/BOOT/AGENTOS.EFI"])
     for remote,local,wanted in [
         ("BOOTX64.EFI","esp-fixture.efi",smoke.evidence.sha256(fixture)),
         ("AGENTOS.EFI","esp-agentos.efi",signed_hash),
@@ -412,15 +412,24 @@ def scenario(args):
     image=smoke.evidence.verify_build(ROOT,commit)
     require(image.get("profile","default")=="default","Only the ordinary signed EFI is permitted")
     digest=image["artifacts"]["agentos.efi"]
-    baseline_path=ROOT/f"build/check/qemu-cpu{args.cpus}-session/smoke.json"
+    image_path=ROOT/"build/agentos.efi"
+    variant=getattr(args,"supervisor_image",None)
+    variant_suffix="" if variant is None else "-sv-"+variant
+    if variant is not None:
+        paired=smoke.load("clock_supervisor_images","verify-supervisor-image.py")
+        identity=paired.verify_identity(ROOT)
+        if variant=="test":
+            image_path=ROOT/"build/supervisor-staging/test.efi"
+            digest=identity["test"]["signed_sha256"]
+    baseline_path=ROOT/f"build/check/qemu-cpu{args.cpus}-session{variant_suffix}/smoke.json"
     baseline=json.loads(baseline_path.read_text())
     require(baseline["result"]=="pass" and baseline["source_commit"]==commit and
             baseline["signed_efi_sha256"]==digest and baseline["esp_boot_efi_sha256"]==digest and
             baseline["cpus"]==args.cpus and baseline["hpet_enabled"] and
-            baseline["interactive_com1_manager_session"],
+            baseline["interactive_com1_manager_session"] and baseline.get("supervisor_image")==variant,
             "Missing ordinary interactive boot of the exact same signed EFI")
     suffix="no-acpi-timers" if args.profile=="disabled" else "clock-"+args.profile
-    dest=ROOT/f"build/check/qemu-cpu{args.cpus}-{suffix}-session"
+    dest=ROOT/f"build/check/qemu-cpu{args.cpus}-{suffix}-session{variant_suffix}"
     # Never consume a previous result as current evidence.
     if dest.exists():
         shutil.rmtree(dest)
@@ -436,23 +445,29 @@ def scenario(args):
              "dev_kvm_accessible":os.access("/dev/kvm",os.R_OK|os.W_OK),
              "platform_verified":False,"boot_verified":False,
              "note":"QEMU-only; no VirtualBox/physical hardware claim"}
+    if variant is not None:
+        receipt["supervisor_image"]=variant
     start=time.monotonic()
     process=capture=qmp=None
     try:
         receipt["qemu_version"]=subprocess.check_output(["qemu-system-x86_64","--version"],text=True).splitlines()[0]
         # Matching direct KVM PM control (even failure is useful evidence).
         # A missing or differently configured comparison cannot imply causality.
-        control=ROOT/f"build/check/qemu-cpu{args.cpus}-no-hpet-{accel}-session"
+        control=ROOT/f"build/check/qemu-cpu{args.cpus}-no-hpet-{accel}-session{variant_suffix}"
         for name in ("smoke.json","failure.json"):
             path=control/name
             if path.is_file():
                 observed=json.loads(path.read_text())
                 require(observed["source_commit"]==commit and observed["signed_efi_sha256"]==digest
-                        and observed["accelerator"]==accel,"Control was not the same signed EFI/accelerator")
+                        and observed["accelerator"]==accel and observed.get("supervisor_image")==variant,
+                        "Control was not the same signed EFI/accelerator")
                 receipt["matched_direct_control"]={"result":observed["result"],
                     "receipt_sha256":smoke.evidence.sha256(path)}
                 break
-        raw,vars_file,fixture_hash=prepare_fixture(dest,digest,args)
+        if variant is not None:
+            require(receipt.get("matched_direct_control",{}).get("result")=="pass",
+                    "Missing matching signed PM supervisor control")
+        raw,vars_file,fixture_hash=prepare_fixture(dest,digest,args,image_path)
         receipt["fixture_efi_sha256"]=fixture_hash
         receipt["esp_agentos_efi_sha256"]=smoke.evidence.sha256(dest/"esp-agentos.efi")
         receipt["ovmf_code_sha256"]=smoke.evidence.sha256(args.ovmf_code)
@@ -526,7 +541,7 @@ def scenario(args):
                         qmp=smoke.Qmp(qmp_socket)
                         qmp.screenshot(dest/"shell-screen.ppm")
                         smoke.console.verify(dest/"shell-screen.ppm",aLevel="info",aOutput="both")
-                        smoke.run_session(process,capture,qmp,dest)
+                        smoke.run_session(process,capture,qmp,dest,variant is not None,variant)
                         break
                     if process.poll() is not None:
                         raise RuntimeError(f"QEMU exited before shell: {process.returncode}")
@@ -575,7 +590,9 @@ def scenario(args):
                 receipt["migration"]=smoke.migration.verify(text,args.cpus)
                 smoke.service_manager.verify(text)
                 receipt["runtime_session"]=smoke.session.verify(data,(dest/"com1-input.bin").read_bytes(),
-                    True,args.cpus,aClockMaintenanceMs=1000)
+                    True,args.cpus,aClockMaintenanceMs=1000,aRuntimeProcess=variant is not None,
+                    aSupervisorImage=variant)
+                receipt["com1_input_sha256"]=smoke.evidence.sha256(dest/"com1-input.bin")
                 receipt["system_clock"]=clocks[0]
                 receipt["boot_verified"]=True
             finally:
@@ -647,6 +664,7 @@ def main():
     parser.add_argument("--ovmf-code",type=Path,required=True)
     parser.add_argument("--ovmf-vars",type=Path,required=True)
     parser.add_argument("--timeout",type=int,default=360)
+    parser.add_argument("--supervisor-image",choices=("control","test"))
     args=parser.parse_args()
     try:
         return scenario(args)

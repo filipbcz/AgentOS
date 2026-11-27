@@ -258,22 +258,24 @@ def verify_identity(root=ROOT, *, write=False):
     return result
 
 
-def verify_pair(root, cpus):
+def verify_pair(root, cpus, no_hpet=False):
     root=Path(root).resolve()
-    path=root/"build/supervisor-staging"/f"pair-cpu{cpus}.json"
+    clock_suffix="-no-hpet" if no_hpet else ""
+    path=root/"build/supervisor-staging"/f"pair-cpu{cpus}{clock_suffix}.json"
     path.unlink(missing_ok=True)
     identity=verify_identity(root)
     session=load(root,"verify-stage3-session.py")
     records, inputs, receipts = {}, [], []
     for variant in ("control","test"):
-        folder=root/"build/check"/f"qemu-cpu{cpus}-session-sv-{variant}"
+        folder=root/"build/check"/f"qemu-cpu{cpus}{clock_suffix}-session-sv-{variant}"
         receipt=json.loads((folder/"smoke.json").read_text())
         expected=identity[variant]["signed_sha256"]
         require(receipt.get("result")=="pass" and receipt.get("supervisor_image")==variant and
                 receipt.get("source_commit")==identity["source_commit"] and receipt.get("cpus")==cpus and
                 receipt.get("interactive_com1_manager_session") is True and
                 receipt.get("ps2_keyboard_session") is True and
-                receipt.get("accelerator")=="tcg" and receipt.get("hpet_enabled") is True and
+                receipt.get("accelerator")=="tcg" and receipt.get("hpet_enabled") is (not no_hpet) and
+                receipt.get("system_clock") in (("ACPI PM24","ACPI PM32") if no_hpet else ("HPET64","HPET32")) and
                 receipt.get("signed_efi_sha256")==receipt.get("esp_boot_efi_sha256")==expected and
                 sha(folder/"esp-bootx64.efi")==expected,
                 "Incomplete or mismatched real signed boot: "+variant)
@@ -303,12 +305,14 @@ def main():
     mode=parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--write-identity",action="store_true")
     mode.add_argument("--cpus",type=int,choices=(1,2))
+    parser.add_argument("--no-hpet",action="store_true")
     args=parser.parse_args()
     if args.write_identity:
+        require(not args.no_hpet,"--no-hpet requires paired sessions")
         result=verify_identity(args.root,write=True)
         print("Verified signed image identity: "+json.dumps(result,sort_keys=True))
     else:
-        print("Verified paired real supervisor sessions: "+json.dumps(verify_pair(args.root,args.cpus),sort_keys=True))
+        print("Verified paired real supervisor sessions: "+json.dumps(verify_pair(args.root,args.cpus,args.no_hpet),sort_keys=True))
     return 0
 
 

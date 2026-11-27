@@ -113,44 +113,91 @@ class ImageTests(unittest.TestCase):
             images.signed_payload(unsigned,unsigned)
 
 
-def supervisor_transcript(shell=9,runner=20):
-    records=[session.SUPERVISOR_COMMAND,
-             f"AGENTOS TEST RUNNER PID={runner:016x} PARENT={shell:016x}",
-             f"AGENTOS SUPERVISOR BEGIN PARENT={runner:016x}"]
-    def exit_line(pid,status,cr3=0x600000):
+def supervisor_phase(parent, first, cr3=0x600000):
+    records=[f"AGENTOS SUPERVISOR BEGIN PARENT={parent:016x}"]
+    def exit_line(pid,status):
         records.append(f"AGENTOS USER EXIT PID={pid:016x} CR3={cr3:016x} STATUS={status:016x}")
     def event(name,pid,status,attempt):
-        records.append(f"AGENTOS SERVICE {name} PARENT={runner:016x} CHILD={pid:016x} "
+        records.append(f"AGENTOS SERVICE {name} PARENT={parent:016x} CHILD={pid:016x} "
                        f"STATUS={status:016x} ATTEMPT={attempt:08x}")
-    exit_line(runner+1,0)
-    event("DONE",runner+1,0,1)
+    exit_line(first,0)
+    event("DONE",first,0,1)
     for attempt in range(1,4):
-        exit_line(runner+1+attempt,42)
-        event("REAP",runner+1+attempt,42,attempt)
-    event("STOP",runner+4,42,3)
-    records.append(f"AGENTOS USER KILL PID={runner+5:016x} PARENT={runner:016x} STATUS={137:016x}")
-    records.append(f"AGENTOS SERVICE DURATION PARENT={runner:016x} CHILD={runner+5:016x} MS={250:016x}")
-    event("TIME",runner+5,137,1)
-    event("STOP",runner+5,137,1)
-    records.append(f"AGENTOS SUPERVISOR ENDED PARENT={runner:016x}")
-    exit_line(runner,0,0x500000)
+        exit_line(first+attempt,42)
+        event("REAP",first+attempt,42,attempt)
+    event("STOP",first+3,42,3)
+    records.append(f"AGENTOS USER KILL PID={first+4:016x} PARENT={parent:016x} STATUS={137:016x}")
+    records.append(f"AGENTOS SERVICE DURATION PARENT={parent:016x} CHILD={first+4:016x} MS={250:016x}")
+    event("TIME",first+4,137,1)
+    event("STOP",first+4,137,1)
+    records.append(f"AGENTOS SUPERVISOR ENDED PARENT={parent:016x}")
+    return records
+
+
+def supervisor_transcript(shell=9,runner=20,apics=(7,),moving=False,skipping=False):
+    """Synthetic evidence including explicitly rejected complete attempts."""
+    cpus=len(apics)
+    count=1 if cpus==1 else 2*cpus
+    total=0 if cpus==1 else 4
+    records=[session.SUPERVISOR_COMMAND]
+    def note(kind,**fields):
+        records.append("AGENTOS TEST "+kind+"".join(f" {k}={v:016x}" for k,v in fields.items()))
+    def snap(kind,pid,parent,cpu,ms,moves=0):
+        note(kind,PID=pid,PARENT=parent,APIC=cpu,CPUS=cpus,MOVES=moves,TOTAL=total,MS=ms)
+    def exit_line(pid,status,cr3):
+        records.append(f"AGENTOS USER EXIT PID={pid:016x} CR3={cr3:016x} STATUS={status:016x}")
+    snap("RUNNER",runner,shell,apics[0],1000)
+    note("WAVE",ROOT=runner,ROUND=1,COUNT=count)
+    for i in range(count):
+        note("CANDIDATE",ROOT=runner,ROUND=1,SLOT=i,PID=runner+1+i)
+    for i in range(count):
+        snap("READY",runner+1+i,runner,apics[i%cpus],1100+i)
+    covered=set()
+    first=runner+1+count
+    ms=1200
+    for i in range(count):
+        pid,cpu=runner+1+i,apics[i%cpus]
+        run=cpu not in covered
+        note("SELECT",ROOT=runner,PID=pid,APIC=cpu,RUN=int(run))
+        status=0
+        if run and i==0 and skipping:
+            total+=1
+            snap("SKIP",pid,runner,apics[1],ms,1)
+            status=75
+        elif run:
+            snap("BEGIN",pid,runner,cpu,ms)
+            records.extend(supervisor_phase(pid,first))
+            first+=5
+            ms+=350
+            if i==0 and moving:
+                total+=1
+                status=76
+            snap("ENDED",pid,runner,cpu,ms)
+            if status==0:
+                covered.add(cpu)
+        exit_line(pid,status,0x500000+i*4096)
+        note("REAP",ROOT=runner,PID=pid,STATUS=status)
+        ms+=10
+    snap("COMPLETE",runner,shell,apics[0],ms)
+    exit_line(runner,0,0x700000)
     records.append("exit status 0")
     return ("\r\n".join(records)+"\r\nagentos> ").encode("ascii")
 
 
 class RuntimeTests(unittest.TestCase):
-    def verify(self,data,variant="test",prior=None):
-        return session.supervisor_prefix(data,9,0x300000,{1,2,9} if prior is None else prior,variant)
+    def verify(self,data,variant="test",prior=None,apics=(7,)):
+        return session.supervisor_prefix(data,9,0x300000,{1,2,9} if prior is None else prior,variant,set(apics))
 
     def test_real_event_contract(self):
         data=supervisor_transcript()
         offset,receipt,seen=self.verify(data)
         self.assertEqual(offset,len(data))
-        self.assertEqual(receipt["child_statuses"],[0,42,42,42,137])
+        self.assertEqual(receipt["intervals"][0]["child_statuses"],[0,42,42,42,137])
+        self.assertEqual(receipt["covered_apics"],[7])
         self.assertEqual(receipt["runner_pid"],20)
         self.assertEqual(receipt["shell_pid"],9)
-        self.assertEqual(seen,set(range(20,26)))
-        self.assertEqual(receipt["duration_ms"],250)
+        self.assertEqual(seen,set(range(20,27)))
+        self.assertEqual(receipt["intervals"][0]["duration_ms"],250)
 
     def test_control_requires_missing_runner(self):
         data=(session.SUPERVISOR_COMMAND+"\r\n").encode()+session.SUPERVISOR_MISSING
@@ -188,7 +235,8 @@ class RuntimeTests(unittest.TestCase):
     def test_full_session_preserves_foreground_fault_and_manager_regressions(self):
         # Reuse the existing independent stage-3 synthetic session fixture.
         fixture=load("test-verify-stage3-session.py")
-        base=fixture.transcript(True)
+        base=(b"AGENTOS TASK BSP APIC=0000000000000007 TIMER-WAKES=0000000000000003\r\n"
+              +fixture.transcript(True))
         for old,new in ((10,30),(11,31),(12,32),(13,33)):
             base=base.replace(f"PID={old:016x}".encode(),f"PID={new:016x}".encode())
         fg=(b"run /svc_ok\r\n"
@@ -221,9 +269,42 @@ class RuntimeTests(unittest.TestCase):
                     session.verify(log.replace(b"PID=000000000000001f CR3=",b"PID=0000000000000014 CR3="),
                                    serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant)
 
+    def test_two_cpu_roster_and_rejected_complete_attempts(self):
+        for flags in ({},{"moving":True},{"skipping":True}):
+            data=supervisor_transcript(apics=(7,19),**flags)
+            offset,result,seen=self.verify(data,apics=(7,19))
+            self.assertEqual(offset,len(data))
+            self.assertEqual(result["covered_apics"],[7,19])
+            self.assertEqual(len(result["intervals"]),2)
+            self.assertEqual(len(result["rejected"]),int(bool(flags)))
+            for interval in result["intervals"]:
+                self.assertEqual(interval["child_statuses"],[0,42,42,42,137])
+                for field in ("apic","moves","total"):
+                    self.assertEqual(interval["before"][field],interval["after"][field])
+            self.assertEqual(len(seen),len(set(seen)))
+
+    def test_reject_fake_locality_duplicate_cpu_pid_incomplete_and_replay(self):
+        data=supervisor_transcript(apics=(7,19))
+        lines=data.splitlines(keepends=True)
+        end=next(l for l in lines if l.startswith(b"AGENTOS TEST ENDED "))
+        begin=next(l for l in lines if l.startswith(b"AGENTOS TEST BEGIN "))
+        for bad in (
+            data.replace(end,end.replace(b"TOTAL=0000000000000004",b"TOTAL=0000000000000005"),1),
+            data.replace(end,end.replace(b"MOVES=0000000000000000",b"MOVES=0000000000000001"),1),
+            data.replace(b"APIC=0000000000000013",b"APIC=0000000000000007"),
+            data.replace(b"PID=0000000000000016",b"PID=0000000000000015",1),
+            data.replace(begin,begin+begin,1),
+            data.replace(end,b"",1),
+            data.replace(b"ROUND=0000000000000001",b"ROUND=0000000000000002",1),
+            supervisor_transcript(apics=(7,19),moving=True).replace(b"STATUS=000000000000004c",b"STATUS=0000000000000000",1),
+        ):
+            with self.assertRaises(session.VerificationError):
+                self.verify(bad,apics=(7,19))
+        with self.assertRaises(session.VerificationError):
+            self.verify(data,apics=(7,23))
+
     def test_old_supervisor_interval_checks_still_apply(self):
-        text=supervisor_transcript().decode("ascii").splitlines()
-        phase="\n".join(text[2:-3])+"\n"
+        phase="\n".join(supervisor_phase(20,21))+"\n"
         phase+="AGENTOS PROCESS OK APIC=0000000000000000 PARENT=0000000000000014\n"
         self.assertEqual(supervisor.verify(phase,1),1)
         with self.assertRaises(supervisor.VerificationError):
