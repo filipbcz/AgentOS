@@ -432,9 +432,10 @@ class RuntimeTests(unittest.TestCase):
                 with self.assertRaises(session.VerificationError):
                     session.verify(log.replace(supervisor_transcript(runner=40,pipe=True),b"",1),
                                    serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant)
+                duplicate=log.replace(b"PID=000000000000006f CR3=",b"PID=0000000000000014 CR3=",1)
+                self.assertNotEqual(duplicate,log)
                 with self.assertRaises(session.VerificationError):
-                    session.verify(log.replace(b"PID=0000000000000033 CR3=",b"PID=0000000000000014 CR3="),
-                                   serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant)
+                    session.verify(duplicate,serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant)
 
     def test_memory_full_locality_and_descendant_evidence(self):
         for kind in ("cow","demand"):
