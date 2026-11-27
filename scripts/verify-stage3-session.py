@@ -43,6 +43,10 @@ IPC_INPUT = (IPC_COMMAND+"\r").encode("ascii")
 IPC_MARKER = b"AGENTOS IPC TEST "
 FAULT_COMMAND = "run /fault-runner"
 FAULT_INPUT = (FAULT_COMMAND+"\r").encode("ascii")
+OOM_COMMAND = "run /oom-runner"
+OOM_INPUT = (OOM_COMMAND+"\r").encode("ascii")
+OOM_MARKER = b"AGENTOS TEST OOM "
+PAGE_OOM = b"AGENTOS PAGE OOM"
 SUPERVISOR_MISSING = b"run: spawn failed (-2)\r\nagentos> "
 ADOPTION_COMMAND = "run /adoption-runner"
 ADOPTION_INPUT = (ADOPTION_COMMAND+"\r").encode("ascii")
@@ -292,7 +296,11 @@ def verify_idle(aBytes, aCpus=1, aClockMaintenanceMs=1000):
 
 def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceMs=1000,
            aRuntimeProcess=False, aSupervisorImage=None, aHistoricalBootMemory=False, aMigrationStaged=False,
-           aFaultStaged=False):
+           aFaultStaged=False, aOomLayout=None):
+    require(aOomLayout is None or (aFaultStaged and aSupervisorImage in ("control","test")),
+            "OOM requires the explicit paired staged contract")
+    if aOomLayout is None:
+        require(OOM_MARKER not in aLog and PAGE_OOM not in aLog,"Unexpected runtime OOM evidence")
     require(not aFaultStaged or (aMigrationStaged and not aHistoricalBootMemory),
             "Mixed historical and staged syscall/fault contracts")
     require(aSupervisorImage is None or (aRuntimeProcess and aSupervisorImage in ("control","test")),
@@ -300,6 +308,8 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
     require(re.search(rb"AGENTOS PIPE (?!TEST )",aLog) is None,
             "Historical boot pipe transfer is not permitted in either signed image")
     pWorkloadMarkers=(b"AGENTOS SUPERVISOR",b"AGENTOS SERVICE ",b"AGENTOS TEST ",b"AGENTOS PIPE TEST ",ADOPTION_MARKER,IPC_MARKER)
+    if aOomLayout is not None:
+        pWorkloadMarkers+=(PAGE_OOM,)
     if aMigrationStaged:
         require(not aHistoricalBootMemory,"Mixed historical and foreground migration contracts")
         pWorkloadMarkers+=(MIGRATION_MARKER,)
@@ -349,6 +359,7 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
     pAdoption=None
     pIpc=None
     pFault=None
+    pOom=None
     pMigration=None
     pPrefixPids=set()
     if aRuntimeProcess:
@@ -406,6 +417,19 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
                 pWorkloadLog+=pInteractive[:pConsumed]
                 pPrefixPids.update(pNewPids)
                 pInteractive=pInteractive[pConsumed:]
+            if aOomLayout is not None:
+                spec=importlib.util.spec_from_file_location("oom_evidence",Path(__file__).with_name("verify-oom-workload.py"))
+                verifier=importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(verifier)
+                try:
+                    pConsumed,pOom,pNewPids=verifier.verify_prefix(
+                        pInteractive,pShell,int(pShellExits[0][2],16),pPrior | pPrefixPids,
+                        aSupervisorImage,bootCpuRoster(aLog,aCpus),aOomLayout)
+                except verifier.VerificationError as e:
+                    raise VerificationError(f"Invalid bounded demand OOM evidence: {e}") from e
+                pWorkloadLog+=pInteractive[:pConsumed]
+                pPrefixPids.update(pNewPids)
+                pInteractive=pInteractive[pConsumed:]
             pConsumed,pAdoption,pNewPids=adoption_prefix(
                 pInteractive,pRoot,pShell,int(pShellExits[0][2],16),
                 pPrior | pPrefixPids,aSupervisorImage,set(pApicList))
@@ -432,6 +456,8 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
             pPrefix+=SUPERVISOR_INPUT+PIPE_INPUT+MEMORY_INPUT+IPC_INPUT
             if aFaultStaged:
                 pPrefix+=FAULT_INPUT
+            if aOomLayout is not None:
+                pPrefix+=OOM_INPUT
             pPrefix+=ADOPTION_INPUT
             if aSupervisorImage=="test":
                 pPrefix+=ADOPTION_BYTES
@@ -469,6 +495,9 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
     require(pExit is not None and int(pExit[1],16)==pRoot and int(pExit[2],16)>0 and
             int(pExit[2],16)%4096==0 and int(pExit[3],16)==0,"PID1 did not exit cleanly")
     if aSupervisorImage=="test":
+        if aOomLayout is not None:
+            require(int(pExit[2],16) not in {pOom[k] for k in ("root_cr3","pressure_cr3","survivor_cr3")},
+                    "OOM client aliased the live PID1")
         if aFaultStaged:
             roots={pFault["runner_cr3"]}
             for interval in pFault["intervals"]+pFault["rejected"]:
@@ -495,6 +524,8 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
         result["runtime_demand"]=pMemory["demand"]
         result["runtime_adoption"]=pAdoption
         result["runtime_ipc"]=pIpc
+        if aOomLayout is not None:
+            result["runtime_oom"]=pOom
         if aFaultStaged:
             result["runtime_fault"]=pFault
         if aMigrationStaged:

@@ -80,12 +80,17 @@ class ImageTests(unittest.TestCase):
         self.migration_runner=b"migration runner fixture"
         self.fault_runner=b"fault runner fixture"
         self.fault_probe=b"fault probe fixture"
+        self.oom_runner=b"oom runner fixture"
+        self.oom_pressure=b"oom pressure fixture"
+        self.oom_survivor=b"oom survivor fixture"
         self.additions=[(images.RUNNER,self.runner),(images.PIPE_RUNNER,self.pipe_runner),
                         (images.PIPE_RECEIVER,self.pipe_receiver),(images.COW_RUNNER,self.cow_runner),
                         (images.DEMAND_RUNNER,self.demand_runner),(images.ADOPTION_RUNNER,self.adoption_runner),
                         (images.IPC_RUNNER,self.ipc_runner),(images.IPC_SERVICE,self.ipc_service),
                         (images.MIGRATION_RUNNER,self.migration_runner),
-                        (images.FAULT_RUNNER,self.fault_runner),(images.FAULT_PROBE,self.fault_probe)]
+                        (images.FAULT_RUNNER,self.fault_runner),(images.FAULT_PROBE,self.fault_probe),
+                        (images.OOM_RUNNER,self.oom_runner),(images.OOM_PRESSURE,self.oom_pressure),
+                        (images.OOM_SURVIVOR,self.oom_survivor)]
         self.staged=archive([*self.entries,*self.additions])
         self.kernel=b"kernel fixture"
 
@@ -95,12 +100,25 @@ class ImageTests(unittest.TestCase):
         return images.verify_contents(images.signed_payload(a,fake_certificate(a)),
             images.signed_payload(b,fake_certificate(b)),self.kernel,control,staged,
             self.runner if runner is None else runner,self.pipe_runner,self.pipe_receiver,
-            self.cow_runner,self.demand_runner,self.adoption_runner,self.ipc_runner,self.ipc_service,self.migration_runner,self.fault_runner,self.fault_probe)
+            self.cow_runner,self.demand_runner,self.adoption_runner,self.ipc_runner,self.ipc_service,self.migration_runner,self.fault_runner,self.fault_probe,
+            self.oom_runner,self.oom_pressure,self.oom_survivor)
 
     def test_exact_archive_addition(self):
         result=self.check(self.control,self.staged)
         self.assertEqual(set(result),{name for name,_ in self.entries})
         self.assertNotIn(images.RUNNER,result)
+
+    def test_oom_payloads_and_marker_cannot_leak(self):
+        for name,data in ((images.OOM_RUNNER,b"elf"),(images.OOM_PRESSURE,b"elf"),
+                          (images.OOM_SURVIVOR,b"elf"),("nested/oom-pressure",b"elf"),
+                          ("renamed",b"AGENTOS TEST OOM BEGIN")):
+            with self.subTest(name=name),self.assertRaises(images.VerificationError):
+                images.verify_distribution(archive([*self.entries,(name,data)]))
+        for name in (images.OOM_RUNNER,images.OOM_PRESSURE,images.OOM_SURVIVOR):
+            for changed in ([(n,v) for n,v in self.additions if n!=name],
+                            [(n,b"wrong" if n==name else v) for n,v in self.additions]):
+                with self.assertRaises(images.VerificationError):
+                    self.check(self.control,archive([*self.entries,*changed]))
 
     def test_fault_payloads_and_marker_cannot_leak(self):
         for name,data in ((images.FAULT_RUNNER,b"elf"),(images.FAULT_PROBE,b"elf"),
@@ -578,6 +596,28 @@ class RuntimeTests(unittest.TestCase):
                          b"AGENTOS MANAGER REAP ROOT=0000000000000001 PID=000000000000006a STATUS=0000000000000089\r\n")
                 log=log.replace(ending,cleanup+ending,1)
             result=session.verify(log,serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant,aMigrationStaged=True,aFaultStaged=True)
+            oom=load("test-verify-oom-workload.py")
+            adoption_echo=(session.ADOPTION_COMMAND+"\r\n").encode()
+            interval=((session.OOM_COMMAND+"\r\n").encode()+session.SUPERVISOR_MISSING
+                      if variant=="control" else oom.transcript())
+            oom_log=log.replace(adoption_echo,interval+adoption_echo,1)
+            oom_input=serial.replace(session.ADOPTION_INPUT,session.OOM_INPUT+session.ADOPTION_INPUT,1)
+            verified=session.verify(oom_log,oom_input,True,1,aRuntimeProcess=True,aSupervisorImage=variant,
+                                    aMigrationStaged=True,aFaultStaged=True,aOomLayout=oom.LAYOUT)
+            self.assertEqual(verified["runtime_oom"].get("absent",False),variant=="control")
+            with self.assertRaises(session.VerificationError):
+                session.verify(oom_log,oom_input,True,1,aRuntimeProcess=True,aSupervisorImage=variant,
+                               aMigrationStaged=True,aFaultStaged=True)
+            with self.assertRaises(session.VerificationError):
+                session.verify(log,serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant,
+                               aMigrationStaged=True,aFaultStaged=True,aOomLayout=oom.LAYOUT)
+            if variant=="test":
+                self.assertEqual(verified["runtime_oom"]["status"],270)
+                record=next(row for row in interval.splitlines(keepends=True) if row.startswith(oom.oom.OOM))
+                for bad in (oom_log.replace(record,b"",1),record+oom_log,oom_log+record):
+                    with self.assertRaises(session.VerificationError):
+                        session.verify(bad,oom_input,True,1,aRuntimeProcess=True,aSupervisorImage=variant,
+                                       aMigrationStaged=True,aFaultStaged=True,aOomLayout=oom.LAYOUT)
             self.assertEqual(result["runtime_adoption"]["absent"],variant=="control")
             self.assertEqual(result["runtime_ipc"]["absent"],variant=="control")
             self.assertEqual(result["runtime_fault"]["absent"],variant=="control")

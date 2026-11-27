@@ -369,7 +369,7 @@ jobs:
           set -euo pipefail
           # The HPET pair is the prerequisite for the PM pair.
           for clock in hpet pm; do
-            options=()
+            options=(--guest-oom)
             if [[ "$clock" == pm ]]; then options=(--no-hpet); fi
             for variant in control test; do
               python3 scripts/qemu-smoke.py --cpus "$CPU_COUNT" --session \

@@ -29,6 +29,9 @@ IPC_SERVICE = "ipc-service"
 MIGRATION_RUNNER = "migration-runner"
 FAULT_RUNNER = "fault-runner"
 FAULT_PROBE = "fault-probe"
+OOM_RUNNER = "oom-runner"
+OOM_PRESSURE = "oom-pressure"
+OOM_SURVIVOR = "oom-survivor"
 SECTIONS = (".text", ".sdata", ".data", ".dynamic", ".dynsym", ".rela",
             ".reloc", ".kernel", ".initrd")
 CFLAGS = ("-std=c11", "-Os", "-Wall", "-Wextra", "-Werror", "-ffreestanding",
@@ -161,12 +164,13 @@ def verify_distribution(archive):
               "orphan_parent","manager","svc_alive","svc_flaky","data","data/transfer.bin"}
     forbidden={"receiver","forktest","demand","service","ipc-test.h","client.c","service.c",
                RUNNER,PIPE_RUNNER,PIPE_RECEIVER,COW_RUNNER,DEMAND_RUNNER,ADOPTION_RUNNER,IPC_RUNNER,IPC_SERVICE,MIGRATION_RUNNER,"migration.c","migration-workload.c",
-               FAULT_RUNNER,FAULT_PROBE,"fault-workload.c","fault-probe.S"}
+               FAULT_RUNNER,FAULT_PROBE,"fault-workload.c","fault-probe.S",
+               OOM_RUNNER,OOM_PRESSURE,OOM_SURVIVOR,"oom-workload.c","oom-entry.S"}
     require(required<=set(distribution) and
             not any(name.rsplit("/",1)[-1] in forbidden for name in distribution),
             "Distribution is missing boot files or contains a historical/staged test ELF")
     require(not any(marker in payload for _,payload in distribution.values()
-                    for marker in (b"AGENTOS PIPE ",b"AGENTOS COW ",b"AGENTOS DEMAND ",b"AGENTOS ADOPTION TEST ",b"AGENTOS IPC ",b"AGENTOS MIGRATION",b"AGENTOS TEST FAULT ")),
+                    for marker in (b"AGENTOS PIPE ",b"AGENTOS COW ",b"AGENTOS DEMAND ",b"AGENTOS ADOPTION TEST ",b"AGENTOS IPC ",b"AGENTOS MIGRATION",b"AGENTOS TEST FAULT ",b"AGENTOS TEST OOM ")),
             "Distribution contains historical or staged pipe/COW/demand/IPC/migration/syscall/fault workload code")
     require(distribution["data/transfer.bin"][1]==bytes((i*73+i//251*19)%256 for i in range(8193)),
             "Shared transfer fixture differs from expected bytes")
@@ -175,7 +179,7 @@ def verify_distribution(archive):
 
 def verify_contents(control, test, kernel, control_cpio, test_cpio, runner, pipe_runner, pipe_receiver,
                     cow_runner, demand_runner, adoption_runner, ipc_runner, ipc_service, migration_runner,
-                    fault_runner, fault_probe):
+                    fault_runner, fault_probe, oom_runner, oom_pressure, oom_survivor):
     for sections, archive in ((control,control_cpio),(test,test_cpio)):
         require(sections[".kernel"][1]==kernel and sections[".initrd"][1]==archive,
                 "Actual embedded kernel/initramfs differs from build files")
@@ -183,7 +187,8 @@ def verify_contents(control, test, kernel, control_cpio, test_cpio, runner, pipe
     additions={RUNNER:runner,PIPE_RUNNER:pipe_runner,PIPE_RECEIVER:pipe_receiver,
                COW_RUNNER:cow_runner,DEMAND_RUNNER:demand_runner,ADOPTION_RUNNER:adoption_runner,
                IPC_RUNNER:ipc_runner,IPC_SERVICE:ipc_service,MIGRATION_RUNNER:migration_runner,
-               FAULT_RUNNER:fault_runner,FAULT_PROBE:fault_probe}
+               FAULT_RUNNER:fault_runner,FAULT_PROBE:fault_probe,
+               OOM_RUNNER:oom_runner,OOM_PRESSURE:oom_pressure,OOM_SURVIVOR:oom_survivor}
     require(set(staged)==set(distribution)|set(additions),
             "Staged archive must add exactly the separate test ELFs")
     require(all(staged[name]==entry for name,entry in distribution.items()),
@@ -284,6 +289,14 @@ def reproduce(root, out, stage, write_maps):
                 "-T",str(root/"user/user.ld"),"-o",ADOPTION_RUNNER,"adoption-entry.o","adoption-runner.o")
         require((work/ADOPTION_RUNNER).read_bytes()==(stage/ADOPTION_RUNNER).read_bytes(),
                 "Adoption runner relink differs")
+        command(work,"gcc-13","-c",str(root/"scripts/tests/oom-entry.S"),"-o","oom-entry.o")
+        for role in ("runner","pressure","survivor"):
+            app="oom-"+role
+            command(work,"gcc-13",*CFLAGS,"-DOOM_"+role.upper(),"-c",
+                    str(root/"scripts/tests/oom-workload.c"),"-o",app+".o")
+            command(work,"ld","--no-undefined","--build-id=none","-z","noexecstack","-s",
+                    "-T",str(root/"user/user.ld"),"-o",app,"oom-entry.o",app+".o")
+            require((work/app).read_bytes()==(stage/app).read_bytes(),"OOM ELF differs: "+app)
         for variant,archive,expected in (
                 ("control",out/"initramfs.cpio",out/"agentos.unsigned.efi"),
                 ("test",stage/"test.cpio",stage/"test.unsigned.efi")):
@@ -322,13 +335,15 @@ def verify_identity(root=ROOT, *, write=False):
     test_signed=(stage/"test.efi").read_bytes()
     control=signed_payload(control_unsigned,control_signed)
     test=signed_payload(test_unsigned,test_signed)
-    kernel,control_cpio,test_cpio,runner,pipe_runner,pipe_receiver,cow_runner,demand_runner,adoption_runner,ipc_runner,ipc_service,migration_runner,fault_runner,fault_probe=(p.read_bytes() for p in
+    kernel,control_cpio,test_cpio,runner,pipe_runner,pipe_receiver,cow_runner,demand_runner,adoption_runner,ipc_runner,ipc_service,migration_runner,fault_runner,fault_probe,oom_runner,oom_pressure,oom_survivor=(p.read_bytes() for p in
         (out/"kernel.elf",out/"initramfs.cpio",stage/"test.cpio",stage/RUNNER,stage/PIPE_RUNNER,
-         stage/PIPE_RECEIVER,stage/COW_RUNNER,stage/DEMAND_RUNNER,stage/ADOPTION_RUNNER,stage/IPC_RUNNER,stage/IPC_SERVICE,stage/MIGRATION_RUNNER,stage/FAULT_RUNNER,stage/FAULT_PROBE))
+         stage/PIPE_RECEIVER,stage/COW_RUNNER,stage/DEMAND_RUNNER,stage/ADOPTION_RUNNER,stage/IPC_RUNNER,stage/IPC_SERVICE,stage/MIGRATION_RUNNER,stage/FAULT_RUNNER,stage/FAULT_PROBE,
+         stage/OOM_RUNNER,stage/OOM_PRESSURE,stage/OOM_SURVIVOR))
     require(build["initramfs_sha256"]==digest(control_cpio),"Distribution receipt archive mismatch")
-    common=verify_contents(control,test,kernel,control_cpio,test_cpio,runner,pipe_runner,pipe_receiver,cow_runner,demand_runner,adoption_runner,ipc_runner,ipc_service,migration_runner,fault_runner,fault_probe)
-    for elf in (runner,pipe_runner,pipe_receiver,cow_runner,demand_runner,adoption_runner,ipc_runner,ipc_service,migration_runner,fault_runner,fault_probe):
+    common=verify_contents(control,test,kernel,control_cpio,test_cpio,runner,pipe_runner,pipe_receiver,cow_runner,demand_runner,adoption_runner,ipc_runner,ipc_service,migration_runner,fault_runner,fault_probe,oom_runner,oom_pressure,oom_survivor)
+    for elf in (runner,pipe_runner,pipe_receiver,cow_runner,demand_runner,adoption_runner,ipc_runner,ipc_service,migration_runner,fault_runner,fault_probe,oom_runner,oom_pressure,oom_survivor):
         load(root,"verify-user-abi.py").verify(elf)
+    oom_layout=load(root,"verify-oom-workload.py").verify_layout(oom_pressure)
     reproduce(root,out,stage,write)
 
     def describe(unsigned,signed,sections):
@@ -349,6 +364,8 @@ def verify_identity(root=ROOT, *, write=False):
             "ipc_runner_sha256":digest(ipc_runner),"ipc_service_sha256":digest(ipc_service),
             "migration_runner_sha256":digest(migration_runner),
             "fault_runner_sha256":digest(fault_runner),"fault_probe_sha256":digest(fault_probe),
+            "oom_runner_sha256":digest(oom_runner),"oom_pressure_sha256":digest(oom_pressure),
+            "oom_survivor_sha256":digest(oom_survivor),"oom_layout":oom_layout,
             "map_sha256":{v:sha(stage/(v+".map")) for v in ("control","test")},
             "control":describe(control_unsigned,control_signed,control),
             "test":describe(test_unsigned,test_signed,test)}
@@ -360,12 +377,14 @@ def verify_identity(root=ROOT, *, write=False):
     return result
 
 
-def verify_pair(root, cpus, no_hpet=False):
+def verify_pair(root, cpus, no_hpet=False, guest_oom=False):
+    require(not guest_oom or not no_hpet,"OOM pair requires HPET")
     root=Path(root).resolve()
     clock_suffix="-no-hpet" if no_hpet else ""
     path=root/"build/supervisor-staging"/f"pair-cpu{cpus}{clock_suffix}.json"
     path.unlink(missing_ok=True)
     identity=verify_identity(root)
+    oom_layout=identity["oom_layout"] if guest_oom else None
     session=load(root,"verify-stage3-session.py")
     processes=load(root,"verify-processes.py")
     orphans=load(root,"verify-orphans.py")
@@ -407,11 +426,16 @@ def verify_pair(root, cpus, no_hpet=False):
             raise VerificationError("Invalid boot root/orphan evidence: "+str(error)) from error
         require(receipt.get("boot_process_contract")=="root-orphan-v1" and
                 receipt.get("boot_roots")==boot_roots,"Missing explicitly verified boot root/orphan contract: "+variant)
-        result=session.verify(log,sent,True,cpus,aRuntimeProcess=True,aSupervisorImage=variant,aMigrationStaged=True,aFaultStaged=True)
+        result=session.verify(log,sent,True,cpus,aRuntimeProcess=True,aSupervisorImage=variant,aMigrationStaged=True,aFaultStaged=True,aOomLayout=oom_layout)
         require(receipt.get("migration_contract")=="foreground-v1" and receipt.get("migration")==result["runtime_migration"],
                 "Missing explicitly verified migration contract: "+variant)
         require(receipt.get("fault_contract")=="staged-v1" and receipt.get("fault")==result["runtime_fault"],
                 "Missing explicitly verified syscall/fault locality contract: "+variant)
+        if guest_oom:
+            require(receipt.get("memory_mib")==256 and receipt.get("guest_oom_contract")=="bounded-demand-oom-v1" and
+                    receipt.get("guest_oom")==result["runtime_oom"],"Invalid guest OOM receipt: "+variant)
+        else:
+            require("guest_oom" not in receipt and "guest_oom_contract" not in receipt,"Unexpected guest OOM receipt")
         require(result==receipt.get("runtime_session"),"Runtime evidence differs from receipt: "+variant)
         require(log.endswith(b"[INFO] INTERACTIVE SHELL STOPPED\r\n"),"Incomplete real shutdown")
         records[variant]={"receipt_sha256":sha(folder/"smoke.json"),"efi_sha256":expected,
@@ -442,17 +466,18 @@ def main():
     mode.add_argument("--distribution-archive",type=Path)
     mode.add_argument("--cpus",type=int,choices=(1,2))
     parser.add_argument("--no-hpet",action="store_true")
+    parser.add_argument("--guest-oom",action="store_true")
     args=parser.parse_args()
     if args.distribution_archive is not None:
-        require(not args.no_hpet,"--no-hpet requires paired sessions")
+        require(not args.no_hpet and not args.guest_oom,"Clock/OOM options require paired sessions")
         verify_distribution(args.distribution_archive.read_bytes())
         print("Verified distribution archive without historical/staged pipe workloads")
     elif args.write_identity:
-        require(not args.no_hpet,"--no-hpet requires paired sessions")
+        require(not args.no_hpet and not args.guest_oom,"Clock/OOM options require paired sessions")
         result=verify_identity(args.root,write=True)
         print("Verified signed image identity: "+json.dumps(result,sort_keys=True))
     else:
-        print("Verified paired real supervisor sessions: "+json.dumps(verify_pair(args.root,args.cpus,args.no_hpet),sort_keys=True))
+        print("Verified paired real supervisor sessions: "+json.dumps(verify_pair(args.root,args.cpus,args.no_hpet,args.guest_oom),sort_keys=True))
     return 0
 
 

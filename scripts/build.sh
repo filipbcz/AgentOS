@@ -217,9 +217,20 @@ if ((staging)); then
     ld --no-undefined --build-id=none -z noexecstack -s -T "$root/user/user.ld" \
         -o fault-probe fault-probe-entry.o fault-probe.o
     python3 "$root/scripts/verify-user-abi.py" fault-probe
-    cp supervisor-runner pipe-runner pipe-receiver cow-runner demand-runner adoption-runner ipc-runner ipc-service migration-runner fault-runner fault-probe "$stage_out/"
-    touch -d @0 supervisor-runner pipe-runner pipe-receiver cow-runner demand-runner adoption-runner ipc-runner ipc-service migration-runner fault-runner fault-probe
-    printf '%s\n' "${files[@]}" supervisor-runner pipe-runner pipe-receiver cow-runner demand-runner adoption-runner ipc-runner ipc-service migration-runner fault-runner fault-probe | cpio --quiet --reproducible --owner=0:0 -o -H newc > initramfs.cpio
+    gcc-13 -c "$root/scripts/tests/oom-entry.S" -o oom-entry.o
+    for role in runner pressure survivor; do
+        gcc-13 -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
+            -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large "-DOOM_${role^^}" \
+            -c "$root/scripts/tests/oom-workload.c" -o "oom-$role.o"
+        ld --no-undefined --build-id=none -z noexecstack -s -T "$root/user/user.ld" \
+            -o "oom-$role" oom-entry.o "oom-$role.o"
+        python3 "$root/scripts/verify-user-abi.py" "oom-$role"
+    done
+    /usr/bin/rustc --edition 2021 --test "$root/scripts/tests/demand-process-host.rs" -o oom-loader-tests
+    AGENTOS_OOM_ELF="$work/oom-pressure" ./oom-loader-tests --ignored --exact loaderAcceptsActualOomPressureElf --nocapture
+    cp supervisor-runner pipe-runner pipe-receiver cow-runner demand-runner adoption-runner ipc-runner ipc-service migration-runner fault-runner fault-probe oom-runner oom-pressure oom-survivor "$stage_out/"
+    touch -d @0 supervisor-runner pipe-runner pipe-receiver cow-runner demand-runner adoption-runner ipc-runner ipc-service migration-runner fault-runner fault-probe oom-runner oom-pressure oom-survivor
+    printf '%s\n' "${files[@]}" supervisor-runner pipe-runner pipe-receiver cow-runner demand-runner adoption-runner ipc-runner ipc-service migration-runner fault-runner fault-probe oom-runner oom-pressure oom-survivor | cpio --quiet --reproducible --owner=0:0 -o -H newc > initramfs.cpio
     cp initramfs.cpio "$stage_out/test.cpio"
     gcc-13 -c "$root/boot/payload.S" -o payload.o
     ld -nostdlib --build-id=none -znocombreloc -T layout.ld -shared -Bsymbolic \

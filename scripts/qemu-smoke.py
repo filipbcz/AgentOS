@@ -60,6 +60,7 @@ def main():
                         help="Separate foreground ELF/fault regression through the ordinary shell")
     parser.add_argument("--supervisor-image", choices=("control","test"),
                         help="Host-only paired signed image regression")
+    parser.add_argument("--guest-oom",action="store_true",help="Explicit bounded 256 MiB HPET TCG signed pair only")
     parser.add_argument("--timeout", type=int, default=720)
     parser.add_argument("--ovmf-code", type=Path, required=True)
     parser.add_argument("--ovmf-vars", type=Path, required=True)
@@ -241,7 +242,7 @@ def wait_session(process, capture, serial, predicate, description, seconds=30):
 
 
 def run_session(process, capture, qmp, destination, runtime_process_regression=False,
-                supervisor_image=None):
+                supervisor_image=None, guest_oom=False):
     serial = destination / "com1.log"
     children = list(session.SHELL_START.finditer(serial.read_bytes()))
     if len(children) != 1:
@@ -270,6 +271,12 @@ def run_session(process, capture, qmp, destination, runtime_process_regression=F
                      else b"exit status 0\r\nagentos> ")
             wait_session(process, capture, serial,
                          lambda data: reply in data[offset:], command, 30)
+        if guest_oom:
+            offset=serial.stat().st_size
+            capture.send(session.OOM_INPUT)
+            reply=(session.SUPERVISOR_MISSING if supervisor_image=="control"
+                   else b"exit status 0\r\nagentos> ")
+            wait_session(process,capture,serial,lambda data: reply in data[offset:],session.OOM_COMMAND,30)
         offset=serial.stat().st_size
         print(f"QEMU {supervisor_image} signed image: {session.ADOPTION_COMMAND!r}",flush=True)
         capture.send(session.ADOPTION_INPUT)
@@ -328,11 +335,17 @@ def boot(args):
     image_path = "build/agentos.efi"
     image_sha = image["artifacts"]["agentos.efi"]
     supervisor_image = getattr(args, "supervisor_image", None)
+    guest_oom=getattr(args,"guest_oom",False)
+    oom_layout=None
+    if guest_oom and (supervisor_image not in ("control","test") or args.memory_mib!=256 or args.no_hpet or args.accel!="tcg"):
+        raise ValueError("Guest OOM requires the explicit 256 MiB HPET TCG signed pair")
     if supervisor_image is not None:
         if not args.session or not getattr(args, "runtime_process_regression", False):
             raise ValueError("Supervisor pair requires the full foreground and shell regressions")
         paired = load("supervisor_image_evidence", "verify-supervisor-image.py")
         identity = paired.verify_identity(root)
+        if guest_oom:
+            oom_layout=identity["oom_layout"]
         if supervisor_image=="test":
             image_path = "build/supervisor-staging/test.efi"
             image_sha = identity["test"]["signed_sha256"]
@@ -466,7 +479,7 @@ def boot(args):
                     console.verify(destination / "shell-screen.ppm", aLevel="info", aOutput="both")
                     if args.session:
                         run_session(process, serial_capture, qmp, destination,
-                                    getattr(args, "runtime_process_regression", False), supervisor_image)
+                                    getattr(args, "runtime_process_regression", False), supervisor_image,guest_oom)
                     run_succeeded = True
                     break
                 if process.poll() is not None:
@@ -530,6 +543,8 @@ def boot(args):
                     process.kill()
                     process.wait(timeout=10)
     text = serial.read_text(encoding="ascii", errors="replace")
+    if not guest_oom and ("AGENTOS PAGE OOM" in text or "AGENTOS TEST OOM " in text):
+        raise RuntimeError("Unexpected runtime OOM outside explicit pressure scenario")
     boot_log.verify(text.encode("ascii", errors="replace"), "info", "both")
     if text.splitlines().count("AGENTOS KERNEL STACK GUARD OK") != 1:
         raise RuntimeError("Missing actual guarded kernel stack fault-probe evidence")
@@ -557,7 +572,7 @@ def boot(args):
         session_result = session.verify(serial.read_bytes(), (destination / "com1-input.bin").read_bytes(),
                                         True, args.cpus,
                                         aRuntimeProcess=getattr(args,"runtime_process_regression",False),
-                                        aSupervisorImage=supervisor_image,aMigrationStaged=True,aFaultStaged=True)
+                                        aSupervisorImage=supervisor_image,aMigrationStaged=True,aFaultStaged=True,aOomLayout=oom_layout)
         if supervisor_image is not None:
             migration_result = session_result["runtime_migration"]
     bases = re.findall(r"(?m)^\[INFO\] KERNEL IMAGE BASE=([0-9a-f]{16})\r?$", text)
@@ -601,6 +616,9 @@ def boot(args):
         "com1_sha256": evidence.sha256(serial),
         "firmware_vars_sha256_after_boot": evidence.sha256(vm_vars),
     }
+    if guest_oom:
+        receipt["guest_oom_contract"]="bounded-demand-oom-v1"
+        receipt["guest_oom"]=session_result["runtime_oom"]
     if supervisor_image is not None:
         receipt["supervisor_image"] = supervisor_image
     if args.session:

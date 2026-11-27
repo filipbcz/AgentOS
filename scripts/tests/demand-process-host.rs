@@ -303,6 +303,47 @@ fn loaderReservesLargeElfBssAndStackWithoutAllocatingTheirPages() {
     pHarness.finish();
 }
 
+
+#[test]
+#[ignore = "Run with the actual freshly linked staged OOM pressure ELF"]
+fn loaderAcceptsActualOomPressureElf() {
+    let pElf=std::fs::read(std::env::var_os("AGENTOS_OOM_ELF").expect("actual pressure ELF path")).unwrap();
+    assert!(pElf.len()<65536);
+    let pWord=|aAt:usize| u64::from_le_bytes(pElf[aAt..aAt+8].try_into().unwrap()) as usize;
+    let pPhOff=pWord(32);
+    let pCount=u16::from_le_bytes(pElf[56..58].try_into().unwrap()) as usize;
+    let mut pRw=Vec::new();
+    for i in 0..pCount {
+        let pAt=pPhOff+i*56;
+        if pElf[pAt..pAt+8]==[1,0,0,0,6,0,0,0] {
+            pRw.push((pWord(pAt+16),pWord(pAt+32),pWord(pAt+40)));
+        }
+    }
+    assert_eq!(pRw.len(),1);
+    let (pBase,pFile,pSize)=pRw[0];
+    assert_eq!((pFile,pSize),(0,320*1024*1024));
+    let pBytes=pElf.len();
+    let mut pHarness=Harness::new(pElf);
+    let pProcess=pHarness.load().ok().expect("production loader rejected actual pressure ELF");
+    let pStats=pProcess.space.stats();
+    assert!(pStats[1]>=81920+4);
+    assert_eq!(pStats[2],0);
+    assert_eq!(pStats[5],0);
+    assert_eq!(pHarness.fFrames.used(),5);
+    for pAddress in [pBase,pBase+pSize-gPage] {
+        assert_eq!(unsafe { pProcess.space.resolveFault(&mut pHarness.fFrames,pAddress,6) },Ok(()));
+        let mut pByte=[0xff];
+        pProcess.space.read(&mut pHarness.fFrames,pAddress,&mut pByte).unwrap();
+        assert_eq!(pByte,[0]);
+        pProcess.space.write(&mut pHarness.fFrames,pAddress,b"x").unwrap();
+    }
+    assert_eq!(pProcess.space.stats()[2],2);
+    assert_eq!(pProcess.space.stats()[5],2);
+    println!("Actual pressure ELF accepted by production loader: file={} base={:#x} reserve={} resident-at-load=0",pBytes,pBase,pSize);
+    releaseProcess(&mut pHarness.fFrames,pProcess);
+    pHarness.finish();
+}
+
 #[test]
 fn malformedLoadableRegionsAreRejectedAndReleaseAllLoaderAllocations() {
     let mut pVariants = Vec::new();

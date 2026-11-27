@@ -335,5 +335,15 @@ done
 "$pLd" --no-undefined --build-id=none -z noexecstack -s -T "$pRoot/user/user.ld" \
     -o "$pOut/fault-probe" "$pOut/fault-probe-entry.o" "$pOut/fault-probe.o"
 "$pPython" "$pRoot/scripts/verify-user-abi.py" "$pOut/fault-probe"
+"$pCc" -c "$pRoot/scripts/tests/oom-entry.S" -o "$pOut/oom-entry.o"
+for pRole in runner pressure survivor; do
+    "$pCc" -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
+        -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large "-DOOM_${pRole^^}" \
+        -c "$pRoot/scripts/tests/oom-workload.c" -o "$pOut/oom-$pRole.o"
+    "$pLd" --no-undefined --build-id=none -z noexecstack -s -T "$pRoot/user/user.ld" \
+        -o "$pOut/oom-$pRole" "$pOut/oom-entry.o" "$pOut/oom-$pRole.o"
+    "$pPython" "$pRoot/scripts/verify-user-abi.py" "$pOut/oom-$pRole"
+done
+AGENTOS_OOM_ELF="$pOut/oom-pressure" "$pOut/demand-process-tests" --ignored --exact loaderAcceptsActualOomPressureElf --nocapture
 printf 'Host tests and kernel/user ELF links passed: %s\n' "$pOut"
 printf 'EFI assembly/signing, pinned-toolchain reproducibility and VM execution remain separate checks.\n'
