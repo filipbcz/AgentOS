@@ -221,12 +221,14 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
            aRuntimeProcess=False, aSupervisorImage=None):
     require(aSupervisorImage is None or (aRuntimeProcess and aSupervisorImage in ("control","test")),
             "Supervisor image scenario requires the existing foreground regression")
+    require(re.search(rb"AGENTOS PIPE (?!TEST )",aLog) is None,
+            "Historical boot pipe transfer is not permitted in either signed image")
     pWorkloadMarkers=(b"AGENTOS SUPERVISOR",b"AGENTOS SERVICE ",b"AGENTOS TEST ",b"AGENTOS PIPE TEST ")
     require(aLog.count(b"AGENTOS TEST RUNNER ")==2*int(aSupervisorImage=="test"),
             "Unexpected runner invocation outside its foreground interval")
     if aSupervisorImage!="test":
         require(not any(marker in aLog for marker in pWorkloadMarkers),
-                "Acceptance supervisor ran in the ordinary distribution")
+                "Acceptance workload ran in the ordinary distribution")
     pTimerCpus = timerCpuCount(aLog,aCpus)
     pRoots,pChildren,pEnds = (list(pPattern.finditer(aLog)) for pPattern in
                               (ROOT_START,SHELL_START,SESSION_STOP))

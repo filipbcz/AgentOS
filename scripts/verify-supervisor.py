@@ -60,8 +60,8 @@ def event(line):
 def verify_absent(text):
     """Distribution-only check. This is NOT proof of runtime supervision."""
     require(not any(marker in text for marker in
-                    ("AGENTOS SUPERVISOR","AGENTOS SERVICE ","AGENTOS TEST ")),
-            "Unexpected acceptance supervisor workload in ordinary distribution")
+                    ("AGENTOS SUPERVISOR","AGENTOS SERVICE ","AGENTOS TEST ","AGENTOS PIPE ")),
+            "Unexpected acceptance workload in ordinary distribution")
 
 
 def verify(text, cpus):

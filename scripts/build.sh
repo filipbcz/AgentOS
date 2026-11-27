@@ -61,12 +61,12 @@ python3 "$root/scripts/verify-trap-return.py" kernel.elf
 # Preserve the exact linked ELF for symbolization of a real guest fault.
 cp kernel.elf "$out/kernel.elf"
 printf 'AgentOS stage 1\n' > stage
-for app in init fault receiver service shell svc_ok svc_fail svc_hang orphan_parent manager svc_alive svc_flaky; do
+for app in init fault service shell svc_ok svc_fail svc_hang orphan_parent manager svc_alive svc_flaky; do
     entry="$app"
     if [[ "$app" == svc_alive || "$app" == svc_flaky ]]; then entry=svc_worker; fi
     gcc-13 -c "$root/user/$entry.S" -o user.o
     objects=(user.o)
-    case "$app" in init) sources=(transfer client orphans forktest demand migration service_manager);; receiver) sources=(receive);; service) sources=(service);; shell) sources=(shell service_client);; manager) sources=(service_manager);; svc_alive|svc_flaky) sources=(svc_worker);; *) sources=();; esac
+    case "$app" in init) sources=(client orphans forktest demand migration service_manager);; service) sources=(service);; shell) sources=(shell service_client);; manager) sources=(service_manager);; svc_alive|svc_flaky) sources=(svc_worker);; *) sources=();; esac
     for src in "${sources[@]}"; do
         defines=()
         if [[ "$app" == svc_flaky ]]; then defines=(-DAGENTOS_FLAKY); fi
@@ -78,9 +78,10 @@ for app in init fault receiver service shell svc_ok svc_fail svc_hang orphan_par
     python3 "$root/scripts/verify-user-abi.py" "$app"
 done
 awk 'BEGIN {for (i=0;i<8193;i++) printf "%c",(i*73+int(i/251)*19)%256}' > data/transfer.bin
-files=(stage init fault receiver service shell svc_ok svc_fail svc_hang orphan_parent manager svc_alive svc_flaky data data/transfer.bin)
+files=(stage init fault service shell svc_ok svc_fail svc_hang orphan_parent manager svc_alive svc_flaky data data/transfer.bin)
 touch -d @0 "${files[@]}"
 printf '%s\n' "${files[@]}" | cpio --quiet --reproducible --owner=0:0 -o -H newc > initramfs.cpio
+python3 "$root/scripts/verify-supervisor-image.py" --distribution-archive initramfs.cpio
 cp initramfs.cpio "$out/initramfs.cpio"
 gcc-13 -I/usr/include/efi -I/usr/include/efi/x86_64 -DGNU_EFI_USE_MS_ABI \
     -O2 -Wall -Wextra -Werror -fpic -ffreestanding -fno-stack-protector -fshort-wchar \
@@ -167,7 +168,7 @@ if ((staging)); then
         -c "$root/scripts/tests/pipe-workload.c" -o pipe-workload.o
     ld --no-undefined --build-id=none -z noexecstack -s -T "$root/user/user.ld" \
         -o pipe-runner runner-entry.o pipe-runner.o pipe-workload.o
-    gcc-13 -c "$root/user/receiver.S" -o pipe-receiver-entry.o
+    gcc-13 -c "$root/scripts/tests/pipe-receiver.S" -o pipe-receiver-entry.o
     gcc-13 -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
         -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large \
         -c "$root/scripts/tests/pipe-receive.c" -o pipe-receive.o

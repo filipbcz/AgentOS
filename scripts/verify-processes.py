@@ -1,4 +1,4 @@
-"""Check COM1 evidence for isolation, pipe transfer and authenticated local IPC.
+"""Check COM1 evidence for isolation and authenticated local IPC during ordinary boot.
 
 This checks a captured log; it does not boot a VM or establish its provenance.
 The current kernel runs each CPU's process scenario sequentially.
@@ -28,16 +28,12 @@ PATTERNS = {
     "exit": f"AGENTOS USER (?:EXIT|PARK) PID={PID} CR3={hex_field('cr3')} "
             f"STATUS={hex_field('status')}",
     "check": f"AGENTOS PROCESS OK APIC={hex_field('apic')} PARENT={hex_field('parent')}",
-    "received": f"AGENTOS PIPE RECEIVED PID={PID} BYTES={hex_field('bytes', 8)} "
-                f"FNV32={hex_field('fnv', 8)}",
-    "sent": f"AGENTOS PIPE SENT PID={PID} CHILD={hex_field('child')}",
     "service": f"AGENTOS IPC SERVICE {PEER}",
     "reply": f"AGENTOS IPC REPLY {PEER}",
 }
 PATTERNS = {kind: re.compile(pattern) for kind, pattern in PATTERNS.items()}
-PREFIXES = ("AGENTOS USER ", "AGENTOS PIPE ", "AGENTOS IPC ", "AGENTOS PROCESS ")
-ORDER = ("fault", "survived", "received", "exit", "sent", "service", "exit",
-         "reply", "exit", "check")
+PREFIXES = ("AGENTOS USER ", "AGENTOS IPC ", "AGENTOS PROCESS ")
+ORDER = ("fault", "survived", "service", "exit", "reply", "exit", "check")
 SHELL_START = re.compile(r"AGENTOS SHELL START PID=([0-9a-f]{16})")
 MANAGER_SESSION = re.compile(r"AGENTOS MANAGER SESSION START PID=([0-9a-f]{16})")
 ORPHAN_BEGIN = re.compile(r"AGENTOS ORPHAN BEGIN ROOT=([0-9a-f]{16})")
@@ -58,6 +54,10 @@ def verify(text, apic_ids):
     expected_cpus = set(apic_ids)
     require(expected_cpus and len(expected_cpus) == len(apic_ids),
             "Expected APIC IDs must be nonempty and unique")
+    # The historical boot-only transfer is forbidden even after the shell boundary.
+    # The separately authenticated foreground verifier owns staged PIPE TEST records.
+    require(re.search(r"AGENTOS PIPE (?!TEST )", text) is None,
+            "Historical boot pipe transfer is not permitted")
     events = []
     orphan_open = None
     orphan_roots = []
@@ -69,8 +69,8 @@ def verify(text, apic_ids):
     for number, line in enumerate(text.splitlines(), 1):
         # Only the separate foreground verifier owns the relocated workload.
         require(not any(marker in line for marker in
-                        ("AGENTOS SUPERVISOR", "AGENTOS SERVICE ", "AGENTOS TEST ")),
-                f"Acceptance supervisor executed during ordinary boot at line {number}")
+                        ("AGENTOS SUPERVISOR", "AGENTOS SERVICE ", "AGENTOS TEST ", "AGENTOS PIPE ")),
+                f"Acceptance workload executed during ordinary boot at line {number}")
         if line.startswith("AGENTOS MANAGER SESSION START"):
             match = MANAGER_SESSION.fullmatch(line)
             require(match is not None and int(match[1],16)>0 and not manager_open and
@@ -87,7 +87,7 @@ def verify(text, apic_ids):
                 break
             # verify-service-manager.py strictly authenticates the entire
             # ongoing registry/worker/ready/restart subtrace. Do not mistake
-            # its worker process EXIT records for IPC transfer children.
+            # its worker process EXIT records for the boot IPC child.
             continue
         if line.startswith("AGENTOS DEMAND "):
             pBegin = gDemandBegin.fullmatch(line)
@@ -136,7 +136,7 @@ def verify(text, apic_ids):
             continue
         if cow_open is not None:
             # verify-cow.py checks the exact forked child, exit and parent
-            # isolation evidence; do not mistake its USER EXIT for pipe IPC.
+            # isolation evidence; do not mistake its USER EXIT for boot IPC.
             continue
         if line.startswith("AGENTOS ORPHAN "):
             begin = ORPHAN_BEGIN.fullmatch(line)
@@ -197,12 +197,12 @@ def verify(text, apic_ids):
         block = events[offset:offset + len(ORDER)]
         require(tuple(event[0] for event in block) == ORDER,
                 f"Invalid process event order starting at line {block[0][2]}")
-        fault, _, received, receiver_exit, sent, service, service_exit, reply, parent_exit, check = (
+        fault, _, service, service_exit, reply, parent_exit, check = (
             event[1] for event in block)
         cpu, parent = check["apic"], check["parent"]
-        child, receiver, server = fault["pid"], received["pid"], service["pid"]
+        child, server = fault["pid"], service["pid"]
         context = f"APIC {cpu:016x}, parent {parent:016x}"
-        pids = {parent, child, receiver, server}
+        pids = {parent, child, server}
         if orphan_roots:
             require(orphan_roots[len(seen_cpus)] == parent,
                     f"Orphan interval does not belong to this parent: {context}")
@@ -214,23 +214,19 @@ def verify(text, apic_ids):
                     f"Demand interval does not belong to this parent: {context}")
         require(cpu in expected_cpus and cpu not in seen_cpus,
                 f"Unexpected or repeated CPU: {context}")
-        require(len(pids) == 4 and 0 not in pids and not (pids & seen_pids),
+        require(len(pids) == 3 and 0 not in pids and not (pids & seen_pids),
                 f"Process IDs must be nonzero, distinct and unreused: {context}")
         require(fault["parent"] == parent and parent_exit["pid"] == parent and
                 (fault["vector"], fault["error"], fault["address"]) == (14, 5, 0x02000000),
                 f"Invalid isolation fault or parent identity: {context}")
-        require(received["bytes"] == 8193 and received["fnv"] == 0x1490a95f and
-                sent["pid"] == parent and sent["child"] == receiver and
-                receiver_exit["pid"] == receiver,
-                f"Invalid two-process pipe transfer: {context}")
         require(service["peer"] == parent and reply["pid"] == parent and
                 reply["peer"] == server and service_exit["pid"] == server and
                 service["uid"] == service["gid"] == reply["uid"] == reply["gid"] == 1000,
                 f"Invalid IPC peer identity: {context}")
-        exits = (receiver_exit, service_exit, parent_exit)
+        exits = (service_exit, parent_exit)
         require(all(record["status"] == 0 for record in exits),
                 f"User process exited unsuccessfully: {context}")
-        roots = (fault["cr3"], receiver_exit["cr3"], service_exit["cr3"])
+        roots = (fault["cr3"], service_exit["cr3"])
         require(parent_exit["cr3"] != 0 and all(root and root != parent_exit["cr3"] for root in roots),
                 f"Missing private child address space: {context}")
         # Sequential children may reuse a released physical page-table root.

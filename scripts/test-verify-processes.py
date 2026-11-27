@@ -20,9 +20,6 @@ def scenario(cpu=0, parent=1):
         "CR3=0000000000400000 VECTOR=000000000000000e ERROR=0000000000000005 "
         "ADDRESS=0000000002000000\n"
         "AGENTOS USER SURVIVED\n"
-        f"AGENTOS PIPE RECEIVED PID={parent+2:016x} BYTES=00002001 FNV32=1490a95f\n"
-        f"AGENTOS USER EXIT PID={parent+2:016x} CR3=0000000000400000 STATUS=0000000000000000\n"
-        f"AGENTOS PIPE SENT PID={parent:016x} CHILD={parent+2:016x}\n"
         f"AGENTOS IPC SERVICE PID={parent+3:016x} PEER={parent:016x} UID=000003e8 GID=000003e8\n"
         f"AGENTOS USER EXIT PID={parent+3:016x} CR3=0000000000400000 STATUS=0000000000000000\n"
         f"AGENTOS IPC REPLY PID={parent:016x} PEER={parent+3:016x} UID=000003e8 GID=000003e8\n"
@@ -57,23 +54,31 @@ class ProcessEvidenceTests(unittest.TestCase):
             with self.subTest(index=index):
                 self.rejected("\n".join(self.lines[:index] + [self.lines[index]] + self.lines[index:]))
 
-    def test_old_pipe_only_log(self):
-        self.rejected("\n".join(self.lines[:5] + self.lines[8:]))
+    def test_removed_pipe_evidence_is_rejected(self):
+        legacy = (
+            "AGENTOS PIPE RECEIVED PID=0000000000000003 BYTES=00002001 FNV32=1490a95f\n"
+            "AGENTOS USER EXIT PID=0000000000000003 CR3=0000000000400000 STATUS=0000000000000000\n"
+            "AGENTOS PIPE SENT PID=0000000000000001 CHILD=0000000000000003\n"
+        )
+        boundary = "AGENTOS SHELL START PID=0000000000000005\n"
+        self.rejected("\n".join(self.lines[:2]) + "\n" + legacy + "\n".join(self.lines[2:]))
+        self.rejected(self.log + boundary + legacy)
+        self.rejected("AGENTOS PIPE TEST RECEIVED\n" + self.log)
 
     def test_out_of_order_and_interleaved_cpus(self):
         lines = self.lines.copy()
-        lines[6], lines[7] = lines[7], lines[6]
+        lines[3], lines[4] = lines[4], lines[3]
         self.rejected("\n".join(lines))
         other = scenario(1, 5).splitlines()
-        self.rejected("\n".join(self.lines[:5] + other[:5] + self.lines[5:] + other[5:]), [0, 1])
+        self.rejected("\n".join(self.lines[:2] + other[:2] + self.lines[2:] + other[2:]), [0, 1])
 
     def test_malformed_and_unknown_records(self):
-        for extra in ("AGENTOS IPC SERVICE PID=bad", "AGENTOS IPC UNKNOWN", self.lines[5] + " extra"):
+        for extra in ("AGENTOS IPC SERVICE PID=bad", "AGENTOS IPC UNKNOWN", self.lines[2] + " extra"):
             with self.subTest(extra=extra):
                 self.rejected(self.log + extra)
 
     def test_peer_ids_and_credentials(self):
-        for index in (5, 7):
+        for index in (2, 4):
             fields = self.lines[index].split()
             for field in fields[3:]:
                 key = field.split("=")[0]
@@ -84,14 +89,14 @@ class ProcessEvidenceTests(unittest.TestCase):
                     self.rejected("\n".join(lines))
 
     def test_nonzero_exit_statuses(self):
-        for index in (3, 6, 8):
+        for index in (3, 5):
             with self.subTest(index=index):
                 lines = self.lines.copy()
                 lines[index] = lines[index].replace("STATUS=0000000000000000", "STATUS=0000000000000001")
                 self.rejected("\n".join(lines))
 
     def test_exit_pid_correspondence(self):
-        for index in (3, 6, 8):
+        for index in (3, 5):
             with self.subTest(index=index):
                 lines = self.lines.copy()
                 lines[index] = lines[index].replace(lines[index].split()[3], "PID=00000000000000ff")
@@ -102,14 +107,11 @@ class ProcessEvidenceTests(unittest.TestCase):
         self.rejected(self.log.replace("CR3=0000000000400000", "CR3=0000000000000000"))
         self.rejected(self.log.replace("CR3=0000000000300000", "CR3=0000000000000000"))
 
-    def test_wrong_fault_or_pipe_evidence(self):
+    def test_wrong_fault_evidence(self):
         replacements = {
             "VECTOR=000000000000000e": "VECTOR=000000000000000d",
             "ERROR=0000000000000005": "ERROR=0000000000000000",
             "ADDRESS=0000000002000000": "ADDRESS=0000000002000001",
-            "BYTES=00002001": "BYTES=00002000",
-            "FNV32=1490a95f": "FNV32=1490a950",
-            "CHILD=0000000000000003": "CHILD=0000000000000004",
         }
         for old, new in replacements.items():
             with self.subTest(field=old):
@@ -117,7 +119,7 @@ class ProcessEvidenceTests(unittest.TestCase):
 
     def test_zero_and_reused_pids(self):
         self.rejected(scenario(parent=0))
-        self.rejected(self.log.replace("0000000000000004", "0000000000000003"))
+        self.rejected(self.log.replace("0000000000000004", "0000000000000002"))
         self.rejected(self.log + scenario(1, 1), [0, 1])
 
     def test_unexpected_missing_duplicate_cpus(self):

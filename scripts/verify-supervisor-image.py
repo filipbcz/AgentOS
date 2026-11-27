@@ -146,17 +146,30 @@ def cpio_entries(data):
         at=next_at
 
 
+def verify_distribution(archive):
+    """Validate the actual distribution CPIO, never just its manifest or receipt."""
+    distribution=cpio_entries(archive)
+    required={"stage","init","fault","service","shell","svc_ok","svc_fail","svc_hang",
+              "orphan_parent","manager","svc_alive","svc_flaky","data","data/transfer.bin"}
+    forbidden={"receiver",RUNNER,PIPE_RUNNER,PIPE_RECEIVER}
+    require(required<=set(distribution) and
+            not any(name.rsplit("/",1)[-1] in forbidden for name in distribution),
+            "Distribution is missing boot files or contains a historical/staged test ELF")
+    require(not any(b"AGENTOS PIPE " in payload for _,payload in distribution.values()),
+            "Distribution contains historical or staged pipe workload code")
+    require(distribution["data/transfer.bin"][1]==bytes((i*73+i//251*19)%256 for i in range(8193)),
+            "Shared transfer fixture differs from expected bytes")
+    return distribution
+
+
 def verify_contents(control, test, kernel, control_cpio, test_cpio, runner, pipe_runner, pipe_receiver):
     for sections, archive in ((control,control_cpio),(test,test_cpio)):
         require(sections[".kernel"][1]==kernel and sections[".initrd"][1]==archive,
                 "Actual embedded kernel/initramfs differs from build files")
-    distribution, staged = cpio_entries(control_cpio), cpio_entries(test_cpio)
+    distribution, staged = verify_distribution(control_cpio), cpio_entries(test_cpio)
     additions={RUNNER:runner,PIPE_RUNNER:pipe_runner,PIPE_RECEIVER:pipe_receiver}
-    require({"init","shell","svc_ok","svc_fail","svc_hang","fault","data/transfer.bin"}<=set(distribution) and
-            not set(additions)&set(distribution) and set(staged)==set(distribution)|set(additions),
+    require(set(staged)==set(distribution)|set(additions),
             "Staged archive must add exactly the separate test ELFs")
-    require(distribution["data/transfer.bin"][1]==bytes((i*73+i//251*19)%256 for i in range(8193)),
-            "Shared transfer fixture differs from expected bytes")
     require(all(staged[name]==entry for name,entry in distribution.items()),
             "A common CPIO entry changed")
     for name,payload in additions.items():
@@ -194,14 +207,14 @@ def reproduce(root, out, stage, write_maps):
         # remaining modules. No acceptance workload object may enter this link.
         command(work,"gcc-13","-c",str(root/"user/init.S"),"-o","init-entry.o")
         init_objects=["init-entry.o"]
-        for name in ("transfer","client","orphans","forktest","demand","migration","service_manager"):
+        for name in ("client","orphans","forktest","demand","migration","service_manager"):
             obj=name+".init.o"
             command(work,"gcc-13",*CFLAGS,"-c",str(root/"user"/(name+".c")),"-o",obj)
             init_objects.append(obj)
         command(work,"ld","--no-undefined","--build-id=none","-z","noexecstack","-s",
                 "-T",str(root/"user/user.ld"),"-o","init",*init_objects)
         require((work/"init").read_bytes()==cpio_entries((out/"initramfs.cpio").read_bytes())["init"][1],
-                "Embedded production init does not reproduce without supervisor workload")
+                "Embedded production init does not reproduce without supervisor/pipe workloads")
         command(work,"gcc-13",*CFLAGS,"-c",str(root/"scripts/tests/supervisor-workload.c"),"-o","supervisor.check.o")
         require((work/"supervisor.check.o").read_bytes()==(work/"supervisor.o").read_bytes(),
                 "Runner supervisor object differs from source")
@@ -212,7 +225,7 @@ def reproduce(root, out, stage, write_maps):
         require((work/RUNNER).read_bytes()==(stage/RUNNER).read_bytes(),"Runner relink differs")
         command(work,"gcc-13",*CFLAGS,"-DPIPE_WORKLOAD","-c",str(root/"scripts/tests/supervisor-runner.c"),"-o","pipe-runner.o")
         command(work,"gcc-13",*CFLAGS,"-c",str(root/"scripts/tests/pipe-workload.c"),"-o","pipe-workload.o")
-        command(work,"gcc-13","-c",str(root/"user/receiver.S"),"-o","pipe-receiver-entry.o")
+        command(work,"gcc-13","-c",str(root/"scripts/tests/pipe-receiver.S"),"-o","pipe-receiver-entry.o")
         command(work,"gcc-13",*CFLAGS,"-c",str(root/"scripts/tests/pipe-receive.c"),"-o","pipe-receive.o")
         for name,objects in ((PIPE_RUNNER,("runner-entry.o","pipe-runner.o","pipe-workload.o")),
                              (PIPE_RECEIVER,("pipe-receiver-entry.o","pipe-receive.o"))):
@@ -310,6 +323,14 @@ def verify_pair(root, cpus, no_hpet=False):
                 receipt.get("signed_efi_sha256")==receipt.get("esp_boot_efi_sha256")==expected and
                 sha(folder/"esp-bootx64.efi")==expected,
                 "Incomplete or mismatched real signed boot: "+variant)
+        # Independently re-read the actual FAT32 boot file, including after the VM run.
+        raw=folder/"esp.raw"
+        require(sha(raw)==receipt.get("esp_sha256"),"Actual ESP differs from receipt: "+variant)
+        with tempfile.TemporaryDirectory(prefix="agentos-esp-") as directory:
+            extracted=Path(directory)/"bootx64.efi"
+            command(Path(directory),"mcopy","-i",str(raw)+"@@1048576",
+                    "::EFI/BOOT/BOOTX64.EFI",str(extracted))
+            require(sha(extracted)==expected,"Actual ESP signed image differs: "+variant)
         log=(folder/"com1.log").read_bytes()
         sent=(folder/"com1-input.bin").read_bytes()
         require(digest(log)==receipt.get("com1_sha256") and digest(sent)==receipt.get("com1_input_sha256"),
@@ -335,10 +356,15 @@ def main():
     parser.add_argument("--root",type=Path,default=ROOT)
     mode=parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--write-identity",action="store_true")
+    mode.add_argument("--distribution-archive",type=Path)
     mode.add_argument("--cpus",type=int,choices=(1,2))
     parser.add_argument("--no-hpet",action="store_true")
     args=parser.parse_args()
-    if args.write_identity:
+    if args.distribution_archive is not None:
+        require(not args.no_hpet,"--no-hpet requires paired sessions")
+        verify_distribution(args.distribution_archive.read_bytes())
+        print("Verified distribution archive without historical/staged pipe workloads")
+    elif args.write_identity:
         require(not args.no_hpet,"--no-hpet requires paired sessions")
         result=verify_identity(args.root,write=True)
         print("Verified signed image identity: "+json.dumps(result,sort_keys=True))

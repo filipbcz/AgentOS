@@ -64,7 +64,8 @@ def fake_certificate(unsigned):
 
 class ImageTests(unittest.TestCase):
     def setUp(self):
-        self.entries=[(n,n.encode()) for n in ("init","shell","svc_ok","svc_fail","svc_hang","fault")]
+        self.entries=[(n,n.encode()) for n in ("stage","init","fault","service","shell","svc_ok",
+                      "svc_fail","svc_hang","orphan_parent","manager","svc_alive","svc_flaky","data")]
         self.entries.append(("data/transfer.bin",bytes((i*73+i//251*19)%256 for i in range(8193))))
         self.control=archive(self.entries)
         self.runner=b"isolated test fixture"
@@ -96,6 +97,23 @@ class ImageTests(unittest.TestCase):
                 self.check(a,b)
         with self.assertRaises(images.VerificationError):
             self.check(self.control,self.staged,b"wrong runner")
+
+    def test_removed_pipe_payload_and_shared_data(self):
+        for extra in (("receiver",b"legacy receiver"),("other/receiver",b"alias"),
+                      ("renamed",b"AGENTOS PIPE RECEIVED PID=")):
+            with self.subTest(extra=extra),self.assertRaises(images.VerificationError):
+                self.check(archive([*self.entries,extra]),archive([*self.entries,extra,*self.additions]))
+        for marker in (b"AGENTOS PIPE SENT PID=",b"AGENTOS PIPE TEST SENT PID="):
+            bad=[(name,payload+marker if name=="init" else payload) for name,payload in self.entries]
+            with self.subTest(marker=marker),self.assertRaises(images.VerificationError):
+                self.check(archive(bad),archive([*bad,*self.additions]))
+        for shared in (self.entries[:-1], self.entries[:-1]+[("data/transfer.bin",b"wrong")]):
+            with self.subTest(shared=len(shared)),self.assertRaises(images.VerificationError):
+                self.check(archive(shared),archive([*shared,*self.additions]))
+        with self.assertRaises(images.VerificationError):
+            self.check(self.control,archive([*self.entries,*self.additions,("receiver",b"legacy")]))
+        with self.assertRaises(images.VerificationError):
+            self.check(self.control,archive([*self.entries,*self.additions[:-1]]))
 
     def test_archive_duplicates_aliases_truncation_and_junk(self):
         for bad in (archive([*self.entries,self.entries[0]]),archive([("./init",b"alias")]),
@@ -347,7 +365,10 @@ class RuntimeTests(unittest.TestCase):
             # must be free of the relocated supervisor, even in the staged image.
             markers=(b"AGENTOS SUPERVISOR BEGIN PARENT=0000000000000001\r\n",
                      b"AGENTOS SERVICE DONE PARENT=0000000000000001\r\n",
-                     b"AGENTOS TEST PEER_BEGIN PID=0000000000000001\r\n")
+                     b"AGENTOS TEST PEER_BEGIN PID=0000000000000001\r\n",
+                     b"AGENTOS PIPE TEST RECEIVED PID=0000000000000001\r\n",
+                     b"AGENTOS PIPE RECEIVED PID=0000000000000001\r\n",
+                     b"AGENTOS PIPE SENT PID=0000000000000001\r\n")
             for marker in markers:
                 for bad in (marker+log,log.replace(prefix,prefix+marker,1)):
                     with self.assertRaises(session.VerificationError):
@@ -363,6 +384,9 @@ class RuntimeTests(unittest.TestCase):
             with self.assertRaises(session.VerificationError):
                 session.verify(log,serial,True,1,aRuntimeProcess=True)
             if variant=="test":
+                with self.assertRaises(session.VerificationError):
+                    session.verify(log.replace(supervisor_transcript(runner=40,pipe=True),b"",1),
+                                   serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant)
                 with self.assertRaises(session.VerificationError):
                     session.verify(log.replace(b"PID=0000000000000033 CR3=",b"PID=0000000000000014 CR3="),
                                    serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant)

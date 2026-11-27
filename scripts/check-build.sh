@@ -244,15 +244,14 @@ printf 'Compiling and linking the kernel with %s and %s\n' "$pRustc" "$pCc"
 "$pOut/kernel-elf-tests" "$pOut/kernel-xhci.elf"
 "$pPython" "$pRoot/scripts/verify-trap-return.py" "$pOut/kernel-xhci.elf"
 
-for pApp in init fault receiver service shell svc_ok svc_fail svc_hang orphan_parent manager svc_alive svc_flaky; do
+for pApp in init fault service shell svc_ok svc_fail svc_hang orphan_parent manager svc_alive svc_flaky; do
     printf 'Compiling and linking user program %s\n' "$pApp"
     pEntry="$pApp"
     if [[ "$pApp" == svc_alive || "$pApp" == svc_flaky ]]; then pEntry=svc_worker; fi
     "$pCc" -c "$pRoot/user/$pEntry.S" -o "$pOut/$pApp-entry.o"
     pObjects=("$pOut/$pApp-entry.o")
     case "$pApp" in
-        init) pSources=(transfer client orphans forktest demand migration service_manager);;
-        receiver) pSources=(receive);;
+        init) pSources=(client orphans forktest demand migration service_manager);;
         service) pSources=(service);;
         shell) pSources=(shell service_client);;
         manager) pSources=(service_manager);;
@@ -289,7 +288,7 @@ done
     -c "$pRoot/scripts/tests/pipe-workload.c" -o "$pOut/pipe-workload.o"
 "$pLd" --no-undefined --build-id=none -z noexecstack -s -T "$pRoot/user/user.ld" \
     -o "$pOut/pipe-runner" "$pOut/supervisor-runner-entry.o" "$pOut/pipe-runner.o" "$pOut/pipe-workload.o"
-"$pCc" -c "$pRoot/user/receiver.S" -o "$pOut/pipe-receiver-entry.o"
+"$pCc" -c "$pRoot/scripts/tests/pipe-receiver.S" -o "$pOut/pipe-receiver-entry.o"
 "$pCc" -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
     -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large \
     -c "$pRoot/scripts/tests/pipe-receive.c" -o "$pOut/pipe-receive.o"

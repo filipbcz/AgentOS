@@ -108,6 +108,9 @@ jobs:
             build/db.esl
             build/check/qemu-cpu${{ matrix.cpus }}-session/smoke.json
             build/check/qemu-cpu${{ matrix.cpus }}-session/com1.log
+            build/check/qemu-cpu${{ matrix.cpus }}-session/com1-input.bin
+            build/check/qemu-cpu${{ matrix.cpus }}-session/esp-bootx64.efi
+            build/check/qemu-cpu${{ matrix.cpus }}-session/esp.raw
             build/check/qemu-cpu${{ matrix.cpus }}-no-acpi-timers-session/*.json
             build/check/qemu-cpu${{ matrix.cpus }}-no-acpi-timers-session/*.txt
             build/check/qemu-cpu${{ matrix.cpus }}-no-acpi-timers-session/*.log
@@ -118,6 +121,9 @@ jobs:
             build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-kvm-session/*.json
             build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-kvm-session/*.log
             build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-kvm-session/*.ppm
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-kvm-session/com1-input.bin
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-kvm-session/esp-bootx64.efi
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-kvm-session/esp.raw
             build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session/*.json
             build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session/*.txt
             build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session/*.log
