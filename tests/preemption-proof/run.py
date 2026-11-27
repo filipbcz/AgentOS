@@ -12,6 +12,7 @@ import subprocess as sp
 import sys
 import time
 import traceback
+import zipfile
 
 sys.dont_write_bytecode=True
 HERE=Path(__file__).resolve().parent
@@ -25,6 +26,14 @@ VARS=Path("/usr/share/OVMF/OVMF_VARS_4M.fd")
 ARM=b"run /preempt-runner\r"
 KERNEL="ae7dbc731ea84e98a4559dfba0642271ca0c2970f508f47e29656446e31f746c"
 CPIO="23974b23c3bad07110806c19f10e808495dfd7541846045c828cf71652dbab25"
+PRIOR_ZIP=OUT/"preemption-proof-prior-2cpu.zip"
+PRIOR_COMMIT="6acac8d9f9b1d397ebea91712b9479a700b1c34b"
+PRIOR_TREE="34ac70974494d5fe3a88eef85c50158746bc0736"
+PRIOR_ZIP_SHA="cae8759a2decfa6092ab3b5cc983d3c74d5f3780b67a366353ebd3168ef64f94"
+PRIOR_RESULT_SHA="4a40184d784af6acc36f72b4cc4f5484666fe0e92ba174ff6fd473d9a23ae901"
+PRIOR_TRACE_SHA="f62196a9fd167ccee2fa064e9634e2e48057a4afaa2ef345be9432c7e8a657c0"
+PRIOR_COM1_SHA="19d116d6a8e3e9ecb35e919beb2b718b6f81b9a890d9183e5b353a65560914ca"
+PRIOR_CLIENT_SHA="46ad9dd1b253614a5083c885774124f2ba43daeb4ef4575db290b011917a239c"
 sys.path.insert(0,str(ROOT/"scripts"))
 import proof
 require=proof.require
@@ -111,15 +120,102 @@ def inputs():
            DEST/"test.cpio",DEST/"test.unsigned.efi",DEST/"test.efi",DEST/"esp-bootx64.efi",
            DEST/"esp.raw",DEST/"OVMF_VARS.secboot.fd",CODE,VARS,
            HERE/"client.S",HERE/"run.py",HERE/"proof.py",HERE/"test-startup.py",
-           ROOT/"scripts/qemu-smoke.py",DEST/"startup-host.json"]
+           ROOT/"scripts/qemu-smoke.py",DEST/"startup-host.json",PRIOR_ZIP,
+           HERE/"test-failure.py",DEST/"failure-host.json",DEST/"baseline-client.elf",
+           DEST/"baseline-client-disassembly.txt",DEST/"client-disassembly.txt"]
     return {str(x):sha(x) for x in paths}
 
+def historical_two_proof():
+    # Reuse the exact completed two-CPU artifact, not a reconstructed result
+    # JSON or a new boot. Read and replay its actual bytes before every guest.
+    digest=lambda data:hashlib.sha256(data).hexdigest()
+    require(sha(PRIOR_ZIP)==PRIOR_ZIP_SHA,"Wrong archived 2 CPU ZIP")
+    require(capture("git","hash-object",HERE/"proof.py")=="350f83d57395fa63de5649447abfa9302c388d39",
+            "Historical IRQ verifier changed")
+    with zipfile.ZipFile(PRIOR_ZIP) as archive:
+        names=archive.namelist()
+        require(len(names)==len(set(names)) and archive.testzip() is None,"Invalid archived ZIP")
+        matches=[n for n in names if n.endswith("preemption-proof-2cpu/preflight.json")]
+        require(len(matches)==1,"Missing exact archived two-CPU preflight")
+        prefix=matches[0][:-len("preflight.json")]
+        product=prefix[:-len("preemption-proof-2cpu/")]
+        def raw(name):
+            return archive.read(prefix+name)
+        def record(name):
+            return json.loads(raw(name))
+        require(archive.read(product+"kernel.elf")== (OUT/"kernel.elf").read_bytes() and
+                archive.read(product+"initramfs.cpio")== (OUT/"initramfs.cpio").read_bytes() and
+                sha(OUT/"kernel.elf")==KERNEL and sha(OUT/"initramfs.cpio")==CPIO,
+                "Historical/current product bytes differ")
+        receipt=record("preflight.json")
+        result=record("result.json")
+        request=record("trace-request.json")
+        ready=record("trace-ready.json")
+        trace=record("trace-result.json")
+        arm=record("arm.json")
+        log=raw("com1.log")
+        trace_bytes=raw("irq-trace.jsonl")
+        rows=[json.loads(line) for line in trace_bytes.splitlines()]
+        require(digest(raw("result.json"))==PRIOR_RESULT_SHA and digest(trace_bytes)==PRIOR_TRACE_SHA and
+                digest(log)==PRIOR_COM1_SHA and digest(raw(CLIENT))==PRIOR_CLIENT_SHA,
+                "Wrong archived result/trace/UART/client bytes")
+        require(receipt["result"]=="pass" and receipt["cpus"]==2 and receipt["commit"]==PRIOR_COMMIT and
+                receipt["tree"]==PRIOR_TREE and receipt["guests"]==0 and
+                result["result"]=="pass" and result["cpus"]==2 and result["commit"]==PRIOR_COMMIT and
+                result["tree"]==PRIOR_TREE and result["guests"]==1 and result["shutdown"] is True and
+                request["cpus"]==2 and request["windows"]==receipt["windows"] and
+                request["runtime_bytes"]==receipt["runtime_bytes"] and
+                request["qmp"]==record("qmp-roster.json") and trace["error"] is None and
+                trace["complete"] is True and len(rows)==trace["stops"] and
+                result["com1_sha256"]==digest(log) and result["trace_sha256"]==digest(trace_bytes) and
+                result["trace"]==trace and arm["ready"]==ready and arm["command"]==ARM.hex() and
+                ready["armed_ns"]<=arm["arm_ns"]<=arm["sent_ns"]==result["bounds"][0]<=result["bounds"][1] and
+                result["chains"]==proof.verify_smp(rows,request,ready,result["identities"],result["bounds"]),
+                "Archived two-CPU replay failed")
+        # Check the original real UART lifecycle against the authenticated
+        # trace identities. The pinned result also binds the original full
+        # boot/process/orphan gates, which were already executed on this log.
+        smoke=load("qemu-smoke.py")
+        offset=arm["offset"]
+        foreground=log[offset:]
+        require(0<offset<len(log) and foreground.startswith(b"run /preempt-runner\r\n") and
+                b"exit status 0\r\nagentos> " in foreground and raw("com1-input.bin")==ARM+b"exit\r" and
+                log.endswith(b"[INFO] INTERACTIVE SHELL STOPPED\r\n") and
+                b"FRAMES=OK" in foreground and smoke.session.SESSION_STOP.search(log) and
+                int(smoke.session.SESSION_STOP.search(log)[1],16)==1,
+                "Archived normal foreground/manager shutdown missing")
+        require(set(result["identities"])==set(proof.smp_tags(2)),"Wrong archived worker set")
+        def pid(mark):
+            found=re.findall(rb"(?m)^"+mark+rb" PID=([0-9a-f]{16})\r$",foreground)
+            require(len(found)==1,"Missing archived lifecycle "+str(mark))
+            return int(found[0],16)
+        root=pid(b"REG ROOT")
+        require(root==result["root"] and root>result["shell"] and pid(b"REG COMPLETE")==root,
+                "Archived root identity mismatch")
+        for label,(worker,parent,cr3) in result["identities"].items():
+            mark=b"REG "+label.encode()
+            require(parent==root and pid(mark)==worker and all(pid(mark+b" "+v)==worker
+                    for v in (b"BEGIN",b"OK",b"REAP")),"Archived worker identity mismatch")
+            exits=[m for m in smoke.session.EXIT.finditer(foreground) if int(m[1],16)==worker]
+            require(len(exits)==1 and int(exits[0][2],16)==cr3 and int(exits[0][3],16)==0 and
+                    foreground.index(mark+b" BEGIN PID=")<foreground.index(mark+b" OK PID=")<exits[0].start()<
+                    foreground.index(mark+b" REAP PID="),"Archived worker exit/reap mismatch")
+        exits=[m for m in smoke.session.EXIT.finditer(foreground) if int(m[1],16)==root]
+        require(len(exits)==1 and int(exits[0][3],16)==0 and
+                foreground.index(b"REG COMPLETE PID=")<exits[0].start(),"Archived root exit mismatch")
+        return dict(cpus=2,commit=PRIOR_COMMIT,tree=PRIOR_TREE,artifact=15236044308,
+                    zip_sha256=sha(PRIOR_ZIP),result_sha256=digest(raw("result.json")),
+                    trace_sha256=digest(trace_bytes),com1_sha256=digest(log),
+                    kernel_sha256=sha(OUT/"kernel.elf"),cpio_sha256=sha(OUT/"initramfs.cpio"),
+                    client_sha256=digest(raw(CLIENT)),stops=len(rows),
+                    replayed_apics=sorted(result["chains"]),lifecycle=True)
+
 def prior_proof():
-    # Never advance on a green heading alone: replay the immediately
-    # preceding profile's archived raw local-IRQ proof.
-    if CPUS==2:
-        return None
-    previous=CPUS//2
+    historical=historical_two_proof()
+    if CPUS==4:
+        return historical
+    require(CPUS==8,"Only continuation profiles 4 and 8 are authorized")
+    previous=4
     dest=OUT/f"preemption-proof-{previous}cpu"
     receipt=json.loads((dest/"preflight.json").read_text())
     result=json.loads((dest/"result.json").read_text())
@@ -129,15 +225,18 @@ def prior_proof():
     rows=[json.loads(line) for line in (dest/"irq-trace.jsonl").read_text().splitlines()]
     require(receipt["result"]=="pass" and receipt["cpus"]==previous and
             receipt["commit"]==capture("git","rev-parse","HEAD") and
+            receipt["prior_proof"]==historical and
+            receipt["failure_host_sha256"]==sha(dest/"failure-host.json") and
             result["result"]=="pass" and result["cpus"]==previous and result["guests"]==1 and
+            result["commit"]==receipt["commit"] and result["tree"]==receipt["tree"] and
             result["shutdown"] is True and request["cpus"]==previous and
             trace["error"] is None and trace["complete"] is True and len(rows)==trace["stops"] and
             result["com1_sha256"]==sha(dest/"com1.log") and
             result["trace_sha256"]==sha(dest/"irq-trace.jsonl") and
             result["chains"]==proof.verify_smp(rows,request,ready,result["identities"],result["bounds"]),
-            "Previous SMP profile has no complete raw proof")
+            "Previous 4 CPU profile has no complete raw proof")
     return {"cpus":previous,"result_sha256":sha(dest/"result.json"),
-            "trace_sha256":sha(dest/"irq-trace.jsonl")}
+            "trace_sha256":sha(dest/"irq-trace.jsonl"),"historical_two":historical}
 
 def preflight():
     require(not DEST.exists(),"Stale proof directory; no repeat")
@@ -224,6 +323,25 @@ def preflight():
         receipt["tags"]=tags
         receipt["windows"]=windows
         (DEST/"client-disassembly.txt").write_text(capture("objdump","-d","-Mintel",DEST/"client.symbols.elf")+"\n")
+        receipt["stage"]="failure_host"
+        cmd(sys.executable,HERE/"test-failure.py","--cpus",CPUS,"--elf",DEST/"client.symbols.elf",
+            "--receipt",DEST/"failure-host.json",timeout=120)
+        failure=json.loads((DEST/"failure-host.json").read_text())
+        cases={"unchanged_success","root_pid","initial_clock","last_spawn_clock","last_spawn_deadline",
+               "last_fork","last_yield","last_retry_yield","post_clock","post_deadline","first_wait_errno",
+               "first_wait_status","try_wait","final_child_check","diagnostic_write_errno","diagnostic_write_short",
+               "root_report","last_spawn_report","reap_report","complete_report","worker_clock","worker_yield",
+               "worker_begin_report","worker_r10_sentinel"}
+        require(failure["result"]=="pass" and failure["guests"]==0 and failure["cpus"]==CPUS and
+                failure["baseline_blob"]=="17f5bbda2a659dc127fa2c172d08c635b7263607" and
+                failure["baseline_sha256"]==sha(DEST/"baseline-client.elf") and
+                failure["actual_sha256"]==sha(DEST/"client.symbols.elf") and
+                failure["source_sha256"]==sha(HERE/"client.S") and
+                failure["test_sha256"]==sha(HERE/"test-failure.py") and set(failure["cases"])==cases and
+                failure["cases"]["unchanged_success"]["status"]==0 and
+                all(old==new for old,new in failure["disassembly"]["windows"].values()),
+                "Missing successful exact diagnostic host execution/disassembly")
+        receipt["failure_host_sha256"]=sha(DEST/"failure-host.json")
         receipt["stage"]="signed_stage"
         # Reuse the independently verified loader object/layout from the
         # existing host staging build, but add only this executable to the
@@ -291,7 +409,8 @@ def guest():
     require(receipt.get("result")=="pass" and receipt.get("guests")==0 and receipt["cpus"]==CPUS and
             receipt["prior_proof"]==prior_proof() and
             receipt["commit"]==capture("git","rev-parse","HEAD") and receipt["inputs"]==inputs() and
-            receipt["arm"]==ARM.hex() and receipt["startup_host_sha256"]==sha(DEST/"startup-host.json"),
+            receipt["arm"]==ARM.hex() and receipt["startup_host_sha256"]==sha(DEST/"startup-host.json") and
+            receipt["failure_host_sha256"]==sha(DEST/"failure-host.json"),
             "Missing/stale successful preflight")
     require(not (DEST/"guest-start.json").exists(),"Second guest forbidden")
     smoke=load("qemu-smoke.py")
@@ -438,7 +557,7 @@ def guest():
 
 if __name__=="__main__":
     require(len(sys.argv)==3 and sys.argv[1] in ("--preflight","--guest") and
-            sys.argv[2] in ("2","4","8"),"Explicit SMP phase and 2/4/8 profile required")
+            sys.argv[2] in ("4","8"),"Explicit continuation phase and 4/8 profile required")
     CPUS=int(sys.argv[2])
     DEST=OUT/f"preemption-proof-{CPUS}cpu"
     raise SystemExit(preflight() if sys.argv[1]=="--preflight" else guest())
