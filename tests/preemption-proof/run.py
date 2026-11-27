@@ -54,12 +54,63 @@ def symbols(path):
             result[fields[2]]=int(fields[0],16)
     return result
 
+
+def startup_remaining(deadline, description):
+    remaining=deadline-time.monotonic()
+    if remaining<=0:
+        raise TimeoutError(description)
+    return remaining
+
+
+def wait_uart_reader(process, uart, serial, deadline):
+    """Wait for the real capture thread's file, not for fabricated data."""
+    while True:
+        remaining=startup_remaining(deadline,"COM1 reader startup deadline expired")
+        if uart.error is not None:
+            raise RuntimeError(f"UART capture stopped during startup: {uart.error}")
+        if process.poll() is not None:
+            raise RuntimeError(f"QEMU exited during COM1 startup: {process.returncode}")
+        if not uart.worker.is_alive():
+            raise RuntimeError("COM1 reader thread exited during startup")
+        if serial.is_file():
+            return dict(reader_ready=True,bytes_at_readiness=serial.stat().st_size,
+                        observed_ns=time.monotonic_ns(),shell_ready_verified=False)
+        time.sleep(min(.01,remaining))
+
+
+def wait_initial_session(smoke, process, uart, serial, predicate, deadline, on_reader):
+    on_reader(wait_uart_reader(process,uart,serial,deadline))
+    log=smoke.wait_session(process,uart,serial,predicate,"ordinary shell",
+                           startup_remaining(deadline,"Shell startup deadline expired"))
+    startup_remaining(deadline,"Shell startup deadline expired")
+    return log
+
+
+def wait_debugger_ready(debugger, path, deadline):
+    """The observer writes JSON non-atomically; existence is not readiness."""
+    while True:
+        remaining=startup_remaining(deadline,"Debugger did not arm before deadline")
+        if debugger.poll() is not None:
+            raise RuntimeError(f"Debugger exited before arming: {debugger.returncode}")
+        try:
+            ready=json.loads(path.read_text())
+        except (FileNotFoundError,json.JSONDecodeError):
+            time.sleep(min(.01,remaining))
+            continue
+        if not isinstance(ready,dict) or ready.get("hardware") is not True or ready.get("threads")!=1:
+            raise ValueError("Invalid debugger readiness record")
+        startup_remaining(deadline,"Debugger did not arm before deadline")
+        if debugger.poll() is not None:
+            raise RuntimeError(f"Debugger exited before arming: {debugger.returncode}")
+        return ready
+
 def inputs():
     paths=[OUT/"kernel.elf",OUT/"initramfs.cpio",OUT/"agentos.efi",OUT/"agentos.unsigned.efi",
            OUT/"build-provenance.json",OUT/"db.cer",DEST/CLIENT,DEST/"client.symbols.elf",
            DEST/"test.cpio",DEST/"test.unsigned.efi",DEST/"test.efi",DEST/"esp-bootx64.efi",
            DEST/"esp.raw",DEST/"OVMF_VARS.secboot.fd",CODE,VARS,
-           HERE/"client.S",HERE/"run.py",HERE/"proof.py"]
+           HERE/"client.S",HERE/"run.py",HERE/"proof.py",HERE/"test-startup.py",
+           ROOT/"scripts/qemu-smoke.py",DEST/"startup-host.json"]
     return {str(x):sha(x) for x in paths}
 
 def preflight():
@@ -74,6 +125,17 @@ def preflight():
         receipt["stage"]="verifier"
         receipt["selftest"]=capture(sys.executable,HERE/"proof.py")
         require("PREEMPTION VERIFIER POSITIVE + 13 NEGATIVE OK" in receipt["selftest"],"Missing verifier test")
+        receipt["stage"]="startup_host"
+        cmd(sys.executable,HERE/"test-startup.py","--receipt",DEST/"startup-host.json")
+        startup_host=json.loads((DEST/"startup-host.json").read_text())
+        require(startup_host["result"]=="pass" and startup_host["guest_runs"]==0 and
+                startup_host["sources"]=={"runner":sha(HERE/"run.py"),"smoke":sha(ROOT/"scripts/qemu-smoke.py"),
+                                          "test":sha(HERE/"test-startup.py")} and
+                set(startup_host["cases"])=={"old_uart_failure","delayed_uart_and_read","dead_process",
+                    "reader_exception","missing_file_timeout","empty_file_not_ready","empty_file_reader",
+                    "old_debugger_failure","delayed_debugger_record","debugger_timeout","debugger_death"},
+                "Missing exact successful startup host regression")
+        receipt["startup_host_sha256"]=sha(DEST/"startup-host.json")
         receipt["stage"]="tools"
         for name in ("gcc-13","ld","nm","objdump","objcopy","qemu-system-x86_64","gdb","mcopy",
                      "sgdisk","mformat","mmd","sbsign","sbverify","openssl","virt-fw-vars"):
@@ -187,7 +249,8 @@ def guest():
     receipt=json.loads((DEST/"preflight.json").read_text())
     require(receipt.get("result")=="pass" and receipt.get("guests")==0 and
             receipt["commit"]==capture("git","rev-parse","HEAD") and receipt["inputs"]==inputs() and
-            receipt["arm"]==ARM.hex(),"Missing/stale successful preflight")
+            receipt["arm"]==ARM.hex() and receipt["startup_host_sha256"]==sha(DEST/"startup-host.json"),
+            "Missing/stale successful preflight")
     require(not (DEST/"guest-start.json").exists(),"Second guest forbidden")
     smoke=load("qemu-smoke.py")
     basic=load("verify-basic-smp.py")
@@ -214,11 +277,19 @@ def guest():
     stderr=(DEST/"qemu-stderr.log").open("wb")
     dbglog=(DEST/"gdb.log").open("wb")
     try:
+        boot_deadline=time.monotonic()+180
         process=sp.Popen(qemu,cwd=ROOT,stdin=sp.DEVNULL,stdout=stderr,stderr=sp.STDOUT)
         uart=smoke.UartCapture(smoke.connect_uart(sock,process),serial)
         def wait(predicate,description,seconds=60):
             return smoke.wait_session(process,uart,serial,predicate,description,seconds)
-        log=wait(lambda d:b"AGENTOS SHELL READY\r\nagentos> " in d,"ordinary shell",180)
+        startup={}
+        def on_reader(record):
+            startup.update(record,boot_deadline_ns=int(boot_deadline*1e9))
+            save("uart-startup.json",startup)
+        log=wait_initial_session(smoke,process,uart,serial,
+            lambda d:b"AGENTOS SHELL READY\r\nagentos> " in d,boot_deadline,on_reader)
+        startup.update(shell_ready_verified=True,shell_ready_ns=time.monotonic_ns(),shell_ready_bytes=len(log))
+        save("uart-startup.json",startup)
         bases=re.findall(rb"(?m)^\[INFO\] KERNEL IMAGE BASE=([0-9a-f]{16})\r?$",log)
         shells=list(smoke.session.SHELL_START.finditer(log))
         require(len(bases)==len(shells)==1 and re.search(rb"SYSTEM CLOCK: HPET(?:64|32)",log),"Wrong boot/base/shell")
@@ -248,11 +319,9 @@ def guest():
         debugger=sp.Popen(["gdb","-nx","-nh","-batch","-ex","set pagination off","-ex","set architecture i386:x86-64",
                            "-ex",f"target remote 127.0.0.1:{port}","-ex","python "+expression],
                           cwd=ROOT,env=environment,stdout=dbglog,stderr=sp.STDOUT)
-        until=time.monotonic()+20
-        while not (DEST/"trace-ready.json").exists():
-            require(debugger.poll() is None and time.monotonic()<until,"Debugger did not arm")
-            time.sleep(.01)
-        ready=json.loads((DEST/"trace-ready.json").read_text())
+        ready=wait_debugger_ready(debugger,DEST/"trace-ready.json",time.monotonic()+20)
+        require(ready["site"]==base+proof.SITE and ready["apic"]==apic and
+                0<ready["armed_ns"]<=time.monotonic_ns(),"Wrong debugger readiness identity")
         offset=serial.stat().st_size
         arm_ns=time.monotonic_ns()
         uart.send(ARM)
