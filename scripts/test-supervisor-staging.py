@@ -140,7 +140,7 @@ def supervisor_phase(parent, first, cr3=0x600000):
 
 
 def supervisor_transcript(shell=9,runner=20,apics=(7,),moving=False,skipping=False,
-                          peer_moving=False,peer_missed=False,pipe=False):
+                          peer_moving=False,peer_missed=False,peer_unpaired=False,pipe=False):
     """Synthetic evidence, not a guest execution or signature proof."""
     cpus=len(apics)
     count=1 if cpus==1 else 2*cpus
@@ -209,33 +209,40 @@ def supervisor_transcript(shell=9,runner=20,apics=(7,),moving=False,skipping=Fal
             ms+=10
             return status
         if cpus==2:
-            while True:
-                pair=next(((pid,peer) for pid in remaining if placement[pid] not in covered
-                           for peer in remaining if placement[peer]!=placement[pid]),None)
-                if pair is None:
+            while len(covered)<cpus:
+                peer=next((peer for fallback in (False,True)
+                           for pid in remaining if placement[pid] not in covered
+                           for peer in remaining if peer!=pid and
+                           (fallback or placement[peer]!=placement[pid])),None)
+                if peer is None:
                     break
-                pid,peer=pair
                 first=pair_number==0
                 pair_number+=1
-                note("PAIR",ROOT=runner,PID=pid,PEER=peer)
+                note("PEER_ACTIVATE",ROOT=runner,ROUND=rnd,PEER=peer)
                 peer_cpu=placement[peer]
                 moves=0
-                if first and peer_missed:
+                if (first and peer_missed) or (pair_number==2 and peer_unpaired):
                     total+=1
                     moves=1
-                    peer_cpu=placement[pid]
+                    peer_cpu=next(a for a in apics if a!=peer_cpu)
                 snap("PEER_BEGIN",peer,runner,peer_cpu,ms,moves,0)
                 ms+=10
-                run=peer_cpu==placement[peer]
-                status=attempt(pid,run,first)
+                pid=next((pid for pid in remaining if pid!=peer and
+                          placement[pid]!=peer_cpu and placement[pid] not in covered),None)
+                status=None
+                if pid is None:
+                    note("UNPAIRED",ROOT=runner,PEER=peer)
+                else:
+                    note("PAIR",ROOT=runner,PID=pid,PEER=peer)
+                    status=attempt(pid,True,first)
                 if first and peer_moving:
                     total+=1
                     moves+=1
-                    peer_cpu=placement[pid]
+                    peer_cpu=next(a for a in apics if a!=peer_cpu)
                 snap("PEER_END",peer,runner,peer_cpu,ms,moves,200)
                 collect(peer,0)
                 ms+=10
-                if run and status==0 and not (first and peer_moving):
+                if pid is not None and status==0 and not (first and peer_moving):
                     covered.add(placement[pid])
             for pid in remaining.copy():
                 attempt(pid,False,False)
@@ -378,7 +385,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(any(r["reason"]=="migration" for r in receipt["rejected"]))
 
     def test_two_cpu_roster_and_rejected_complete_attempts(self):
-        for flags in ({},{"moving":True},{"skipping":True},{"peer_moving":True},{"peer_missed":True}):
+        for flags in ({},{"moving":True},{"skipping":True},{"peer_moving":True},{"peer_missed":True},{"peer_unpaired":True}):
             data=supervisor_transcript(apics=(7,19),**flags)
             offset,result,seen=self.verify(data,apics=(7,19))
             self.assertEqual(offset,len(data))
@@ -392,6 +399,61 @@ class RuntimeTests(unittest.TestCase):
                 for field in ("apic","moves","total"):
                     self.assertEqual(interval["before"][field],interval["after"][field])
             self.assertEqual(len(seen),len(set(seen)))
+
+    def test_peer_first_reselects_after_wake_and_retains_unpaired_candidates(self):
+        import re
+        for pipe in (False,True):
+            def check(data):
+                return session.supervisor_prefix(data,9,0x300000,{1,2,9},"test",{7,19},pipe=pipe)
+            data=supervisor_transcript(apics=(7,19),peer_missed=True,pipe=pipe)
+            _,result,_=check(data)
+            first=result["intervals"][0]
+            self.assertEqual(first["pid"],24)
+            self.assertEqual(first["apic"],19)
+            self.assertEqual(first["peer"]["pid"],22)
+            self.assertEqual(first["peer"]["ready"]["apic"],19)
+            self.assertEqual(first["peer"]["before"]["apic"],7)
+            self.assertEqual(first["peer"]["after"]["apic"],7)
+            self.assertEqual(first["peer"]["before"]["moves"],1)
+            self.assertEqual(first["peer"]["after"]["moves"],1)
+            self.assertEqual(result["covered_apics"],[7,19])
+            lines=data.splitlines(keepends=True)
+            activate=next(l for l in lines if l.startswith(b"AGENTOS TEST PEER_ACTIVATE "))
+            start=next(l for l in lines if l.startswith(b"AGENTOS TEST PEER_BEGIN "))
+            pair=next(l for l in lines if l.startswith(b"AGENTOS TEST PAIR "))
+            self.assertLess(lines.index(activate),lines.index(start))
+            self.assertLess(lines.index(start),lines.index(pair))
+            for bad in (
+                data.replace(start,re.sub(rb"MS=[0-9a-f]{16}",b"MS=0000000000000000",start),1),
+                data.replace(start,start.replace(b"MOVES=0000000000000001",b"MOVES=0000000000000000"),1),
+                data.replace(start,start.replace(b"APIC=0000000000000007",b"APIC=0000000000000013"),1),
+                data.replace(pair,pair.replace(b"PID=0000000000000018",b"PID=0000000000000015"),1),
+                data.replace(activate,activate.replace(b"PEER=0000000000000016",b"PEER=0000000000000015"),1),
+                data.replace(start+pair,pair+start,1),
+                data.replace(pair,b"AGENTOS TEST UNPAIRED ROOT=0000000000000014 PEER=0000000000000016\r\n",1),
+            ):
+                self.assertNotEqual(bad,data)
+                with self.assertRaises(session.VerificationError):
+                    check(bad)
+            data=supervisor_transcript(apics=(7,19),peer_unpaired=True,pipe=pipe)
+            _,result,_=check(data)
+            self.assertEqual(result["covered_apics"],[7,19])
+            misses=[r for r in result["rejected"] if r["reason"]=="peer-unpaired"]
+            self.assertEqual(len(misses),1)
+            peer=misses[0]["peer"]["pid"]
+            self.assertEqual(peer,23)
+            unpaired=next(l for l in data.splitlines(keepends=True) if l.startswith(b"AGENTOS TEST UNPAIRED "))
+            peer_end=data.index(b"AGENTOS TEST PEER_END ",data.index(unpaired))
+            # Candidate 24 is not spent on a stale pair. Its only SELECT
+            # follows the peer's full work/stop/collection.
+            remaining=b"AGENTOS TEST SELECT ROOT=0000000000000014 PID=0000000000000018"
+            self.assertGreater(data.index(remaining),peer_end)
+            self.assertEqual(data.count(remaining),1)
+            for bad in (data.replace(unpaired,b"",1),
+                        data.replace(unpaired,unpaired.replace(b"PEER=0000000000000017",b"PEER=0000000000000018"),1)):
+                self.assertNotEqual(bad,data)
+                with self.assertRaises(session.VerificationError):
+                    check(bad)
 
     def test_reject_fake_locality_duplicate_cpu_pid_incomplete_and_replay(self):
         data=supervisor_transcript(apics=(7,19))

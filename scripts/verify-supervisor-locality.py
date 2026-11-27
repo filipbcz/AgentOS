@@ -162,34 +162,48 @@ def verify(data, shell, shell_cr3, prior_pids, apics, supervisor, require, pipe=
             intervals.append(outcome)
 
         if len(apics)==2:
-            # The same deterministic pairing policy as the guest controller.
-            # Never accept an idle or absent peer, even for an otherwise local
-            # supervisor interval. Both candidate lifetimes must be consumed.
-            while True:
-                pair=next(((pid,peer) for pid in remaining if placements[pid]["apic"] not in covered
-                           for peer in remaining if placements[peer]["apic"]!=placements[pid]["apic"]),None)
-                if pair is None:
+            # Independently reconstruct the bounded peer-first policy. READY
+            # is a hint, not evidence of the CPU after the IPC wake. An
+            # activated peer is always reaped; unpaired children remain live
+            # until a later explicit selection or ordinary final cleanup.
+            while covered!=apics:
+                peer=next((peer for fallback in (False,True)
+                           for pid in remaining if placements[pid]["apic"] not in covered
+                           for peer in remaining if peer!=pid and
+                           (fallback or placements[peer]["apic"]!=placements[pid]["apic"])),None)
+                if peer is None:
                     break
-                pid,peer=pair
-                cpu,peer_cpu=placements[pid]["apic"],placements[peer]["apic"]
-                require(fields("PAIR",("ROOT","PID","PEER"))==(runner,pid,peer),"Wrong or replayed peer selection")
+                require(fields("PEER_ACTIVATE",("ROOT","ROUND","PEER"))==(runner,rnd,peer),
+                        "Wrong or replayed peer activation")
                 before=snap("PEER_BEGIN")
                 require(progresses(placements[peer],before) and before["work"]==0 and
                         floor_ms<=before["ms"]<=deadline and before["total"]>=floor_total,
                         "Invalid peer start identity, counters or time")
                 floor_ms,floor_total=before["ms"],before["total"]
-                run=before["apic"]==peer_cpu
-                status,outcome,root=attempt(pid,run)
+                peer_cpu=before["apic"]
+                pid=next((pid for pid in remaining if pid!=peer and
+                          placements[pid]["apic"]!=peer_cpu and
+                          placements[pid]["apic"] not in covered),None)
+                status,outcome,root=None,None,None
+                if pid is None:
+                    require(fields("UNPAIRED",("ROOT","PEER"))==(runner,peer),
+                            "Missing unpaired peer or falsely rejected eligible partner")
+                else:
+                    cpu=placements[pid]["apic"]
+                    require(fields("PAIR",("ROOT","PID","PEER"))==(runner,pid,peer),
+                            "Wrong or replayed partner after live peer snapshot")
+                    status,outcome,root=attempt(pid,True)
                 after=snap("PEER_END")
                 require(progresses(before,after) and 0<after["work"]<=2000000 and
                         floor_ms<=after["ms"]<=deadline and after["total"]>=floor_total,
                         "Invalid peer work, stop identity, counters or time")
                 floor_ms,floor_total=after["ms"],after["total"]
                 peer_root=collect(peer,0,[])
-                require(peer_root!=root,"Peer aliases live supervisor candidate")
-                peer_proof={"pid":peer,"apic":peer_cpu,"before":before,"after":after,"cr3":peer_root}
-                if not run:
-                    rejected.append({"pid":pid,"reason":"peer-placement","peer":peer_proof})
+                require(root is None or peer_root!=root,"Peer aliases live supervisor candidate")
+                peer_proof={"pid":peer,"apic":peer_cpu,"ready":placements[peer],
+                            "before":before,"after":after,"cr3":peer_root}
+                if pid is None:
+                    rejected.append({"pid":peer,"reason":"peer-unpaired","peer":peer_proof})
                     continue
                 outcome["peer"]=peer_proof
                 if status!=75:

@@ -58,6 +58,16 @@ static int peerSnapshot(const char *kind,const struct PeerReport *p) {
     const unsigned long v[]={s->stats[6],s->stats[7],s->stats[1],s->stats[2],s->stats[3],s->stats[4],s->ms,p->work};
     return record(kind,names,v,8);
 }
+static int activatePeer(long peer,unsigned round) {
+    const char *const names[]={" ROOT="," ROUND="," PEER="};
+    const unsigned long v[]={gRoot,round,(unsigned long)peer};
+    return record("PEER_ACTIVATE",names,v,3);
+}
+static int unpaired(long peer) {
+    const char *const names[]={" ROOT="," PEER="};
+    const unsigned long v[]={gRoot,(unsigned long)peer};
+    return record("UNPAIRED",names,v,2);
+}
 static int pairRecord(long pid,long peer) {
     const char *const names[]={" ROOT="," PID="," PEER="};
     const unsigned long v[]={gRoot,(unsigned long)pid,(unsigned long)peer};
@@ -233,21 +243,57 @@ static int readPeer(unsigned slot,unsigned round,struct PeerReport *report,const
         in.body.report.sample.stats[7]!=gRoot || !peerSnapshot(kind,&in.body)) return 0;
     *report=in.body; return 1;
 }
-static int runPair(unsigned slot,unsigned peer,unsigned round,const struct Sample ready[]) {
-    unsigned long apic=ready[slot].stats[1], peerApic=ready[peer].stats[1];
+/* READY is only a placement hint for a sleeping child. Select the peer
+ * first, then choose an unused candidate using the authenticated live
+ * PEER_BEGIN. A miss consumes only the peer, never an unrelated candidate.
+ * Prefer the former opposite-CPU hint; if none exists, a peer may still
+ * migrate upon wake. Each activation consumes one existing pool member. */
+static unsigned choosePeer(const struct Sample ready[]) {
+    for (unsigned pass=0;pass<2;++pass)
+        for (unsigned i=0;i<gCount;++i)
+            if (gPids[i]>0 && !covered(ready[i].stats[1]))
+                for (unsigned j=0;j<gCount;++j)
+                    if (j!=i && gPids[j]>0 &&
+                        (pass || ready[j].stats[1]!=ready[i].stats[1])) return j;
+    return gCount;
+}
+static unsigned choosePartner(unsigned peer,unsigned long liveApic,const struct Sample ready[]) {
+    for (unsigned i=0;i<gCount;++i)
+        if (i!=peer && gPids[i]>0 && ready[i].stats[1]!=liveApic &&
+            !covered(ready[i].stats[1])) return i;
+    return gCount;
+}
+static int advances(const struct Sample *a,const struct Sample *b) {
+    return a->stats[6]==b->stats[6] && a->stats[7]==b->stats[7] &&
+        a->stats[2]==b->stats[2] && a->ms<=b->ms && b->ms<=(unsigned long)gDeadline &&
+        a->stats[3]<=b->stats[3] && a->stats[4]<=b->stats[4] &&
+        b->stats[3]-a->stats[3]<=b->stats[4]-a->stats[4] &&
+        (a->stats[1]==b->stats[1] || a->stats[3]<b->stats[3]);
+}
+static int runPair(unsigned peer,unsigned round,const struct Sample ready[]) {
+    /* The command token remains the original hint for authenticated STOP.
+     * Actual locality is based solely on the live start/end snapshots. */
+    unsigned long token=ready[peer].stats[1];
     struct PeerReport before,after;
-    if (!pairRecord(gPids[slot],gPids[peer]) || !command(peer,round,peerCommand,peerApic) ||
-        !readPeer(peer,round,&before,"PEER_BEGIN") || before.work!=0) return 0;
-    int run=before.report.sample.stats[1]==peerApic;
-    long status=selectAndCollect(slot,round,apic,run);
-    if (status<0 || (!run && status!=0) || (run && status!=0 && status!=skipStatus && status!=movedStatus)) return 0;
-    if (!command(peer,round,peerStop,peerApic) || !readPeer(peer,round,&after,"PEER_END") ||
-        !command(peer,round,stopCommand,peerApic) || collect(peer)!=0) return 0;
+    if (!activatePeer(gPids[peer],round) || !command(peer,round,peerCommand,token) ||
+        !readPeer(peer,round,&before,"PEER_BEGIN") || before.work!=0 ||
+        !advances(&ready[peer],&before.report.sample)) return 0;
+    unsigned long peerApic=before.report.sample.stats[1];
+    unsigned slot=choosePartner(peer,peerApic,ready);
+    unsigned long apic=0;
+    long status=-1;
+    if (slot<gCount) {
+        apic=ready[slot].stats[1];
+        if (!pairRecord(gPids[slot],gPids[peer])) return 0;
+        /* worker() rechecks its actual APIC immediately before BEGIN. */
+        status=selectAndCollect(slot,round,apic,1);
+        if (status!=0 && status!=skipStatus && status!=movedStatus) return 0;
+    } else if (!unpaired(gPids[peer])) return 0;
+    if (!command(peer,round,peerStop,token) || !readPeer(peer,round,&after,"PEER_END") ||
+        !command(peer,round,stopCommand,token) || collect(peer)!=0) return 0;
     if (after.work==0 || after.work>peerIterations ||
-        after.report.sample.ms<before.report.sample.ms ||
-        after.report.sample.stats[4]<before.report.sample.stats[4] ||
-        after.report.sample.stats[3]<before.report.sample.stats[3]) return 0;
-    if (run && status==0 && after.report.sample.stats[1]==peerApic &&
+        !advances(&before.report.sample,&after.report.sample)) return 0;
+    if (slot<gCount && status==0 && after.report.sample.stats[1]==peerApic &&
         after.report.sample.stats[3]==before.report.sample.stats[3]) gApics[gCovered++]=apic;
     return 1;
 }
@@ -276,18 +322,10 @@ static int runWave(unsigned round) {
         ready[i]=in.body.sample;
     }
     if (gCpus==2) {
-        /* Keep the previous pool and wave bounds. Pair only live candidates
-         * on distinct observed CPUs; consume both, never use an idle peer. */
-        for (;;) {
-            unsigned slot=gCount,peer=gCount;
-            for (unsigned i=0;i<gCount && slot==gCount;++i)
-                if (gPids[i]>0 && !covered(ready[i].stats[1]))
-                    for (unsigned j=0;j<gCount;++j)
-                        if (gPids[j]>0 && ready[j].stats[1]!=ready[i].stats[1]) {
-                            slot=i; peer=j; break;
-                        }
-            if (slot==gCount) break;
-            if (!runPair(slot,peer,round,ready)) return 0;
+        while (gCovered<gCpus) {
+            unsigned peer=choosePeer(ready);
+            if (peer==gCount) break;
+            if (!runPair(peer,round,ready)) return 0;
         }
         for (unsigned i=0;i<gCount;++i)
             if (gPids[i]>0 && selectAndCollect(i,round,ready[i].stats[1],0)!=0) return 0;
