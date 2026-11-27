@@ -1,8 +1,9 @@
 //! First canonical TTY. The device IRQs stay routed to their BSP while
 //! descriptors may move between CPUs. A private IRQ-masked gate protects the
-//! complete line, UART and framebuffer state in one owned writable frame.
+//! complete line, UART and text-model metadata in one owned writable frame.
+//! The separately owned display storage is never rendered under this gate.
 #![allow(non_snake_case)]
-use crate::{acpi::Platform, fb_console::Console, input, ioapic::Route, keyboard::Keyboard,
+use crate::{acpi::Platform, fb_console::{Console,Renderer}, input, ioapic::Route, keyboard::Keyboard,
             line::{LineInput, Read}, log_policy::Level, logger::LOGGER, out, ps2, COM};
 use core::{cell::UnsafeCell, hint::spin_loop, sync::atomic::{AtomicBool, Ordering}};
 
@@ -10,11 +11,12 @@ pub const VECTOR: u32 = 0xe1;
 pub const KEYBOARD_VECTOR: u32 = 0xe2;
 pub struct Terminal {
     fLocked: AtomicBool,
+    fScreenPending: AtomicBool,
     fState: UnsafeCell<TerminalState>,
 }
 
 // Every access to the state takes fLocked with local IRQs masked. The device
-// routes and framebuffer backing remain alive until all session tasks stop.
+// routes and text backing remain alive until all session tasks stop.
 unsafe impl Sync for Terminal {}
 
 struct TerminalState {
@@ -34,7 +36,7 @@ const _: () = assert!(core::mem::size_of::<Terminal>() <= 4096);
 
 impl Terminal {
     pub unsafe fn new(aPlatform: &Platform, aCpu: u8, aSerialPresent: bool) -> Self {
-        Self { fLocked: AtomicBool::new(false),
+        Self { fLocked: AtomicBool::new(false), fScreenPending: AtomicBool::new(false),
                fState: UnsafeCell::new(TerminalState::new(aPlatform, aCpu, aSerialPresent)) }
     }
 
@@ -52,11 +54,22 @@ impl Terminal {
             while self.fLocked.load(Ordering::Relaxed) { spin_loop(); }
         }
         let _pGuard = TerminalGuard { fLocked: &self.fLocked, fFlags: pFlags };
-        aOperation(unsafe { &mut *self.fState.get() })
+        let pState=unsafe {&mut *self.fState.get()};
+        let pResult=aOperation(pState);
+        // Publish/clear under the producer/snapshot gate, never after release.
+        self.fScreenPending.store(pState.fScreen.as_ref().map_or(false,|s|s.pending()),Ordering::Release);
+        pResult
     }
 
     pub fn attach_screen(&self, aConsole: Console) {
         self.withState(|pState| pState.attach_screen(aConsole));
+    }
+    /// The terminal and its stable event outlive the scheduled display owner.
+    pub fn screen_event(&self)->*const AtomicBool { &self.fScreenPending }
+    pub fn screen_pending(&self)->bool { self.fScreenPending.load(Ordering::Acquire) }
+    pub fn snapshot_screen(&self,renderer:&mut Renderer)->bool {
+        if !self.screen_pending() {return false;}
+        self.withState(|s|s.fScreen.as_mut().map_or(false,|screen|screen.snapshot(renderer)))
     }
     pub unsafe fn enable(&self) { self.withState(|pState| pState.enable()); }
     pub unsafe fn disable(&self) { self.withState(|pState| pState.disable()); }

@@ -37,6 +37,9 @@ struct Task {
 }
 
 const CAPACITY: usize = 8;
+// Owner-local kernel service, outside the process slots and load-balancing pool.
+const SERVICE_SLOT: usize = CAPACITY;
+const TOTAL_SLOTS: usize = CAPACITY+1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MigrationInfo {
@@ -66,7 +69,8 @@ impl TimedWait {
 }
 
 pub struct Queue {
-    tasks: [Option<Task>; CAPACITY],
+    tasks: [Option<Task>; TOTAL_SLOTS],
+    fServiceEvent: *const core::sync::atomic::AtomicBool,
     count: usize,
     current: Option<usize>,
     fRetiring: Option<usize>,
@@ -85,11 +89,26 @@ pub struct Queue {
 
 impl Queue {
     pub fn new() -> Self {
-        Self { tasks: core::array::from_fn(|_| None), count: 0, current: None, fRetiring: None, fRuntimeIdle: false, fPrograms: ptr::null(), caller: 0, init_pid: None, boot_parked: None, boot_handoff_done: false, active: false }
+        Self { tasks: core::array::from_fn(|_| None), fServiceEvent: ptr::null(), count: 0, current: None, fRetiring: None, fRuntimeIdle: false, fPrograms: ptr::null(), caller: 0, init_pid: None, boot_parked: None, boot_handoff_done: false, active: false }
     }
 
     pub fn spawn(&mut self, frames: &mut Frames<'_>, entry: extern "C" fn(usize), arg: usize) -> Option<()> {
-        if self.active || self.count == CAPACITY { return None; }
+        if self.active || self.count >= CAPACITY { return None; }
+        self.spawn_kernel_at(frames,self.count,entry,arg)
+    }
+
+    /// Install a normal sleeping kernel service before runtime starts.
+    /// Event storage must outlive its queue entry and retirement.
+    pub unsafe fn spawn_service(&mut self,frames:&mut Frames<'_>,entry:extern "C" fn(usize),arg:usize,
+                                event:*const core::sync::atomic::AtomicBool)->Option<()> {
+        if self.active || self.current.is_some() || event.is_null() ||
+           self.tasks[SERVICE_SLOT].is_some() {return None;}
+        self.spawn_kernel_at(frames,SERVICE_SLOT,entry,arg)?;
+        self.fServiceEvent=event;
+        Some(())
+    }
+
+    fn spawn_kernel_at(&mut self,frames:&mut Frames<'_>,slot:usize,entry:extern "C" fn(usize),arg:usize)->Option<()> {
         let stack = KernelStack::allocate(frames)?;
         let top = stack.top();
         let context = (top - 16 - size_of::<Context>()) as *mut Context;
@@ -105,9 +124,9 @@ impl Queue {
             (*context).ss = 16;
             ((top - 8) as *mut usize).write(task_return as usize);
         }
-        self.tasks[self.count] = Some(Task { stack, context: context as usize, runnable: true, waiting: None, timed: None,
+        self.tasks[slot] = Some(Task { stack, context: context as usize, runnable: true, waiting: None, timed: None,
                                           clock_error: false, preemptions: 0, fHasRun: false, fMigrations: 0, process: None });
-        self.count += 1;
+        self.count = self.count.max(slot+1);
         Some(())
     }
 
@@ -117,7 +136,7 @@ impl Queue {
         const SPAWN_STDIO_ONLY: usize = 1;
         if flags & !SPAWN_STDIO_ONLY != 0 { return Err(-22); }
         if !self.fPrograms.is_null() && self.fPrograms != programs as *const Programs { return Err(-22); }
-        let slot = self.tasks.iter().position(Option::is_none).ok_or(-11isize)?;
+        let slot = self.tasks[..CAPACITY].iter().position(Option::is_none).ok_or(-11isize)?;
         let stack = KernelStack::allocate(frames).ok_or(-12isize)?;
         let credentials = self.process().map_or(crate::process::Credentials::BOOT_USER, |p| p.credentials);
         let mut process = match programs.load(frames, name, parent, credentials) {
@@ -153,7 +172,7 @@ impl Queue {
     pub unsafe fn fork_process(&mut self, frames: &mut Frames<'_>, programs: &Programs,
                                parent_context: &Context) -> Result<usize, isize> {
         if self.fPrograms != programs as *const Programs { return Err(-22); }
-        let slot = self.tasks.iter().position(Option::is_none).ok_or(-11isize)?;
+        let slot = self.tasks[..CAPACITY].iter().position(Option::is_none).ok_or(-11isize)?;
         let parent = self.process().ok_or(-1isize)?;
         let stack = KernelStack::allocate(frames).ok_or(-12isize)?;
         let Some(mut files) = crate::files::Descriptors::new(frames) else {
@@ -331,6 +350,10 @@ impl Queue {
     /// The caller holds the local queue lock and Frames. Remote I/O/exit
     /// events request an IPI; the destination performs this scan itself.
     pub fn wake_io(&mut self, aFrames: &mut Frames<'_>) {
+        if !self.fServiceEvent.is_null() &&
+           unsafe {(*self.fServiceEvent).load(core::sync::atomic::Ordering::Acquire)} {
+            self.tasks[SERVICE_SLOT].as_mut().unwrap().runnable=true;
+        }
         let pPrograms = unsafe { self.fPrograms.as_ref() };
         for pTask in self.tasks.iter_mut().flatten() {
             if pTask.waiting.map_or(false, |pWait| pWait.ready(aFrames)) {
@@ -455,11 +478,27 @@ impl Queue {
         if aEnabled { self.active = true; }
     }
 
+    // Preserve the original process-balancing counts and user capacity.
+    // The existing round robin and timer still select every runnable task.
     pub fn runnableCount(&self) -> usize {
-        self.tasks.iter().flatten().filter(|pTask| pTask.runnable).count()
+        self.tasks[..CAPACITY].iter().flatten().filter(|pTask| pTask.runnable).count()
     }
-    pub fn taskCount(&self) -> usize { self.tasks.iter().flatten().count() }
-    pub fn hasFreeSlot(&self) -> bool { self.tasks.iter().any(Option::is_none) }
+    pub fn hasRunnable(&self)->bool { self.tasks.iter().flatten().any(|t|t.runnable) }
+    pub fn taskCount(&self) -> usize { self.tasks[..CAPACITY].iter().flatten().count() }
+    pub fn hasFreeSlot(&self) -> bool { self.tasks[..CAPACITY].iter().any(Option::is_none) }
+
+    /// Owner CPU, IF=0. Recheck the event when publishing sleep; wake_io
+    /// checks its level again on the next IPI/timer/IO switch.
+    pub fn park_service_if_idle(&mut self) {
+        assert_eq!(self.current,Some(SERVICE_SLOT));
+        assert!(!self.fServiceEvent.is_null());
+        if !unsafe {(*self.fServiceEvent).load(core::sync::atomic::Ordering::Acquire)} {
+            self.tasks[SERVICE_SLOT].as_mut().unwrap().runnable=false;
+        }
+    }
+    pub fn service_runnable(&self)->bool {
+        self.tasks[SERVICE_SLOT].as_ref().map_or(false,|t|t.runnable)
+    }
     pub fn currentMigrations(&self) -> usize {
         self.current.and_then(|pIndex| self.tasks[pIndex].as_ref())
             .map_or(0, |pTask| pTask.fMigrations)
@@ -469,7 +508,7 @@ impl Queue {
     /// local IRQs masked. No allocation, shared frame operation or remote
     /// hardware access occurs here. A full target leaves ownership untouched.
     pub fn moveRunnableTo(&mut self, aTarget: &mut Queue) -> Result<MigrationInfo, isize> {
-        let pTargetSlot = aTarget.tasks.iter().position(Option::is_none).ok_or(-11isize)?;
+        let pTargetSlot = aTarget.tasks[..CAPACITY].iter().position(Option::is_none).ok_or(-11isize)?;
         if !aTarget.fPrograms.is_null() && aTarget.fPrograms != self.fPrograms { return Err(-22); }
         let pSourceSlot = (0..self.count).find(|&pIndex| {
             if self.current == Some(pIndex) || self.fRetiring == Some(pIndex) { return false; }
@@ -536,6 +575,7 @@ impl Queue {
         assert!(!self.active && self.current.is_none() && self.fRetiring.is_none());
         for i in 0..self.count { self.release_task(i, frames); }
         self.count = 0;
+        self.fServiceEvent=ptr::null();
         self.init_pid = None;
         self.boot_parked = None;
     }
@@ -568,7 +608,7 @@ mod timed_tests {
             let pEntry = unsafe { self.fPrograms.fRegistry.register(&mut self.fFrames, pPid, aParent).unwrap() };
             let pQueue = &mut self.fQueues[aCpu];
             pQueue.fPrograms = &*self.fPrograms;
-            let pSlot = pQueue.tasks.iter().position(Option::is_none).unwrap();
+            let pSlot = pQueue.tasks[..CAPACITY].iter().position(Option::is_none).unwrap();
             let mut pSpace = crate::paging::UserSpace::test_dummy();
             pSpace.root = 0x100000 + pPid * 4096;
             pQueue.tasks[pSlot] = Some(Task {
@@ -989,4 +1029,40 @@ mod timed_tests {
         p.select(0, 0, false);
         assert_eq!(p.fQueues[0].collectRetired(&mut p.fFrames), 1);
     }
+
+    #[test]
+    fn reserved_kernel_service_does_not_consume_process_slots_and_progresses() {
+        use core::sync::atomic::{AtomicBool,Ordering};
+        let event=AtomicBool::new(true);
+        let mut q=Queue::new();
+        let mut frames=Frames::test_dummy();
+        extern "C" fn entry(_:usize) {}
+        // The host stack allocator deliberately fails.
+        assert!(unsafe{q.spawn_service(&mut frames,entry,0,&event)}.is_none());
+        assert!(q.fServiceEvent.is_null());
+        for slot in 0..TOTAL_SLOTS {
+            q.tasks[slot]=Some(Task{stack:KernelStack::test_dummy(),context:0x1000+slot*0x100,
+                runnable:slot<CAPACITY,waiting:None,timed:None,clock_error:false,
+                preemptions:0,fHasRun:false,fMigrations:0,process:None});
+        }
+        q.count=TOTAL_SLOTS;q.fServiceEvent=&event;q.setRuntimeIdle(true);
+        assert_eq!(q.runnableCount(),CAPACITY);assert!(!q.hasFreeSlot());
+        q.wake_io(&mut frames);assert!(q.service_runnable());
+        // All process slots permanently runnable: existing round robin
+        // still selects the kernel owner without returning to idle.
+        for i in 0..TOTAL_SLOTS {
+            assert_eq!(q.select(0x8000+i*0x100,true),0x1000+i*0x100);
+            q.completeSwitch();
+        }
+        event.store(false,Ordering::Release);q.park_service_if_idle();
+        assert!(!q.service_runnable());
+        assert_eq!(q.runnableCount(),CAPACITY);
+        event.store(true,Ordering::Release);q.wake_io(&mut frames);
+        assert!(q.service_runnable());
+        assert_eq!(q.select(0x9000,false),0x8100);q.completeSwitch();
+        q.tasks[SERVICE_SLOT]=None;
+        q.fServiceEvent=ptr::null();
+        assert!(!q.hasFreeSlot());
+    }
+
 }

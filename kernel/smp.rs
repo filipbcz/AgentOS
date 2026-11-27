@@ -490,7 +490,7 @@ impl Cpu {
                     pQueue.wake_io(pFrames);
                 });
                 let pNow = self.runtime_clock().unwrap_or(0);
-                self.arm_timer(pQueue.runnableCount() != 0, pQueue.next_deadline(), pNow);
+                self.arm_timer(pQueue.hasRunnable(), pQueue.next_deadline(), pNow);
             }
             if pChanged { notifyRemote(); }
             if let Some(pExit) = pStatus {
@@ -750,6 +750,35 @@ unsafe fn active_root() -> usize {
     let root: usize;
     asm!("mov {}, cr3", out(reg) root, options(nomem, nostack));
     root
+}
+
+/// Runtime GOP owner, with an ordinary guarded kernel stack. This is not
+/// an IRQ callback or a syscall/IRET epilogue. Producers only update RAM.
+struct ScreenWork {
+    terminal: *mut crate::tty::Terminal,
+    renderer: crate::fb_console::Renderer,
+}
+extern "C" fn screen_worker(arg:usize) {
+    let work=arg as *mut ScreenWork;
+    unsafe {
+        loop {
+            // Never hold a mutable renderer borrow across a parked context.
+            if (*(*work).terminal).snapshot_screen(&mut (*work).renderer) {
+                (*work).renderer.render();
+            }
+            asm!("cli",options(nostack));
+            let cpu=current_cpu();
+            cpu.lockQueue().park_service_if_idle();
+            // Yield even if another batch arrived. On a clean screen the
+            // level-triggered IO scan/IPI wakes the blocked service.
+            cpu.requestReschedule(cpu);
+            loop {
+                wait_for_irq();
+                if cpu.lockQueue().service_runnable() {break;}
+            }
+            asm!("sti",options(nostack));
+        }
+    }
 }
 
 extern "C" fn allocation_task(slot: usize) {
@@ -1476,19 +1505,43 @@ pub unsafe fn shell(platform: &Platform, info: &crate::BootInfo) -> Result<(), E
     };
     let terminal = storage.address() as *mut crate::tty::Terminal;
     let mut initialized = false;
+    let mut display: Option<ScreenWork> = None;
+    let mut display_storage: Option<crate::frames::FrameRange> = None;
     let started = (|| -> Result<usize, Error> {
         terminal.write(crate::tty::Terminal::new(platform, cpu.expected_id, crate::serial_available()));
         initialized = true;
         // The BSP TTY owns the mapped GOP framebuffer for the entire shell
         // session; the serial path remains available if GOP validation fails.
-        if let Some(screen) = crate::fb_console::Console::below_boot_status(
-            info.framebuffer, info.width as usize, info.height as usize,
-            info.stride as usize, info.pixel_format
-        ) {
-            (*terminal).attach_screen(screen);
-        } else {
+        let configured = (|| -> Option<()> {
+            let geometry=crate::fb_console::Geometry::below_boot_status(
+                info.framebuffer,info.width as usize,info.height as usize,
+                info.stride as usize,info.pixel_format)?;
+            let pages=geometry.storage_bytes()?.checked_add(PAGE-1)?/PAGE;
+            let range=cpu.load.frames.with(|f|f.alloc_contiguous(pages,PAGE,0,u64::MAX))?;
+            let Some((model,renderer))=crate::fb_console::Console::new(
+                geometry,range.address() as *mut u8,range.byte_len()) else {
+                cpu.load.frames.with(|f|f.release_range(range));return None;
+            };
+            display=Some(ScreenWork{terminal,renderer});
+            let work=display.as_mut().unwrap() as *mut ScreenWork;
+            // The runtime queue is not active or published yet. Allocate a
+            // separate kernel-service stack without consuming a user slot.
+            if cpu.load.frames.with(|f|(*cpu.queue.get()).spawn_service(
+                f,screen_worker,work as usize,(*terminal).screen_event())).is_none() {
+                display=None;
+                cpu.load.frames.with(|f|f.release_range(range));
+                return None;
+            }
+            // Outside every lock, before any IRQ or worker can see the TTY.
+            (*work).renderer.initialize();
+            (*terminal).attach_screen(model);
+            display_storage=Some(range);
+            Some(())
+        })();
+        if configured.is_none() {
             let _ = crate::logger::LOGGER.record(timestamp(), cpu.expected_id as u32,
                 crate::log_policy::Level::Error, b"TTY GOP unavailable");
+            if !crate::serial_available() {return Err(b"TTY output unavailable");}
         }
         let queue = &mut *cpu.queue.get();
         let pid = queue.parked_root().ok_or(b"PID1 not parked" as Error)?;
@@ -1508,11 +1561,18 @@ pub unsafe fn shell(platform: &Platform, info: &crate::BootInfo) -> Result<(), E
     if initialized { (*terminal).disable(); }
     cpu.terminal.get().write(ptr::null_mut());
     gTerminal.store(0, Ordering::Release);
+    // The runtime caller can only be selected when the display task is
+    // parked, not halfway through painting a snapshot. Finish final echo
+    // or disable diagnostics before releasing its separately owned RAM.
+    if let Some(work)=display.as_mut() {
+        if (*terminal).snapshot_screen(&mut work.renderer) {work.renderer.render();}
+    }
     let mut pCleanupQueue = cpu.lockQueue();
     let result = cpu.load.frames.with(|f| {
         let q = &mut *pCleanupQueue;
         let status = started;
         q.reap(f);
+        if let Some(range)=display_storage.take() {f.release_range(range);}
         f.release(storage);
         let matched = baseline.matches(f);
         baseline.release(f);

@@ -161,6 +161,20 @@ fn terminal() -> tty::Terminal {
     pTerminal
 }
 
+fn attach_screen(term:&tty::Terminal,pixels:&mut [u32],width:usize,height:usize)
+    ->(Vec<u8>,fb_console::Renderer) {
+    let geometry=unsafe{fb_console::Geometry::new(pixels.as_mut_ptr(),width,height,width,0)}.unwrap();
+    let mut backing=vec![0xa5;geometry.storage_bytes().unwrap()];
+    let (screen,mut renderer)=unsafe{fb_console::Console::new(geometry,backing.as_mut_ptr(),backing.len())}.unwrap();
+    renderer.initialize();
+    term.attach_screen(screen);
+    assert!(term.snapshot_screen(&mut renderer));renderer.render();
+    (backing,renderer)
+}
+fn flush_screen(term:&tty::Terminal,renderer:&mut fb_console::Renderer)->usize {
+    if term.snapshot_screen(renderer) {renderer.render()} else {0}
+}
+
 fn receive(aTerminal: &mut tty::Terminal, aBytes: &[u8]) {
     ports(|p| p.fReceive.extend(aBytes.iter().copied()));
     unsafe { aTerminal.interrupt(); }
@@ -307,16 +321,18 @@ fn damagedKeyboardInputCannotExecuteTruncatedCommand() {
 fn shellAndKeyboardOutputAreMirroredToFramebuffer() {
     let width=96usize;let height=27usize;
     let mut pixels=vec![0u32;width*height];
-    let screen=unsafe{fb_console::Console::new(pixels.as_mut_ptr(),width,height,width,0)}.unwrap();
-    let before=pixels.clone();
     let mut term=terminal();
-    term.attach_screen(screen);
+    let (_backing,mut renderer)=attach_screen(&term,&mut pixels,width,height);
+    let before=pixels.clone();
     assert_eq!(unsafe{term.write(b"shell> ")},Ok(7));
+    assert_eq!(pixels,before,"producer drew under TTY gate");
+    assert!(flush_screen(&term,&mut renderer)>0);
     assert_ne!(pixels,before,"shell prompt never reached framebuffer");
     receive(&mut term,b"x");
     ps2::inject(&[Ok(0x2e),Ok(0x1c)]); // 'c', Enter
     unsafe{term.keyboard_interrupt();}
     assert_eq!(read(&mut term,64),Ok((Some(3),b"xc\n".to_vec())));
+    assert!(flush_screen(&term,&mut renderer)>0);
     assert!(pixels.iter().any(|&v|v==0xffffff),"no rendered glyph pixels");
     ports(|p|assert!(p.fTransmit.ends_with(b"xc\r\n")));
 }
@@ -325,12 +341,13 @@ fn shellAndKeyboardOutputAreMirroredToFramebuffer() {
 fn framebufferShellStaysUsableWhenUartTransmitStalls() {
     let width=60usize;let height=27usize;
     let mut pixels=vec![0u32;width*height];
-    let screen=unsafe{fb_console::Console::new(pixels.as_mut_ptr(),width,height,width,0)}.unwrap();
-    let initial=pixels.clone();
     let mut term=terminal();
-    term.attach_screen(screen);
+    let (_backing,mut renderer)=attach_screen(&term,&mut pixels,width,height);
+    let initial=pixels.clone();
     ports(|p|p.fTransmitRemaining=Some(0));
     assert_eq!(unsafe{term.write(b"hello\n")},Ok(6));
+    assert_eq!(pixels,initial);
+    assert!(flush_screen(&term,&mut renderer)>0);
     assert_ne!(pixels,initial,"serial failure must not suppress screen output");
     ports(|p|assert!(p.fTransmit.is_empty()));
     receive(&mut term,b"ok\r");
@@ -412,11 +429,13 @@ fn localKeyboardAndGopOperateWithoutAnyUart() {
     ports(|p| *p = Ports::default());
     let mut terminal = unsafe { tty::Terminal::new(&acpi::Platform { ps2_controller: true }, 0, false) };
     let mut pixels = vec![0u32; 96*27];
-    terminal.attach_screen(unsafe { fb_console::Console::new(pixels.as_mut_ptr(),96,27,96,0) }.unwrap());
+    let (_backing,mut renderer)=attach_screen(&terminal,&mut pixels,96,27);
     let before = pixels.clone();
     unsafe { terminal.enable(); terminal.enable(); }
     assert!(!terminal.ready());
     assert_eq!(unsafe { terminal.write(b"agentos> ") }, Ok(9));
+    assert_eq!(pixels,before);
+    assert!(flush_screen(&terminal,&mut renderer)>0);
     assert_ne!(pixels,before);
     ps2::inject(&[Ok(0x23), Ok(0x12), Ok(0x26), Ok(0x19), Ok(0x1c)]);
     unsafe { terminal.keyboard_interrupt(); terminal.interrupt(); }
@@ -463,4 +482,28 @@ fn missingKeyboardRouteOrControllerDoesNotTouchAnAbsentUart() {
             assert!(p.fWrites.is_empty());
         });
     }
+}
+
+
+#[test]
+fn short_writes_and_irq_echo_coalesce_without_losing_pending_work() {
+    let mut term=terminal();
+    let mut pixels=vec![0u32;96*27];
+    let (_backing,mut renderer)=attach_screen(&term,&mut pixels,96,27);
+    let before=pixels.clone();
+    for _ in 0..64 {assert_eq!(unsafe{term.write(b"x\n")},Ok(2));}
+    receive(&mut term,b"echo");
+    assert_eq!(pixels,before);
+    assert!(term.snapshot_screen(&mut renderer));
+    assert!(!term.screen_pending());
+    assert_eq!(unsafe{term.write(b"later")},Ok(5));
+    receive(&mut term,b" hi\r");
+    assert!(term.screen_pending());
+    assert!(renderer.render()>0);
+    let first=pixels.clone();
+    assert!(flush_screen(&term,&mut renderer)>0);
+    assert_ne!(pixels,first);
+    assert!(!term.screen_pending());
+    assert_eq!(flush_screen(&term,&mut renderer),0);
+    assert_eq!(read(&mut term,64),Ok((Some(8),b"echo hi\n".to_vec())));
 }
