@@ -256,7 +256,8 @@ def run_session(process, capture, qmp, destination, runtime_process_regression=F
             wait_session(process, capture, serial,
                          lambda data: reply in data[offset:], command, 30)
     if supervisor_image is not None:
-        for command,request in ((session.SUPERVISOR_COMMAND,session.SUPERVISOR_INPUT),
+        for command,request in ((session.MIGRATION_COMMAND,session.MIGRATION_INPUT),
+                                (session.SUPERVISOR_COMMAND,session.SUPERVISOR_INPUT),
                                 (session.PIPE_COMMAND,session.PIPE_INPUT),
                                 *((command,(command+"\r").encode("ascii"))
                                   for command in session.MEMORY_COMMANDS),
@@ -546,14 +547,17 @@ def boot(args):
     if supervisor_image!="test":
         cow.verify_absent(text)
         demand.verify_absent(text)
-    migration_result = migration.verify(text, args.cpus)
-    service_manager.verify(text)
+    migration.verify_boot(text, allow_foreground=supervisor_image=="test")
+    service_manager.verify(text, migration_staged=True, allow_migration_workload=supervisor_image=="test")
+    migration_result = {"absent":True}
     session_result = None
     if args.session:
         session_result = session.verify(serial.read_bytes(), (destination / "com1-input.bin").read_bytes(),
                                         True, args.cpus,
                                         aRuntimeProcess=getattr(args,"runtime_process_regression",False),
-                                        aSupervisorImage=supervisor_image)
+                                        aSupervisorImage=supervisor_image,aMigrationStaged=True)
+        if supervisor_image is not None:
+            migration_result = session_result["runtime_migration"]
     bases = re.findall(r"(?m)^\[INFO\] KERNEL IMAGE BASE=([0-9a-f]{16})\r?$", text)
     if len(bases) != 1:
         raise RuntimeError(f"Expected one actual runtime kernel image address: {bases}")
@@ -580,6 +584,7 @@ def boot(args):
         "interactive_com1_manager_session": args.session,
         "ps2_keyboard_session": args.session,
         "runtime_session": session_result,
+        "migration_contract": "foreground-v1",
         "migration": migration_result,
         "gop_sha256": evidence.sha256(destination / "shell-screen.ppm"),
         "host_elapsed_seconds": round(time.monotonic()-start, 3),

@@ -77,10 +77,12 @@ class ImageTests(unittest.TestCase):
         self.adoption_runner=b"adoption runner fixture"
         self.ipc_runner=b"ipc runner fixture"
         self.ipc_service=b"ipc service fixture"
+        self.migration_runner=b"migration runner fixture"
         self.additions=[(images.RUNNER,self.runner),(images.PIPE_RUNNER,self.pipe_runner),
                         (images.PIPE_RECEIVER,self.pipe_receiver),(images.COW_RUNNER,self.cow_runner),
                         (images.DEMAND_RUNNER,self.demand_runner),(images.ADOPTION_RUNNER,self.adoption_runner),
-                        (images.IPC_RUNNER,self.ipc_runner),(images.IPC_SERVICE,self.ipc_service)]
+                        (images.IPC_RUNNER,self.ipc_runner),(images.IPC_SERVICE,self.ipc_service),
+                        (images.MIGRATION_RUNNER,self.migration_runner)]
         self.staged=archive([*self.entries,*self.additions])
         self.kernel=b"kernel fixture"
 
@@ -90,12 +92,22 @@ class ImageTests(unittest.TestCase):
         return images.verify_contents(images.signed_payload(a,fake_certificate(a)),
             images.signed_payload(b,fake_certificate(b)),self.kernel,control,staged,
             self.runner if runner is None else runner,self.pipe_runner,self.pipe_receiver,
-            self.cow_runner,self.demand_runner,self.adoption_runner,self.ipc_runner,self.ipc_service)
+            self.cow_runner,self.demand_runner,self.adoption_runner,self.ipc_runner,self.ipc_service,self.migration_runner)
 
     def test_exact_archive_addition(self):
         result=self.check(self.control,self.staged)
         self.assertEqual(set(result),{name for name,_ in self.entries})
         self.assertNotIn(images.RUNNER,result)
+
+    def test_migration_payload_and_marker_cannot_leak(self):
+        for name,data in ((images.MIGRATION_RUNNER,b"elf"),("nested/migration-runner",b"elf"),
+                          ("renamed",b"AGENTOS MIGRATION OWNER")):
+            with self.subTest(name=name),self.assertRaises(images.VerificationError):
+                images.verify_distribution(archive([*self.entries,(name,data)]))
+        for changed in ([(n,v) for n,v in self.additions if n!=images.MIGRATION_RUNNER],
+                        [(n,b"wrong" if n==images.MIGRATION_RUNNER else v) for n,v in self.additions]):
+            with self.assertRaises(images.VerificationError):
+                self.check(self.control,archive([*self.entries,*changed]))
 
     def test_missing_extra_changed_runner_or_common_entry(self):
         for a,b in ((self.staged,self.staged),(self.control,self.control),
@@ -506,7 +518,7 @@ class RuntimeTests(unittest.TestCase):
             b"exit status 42\r\nagentos> run /fault\r\n"
             b"AGENTOS USER FAULT PID=0000000000000012 PARENT=0000000000000009 CR3=0000000000500000 VECTOR=000000000000000e ERROR=0000000000000005 ADDRESS=0000000002000000\r\n"
             b"exit status 270\r\nagentos> ")
-        common_input=session.runtime_input()+session.SUPERVISOR_INPUT+session.PIPE_INPUT+session.MEMORY_INPUT+session.IPC_INPUT+session.ADOPTION_INPUT
+        common_input=session.runtime_input()+session.MIGRATION_INPUT+session.SUPERVISOR_INPUT+session.PIPE_INPUT+session.MEMORY_INPUT+session.IPC_INPUT+session.ADOPTION_INPUT
         for variant,prefix in (("control",(session.SUPERVISOR_COMMAND+"\r\n").encode()+session.SUPERVISOR_MISSING+
                                           (session.PIPE_COMMAND+"\r\n").encode()+session.SUPERVISOR_MISSING+
                                           b"".join((command+"\r\n").encode()+session.SUPERVISOR_MISSING
@@ -515,6 +527,10 @@ class RuntimeTests(unittest.TestCase):
                                ("test",supervisor_transcript()+supervisor_transcript(runner=40,pipe=True)+
                                 supervisor_transcript(runner=60,memory="cow")+supervisor_transcript(runner=80,memory="demand")+
                                 supervisor_transcript(runner=90,ipc=True))):
+            migration_echo=(session.MIGRATION_COMMAND+"\r\n").encode()
+            migration_fixture=load("test-verify-migration.py")
+            prefix=migration_echo+(session.SUPERVISOR_MISSING if variant=="control" else
+                                   migration_fixture.foreground((7,)))+prefix
             prefix+=((session.ADOPTION_COMMAND+"\r\n").encode()+session.SUPERVISOR_MISSING
                      if variant=="control" else adoption_transcript())
             serial=common_input+(session.ADOPTION_BYTES if variant=="test" else b"")+session.transmitted_input(9,True)
@@ -524,9 +540,10 @@ class RuntimeTests(unittest.TestCase):
                 cleanup=(b"AGENTOS USER KILL PID=000000000000006a PARENT=0000000000000001 STATUS=0000000000000089\r\n"
                          b"AGENTOS MANAGER REAP ROOT=0000000000000001 PID=000000000000006a STATUS=0000000000000089\r\n")
                 log=log.replace(ending,cleanup+ending,1)
-            result=session.verify(log,serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant)
+            result=session.verify(log,serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant,aMigrationStaged=True)
             self.assertEqual(result["runtime_adoption"]["absent"],variant=="control")
             self.assertEqual(result["runtime_ipc"]["absent"],variant=="control")
+            self.assertEqual(result["runtime_migration"].get("absent",False),variant=="control")
             if variant=="test":
                 self.assertEqual(result["runtime_adoption"]["shutdown_collection"],{"pid":106,"status":137})
                 self.assertEqual(result,json.loads(json.dumps(result)))
@@ -535,7 +552,7 @@ class RuntimeTests(unittest.TestCase):
                                         b"PID=000000000000006a STATUS=0000000000000000",1)):
                     self.assertNotEqual(bad,log)
                     with self.assertRaises(session.VerificationError):
-                        session.verify(bad,serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant)
+                        session.verify(bad,serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant,aMigrationStaged=True)
             self.assertEqual([r["status"] for r in result["runtime_process_regression"]],[0,42,270])
             self.assertEqual(result["restarted_pids"],[111,112,113])
             self.assertEqual(result["runtime_supervisor"]["absent"],variant=="control")
@@ -544,7 +561,7 @@ class RuntimeTests(unittest.TestCase):
                 self.assertEqual(result["runtime_"+kind]["absent"],variant=="control")
             # The entire normal boot (and every non-workload byte afterward)
             # must be free of the relocated supervisor, even in the staged image.
-            markers=(b"AGENTOS SUPERVISOR BEGIN PARENT=0000000000000001\r\n",
+            markers=(b"AGENTOS MIGRATION OWNER ROOT=0000000000000001\r\n",b"AGENTOS SUPERVISOR BEGIN PARENT=0000000000000001\r\n",
                      b"AGENTOS SERVICE DONE PARENT=0000000000000001\r\n",
                      b"AGENTOS TEST PEER_BEGIN PID=0000000000000001\r\n",
                      b"AGENTOS PIPE TEST RECEIVED PID=0000000000000001\r\n",
@@ -559,25 +576,30 @@ class RuntimeTests(unittest.TestCase):
             for marker in markers:
                 for bad in (marker+log,log.replace(prefix,prefix+marker,1)):
                     with self.assertRaises(session.VerificationError):
-                        session.verify(bad,serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant)
+                        session.verify(bad,serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant,aMigrationStaged=True)
+            for bad in (log.replace(b"run /migration-runner\r\n",b"",1),
+                        log.replace(b"APIC=0000000000000007 TIMER-WAKES=",b"APIC=0000000000000008 TIMER-WAKES=",1)
+                        if variant=="test" else log.replace(b"TIMER-WAKES=0000000000000003",b"TIMER-WAKES=0000000000000002",1)):
+                with self.assertRaises(session.VerificationError):
+                    session.verify(bad,serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant,aMigrationStaged=True)
             for bad,bad_input in ((log,serial[1:]),(log.replace(b"FRAMES=OK",b"FRAMES=LEAK"),serial),
                                   (log.replace(b"VECTOR=000000000000000e",b"VECTOR=000000000000000d"),serial),
                                   (log.replace(b"TIMERS=0000000000000005",b"TIMERS=0000000000000100"),serial)):
                 with self.assertRaises(session.VerificationError):
-                    session.verify(bad,bad_input,True,1,aRuntimeProcess=True,aSupervisorImage=variant)
+                    session.verify(bad,bad_input,True,1,aRuntimeProcess=True,aSupervisorImage=variant,aMigrationStaged=True)
             with self.assertRaises(session.VerificationError):
                 session.verify(log,serial,True,1,aRuntimeProcess=True,
-                               aSupervisorImage="test" if variant=="control" else "control")
+                               aSupervisorImage="test" if variant=="control" else "control",aMigrationStaged=True)
             with self.assertRaises(session.VerificationError):
                 session.verify(log,serial,True,1,aRuntimeProcess=True)
             if variant=="test":
                 with self.assertRaises(session.VerificationError):
                     session.verify(log.replace(supervisor_transcript(runner=40,pipe=True),b"",1),
-                                   serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant)
+                                   serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant,aMigrationStaged=True)
                 duplicate=log.replace(b"PID=000000000000006f CR3=",b"PID=0000000000000014 CR3=",1)
                 self.assertNotEqual(duplicate,log)
                 with self.assertRaises(session.VerificationError):
-                    session.verify(duplicate,serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant)
+                    session.verify(duplicate,serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant,aMigrationStaged=True)
 
     def test_adoption_requires_original_status_owner_distinct_passes_and_actual_cpu(self):
         for apics in ((7,),(7,19)):

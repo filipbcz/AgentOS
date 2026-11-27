@@ -29,6 +29,9 @@ READY = b"AGENTOS SHELL READY\r\nagentos> "
 # Only the separate test harness sends these ordinary shell commands.
 # These ELF fixtures already exist in the historical signed initramfs.
 RUNTIME_PROGRAMS = (("run /svc_ok",0),("run /svc_fail",42),("run /fault",270))
+MIGRATION_COMMAND = "run /migration-runner"
+MIGRATION_INPUT = (MIGRATION_COMMAND+"\r").encode("ascii")
+MIGRATION_MARKER = b"AGENTOS MIGRATION"
 SUPERVISOR_COMMAND = "run /supervisor-runner"
 SUPERVISOR_INPUT = (SUPERVISOR_COMMAND+"\r").encode("ascii")
 PIPE_COMMAND = "run /pipe-runner"
@@ -209,9 +212,41 @@ def without_kernel_events(aBytes):
     return KERNEL_EVENT.sub(b"",aBytes)
 
 
-def timerCpuCount(aLog, aCpus):
+def bootCpuRoster(aLog, aCpus):
+    require(type(aCpus) is int and aCpus in (1,2), "Invalid configured CPU count")
+    shell = SHELL_START.search(aLog)
+    require(shell is not None, "Missing shell boundary for actual CPU roster")
+    roster = re.findall(rb"(?m)^AGENTOS TASK (BSP|AP) APIC=("+HEX+
+                        rb") TIMER-WAKES=0000000000000003\r?$",aLog[:shell.start()])
+    ids = [int(v,16) for _,v in roster]
+    require(len(roster)==len(set(ids))==aCpus and all(0<=v<255 for v in ids)
+            and sum(role==b"BSP" for role,_ in roster)==1,"Missing actual boot CPU roster")
+    return set(ids)
+
+
+def migration_prefix(data, shell, shell_cr3, prior_pids, variant, apics):
+    echo = (MIGRATION_COMMAND+"\r\n").encode("ascii")
+    require(data.startswith(echo),"Missing migration foreground command echo")
+    if variant=="control":
+        require(data[len(echo):].startswith(SUPERVISOR_MISSING),
+                "Distribution did not reject the absent migration runner")
+        return len(echo)+len(SUPERVISOR_MISSING), {"absent":True}, set()
+    require(variant=="test", "Unknown migration image variant")
+    spec=importlib.util.spec_from_file_location("foregroundMigration",Path(__file__).with_name("verify-migration.py"))
+    verifier=importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+    try:
+        consumed,result,pids=verifier.verify_foreground(data[len(echo):],shell,shell_cr3,prior_pids,apics)
+    except verifier.VerificationError as error:
+        raise VerificationError(f"Invalid foreground migration evidence: {error}") from error
+    return len(echo)+consumed,result,pids
+
+
+def timerCpuCount(aLog, aCpus, *, aMigrationStaged=False):
     require(aCpus is None or type(aCpus) is int and aCpus in (1,2),
             "Invalid configured CPU count for runtime timing")
+    if aMigrationStaged:
+        return len(bootCpuRoster(aLog,aCpus))
     # Historical native-v1 captures measured one CPU. A command-line override
     # must not silently enlarge their budget. Native-v2 evidence includes the
     # complete migration prelude and must match the actual VM configuration.
@@ -251,12 +286,15 @@ def verify_idle(aBytes, aCpus=1, aClockMaintenanceMs=1000):
 
 
 def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceMs=1000,
-           aRuntimeProcess=False, aSupervisorImage=None, aHistoricalBootMemory=False):
+           aRuntimeProcess=False, aSupervisorImage=None, aHistoricalBootMemory=False, aMigrationStaged=False):
     require(aSupervisorImage is None or (aRuntimeProcess and aSupervisorImage in ("control","test")),
             "Supervisor image scenario requires the existing foreground regression")
     require(re.search(rb"AGENTOS PIPE (?!TEST )",aLog) is None,
             "Historical boot pipe transfer is not permitted in either signed image")
     pWorkloadMarkers=(b"AGENTOS SUPERVISOR",b"AGENTOS SERVICE ",b"AGENTOS TEST ",b"AGENTOS PIPE TEST ",ADOPTION_MARKER,IPC_MARKER)
+    if aMigrationStaged:
+        require(not aHistoricalBootMemory,"Mixed historical and foreground migration contracts")
+        pWorkloadMarkers+=(MIGRATION_MARKER,)
     if aHistoricalBootMemory:
         # Explicit historical receipt inspection only, after its independent
         # old boot-memory validators have run. Never selected by QEMU or the
@@ -275,7 +313,7 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
     if aSupervisorImage!="test":
         require(not any(marker in aLog for marker in pWorkloadMarkers),
                 "Acceptance workload ran in the ordinary distribution")
-    pTimerCpus = timerCpuCount(aLog,aCpus)
+    pTimerCpus = timerCpuCount(aLog,aCpus,aMigrationStaged=aMigrationStaged)
     pRoots,pChildren,pEnds = (list(pPattern.finditer(aLog)) for pPattern in
                               (ROOT_START,SHELL_START,SESSION_STOP))
     require(len(pRoots)==len(pChildren)==len(pEnds)==1,
@@ -302,6 +340,7 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
     pMemory={}
     pAdoption=None
     pIpc=None
+    pMigration=None
     pPrefixPids=set()
     if aRuntimeProcess:
         # Account for every earlier actual PID, not just the current shell.
@@ -318,6 +357,14 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
                 rb"(?m)^AGENTOS TASK (?:BSP|AP) APIC=("+HEX+rb") TIMER-WAKES=0000000000000003\r?$",
                 aLog[:pChildren[0].start()])]
             require(len(pApicList)==len(set(pApicList))==aCpus,"Missing actual boot CPU roster")
+            pMigrationLog=b""
+            if aMigrationStaged:
+                pConsumed,pMigration,pNewPids=migration_prefix(
+                    pInteractive,pShell,int(pShellExits[0][2],16),
+                    pPrior | pPrefixPids,aSupervisorImage,bootCpuRoster(aLog,aCpus))
+                pMigrationLog=pInteractive[:pConsumed]
+                pPrefixPids.update(pNewPids)
+                pInteractive=pInteractive[pConsumed:]
             pConsumed,pSupervisor,pNewPids=supervisor_prefix(
                 pInteractive,pShell,int(pShellExits[0][2],16),
                 pPrior | pPrefixPids,aSupervisorImage,set(pApicList))
@@ -327,7 +374,7 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
             pConsumed,pPipe,pNewPids=supervisor_prefix(
                 pInteractive,pShell,int(pShellExits[0][2],16),
                 pPrior | pPrefixPids,aSupervisorImage,set(pApicList),pipe=True)
-            pWorkloadLog=pSupervisorLog+pInteractive[:pConsumed]
+            pWorkloadLog=pMigrationLog+pSupervisorLog+pInteractive[:pConsumed]
             pPrefixPids.update(pNewPids)
             pInteractive=pInteractive[pConsumed:]
             for kind in ("cow","demand"):
@@ -364,6 +411,8 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
     if aInput is not None:
         pPrefix=runtime_input() if aRuntimeProcess else b""
         if aSupervisorImage is not None:
+            if aMigrationStaged:
+                pPrefix+=MIGRATION_INPUT
             pPrefix+=SUPERVISOR_INPUT+PIPE_INPUT+MEMORY_INPUT+IPC_INPUT+ADOPTION_INPUT
             if aSupervisorImage=="test":
                 pPrefix+=ADOPTION_BYTES
@@ -401,6 +450,9 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
     require(pExit is not None and int(pExit[1],16)==pRoot and int(pExit[2],16)>0 and
             int(pExit[2],16)%4096==0 and int(pExit[3],16)==0,"PID1 did not exit cleanly")
     if aSupervisorImage=="test":
+        if aMigrationStaged:
+            require(int(pExit[2],16) not in ({pMigration["cr3"]} | {x["cr3"] for x in pMigration["worker_exits"]}),
+                    "Foreground migration aliased the live PID1 address space")
         require(int(pExit[2],16) not in {x["cr3"] for x in pAdoption["natural_exits"]},
                 "Adoption descendant aliased the living PID1 address space")
     require(aLog[pEnds[0].end():] in (b"[INFO] INTERACTIVE SHELL STOPPED\r\n",b""),
@@ -416,6 +468,8 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
         result["runtime_demand"]=pMemory["demand"]
         result["runtime_adoption"]=pAdoption
         result["runtime_ipc"]=pIpc
+        if aMigrationStaged:
+            result["runtime_migration"]=pMigration
     return result
 
 
@@ -428,6 +482,7 @@ def main():
     pParser.add_argument("--plan-pid",type=int)
     pParser.add_argument("--runtime-process-regression",action="store_true")
     pParser.add_argument("--supervisor-image",choices=("control","test"))
+    pParser.add_argument("--migration-staged",action="store_true",help="Use the explicit foreground migration contract")
     pArgs = pParser.parse_args()
     if pArgs.plan_pid is not None:
         require(not pArgs.runtime_process_regression and pArgs.supervisor_image is None,"Separate process regression uses the QEMU test driver")
@@ -442,7 +497,7 @@ def main():
     try:
         pResult = verify(pArgs.log.read_bytes(),pArgs.input.read_bytes() if pArgs.input else None,
                          pArgs.keyboard,pArgs.cpus,aRuntimeProcess=pArgs.runtime_process_regression,
-                         aSupervisorImage=pArgs.supervisor_image)
+                         aSupervisorImage=pArgs.supervisor_image,aMigrationStaged=pArgs.migration_staged)
     except (OSError,VerificationError) as pError:
         print(f"Stage-3 interactive verification failed: {pError}",file=sys.stderr)
         return 1

@@ -251,7 +251,7 @@ for pApp in init fault shell svc_ok svc_fail svc_hang orphan_parent manager svc_
     "$pCc" -c "$pRoot/user/$pEntry.S" -o "$pOut/$pApp-entry.o"
     pObjects=("$pOut/$pApp-entry.o")
     case "$pApp" in
-        init) pSources=(orphans migration service_manager);;
+        init) pSources=(orphans service_manager);;
         shell) pSources=(shell service_client);;
         manager) pSources=(service_manager);;
         svc_alive|svc_flaky) pSources=(svc_worker);;
@@ -321,5 +321,12 @@ done
 "$pLd" --no-undefined --build-id=none -z noexecstack -s -T "$pRoot/user/user.ld" \
     -o "$pOut/ipc-service" "$pOut/ipc-service-entry.o" "$pOut/ipc-service.o"
 "$pPython" "$pRoot/scripts/verify-user-abi.py" "$pOut/ipc-service"
+"$pCc" -c "$pRoot/scripts/tests/migration-runner.S" -o "$pOut/migration-runner-entry.o"
+"$pCc" -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
+    -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large \
+    -c "$pRoot/scripts/tests/migration-workload.c" -o "$pOut/migration-workload.o"
+"$pLd" --no-undefined --build-id=none -z noexecstack -s -T "$pRoot/user/user.ld" \
+    -o "$pOut/migration-runner" "$pOut/migration-runner-entry.o" "$pOut/migration-workload.o"
+"$pPython" "$pRoot/scripts/verify-user-abi.py" "$pOut/migration-runner"
 printf 'Host tests and kernel/user ELF links passed: %s\n' "$pOut"
 printf 'EFI assembly/signing, pinned-toolchain reproducibility and VM execution remain separate checks.\n'

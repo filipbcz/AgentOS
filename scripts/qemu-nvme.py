@@ -232,8 +232,8 @@ def phase(args, out, raw, vars_file, esp, mode, expected_details):
                     smoke.orphans.verify(text, args.cpus)
                     smoke.cow.verify_absent(text)
                     smoke.demand.verify_absent(text)
-                    smoke.migration.verify(text, args.cpus)
-                    smoke.service_manager.verify(text)
+                    smoke.migration.verify_boot(text)
+                    smoke.service_manager.verify(text,migration_staged=True)
                     monitor.screenshot(folder / "shell-screen.ppm")
                     smoke.console.verify(folder / "shell-screen.ppm", aLevel="info", aOutput="both")
                 # Stop the emulator process, not a guest reset or snapshot.

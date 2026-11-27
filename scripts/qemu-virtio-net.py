@@ -76,8 +76,8 @@ def verify_kernel(data, cpus):
     smoke.orphans.verify(text,cpus)
     smoke.cow.verify_absent(text)
     smoke.demand.verify_absent(text)
-    smoke.migration.verify(text,cpus)
-    smoke.service_manager.verify(text)
+    smoke.migration.verify_boot(text)
+    smoke.service_manager.verify(text,migration_staged=True)
 
 
 def run(args):

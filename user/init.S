@@ -70,9 +70,6 @@ _start:
     syscall
     test %eax, %eax
     jne failed
-    call runMigration
-    test %eax, %eax
-    jne finished
     call runServiceManager
     jmp finished
 ap_finished:

@@ -66,7 +66,7 @@ for app in init fault shell svc_ok svc_fail svc_hang orphan_parent manager svc_a
     if [[ "$app" == svc_alive || "$app" == svc_flaky ]]; then entry=svc_worker; fi
     gcc-13 -c "$root/user/$entry.S" -o user.o
     objects=(user.o)
-    case "$app" in init) sources=(orphans migration service_manager);; shell) sources=(shell service_client);; manager) sources=(service_manager);; svc_alive|svc_flaky) sources=(svc_worker);; *) sources=();; esac
+    case "$app" in init) sources=(orphans service_manager);; shell) sources=(shell service_client);; manager) sources=(service_manager);; svc_alive|svc_flaky) sources=(svc_worker);; *) sources=();; esac
     for src in "${sources[@]}"; do
         defines=()
         if [[ "$app" == svc_flaky ]]; then defines=(-DAGENTOS_FLAKY); fi
@@ -203,9 +203,16 @@ if ((staging)); then
     ld --no-undefined --build-id=none -z noexecstack -s -T "$root/user/user.ld" \
         -o ipc-service ipc-service-entry.o ipc-service.o
     python3 "$root/scripts/verify-user-abi.py" ipc-service
-    cp supervisor-runner pipe-runner pipe-receiver cow-runner demand-runner adoption-runner ipc-runner ipc-service "$stage_out/"
-    touch -d @0 supervisor-runner pipe-runner pipe-receiver cow-runner demand-runner adoption-runner ipc-runner ipc-service
-    printf '%s\n' "${files[@]}" supervisor-runner pipe-runner pipe-receiver cow-runner demand-runner adoption-runner ipc-runner ipc-service | cpio --quiet --reproducible --owner=0:0 -o -H newc > initramfs.cpio
+    gcc-13 -c "$root/scripts/tests/migration-runner.S" -o migration-runner-entry.o
+    gcc-13 -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
+        -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large \
+        -c "$root/scripts/tests/migration-workload.c" -o migration-workload.o
+    ld --no-undefined --build-id=none -z noexecstack -s -T "$root/user/user.ld" \
+        -o migration-runner migration-runner-entry.o migration-workload.o
+    python3 "$root/scripts/verify-user-abi.py" migration-runner
+    cp supervisor-runner pipe-runner pipe-receiver cow-runner demand-runner adoption-runner ipc-runner ipc-service migration-runner "$stage_out/"
+    touch -d @0 supervisor-runner pipe-runner pipe-receiver cow-runner demand-runner adoption-runner ipc-runner ipc-service migration-runner
+    printf '%s\n' "${files[@]}" supervisor-runner pipe-runner pipe-receiver cow-runner demand-runner adoption-runner ipc-runner ipc-service migration-runner | cpio --quiet --reproducible --owner=0:0 -o -H newc > initramfs.cpio
     cp initramfs.cpio "$stage_out/test.cpio"
     gcc-13 -c "$root/boot/payload.S" -o payload.o
     ld -nostdlib --build-id=none -znocombreloc -T layout.ld -shared -Bsymbolic \

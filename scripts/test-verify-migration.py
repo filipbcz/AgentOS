@@ -2,6 +2,7 @@
 import importlib.util
 from pathlib import Path
 import unittest
+import re
 
 
 def imported(aFile, aName):
@@ -76,6 +77,30 @@ def block(aCpus=2):
     return pLines
 
 
+def foreground(apics=(7,19), root=200, shell=9):
+    """Synthetic host mutation fixture; never a VM receipt."""
+    records=[]
+    for record in block(len(apics)):
+        record=record.replace("ROOT=0000000000000001",f"ROOT={root:016x}")
+        record=record.replace("PARENT=0000000000000001",f"PARENT={root:016x}")
+        record=re.sub(r"\b(CHILD|PID)=([0-9a-f]{16})",
+                      lambda m:f"{m[1]}={root+1+int(m[2],16)-70:016x}",record)
+        record=re.sub(r"\b(CPU|OWNER|SENDER|READER)=([0-9a-f]{16})",
+                      lambda m:f"{m[1]}={apics[int(m[2],16)]:016x}",record)
+        record=re.sub(r"CR3=([0-9a-f]{16})",
+                      lambda m:f"CR3={int(m[1],16)+0x300000:016x}",record)
+        if record.startswith("AGENTOS MIGRATION REAP"):
+            record+=" AGAIN=fffffffffffffff6"
+        records.append(record)
+    def owner(kind):
+        return (f"AGENTOS MIGRATION {kind} ROOT={root:016x} PARENT={shell:016x} "
+                f"CPU={apics[0]:016x} FDS=0000000000000007 CHILD_AFTER=fffffffffffffff6")
+    records=[owner("OWNER"),*records,owner("CLEAN"),
+             f"AGENTOS USER EXIT PID={root:016x} CR3=0000000000600000 STATUS=0000000000000000",
+             "exit status 0"]
+    return ("\r\n".join(records)+"\r\nagentos> ").encode("ascii")
+
+
 def scenario(aCpus=2):
     pLines = gManagerFixture.transcript().splitlines()
     pAt = next(pIndex for pIndex, pLine in enumerate(pLines) if pLine.startswith("AGENTOS MANAGER BEGIN"))
@@ -102,6 +127,34 @@ class MigrationEvidenceTests(unittest.TestCase):
             self.assertEqual(pResult["remote_kill"], pCpus == 2)
             self.assertEqual(pResult["kill_owner_cpu"], 1 if pCpus == 2 else 0)
             self.assertEqual(pManager.verify(pLog), (1, 105))
+
+    def testForegroundIdentityRosterExitAndActualTransitions(self):
+        for apics in ((7,), (7,19)):
+            data=foreground(apics)
+            n,result,pids=gMigration.verify_foreground(data,9,0x300000,{1,9},set(apics))
+            self.assertEqual(n,len(data))
+            self.assertEqual(result["parent"],9)
+            self.assertEqual(result["cr3"],0x600000)
+            self.assertEqual(pids,set(range(200,205)))
+            self.assertEqual(result["worker_apics"],list(apics))
+            self.assertEqual(result["work_observed_moves"],2 if len(apics)==2 else 0)
+            for old,new in ((b"PARENT=0000000000000009",b"PARENT=0000000000000001"),
+                            (b"CPU=0000000000000007",b"CPU=0000000000000008"),
+                            (b"AGAIN=fffffffffffffff6",b"AGAIN=0000000000000000"),
+                            (b"FDS=0000000000000007",b"FDS=000000000000000f"),
+                            (b"CR3=0000000000600000",b"CR3=0000000000300000"),
+                            (b"exit status 0",b"exit status 137"),
+                            (b"AGENTOS MIGRATION ENDED",b"AGENTOS MIGRATION LOST"),
+                            (b"STATUS=0000000000000089",b"STATUS=0000000000000000")):
+                with self.subTest(old=old),self.assertRaises(gMigration.VerificationError):
+                    gMigration.verify_foreground(data.replace(old,new,1),9,0x300000,{1,9},set(apics))
+            with self.assertRaises(gMigration.VerificationError):
+                gMigration.verify_foreground(data,9,0x300000,{1,9,201},set(apics))
+        bad=foreground().replace(b"MOVED",b"ARMED",1)
+        with self.assertRaises(gMigration.VerificationError):
+            gMigration.verify_foreground(bad,9,0x300000,{1,9},{7,19})
+        with self.assertRaises(gMigration.VerificationError):
+            gMigration.verify(foreground().decode("ascii"),2)
 
     def testEveryProtocolRecordIsRequiredAndDuplicatesAreRejected(self):
         pLines = scenario().splitlines()

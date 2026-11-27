@@ -1,4 +1,4 @@
-#include "abi.h"
+#include "../../user/abi.h"
 
 /* Real native processes exercise the ordinary balancing policy. There is no
  * test affinity, forced-move syscall, fixed PID or shared userspace address
@@ -87,7 +87,36 @@ static int boundary(const char *aKind, const struct ScheduleStats *aStats,
     return output(pLine, pLength);
 }
 
-static int reaped(unsigned aSlot, long aChild, long aStatus) {
+/* Foreground spawn inherits only stdio. DUP2(fd,fd) validates an open
+ * descriptor without changing it, and CHILD_AFTER is scoped to its owner. */
+static long descriptorMask(void) {
+    unsigned long pMask = 0;
+    for (long pFd = 0; pFd < 32; ++pFd) {
+        long pResult = os_call(SYS_DUP2, pFd, pFd, 0);
+        if (pResult == pFd) pMask |= 1UL << pFd;
+        else if (pResult != -9) return -1;
+    }
+    return (long)pMask;
+}
+
+static int ownerEvent(const char *aKind, const struct ScheduleStats *aStats) {
+    char pLine[256];
+    unsigned pLength = 0;
+    long pMask = descriptorMask();
+    long pEmpty = os_call(SYS_CHILD_AFTER, 0, 0, 0);
+    if (pMask != 7 || pEmpty != -10 || aStats->fPid != (unsigned long)gRoot ||
+        aStats->fParent <= 1) return 0;
+    appendText(pLine, &pLength, "AGENTOS MIGRATION ");
+    appendText(pLine, &pLength, aKind);
+    appendField(pLine, &pLength, " ROOT=", aStats->fPid);
+    appendField(pLine, &pLength, " PARENT=", aStats->fParent);
+    appendField(pLine, &pLength, " CPU=", aStats->fCpu);
+    appendField(pLine, &pLength, " FDS=", pMask);
+    appendField(pLine, &pLength, " CHILD_AFTER=", pEmpty);
+    return output(pLine, pLength);
+}
+
+static int reaped(unsigned aSlot, long aChild, long aStatus, long aAgain) {
     char pLine[160];
     unsigned pLength = 0;
     appendText(pLine, &pLength, "AGENTOS MIGRATION REAP");
@@ -95,6 +124,7 @@ static int reaped(unsigned aSlot, long aChild, long aStatus) {
     appendField(pLine, &pLength, " CHILD=", aChild);
     appendField(pLine, &pLength, " SLOT=", aSlot);
     appendField(pLine, &pLength, " STATUS=", aStatus);
+    appendField(pLine, &pLength, " AGAIN=", aAgain);
     return output(pLine, pLength);
 }
 
@@ -350,7 +380,7 @@ static int migrationScenario(void) {
         os_call(SYS_SCHED_STATS, 0, sizeof(pBefore), 0) != -14 ||
         os_call(SYS_SCHED_STATS, (long)&pBefore, sizeof(pBefore) - 1, 0) != -22 ||
         os_call(SYS_SCHED_STATS, (long)&pBefore, sizeof(pBefore), 1) != -22 ||
-        !boundary("BEGIN", &pBefore, 0, pNow)) return 171;
+        !ownerEvent("OWNER", &pBefore) || !boundary("BEGIN", &pBefore, 0, pNow)) return 171;
     long pTimeout = pNow + pTimeoutMs;
     gMigrationMemory[0] = 0x31;
     static const char pFile[] = "/data/transfer.bin";
@@ -454,8 +484,9 @@ static int migrationScenario(void) {
     if (pVictim == pWorkers || pNow < 0 || pNow > pTimeout - pKillMs) return 190;
     long pKillUntil = pNow + pKillMs;
     if (!killEvent("KILL", pVictim, &pChildren[pVictim], &pKillParent, pNow, pKillUntil) ||
-        os_call(SYS_KILL, pChildren[pVictim].fPid, 0, 0) != 0 ||
-        os_call(SYS_WAIT_CHILD_UNTIL, pChildren[pVictim].fPid, pKillUntil, 0) != 137) return 191;
+        os_call(SYS_KILL, pChildren[pVictim].fPid, 0, 0) != 0) return 191;
+    long pKillStatus = os_call(SYS_WAIT_CHILD_UNTIL, pChildren[pVictim].fPid, pKillUntil, 0);
+    if (pKillStatus != 137) return 191;
     pNow = now();
     struct ScheduleStats pCollected;
     if (pNow < 0 || pNow > pKillUntil || !scheduleStats(&pCollected) ||
@@ -470,9 +501,11 @@ static int migrationScenario(void) {
     for (unsigned pIndex = 0; pIndex < pWorkers; ++pIndex)
         if (pIndex != pVictim && !sendCommand(pIndex, pExit, 0)) return 184;
     for (unsigned pIndex = 0; pIndex < pWorkers; ++pIndex) {
-        long pStatus = pIndex == pVictim ? 137 :
+        long pStatus = pIndex == pVictim ? pKillStatus :
             os_call(SYS_WAIT_CHILD_UNTIL, pChildren[pIndex].fPid, pTimeout, 0);
-        if (pStatus != (pIndex == pVictim ? 137 : 0) || !reaped(pIndex, pChildren[pIndex].fPid, pStatus) ||
+        long pAgain = os_call(SYS_TRY_WAIT, pChildren[pIndex].fPid, 0, 0);
+        if (pStatus != (pIndex == pVictim ? 137 : 0) || pAgain != -10 ||
+            !reaped(pIndex, pChildren[pIndex].fPid, pStatus, pAgain) ||
             os_call(SYS_CLOSE, gChannels[pIndex][0], 0, 0) != 0) return 185;
     }
     pNow = now();
@@ -483,7 +516,8 @@ static int migrationScenario(void) {
         (pAfter.fCpus == 1 && (pObserved != 0 || pAfter.fTotalMoves != pBefore.fTotalMoves)) ||
         (pAfter.fCpus > 1 && (pObserved < 2 || pAfter.fTotalMoves - pBefore.fTotalMoves < pObserved ||
                            pAfter.fWakeups == pBefore.fWakeups)) ||
-        !boundary("ENDED", &pAfter, pObserved, pNow)) return 186;
+        pAfter.fParent != pBefore.fParent ||
+        !boundary("ENDED", &pAfter, pObserved, pNow) || !ownerEvent("CLEAN", &pAfter)) return 186;
     return 0;
 }
 
