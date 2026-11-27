@@ -33,6 +33,8 @@ SUPERVISOR_COMMAND = "run /supervisor-runner"
 SUPERVISOR_INPUT = (SUPERVISOR_COMMAND+"\r").encode("ascii")
 PIPE_COMMAND = "run /pipe-runner"
 PIPE_INPUT = (PIPE_COMMAND+"\r").encode("ascii")
+MEMORY_COMMANDS = ("run /cow-runner", "run /demand-runner")
+MEMORY_INPUT = b"".join((command+"\r").encode("ascii") for command in MEMORY_COMMANDS)
 SUPERVISOR_MISSING = b"run: spawn failed (-2)\r\nagentos> "
 
 def runtime_input():
@@ -74,10 +76,12 @@ def runtime_process_prefix(data, shell, shell_cr3, prior_pids):
     return offset,records
 
 
-def supervisor_prefix(data, shell, shell_cr3, prior_pids, variant, apics, *, pipe=False):
+def supervisor_prefix(data, shell, shell_cr3, prior_pids, variant, apics, *, pipe=False, memory=None):
     """Consume only a verified per-CPU foreground workload (or real ENOENT)."""
     require(variant in ("control", "test"), "Invalid supervisor image variant")
-    echo = ((PIPE_COMMAND if pipe else SUPERVISOR_COMMAND)+"\r\n").encode("ascii")
+    require(memory in (None,"cow","demand") and not (pipe and memory),"Invalid workload kind")
+    command=("run /"+memory+"-runner" if memory else PIPE_COMMAND if pipe else SUPERVISOR_COMMAND)
+    echo = (command+"\r\n").encode("ascii")
     require(data.startswith(echo), "Missing supervisor command echo")
     offset = len(echo)
     if variant == "control":
@@ -89,13 +93,16 @@ def supervisor_prefix(data, shell, shell_cr3, prior_pids, variant, apics, *, pip
     filenames=("verify-supervisor.py","verify-supervisor-locality.py")
     if pipe:
         filenames+=("verify-pipe-transfer.py",)
+    elif memory:
+        filenames+=("verify-memory-workload.py",)
     for filename in filenames:
         spec=importlib.util.spec_from_file_location(filename,Path(__file__).with_name(filename))
         module=importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         modules.append(module)
     consumed,result,pids=modules[1].verify(data[offset:],shell,shell_cr3,prior_pids,apics,modules[0],require,
-                                           pipe=modules[2] if pipe else None)
+                                           pipe=modules[2] if pipe else None,
+                                           memory=modules[2] if memory else None,memory_kind=memory)
     return offset+consumed,result,pids
 
 
@@ -218,13 +225,24 @@ def verify_idle(aBytes, aCpus=1, aClockMaintenanceMs=1000):
 
 
 def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceMs=1000,
-           aRuntimeProcess=False, aSupervisorImage=None):
+           aRuntimeProcess=False, aSupervisorImage=None, aHistoricalBootMemory=False):
     require(aSupervisorImage is None or (aRuntimeProcess and aSupervisorImage in ("control","test")),
             "Supervisor image scenario requires the existing foreground regression")
     require(re.search(rb"AGENTOS PIPE (?!TEST )",aLog) is None,
             "Historical boot pipe transfer is not permitted in either signed image")
     pWorkloadMarkers=(b"AGENTOS SUPERVISOR",b"AGENTOS SERVICE ",b"AGENTOS TEST ",b"AGENTOS PIPE TEST ")
-    require(aLog.count(b"AGENTOS TEST RUNNER ")==2*int(aSupervisorImage=="test"),
+    if aHistoricalBootMemory:
+        # Explicit historical receipt inspection only, after its independent
+        # old boot-memory validators have run. Never selected by QEMU or the
+        # current staged session verifier.
+        require(not aRuntimeProcess and aSupervisorImage is None,"Mixed historical and staged evidence")
+        historical_shell=SHELL_START.search(aLog)
+        require(historical_shell is not None and not any(
+            marker in aLog[historical_shell.start():] for marker in (b"AGENTOS COW ",b"AGENTOS DEMAND ")),
+            "Historical memory evidence outside the boot interval")
+    else:
+        pWorkloadMarkers+=(b"AGENTOS COW ",b"AGENTOS DEMAND ")
+    require(aLog.count(b"AGENTOS TEST RUNNER ")==4*int(aSupervisorImage=="test"),
             "Unexpected runner invocation outside its foreground interval")
     if aSupervisorImage!="test":
         require(not any(marker in aLog for marker in pWorkloadMarkers),
@@ -253,6 +271,7 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
     pRuntimeRecords=[]
     pSupervisor=None
     pPipe=None
+    pMemory={}
     pPrefixPids=set()
     if aRuntimeProcess:
         # Account for every earlier actual PID, not just the current shell.
@@ -278,11 +297,18 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
             pConsumed,pPipe,pNewPids=supervisor_prefix(
                 pInteractive,pShell,int(pShellExits[0][2],16),
                 pPrior | pPrefixPids,aSupervisorImage,set(pApicList),pipe=True)
-            require(all(aLog.count(marker)==(pSupervisorLog+pInteractive[:pConsumed]).count(marker)
-                        for marker in pWorkloadMarkers),
-                    "Test evidence outside its authenticated foreground interval")
+            pWorkloadLog=pSupervisorLog+pInteractive[:pConsumed]
             pPrefixPids.update(pNewPids)
             pInteractive=pInteractive[pConsumed:]
+            for kind in ("cow","demand"):
+                pConsumed,pMemory[kind],pNewPids=supervisor_prefix(
+                    pInteractive,pShell,int(pShellExits[0][2],16),
+                    pPrior | pPrefixPids,aSupervisorImage,set(pApicList),memory=kind)
+                pWorkloadLog+=pInteractive[:pConsumed]
+                pPrefixPids.update(pNewPids)
+                pInteractive=pInteractive[pConsumed:]
+            require(all(aLog.count(marker)==pWorkloadLog.count(marker) for marker in pWorkloadMarkers),
+                    "Test evidence outside its authenticated foreground interval")
     pClean = without_kernel_events(pInteractive)
     pExpected = b"".join(
         pStep["pattern"].encode("ascii") for pStep in steps(pShell,aKeyboard))
@@ -294,7 +320,7 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
     if aInput is not None:
         pPrefix=runtime_input() if aRuntimeProcess else b""
         if aSupervisorImage is not None:
-            pPrefix+=SUPERVISOR_INPUT+PIPE_INPUT
+            pPrefix+=SUPERVISOR_INPUT+PIPE_INPUT+MEMORY_INPUT
         require(aInput==pPrefix+transmitted_input(pShell,aKeyboard),"Captured transmitted UART bytes differ from scenario")
     pRestart = pInteractive.find(b"service restart flaky\r\n")
     require(pRestart>=0,"No explicit service RESTART command")
@@ -332,6 +358,8 @@ def verify(aLog, aInput=None, aKeyboard=False, aCpus=None, *, aClockMaintenanceM
     if aSupervisorImage is not None:
         result["runtime_supervisor"]=pSupervisor
         result["runtime_pipe"]=pPipe
+        result["runtime_cow"]=pMemory["cow"]
+        result["runtime_demand"]=pMemory["demand"]
     return result
 
 

@@ -1,6 +1,6 @@
-#include "abi.h"
+#include "../../user/abi.h"
 
-/* The init ELF reserves this real NOBITS segment. Accesses below deliberately
+/* This standalone staged ELF reserves this real NOBITS segment. Accesses below deliberately
  * reach different 2 MiB page-table ranges, leaving nearly all pages untouched.
  * No kernel test hook, synthetic memory backend or special ELF is involved.
  */
@@ -191,7 +191,8 @@ static int checkProtection(unsigned long aRoot, unsigned aKind, unsigned long aA
     return 0;
 }
 
-int runDemandPaging(void) {
+/* The locality controller must not pre-touch the workload entry page. */
+__attribute__((aligned(4096))) int runDemandPaging(void) {
     struct VmStats pStats;
     long pRoot = os_call(SYS_GETPID, 0, 0, 0);
     if (pRoot <= 0 ||

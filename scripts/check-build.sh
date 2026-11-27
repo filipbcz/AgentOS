@@ -251,7 +251,7 @@ for pApp in init fault service shell svc_ok svc_fail svc_hang orphan_parent mana
     "$pCc" -c "$pRoot/user/$pEntry.S" -o "$pOut/$pApp-entry.o"
     pObjects=("$pOut/$pApp-entry.o")
     case "$pApp" in
-        init) pSources=(client orphans forktest demand migration service_manager);;
+        init) pSources=(client orphans migration service_manager);;
         service) pSources=(service);;
         shell) pSources=(shell service_client);;
         manager) pSources=(service_manager);;
@@ -296,6 +296,17 @@ done
     -o "$pOut/pipe-receiver" "$pOut/pipe-receiver-entry.o" "$pOut/pipe-receive.o"
 for pApp in pipe-runner pipe-receiver; do
     "$pPython" "$pRoot/scripts/verify-user-abi.py" "$pOut/$pApp"
+done
+for pApp in cow demand; do
+    "$pCc" -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
+        -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large "-D${pApp^^}_WORKLOAD" \
+        -c "$pRoot/scripts/tests/supervisor-runner.c" -o "$pOut/$pApp-runner.o"
+    "$pCc" -std=c11 -Os -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-pie \
+        -fno-asynchronous-unwind-tables -mno-red-zone -mcmodel=large \
+        -c "$pRoot/scripts/tests/$pApp-workload.c" -o "$pOut/$pApp-workload.o"
+    "$pLd" --no-undefined --build-id=none -z noexecstack -s -T "$pRoot/user/user.ld" \
+        -o "$pOut/$pApp-runner" "$pOut/supervisor-runner-entry.o" "$pOut/$pApp-runner.o" "$pOut/$pApp-workload.o"
+    "$pPython" "$pRoot/scripts/verify-user-abi.py" "$pOut/$pApp-runner"
 done
 printf 'Host tests and kernel/user ELF links passed: %s\n' "$pOut"
 printf 'EFI assembly/signing, pinned-toolchain reproducibility and VM execution remain separate checks.\n'

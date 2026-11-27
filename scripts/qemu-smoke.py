@@ -257,7 +257,9 @@ def run_session(process, capture, qmp, destination, runtime_process_regression=F
                          lambda data: reply in data[offset:], command, 30)
     if supervisor_image is not None:
         for command,request in ((session.SUPERVISOR_COMMAND,session.SUPERVISOR_INPUT),
-                                (session.PIPE_COMMAND,session.PIPE_INPUT)):
+                                (session.PIPE_COMMAND,session.PIPE_INPUT),
+                                *((command,(command+"\r").encode("ascii"))
+                                  for command in session.MEMORY_COMMANDS)):
             offset = serial.stat().st_size
             print(f"QEMU {supervisor_image} signed image: {command!r}", flush=True)
             capture.send(request)
@@ -517,8 +519,11 @@ def boot(args):
         supervisor.verify_absent(text)
     # The test image must pass the full authenticated runtime session below.
     orphans.verify(text, args.cpus)
-    cow.verify(text, args.cpus)
-    demand.verify(text, args.cpus)
+    # Staged memory evidence belongs exclusively to the strict foreground
+    # verifier below. Every other profile must lack it entirely.
+    if supervisor_image!="test":
+        cow.verify_absent(text)
+        demand.verify_absent(text)
     migration_result = migration.verify(text, args.cpus)
     service_manager.verify(text)
     session_result = None

@@ -1,11 +1,14 @@
-#include "abi.h"
+#include "../../user/abi.h"
 
 /* Real in-guest fork/COW acceptance: both sides continue from one instruction.
  * Parent data and a previously loaded writable segment remain unchanged
  * after child writes. SYS_READ exercises kernel copy_to_user into COW .bss.
  */
 static volatile unsigned long private_value = 0x19f6b5a40d73c258UL;
-static unsigned char shared_buffer[64];
+/* Keep copy-out on a different page from the user-written data and
+ * controller state. Otherwise the prior store can resolve the COW fault
+ * before SYS_READ reaches this buffer. */
+static unsigned char shared_buffer[64] __attribute__((aligned(4096)));
 static const char data_file[] = "/data/transfer.bin";
 _Static_assert((0x07ad52c1b843e06fUL ^ 0x22ac19f0807d43beUL) ==
                0x25014b31383ea3d1UL, "COW stack XOR vector");

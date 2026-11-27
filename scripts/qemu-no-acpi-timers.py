@@ -587,8 +587,9 @@ def scenario(args):
                     smoke.supervisor.verify_absent(text)
                 # Staged proof is mandatory in the full runtime session below.
                 smoke.orphans.verify(text,args.cpus)
-                smoke.cow.verify(text,args.cpus)
-                smoke.demand.verify(text,args.cpus)
+                if variant!="test":
+                    smoke.cow.verify_absent(text)
+                    smoke.demand.verify_absent(text)
                 receipt["migration"]=smoke.migration.verify(text,args.cpus)
                 smoke.service_manager.verify(text)
                 receipt["runtime_session"]=smoke.session.verify(data,(dest/"com1-input.bin").read_bytes(),

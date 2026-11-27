@@ -21,6 +21,8 @@ ROOT = Path(__file__).resolve().parent.parent
 RUNNER = "supervisor-runner"
 PIPE_RUNNER = "pipe-runner"
 PIPE_RECEIVER = "pipe-receiver"
+COW_RUNNER = "cow-runner"
+DEMAND_RUNNER = "demand-runner"
 SECTIONS = (".text", ".sdata", ".data", ".dynamic", ".dynsym", ".rela",
             ".reloc", ".kernel", ".initrd")
 CFLAGS = ("-std=c11", "-Os", "-Wall", "-Wextra", "-Werror", "-ffreestanding",
@@ -151,23 +153,26 @@ def verify_distribution(archive):
     distribution=cpio_entries(archive)
     required={"stage","init","fault","service","shell","svc_ok","svc_fail","svc_hang",
               "orphan_parent","manager","svc_alive","svc_flaky","data","data/transfer.bin"}
-    forbidden={"receiver",RUNNER,PIPE_RUNNER,PIPE_RECEIVER}
+    forbidden={"receiver","forktest","demand",RUNNER,PIPE_RUNNER,PIPE_RECEIVER,COW_RUNNER,DEMAND_RUNNER}
     require(required<=set(distribution) and
             not any(name.rsplit("/",1)[-1] in forbidden for name in distribution),
             "Distribution is missing boot files or contains a historical/staged test ELF")
-    require(not any(b"AGENTOS PIPE " in payload for _,payload in distribution.values()),
-            "Distribution contains historical or staged pipe workload code")
+    require(not any(marker in payload for _,payload in distribution.values()
+                    for marker in (b"AGENTOS PIPE ",b"AGENTOS COW ",b"AGENTOS DEMAND ")),
+            "Distribution contains historical or staged pipe/COW/demand workload code")
     require(distribution["data/transfer.bin"][1]==bytes((i*73+i//251*19)%256 for i in range(8193)),
             "Shared transfer fixture differs from expected bytes")
     return distribution
 
 
-def verify_contents(control, test, kernel, control_cpio, test_cpio, runner, pipe_runner, pipe_receiver):
+def verify_contents(control, test, kernel, control_cpio, test_cpio, runner, pipe_runner, pipe_receiver,
+                    cow_runner, demand_runner):
     for sections, archive in ((control,control_cpio),(test,test_cpio)):
         require(sections[".kernel"][1]==kernel and sections[".initrd"][1]==archive,
                 "Actual embedded kernel/initramfs differs from build files")
     distribution, staged = verify_distribution(control_cpio), cpio_entries(test_cpio)
-    additions={RUNNER:runner,PIPE_RUNNER:pipe_runner,PIPE_RECEIVER:pipe_receiver}
+    additions={RUNNER:runner,PIPE_RUNNER:pipe_runner,PIPE_RECEIVER:pipe_receiver,
+               COW_RUNNER:cow_runner,DEMAND_RUNNER:demand_runner}
     require(set(staged)==set(distribution)|set(additions),
             "Staged archive must add exactly the separate test ELFs")
     require(all(staged[name]==entry for name,entry in distribution.items()),
@@ -207,14 +212,14 @@ def reproduce(root, out, stage, write_maps):
         # remaining modules. No acceptance workload object may enter this link.
         command(work,"gcc-13","-c",str(root/"user/init.S"),"-o","init-entry.o")
         init_objects=["init-entry.o"]
-        for name in ("client","orphans","forktest","demand","migration","service_manager"):
+        for name in ("client","orphans","migration","service_manager"):
             obj=name+".init.o"
             command(work,"gcc-13",*CFLAGS,"-c",str(root/"user"/(name+".c")),"-o",obj)
             init_objects.append(obj)
         command(work,"ld","--no-undefined","--build-id=none","-z","noexecstack","-s",
                 "-T",str(root/"user/user.ld"),"-o","init",*init_objects)
         require((work/"init").read_bytes()==cpio_entries((out/"initramfs.cpio").read_bytes())["init"][1],
-                "Embedded production init does not reproduce without supervisor/pipe workloads")
+                "Embedded production init does not reproduce without supervisor/pipe/COW/demand workloads")
         command(work,"gcc-13",*CFLAGS,"-c",str(root/"scripts/tests/supervisor-workload.c"),"-o","supervisor.check.o")
         require((work/"supervisor.check.o").read_bytes()==(work/"supervisor.o").read_bytes(),
                 "Runner supervisor object differs from source")
@@ -232,6 +237,17 @@ def reproduce(root, out, stage, write_maps):
             command(work,"ld","--no-undefined","--build-id=none","-z","noexecstack","-s",
                     "-T",str(root/"user/user.ld"),"-o",name,*objects)
             require((work/name).read_bytes()==(stage/name).read_bytes(),"Test ELF relink differs: "+name)
+        for app in ("cow","demand"):
+            runner_name=app+"-runner"
+            command(work,"gcc-13",*CFLAGS,"-D"+app.upper()+"_WORKLOAD",
+                    "-c",str(root/"scripts/tests/supervisor-runner.c"),"-o",runner_name+".o")
+            command(work,"gcc-13",*CFLAGS,"-c",str(root/"scripts/tests"/(app+"-workload.c")),
+                    "-o",app+"-workload.o")
+            command(work,"ld","--no-undefined","--build-id=none","-z","noexecstack","-s",
+                    "-T",str(root/"user/user.ld"),"-o",runner_name,"runner-entry.o",
+                    runner_name+".o",app+"-workload.o")
+            require((work/runner_name).read_bytes()==(stage/runner_name).read_bytes(),
+                    "Memory test ELF relink differs: "+runner_name)
         for variant,archive,expected in (
                 ("control",out/"initramfs.cpio",out/"agentos.unsigned.efi"),
                 ("test",stage/"test.cpio",stage/"test.unsigned.efi")):
@@ -270,11 +286,12 @@ def verify_identity(root=ROOT, *, write=False):
     test_signed=(stage/"test.efi").read_bytes()
     control=signed_payload(control_unsigned,control_signed)
     test=signed_payload(test_unsigned,test_signed)
-    kernel,control_cpio,test_cpio,runner,pipe_runner,pipe_receiver=(p.read_bytes() for p in
-        (out/"kernel.elf",out/"initramfs.cpio",stage/"test.cpio",stage/RUNNER,stage/PIPE_RUNNER,stage/PIPE_RECEIVER))
+    kernel,control_cpio,test_cpio,runner,pipe_runner,pipe_receiver,cow_runner,demand_runner=(p.read_bytes() for p in
+        (out/"kernel.elf",out/"initramfs.cpio",stage/"test.cpio",stage/RUNNER,stage/PIPE_RUNNER,
+         stage/PIPE_RECEIVER,stage/COW_RUNNER,stage/DEMAND_RUNNER))
     require(build["initramfs_sha256"]==digest(control_cpio),"Distribution receipt archive mismatch")
-    common=verify_contents(control,test,kernel,control_cpio,test_cpio,runner,pipe_runner,pipe_receiver)
-    for elf in (runner,pipe_runner,pipe_receiver):
+    common=verify_contents(control,test,kernel,control_cpio,test_cpio,runner,pipe_runner,pipe_receiver,cow_runner,demand_runner)
+    for elf in (runner,pipe_runner,pipe_receiver,cow_runner,demand_runner):
         load(root,"verify-user-abi.py").verify(elf)
     reproduce(root,out,stage,write)
 
@@ -291,6 +308,7 @@ def verify_identity(root=ROOT, *, write=False):
             "supervisor_object_sha256":sha(stage/"supervisor.o"),"kernel_sha256":digest(kernel),
             "common_entries":common,"runner_sha256":digest(runner),
             "pipe_runner_sha256":digest(pipe_runner),"pipe_receiver_sha256":digest(pipe_receiver),
+            "cow_runner_sha256":digest(cow_runner),"demand_runner_sha256":digest(demand_runner),
             "map_sha256":{v:sha(stage/(v+".map")) for v in ("control","test")},
             "control":describe(control_unsigned,control_signed,control),
             "test":describe(test_unsigned,test_signed,test)}

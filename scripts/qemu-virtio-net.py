@@ -74,8 +74,8 @@ def verify_kernel(data, cpus):
     smoke.processes.verify(text,[int(x,16) for x in apics])
     smoke.supervisor.verify_absent(text)
     smoke.orphans.verify(text,cpus)
-    smoke.cow.verify(text,cpus)
-    smoke.demand.verify(text,cpus)
+    smoke.cow.verify_absent(text)
+    smoke.demand.verify_absent(text)
     smoke.migration.verify(text,cpus)
     smoke.service_manager.verify(text)
 

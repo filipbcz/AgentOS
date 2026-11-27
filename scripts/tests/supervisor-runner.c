@@ -1,8 +1,12 @@
 /* Test-only workload, invoked by the ordinary shell. */
 #include "../../user/abi.h"
 
-#ifdef PIPE_WORKLOAD
+#if defined(PIPE_WORKLOAD)
 int run_pipe_transfer(long deadline);
+#elif defined(COW_WORKLOAD)
+int run_forktest(void);
+#elif defined(DEMAND_WORKLOAD)
+int runDemandPaging(void);
 #else
 int run_supervisor(void);
 #endif
@@ -244,8 +248,12 @@ static int worker(unsigned slot,unsigned round) {
     if (!sample(&before) || before.stats[7]!=gRoot || before.ms>(unsigned long)(gDeadline-runReserveMs)) return 73;
     if (before.stats[1]!=c.apic) return snapshot("SKIP",&before)?skipStatus:74;
     if (!snapshot("BEGIN",&before)) return 74;
-#ifdef PIPE_WORKLOAD
+#if defined(PIPE_WORKLOAD)
     int result=run_pipe_transfer(gDeadline);
+#elif defined(COW_WORKLOAD)
+    int result=run_forktest();
+#elif defined(DEMAND_WORKLOAD)
+    int result=runDemandPaging();
 #else
     int result=run_supervisor();
 #endif

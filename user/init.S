@@ -64,12 +64,6 @@ _start:
     call run_orphans
     test %eax, %eax
     jne finished
-    call run_forktest
-    test %eax, %eax
-    jne finished
-    call runDemandPaging
-    test %eax, %eax
-    jne finished
     // BSP PID 1 stays resident for service supervision; AP roots exit.
     mov $SYS_GETPID, %eax
     syscall

@@ -71,8 +71,11 @@ class ImageTests(unittest.TestCase):
         self.runner=b"isolated test fixture"
         self.pipe_runner=b"pipe sender fixture"
         self.pipe_receiver=b"pipe receiver fixture"
+        self.cow_runner=b"cow runner fixture"
+        self.demand_runner=b"demand runner fixture"
         self.additions=[(images.RUNNER,self.runner),(images.PIPE_RUNNER,self.pipe_runner),
-                        (images.PIPE_RECEIVER,self.pipe_receiver)]
+                        (images.PIPE_RECEIVER,self.pipe_receiver),(images.COW_RUNNER,self.cow_runner),
+                        (images.DEMAND_RUNNER,self.demand_runner)]
         self.staged=archive([*self.entries,*self.additions])
         self.kernel=b"kernel fixture"
 
@@ -81,7 +84,8 @@ class ImageTests(unittest.TestCase):
         b=pe(self.kernel,staged)
         return images.verify_contents(images.signed_payload(a,fake_certificate(a)),
             images.signed_payload(b,fake_certificate(b)),self.kernel,control,staged,
-            self.runner if runner is None else runner,self.pipe_runner,self.pipe_receiver)
+            self.runner if runner is None else runner,self.pipe_runner,self.pipe_receiver,
+            self.cow_runner,self.demand_runner)
 
     def test_exact_archive_addition(self):
         result=self.check(self.control,self.staged)
@@ -114,6 +118,21 @@ class ImageTests(unittest.TestCase):
             self.check(self.control,archive([*self.entries,*self.additions,("receiver",b"legacy")]))
         with self.assertRaises(images.VerificationError):
             self.check(self.control,archive([*self.entries,*self.additions[:-1]]))
+
+    def test_memory_clients_and_code_forbidden_in_distribution_and_required_staged(self):
+        for name in (images.COW_RUNNER,images.DEMAND_RUNNER,"other/cow-runner","forktest","demand"):
+            extra=(name,b"memory fixture")
+            with self.subTest(name=name),self.assertRaises(images.VerificationError):
+                self.check(archive([*self.entries,extra]),archive([*self.entries,extra,*self.additions]))
+        for marker in (b"AGENTOS COW BEGIN ROOT=",b"AGENTOS DEMAND BASE ROOT="):
+            changed=[(name,payload+marker if name=="init" else payload) for name,payload in self.entries]
+            with self.subTest(marker=marker),self.assertRaises(images.VerificationError):
+                self.check(archive(changed),archive([*changed,*self.additions]))
+        for name in (images.COW_RUNNER,images.DEMAND_RUNNER):
+            for changed in ([(n,v) for n,v in self.additions if n!=name],
+                            [(n,b"wrong" if n==name else v) for n,v in self.additions]):
+                with self.subTest(name=name),self.assertRaises(images.VerificationError):
+                    self.check(self.control,archive([*self.entries,*changed]))
 
     def test_archive_duplicates_aliases_truncation_and_junk(self):
         for bad in (archive([*self.entries,self.entries[0]]),archive([("./init",b"alias")]),
@@ -158,12 +177,12 @@ def supervisor_phase(parent, first, cr3=0x600000):
 
 
 def supervisor_transcript(shell=9,runner=20,apics=(7,),moving=False,skipping=False,
-                          peer_moving=False,peer_missed=False,peer_unpaired=False,pipe=False,probe="runnable"):
+                          peer_moving=False,peer_missed=False,peer_unpaired=False,pipe=False,probe="runnable",memory=None):
     """Synthetic evidence, not a guest execution or signature proof."""
     cpus=len(apics)
     count=1 if cpus==1 else 2*cpus
     total=0 if cpus==1 else 4
-    records=[session.PIPE_COMMAND if pipe else session.SUPERVISOR_COMMAND]
+    records=["run /"+memory+"-runner" if memory else session.PIPE_COMMAND if pipe else session.SUPERVISOR_COMMAND]
     def note(kind,**fields):
         records.append("AGENTOS TEST "+kind+"".join(f" {k}={v:016x}" for k,v in fields.items()))
     def snap(kind,pid,parent,cpu,ms,moves=0,work=None):
@@ -227,6 +246,25 @@ def supervisor_transcript(shell=9,runner=20,apics=(7,),moving=False,skipping=Fal
                     exit_line(child,0,0x600000)
                     records.append(f"AGENTOS PIPE TEST SENT PID={pid:016x} CHILD={child:016x} BYTES=0000000000002001 DIRECT=000000000000000c DUP=000000000000000b WRITES=0000000000000018 SHORT=0000000000000001")
                     next_pid+=1
+                elif memory:
+                    child=next_pid
+                    if memory=="cow":
+                        block=load("test-verify-cow.py").block(pid)
+                        original=pid+11
+                        count=1
+                    else:
+                        block=load("test-verify-demand-paging.py").block(pid)
+                        original=pid+12
+                        count=4
+                    # Rewrite synthetic fixture descendant identities to the
+                    # real allocation ordering expected by the protocol.
+                    mapping={f"{original+i:016x}":f"{child+i:016x}" for i in range(count)}
+                    import re
+                    for row in block:
+                        row=re.sub(r"(?:CHILD|PID)=([0-9a-f]{16})",
+                                   lambda m:m[0].split("=")[0]+"="+mapping.get(m[1],m[1]),row)
+                        records.append(row)
+                    next_pid+=count
                 else:
                     records.extend(supervisor_phase(pid,next_pid))
                     next_pid+=5
@@ -342,7 +380,7 @@ class RuntimeTests(unittest.TestCase):
         fixture=load("test-verify-stage3-session.py")
         base=(b"AGENTOS TASK BSP APIC=0000000000000007 TIMER-WAKES=0000000000000003\r\n"
               +fixture.transcript(True))
-        for old,new in ((10,50),(11,51),(12,52),(13,53)):
+        for old,new in ((10,110),(11,111),(12,112),(13,113)):
             base=base.replace(f"PID={old:016x}".encode(),f"PID={new:016x}".encode())
         fg=(b"run /svc_ok\r\n"
             b"AGENTOS USER EXIT PID=0000000000000010 CR3=0000000000500000 STATUS=0000000000000000\r\n"
@@ -351,16 +389,21 @@ class RuntimeTests(unittest.TestCase):
             b"exit status 42\r\nagentos> run /fault\r\n"
             b"AGENTOS USER FAULT PID=0000000000000012 PARENT=0000000000000009 CR3=0000000000500000 VECTOR=000000000000000e ERROR=0000000000000005 ADDRESS=0000000002000000\r\n"
             b"exit status 270\r\nagentos> ")
-        serial=session.runtime_input()+session.SUPERVISOR_INPUT+session.PIPE_INPUT+session.transmitted_input(9,True)
+        serial=session.runtime_input()+session.SUPERVISOR_INPUT+session.PIPE_INPUT+session.MEMORY_INPUT+session.transmitted_input(9,True)
         for variant,prefix in (("control",(session.SUPERVISOR_COMMAND+"\r\n").encode()+session.SUPERVISOR_MISSING+
-                                          (session.PIPE_COMMAND+"\r\n").encode()+session.SUPERVISOR_MISSING),
-                               ("test",supervisor_transcript()+supervisor_transcript(runner=40,pipe=True))):
+                                          (session.PIPE_COMMAND+"\r\n").encode()+session.SUPERVISOR_MISSING+
+                                          b"".join((command+"\r\n").encode()+session.SUPERVISOR_MISSING
+                                                   for command in session.MEMORY_COMMANDS)),
+                               ("test",supervisor_transcript()+supervisor_transcript(runner=40,pipe=True)+
+                                supervisor_transcript(runner=60,memory="cow")+supervisor_transcript(runner=80,memory="demand"))):
             log=base.replace(session.READY,session.READY+fg+prefix,1)
             result=session.verify(log,serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant)
             self.assertEqual([r["status"] for r in result["runtime_process_regression"]],[0,42,270])
-            self.assertEqual(result["restarted_pids"],[51,52,53])
+            self.assertEqual(result["restarted_pids"],[111,112,113])
             self.assertEqual(result["runtime_supervisor"]["absent"],variant=="control")
             self.assertEqual(result["runtime_pipe"]["absent"],variant=="control")
+            for kind in ("cow","demand"):
+                self.assertEqual(result["runtime_"+kind]["absent"],variant=="control")
             # The entire normal boot (and every non-workload byte afterward)
             # must be free of the relocated supervisor, even in the staged image.
             markers=(b"AGENTOS SUPERVISOR BEGIN PARENT=0000000000000001\r\n",
@@ -368,7 +411,9 @@ class RuntimeTests(unittest.TestCase):
                      b"AGENTOS TEST PEER_BEGIN PID=0000000000000001\r\n",
                      b"AGENTOS PIPE TEST RECEIVED PID=0000000000000001\r\n",
                      b"AGENTOS PIPE RECEIVED PID=0000000000000001\r\n",
-                     b"AGENTOS PIPE SENT PID=0000000000000001\r\n")
+                     b"AGENTOS PIPE SENT PID=0000000000000001\r\n",
+                     b"AGENTOS COW BEGIN ROOT=0000000000000001\r\n",
+                     b"AGENTOS DEMAND BASE ROOT=0000000000000001\r\n")
             for marker in markers:
                 for bad in (marker+log,log.replace(prefix,prefix+marker,1)):
                     with self.assertRaises(session.VerificationError):
@@ -390,6 +435,58 @@ class RuntimeTests(unittest.TestCase):
                 with self.assertRaises(session.VerificationError):
                     session.verify(log.replace(b"PID=0000000000000033 CR3=",b"PID=0000000000000014 CR3="),
                                    serial,True,1,aRuntimeProcess=True,aSupervisorImage=variant)
+
+    def test_memory_full_locality_and_descendant_evidence(self):
+        for kind in ("cow","demand"):
+            def verify(data,apics=(7,19),variant="test"):
+                return session.supervisor_prefix(data,9,0x300000,{1,2,9},variant,set(apics),memory=kind)
+            for apics in ((7,),(7,19)):
+                data=supervisor_transcript(apics=apics,memory=kind)
+                consumed,result,seen=verify(data,apics)
+                self.assertEqual(consumed,len(data))
+                self.assertEqual(result["covered_apics"],list(apics))
+                self.assertEqual(len(result["intervals"]),len(apics))
+                for proof in result["intervals"]:
+                    self.assertEqual(proof["child_statuses"],[0] if kind=="cow" else [0,270,270,270])
+                    self.assertEqual(proof["before"]["total"],proof["after"]["total"])
+                    self.assertEqual(proof["before"]["moves"],proof["after"]["moves"])
+                    self.assertIn(proof["pid"],seen)
+            data=supervisor_transcript(apics=(7,19),memory=kind)
+            with self.assertRaises(session.VerificationError):
+                verify(data,(7,23))
+            with self.assertRaises(session.VerificationError):
+                verify(supervisor_transcript(apics=(7,),memory=kind))
+            # Reject missing records and foreign/fabricated child identity,
+            # non-private CR3, fault/status mutations and stale snapshots.
+            lines=data.splitlines(keepends=True)
+            for i,row in enumerate(lines):
+                if row.startswith((b"AGENTOS COW ",b"AGENTOS DEMAND ",
+                                   b"AGENTOS USER ",b"AGENTOS TEST BEGIN ",
+                                   b"AGENTOS TEST ENDED ",b"AGENTOS TEST REAP ")):
+                    with self.subTest(kind=kind,removed=i),self.assertRaises(session.VerificationError):
+                        verify(b"".join(lines[:i]+lines[i+1:]))
+            for old,new in ((b"CR3=0000000000400000",b"CR3=0000000000300000"),
+                            (b"CR3=0000000000400000",b"CR3=0000000000500000"),
+                            (b"STATUS=0000000000000000",b"STATUS=0000000000000001")):
+                self.assertIn(old,data)
+                with self.subTest(kind=kind,field=old),self.assertRaises(session.VerificationError):
+                    verify(data.replace(old,new,1))
+            if kind=="demand":
+                for old,new in ((b"ERROR=0000000000000014",b"ERROR=0000000000000004"),
+                                (b"RESIDENT=0000000000000024",b"RESIDENT=0000000000000020")):
+                    self.assertIn(old,data)
+                    with self.assertRaises(session.VerificationError):
+                        verify(data.replace(old,new,1))
+            absent=("run /"+kind+"-runner\r\n").encode()+session.SUPERVISOR_MISSING
+            self.assertEqual(verify(absent,variant="control"),(len(absent),{"absent":True},set()))
+            with self.assertRaises(session.VerificationError):
+                verify(data,variant="control")
+            with self.assertRaises(session.VerificationError):
+                verify(absent)
+            module=load("verify-"+("cow" if kind=="cow" else "demand-paging")+".py")
+            module.verify_absent("normal boot")
+            with self.assertRaises(module.VerificationError):
+                module.verify_absent(data.decode("ascii"))
 
     def test_pipe_full_locality_and_receiver_evidence(self):
         for apics in ((7,),(7,19)):

@@ -227,6 +227,17 @@ def verify_run(root, run_dir, require_pass=True, *, legacy_traces=False):
                 pVerifier.verify(log.decode("ascii", errors="replace"), cpus)
             except pVerifier.VerificationError as pError:
                 raise EvidenceError(f"Invalid demand-paging evidence: {pError}") from pError
+            # Keep the old VM acceptance gate fail-closed. This reader still
+            # verifies historical boot COW/demand receipts; the future final
+            # VirtualBox matrix must explicitly exercise the separate images.
+            pSpec = importlib.util.spec_from_file_location(
+                "receiptCowEvidence", Path(__file__).with_name("verify-cow.py"))
+            pCow = importlib.util.module_from_spec(pSpec)
+            pSpec.loader.exec_module(pCow)
+            try:
+                pCow.verify(log.decode("ascii", errors="replace"), cpus)
+            except pCow.VerificationError as pError:
+                raise EvidenceError(f"Invalid COW evidence: {pError}") from pError
         if has_migration:
             pSpec = importlib.util.spec_from_file_location(
                 "receiptMigrationEvidence", Path(__file__).with_name("verify-migration.py"))
@@ -249,7 +260,8 @@ def verify_run(root, run_dir, require_pass=True, *, legacy_traces=False):
                 pVerifier = importlib.util.module_from_spec(pSpec)
                 pSpec.loader.exec_module(pVerifier)
                 try:
-                    pVerifier.verify(log,(run_dir / "com1-input.bin").read_bytes(),keyboard,cpus)
+                    pVerifier.verify(log,(run_dir / "com1-input.bin").read_bytes(),keyboard,cpus,
+                                     aHistoricalBootMemory=has_demand)
                 except pVerifier.VerificationError as pError:
                     raise EvidenceError(f"Invalid native-v2 session evidence: {pError}") from pError
     else:
