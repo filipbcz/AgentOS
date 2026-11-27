@@ -6,16 +6,19 @@ Only this wrapper adds the existing QEMU GDB chardev and records UART
 timestamps. Attach immediately before the ordinary IPC command, after
 all preceding foreground programs have returned. No guest image edits.
 """
+import ast
 import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import traceback
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[2]
@@ -62,8 +65,161 @@ class TimestampedLink:
                             "length": len(packet), "hex": packet.hex()})
         self.tx += len(packet)
 
+def load_smoke():
+    sys.path.insert(0, str(ROOT / "scripts"))
+    spec = importlib.util.spec_from_file_location("original_smoke", ROOT/"scripts/qemu-smoke.py")
+    smoke = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(smoke)
+    return smoke
+
+def require(condition, message):
+    if not condition:
+        raise RuntimeError(message)
+
+def preflight_inputs():
+    paths = [ROOT/p for p in EXPECTED] + [
+        ROOT/"build/build-provenance.json", ROOT/"build/agentos.efi",
+        ROOT/"build/agentos.unsigned.efi", ROOT/"build/db.cer", ROOT/"build/db.esl",
+        ROOT/"build/supervisor-staging/identity.json",
+        ROOT/"build/supervisor-staging/test.efi",
+        ROOT/"build/supervisor-staging/test.unsigned.efi",
+        ROOT/"build/supervisor-staging/ipc-service",
+        Path("/usr/share/OVMF/OVMF_CODE_4M.secboot.fd"),
+        Path("/usr/share/OVMF/OVMF_VARS_4M.fd"),
+        Path.home()/".local/share/agentos/stage1-test-keys/db.crt",
+        HERE/"run.py", HERE/"trace.py", ROOT/"scripts/qemu-smoke.py",
+    ]
+    return {str(p): sha(p) for p in paths}
+
+def preflight():
+    """Run on the actual CI checkout after the signed build, without a guest."""
+    DEST.mkdir(parents=True, exist_ok=True)
+    receipt = {"result": "fail", "guest_started": False, "qemu_count": 0,
+               "stage": "checkout", "expected": EXPECTED}
+    try:
+        receipt.update(commit=capture("git", "rev-parse", "HEAD"),
+                       tree=capture("git", "rev-parse", "HEAD^{tree}"))
+        require(not capture("git", "status", "--porcelain", "--untracked-files=normal"),
+                "Preflight requires the same clean checkout as the ordinary harness")
+        receipt["stage"] = "full_harness_import"
+        smoke = load_smoke()
+        modules = {name: getattr(smoke, name) for name in (
+            "evidence", "processes", "supervisor", "orphans", "cow", "demand",
+            "migration", "service_manager", "boot_log", "physical_oom", "session", "console")}
+        modules["smoke"] = smoke
+        receipt["imports"] = {}
+        for name, module in modules.items():
+            path = Path(module.__file__).resolve()
+            require(path.parent == ROOT/"scripts", "Wrong harness module: "+name)
+            receipt["imports"][name] = {"path": str(path.relative_to(ROOT)), "sha256": sha(path)}
+        require(Path(smoke.boot_log.physical_oom.__file__).resolve() ==
+                ROOT/"scripts/physical_oom_evidence.py", "Wrong sibling physical OOM module")
+        require(callable(smoke.main) and callable(smoke.boot) and
+                all(callable(getattr(smoke.UartCapture, name, None))
+                    for name in ("__init__", "send", "close")) and
+                smoke.session.IPC_INPUT == b"run /ipc-runner\r" and
+                hasattr(smoke.session.SHELL_START, "finditer"),
+                "Original wrapper/harness interface changed")
+        # Also load the real modules deferred by the staged session and identity checks.
+        receipt["stage"] = "deferred_imports"
+        for filename in ("verify-supervisor-image.py", "verify-boot-roots.py",
+                         "verify-supervisor-locality.py", "verify-pipe-transfer.py",
+                         "verify-memory-workload.py", "verify-ipc-workload.py",
+                         "verify-fault-workload.py", "verify-adoption.py",
+                         "verify-user-abi.py", "verify-oom-workload.py"):
+            module = smoke.load("preflight_"+filename, filename)
+            path = Path(module.__file__).resolve()
+            require(path == ROOT/"scripts"/filename, "Wrong deferred module: "+filename)
+            receipt["imports"][filename] = {"path": str(path.relative_to(ROOT)), "sha256": sha(path)}
+            if filename == "verify-supervisor-image.py":
+                paired = module
+        receipt["stage"] = "host_dependencies"
+        receipt["tools"] = {}
+        for name in ("git", "bash", "gcc-13", "ld", "objcopy", "objdump", "rustc",
+                     "truncate", "sgdisk", "mformat", "mmd", "mcopy", "virt-fw-vars",
+                     "openssl", "sbverify", "qemu-system-x86_64", "gdb", "dpkg-query", "uname"):
+            path = shutil.which(name)
+            require(path is not None, "Missing executable: "+name)
+            receipt["tools"][name] = path
+        capture("bash", "-n", "scripts/disk.sh")
+        receipt["stage"] = "input_hashes"
+        actual = {p: sha(ROOT/p) for p in EXPECTED}
+        receipt["hashes"] = actual
+        require(actual == EXPECTED, "ELF/CPIO identity changed; offsets not valid")
+        receipt["inputs"] = preflight_inputs()
+        cert = Path.home()/".local/share/agentos/stage1-test-keys/db.crt"
+        der = subprocess.check_output(["openssl", "x509", "-in", str(cert), "-outform", "der"])
+        require(der == (ROOT/"build/db.cer").read_bytes(), "Wrong enrolled certificate")
+        receipt["firmware_vars"] = capture("virt-fw-vars", "--input",
+            "/usr/share/OVMF/OVMF_VARS_4M.fd", "--print", "--verbose")
+        receipt["stage"] = "real_signed_identity"
+        build = smoke.evidence.verify_build(ROOT, receipt["commit"])
+        identity = paired.verify_identity(ROOT)
+        require(identity["source_commit"] == receipt["commit"] and
+                identity["source_tree"] == receipt["tree"], "Staged identity is not this checkout")
+        receipt["build_artifacts"] = build["artifacts"]
+        receipt["staged_identity"] = identity
+        receipt["stage"] = "tracer_interface"
+        source = (HERE/"trace.py").read_text()
+        compile(source, str(HERE/"trace.py"), "exec")
+        constants = {}
+        for node in ast.parse(source).body:
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id in ("SITES", "CALLS"):
+                        constants[target.id] = ast.literal_eval(node.value)
+        kernel = (ROOT/"build/kernel.elf").read_bytes()
+        runner = (ROOT/"build/supervisor-staging/ipc-runner").read_bytes()
+        require(set(constants) == {"SITES", "CALLS"} and
+                {"move_before", "move_after_increment", "sched_stats_loaded", "exit_committed",
+                 "collect_result", "ipc_send_committed", "ipc_receive_committed"}
+                <= set(constants["SITES"].values()) and
+                {"RUNNER", "ENDED", "PEER_END"} <= set(constants["CALLS"].values()),
+                "Incomplete tracer interface")
+        for key, data in (("SITES", kernel), ("CALLS", runner)):
+            require(all(type(offset) is int and 0 <= offset and
+                        0x1000+offset+12 <= len(data) for offset in constants[key]),
+                    "Tracer ELF offset outside file: "+key)
+        receipt["sites"] = constants["SITES"]
+        receipt["calls"] = constants["CALLS"]
+        # GDB's actual embedded Python, without attaching or loading a guest.
+        code = ("import gdb, json, os, time; from pathlib import Path; "
+                "compile(Path("+repr(str(HERE/"trace.py"))+").read_text(), 'trace.py', 'exec'); "
+                "assert all(hasattr(gdb, n) for n in ('Breakpoint','BP_HARDWARE_BREAKPOINT',"
+                "'selected_inferior','selected_thread','parse_and_eval','execute','GdbError')); "
+                "assert all(hasattr(gdb.Inferior,n) for n in ('read_memory','threads')); "
+                "assert hasattr(gdb.Breakpoint,'delete') and callable(time.monotonic_ns); "
+                "print('IPC_TRACE_GDB_PREFLIGHT_OK')")
+        result = subprocess.run(["gdb", "-nx", "-nh", "-batch", "-ex", "python "+code],
+                                cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, timeout=30)
+        receipt["gdb_preflight"] = {"returncode": result.returncode, "output": result.stdout}
+        require(result.returncode == 0 and "IPC_TRACE_GDB_PREFLIGHT_OK" in result.stdout,
+                "GDB embedded Python/trace API preflight failed")
+        require(receipt["inputs"] == preflight_inputs(), "Preflight changed an input")
+        receipt["stage"] = "complete"
+        receipt["result"] = "pass"
+    except Exception as exc:
+        receipt["error"] = str(exc)
+        receipt["traceback"] = traceback.format_exc()
+    finally:
+        save("trace-preflight.json", receipt)
+        print("IPC preflight:", receipt["result"], receipt["stage"],
+              receipt.get("error", ""), flush=True)
+    return 0 if receipt["result"] == "pass" else 1
+
+def require_preflight():
+    receipt = json.loads((DEST/"trace-preflight.json").read_text())
+    require(receipt.get("result") == "pass" and receipt.get("stage") == "complete" and
+            receipt.get("guest_started") is False and receipt.get("qemu_count") == 0 and
+            receipt.get("commit") == capture("git", "rev-parse", "HEAD") and
+            receipt.get("tree") == capture("git", "rev-parse", "HEAD^{tree}") and
+            receipt.get("hashes") == EXPECTED and receipt.get("inputs") == preflight_inputs(),
+            "Missing or stale successful preflight; diagnostic guest forbidden")
+
 def run():
     DEST.mkdir(parents=True, exist_ok=True)
+    require_preflight()
     actual = {p: sha(ROOT/p) for p in EXPECTED}
     save("trace-environment.json", {
         "commit": capture("git", "rev-parse", "HEAD"),
@@ -82,10 +238,7 @@ def run():
                                     "guest_started": False})
         return 1
 
-    sys.path.insert(0, str(ROOT / "scripts"))
-    spec = importlib.util.spec_from_file_location("original_smoke", ROOT/"scripts/qemu-smoke.py")
-    smoke = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(smoke)
+    smoke = load_smoke()
     original_capture = smoke.UartCapture
     state = {"qemu_count": 0, "attach_count": 0, "process": None,
              "uart": None, "attach_ns": None, "ready_ns": None}
@@ -183,4 +336,8 @@ def run():
         return 0 if status == 0 and result["result"]=="recorded" and result["gdb_returncode"]==0 else 1
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--preflight"]:
+        raise SystemExit(preflight())
+    if sys.argv[1:]:
+        raise SystemExit("Expected no arguments or --preflight")
     raise SystemExit(run())

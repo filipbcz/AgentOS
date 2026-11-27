@@ -1,21 +1,25 @@
 name: Isolated IPC peer tail trace
 
-# Archived single diagnostic attempt 46048349147; do not rerun on PR updates.
+# One authorized synchronize event, from the exact previous head. No reruns.
 on:
-  workflow_dispatch:
+  pull_request:
+    types: [synchronize]
+    paths:
+      - 'tests/ipc-tail-trace/run.py'
+      - '.github/workflows/qemu-ipc-tail-trace.yml'
 
 permissions:
   contents: read
 
 jobs:
   trace:
-    if: github.repository == 'filipbcz/AgentOS' && github.ref == 'refs/heads/dev/stage4-nvme'
+    if: github.repository == 'filipbcz/AgentOS' && github.event.pull_request.number == 2 && github.event.pull_request.head.ref == 'dev/stage4-nvme' && github.event.pull_request.head.repo.full_name == github.repository && github.event.before == '48c3a243ca680739662edc222f270f44826e5de1' && github.run_attempt == 1
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
       - name: Existing signed build and debugger dependencies
         run: |
@@ -25,7 +29,19 @@ jobs:
             sbsigntool efitools gdisk mtools qemu-system-x86 ovmf python3-virt-firmware gdb
       - name: Build unchanged ordinary and separately signed staged images
         run: bash scripts/build.sh --supervisor-staging
+      - name: Preflight real harness, dependencies, signed inputs and GDB API (no guest)
+        id: preflight
+        run: python3 tests/ipc-tail-trace/run.py --preflight
+      - name: Archive evaluated preflight before any guest
+        if: always() && steps.preflight.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipc-tail-trace-preflight
+          retention-days: 14
+          if-no-files-found: error
+          path: build/check/qemu-cpu2-no-hpet-session-sv-test/trace-preflight.json
       - name: One signed TCG PM24 staged 2 CPU session with host debugger
+        if: success() && steps.preflight.outcome == 'success'
         run: python3 tests/ipc-tail-trace/run.py
       - name: Preserve actual signed images, full session and debugger evidence
         if: always()
