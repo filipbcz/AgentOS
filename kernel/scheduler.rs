@@ -220,6 +220,13 @@ impl Queue {
     pub fn process(&self) -> Option<&Process> { self.tasks[self.current?].as_ref()?.process.as_ref() }
     pub fn process_mut(&mut self) -> Option<&mut Process> { self.tasks[self.current?].as_mut()?.process.as_mut() }
     pub fn running(&self) -> bool { self.current.is_some() }
+    /// Read-only check under exclusive boot ownership. Finished tasks may
+    /// remain resident for normal reap; an executing or retiring stack may not.
+    pub fn bootHandoffReady(&self) -> bool {
+        !self.active && self.current.is_none() && self.fRetiring.is_none() &&
+            !self.fRuntimeIdle && self.tasks.iter().flatten()
+                .all(|task| !task.runnable && task.waiting.is_none() && task.timed.is_none())
+    }
     pub fn all_blocked(&self) -> bool {
         self.active && !self.tasks.iter().flatten().any(|task| task.runnable)
     }
@@ -1028,6 +1035,52 @@ mod timed_tests {
         assert_eq!(p.fQueues[0].collectRetired(&mut p.fFrames), 0);
         p.select(0, 0, false);
         assert_eq!(p.fQueues[0].collectRetired(&mut p.fFrames), 1);
+    }
+
+    #[test]
+    fn bootHandoffRequiresActualSwitchCompletionButAllowsUnreapedTasks() {
+        let mut q = Queue::new();
+        assert!(q.bootHandoffReady());
+        q.tasks[0] = Some(Task { stack: KernelStack::test_dummy(), context: 0x2000,
+            runnable: true, waiting: None, timed: None, clock_error: false,
+            preemptions: 0, fHasRun: false, fMigrations: 0, process: None });
+        q.count = 1;
+        assert!(!q.bootHandoffReady()); // runnable even before activation
+        q.active = true;
+        assert!(!q.bootHandoffReady());
+        assert_eq!(q.select(0x1000, true), 0x2000);
+        q.completeSwitch();
+        assert!(!q.bootHandoffReady()); // executing task
+        q.finish_current();
+        assert!(!q.bootHandoffReady()); // finished but still on its stack
+        assert_eq!(q.select(0x3000, true), 0x1000);
+        assert!(!q.active && q.current.is_none());
+        assert_eq!(q.fRetiring, Some(0));
+        assert!(!q.bootHandoffReady()); // returned context selected, not restored
+        q.completeSwitch();
+        assert!(q.bootHandoffReady());
+        assert_eq!(q.taskCount(), 1); // no state cleared by the predicate
+        q.reap(&mut Frames::test_dummy());
+        assert_eq!(q.taskCount(), 0);
+        assert!(q.bootHandoffReady());
+    }
+
+    #[test]
+    fn bootHandoffRejectsActiveCurrentRetiringAndRuntimeIdleIndependently() {
+        let mut q = Queue::new();
+        q.active = true;
+        assert!(!q.bootHandoffReady());
+        q.active = false;
+        q.current = Some(0);
+        assert!(!q.bootHandoffReady());
+        q.current = None;
+        q.fRetiring = Some(0);
+        assert!(!q.bootHandoffReady());
+        q.fRetiring = None;
+        q.fRuntimeIdle = true;
+        assert!(!q.bootHandoffReady());
+        q.fRuntimeIdle = false;
+        assert!(q.bootHandoffReady());
     }
 
     #[test]

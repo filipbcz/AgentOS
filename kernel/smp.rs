@@ -22,6 +22,9 @@ const PAGE: usize = 4096;
 const TIMER: u32 = 0xe0;
 const MASK: u32 = 1 << 16;
 const WAKEUPS: u32 = 3;
+const AP_INITIALIZED: u32 = 1;
+const BOOT_QUEUE_HANDED_OFF: u32 = 2;
+const AP_FAILED: u32 = 3;
 const PROCESS_PHASE: u32 = 2;
 const IDLE_PHASE: u32 = 3;
 const IDLE_FINISHED: u32 = 5;
@@ -463,6 +466,44 @@ impl Cpu {
         while ptr::addr_of!((*self.queue.get()).active).read_volatile() { wait_for_irq(); }
         self.apic.write(0x320, MASK | TIMER);
         self.apic.write(0x380, 0);
+    }
+
+    /// Transfer the boot queue to the BSP until PROCESS_PHASE is published.
+    /// Called on this AP's original startup stack, after schedule returns
+    /// through wait_for_irq's CLI and the restore path acknowledges retirement.
+    unsafe fn handoffBootQueue(&self) -> Result<(), Error> {
+        let flags: usize;
+        asm!("pushfq", "pop {}", out(reg) flags, options(preserves_flags));
+        if flags & (1 << 9) != 0 { return Err(b"AP boot queue handoff with IRQs enabled"); }
+        // Remote queue acquisition is disabled before runtime publication.
+        // The BSP may not touch this queue until our Release below; with IF
+        // clear there is no local IRQ owner. Do not clear or wait on a held gate.
+        if gRuntimeEnabled.load(Ordering::Acquire) ||
+           self.fRuntimeReady.load(Ordering::Acquire) ||
+           self.fQueueLocked.load(Ordering::Acquire) ||
+           self.complete.load(Ordering::Acquire) != AP_INITIALIZED ||
+           self.phase.load(Ordering::Acquire) != 0 {
+            return Err(b"AP boot queue ownership not exclusive");
+        }
+        if !(&*self.queue.get()).bootHandoffReady() {
+            return Err(b"AP boot queue not quiescent");
+        }
+        self.complete.store(BOOT_QUEUE_HANDED_OFF, Ordering::Release);
+        // No access to the queue (including IRQ-driven access) until the BSP
+        // has finished its raw accesses and publishes the next phase.
+        while self.phase.load(Ordering::Acquire) < PROCESS_PHASE { spin_loop(); }
+        Ok(())
+    }
+
+    /// BSP acquires the AP's boot queue, or refuses to proceed on failure.
+    fn acquireBootQueue(&self) -> Result<(), Error> {
+        loop {
+            match self.complete.load(Ordering::Acquire) {
+                BOOT_QUEUE_HANDED_OFF => return Ok(()),
+                AP_INITIALIZED => { let _ = crate::system_clock::millis(); spin_loop(); }
+                _ => return Err(b"AP boot queue handoff failed"),
+            }
+        }
     }
 
     unsafe fn runtimeWorker(&self) -> ! {
@@ -1217,7 +1258,7 @@ unsafe extern "C" fn ap_main(cpu: &'static Cpu) -> ! {
         cpu.run_task()
     }) {
         Ok(()) => {
-            cpu.complete.store(1, Ordering::Release);
+            cpu.complete.store(AP_INITIALIZED, Ordering::Release);
             // With an independent ACPI epoch, TSC is optional. With
             // TSC-only bring-up its local rate was qualified above.
             if cpu.reference.tsc_hz().is_none() {
@@ -1231,11 +1272,16 @@ unsafe extern "C" fn ap_main(cpu: &'static Cpu) -> ! {
                 spin_loop();
             }
             cpu.schedule();
-            cpu.complete.store(2, Ordering::Release);
-            while cpu.phase.load(Ordering::Acquire) < PROCESS_PHASE { spin_loop(); }
+            if let Err(reason) = cpu.handoffBootQueue() {
+                // Publish failure even if diagnostics cannot make progress.
+                // Never make a failed ownership check look like a handoff.
+                asm!("cli", options(nostack));
+                cpu.complete.store(AP_FAILED, Ordering::Release);
+                serial(b"SMP FAILED: "); serial(reason); serial(b"\r\n"); halt();
+            }
             if let Err(reason) = cpu.process_test() {
                 serial(b"SMP FAILED: "); serial(reason); serial(b"\r\n");
-                cpu.complete.store(3, Ordering::Release); halt();
+                cpu.complete.store(AP_FAILED, Ordering::Release); halt();
             }
             cpu.complete.store(PROCESSES_FINISHED, Ordering::Release);
             while cpu.phase.load(Ordering::Acquire) < IDLE_PHASE { spin_loop(); }
@@ -1247,13 +1293,13 @@ unsafe extern "C" fn ap_main(cpu: &'static Cpu) -> ! {
                 },
                 Err(reason) => {
                     serial(b"SMP FAILED: "); serial(reason); serial(b"\r\n");
-                    cpu.complete.store(3, Ordering::Release);
+                    cpu.complete.store(AP_FAILED, Ordering::Release);
                 }
             }
         }
         Err(reason) => {
             serial(b"SMP FAILED: "); serial(reason); serial(b"\r\n");
-            cpu.complete.store(3, Ordering::Release);
+            cpu.complete.store(AP_FAILED, Ordering::Release);
         }
     }
     halt()
@@ -1296,7 +1342,7 @@ unsafe fn start_ap(cpu: &Cpu, root: usize, base: usize, stack: usize, clock: &Br
             WaitError::Timeout => b"AP task timeout" as Error,
             WaitError::Unresponsive => b"AP task reference clock stopped" as Error,
         })?;
-    if cpu.complete.load(Ordering::Acquire) != 1 { return Err(b"AP task failed"); }
+    if cpu.complete.load(Ordering::Acquire) != AP_INITIALIZED { return Err(b"AP task failed"); }
     Ok(())
 }
 
@@ -1418,10 +1464,12 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
     let baseline = shared_frames.with(|f| f.snapshot()).ok_or(b"bitmap snapshot" as Error)?;
     gStartupReady.store(true, Ordering::Release);
     boot_cpu.schedule();
+    // Acquire every AP queue independently of what the BSP will do with it.
+    // Ownership remains with the BSP until PROCESS_PHASE below.
+    for cpu in cpus.iter().flatten().filter(|cpu| cpu.expected_id != bsp) {
+        cpu.acquireBootQueue()?;
+    }
     for cpu in cpus.iter().flatten() {
-        if cpu.expected_id != bsp {
-            while cpu.complete.load(Ordering::Acquire) != 2 { let _ = crate::system_clock::millis(); spin_loop(); }
-        }
         for slot in 0..stress::TASKS {
             let switches = (*cpu.queue.get()).preemptions(slot);
             let pages = cpu.released[slot].load(Ordering::Acquire);
@@ -1444,7 +1492,7 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
     boot_cpu.process_test()?;
     for cpu in cpus.iter().flatten().filter(|c| c.expected_id != bsp) {
         cpu.phase.store(PROCESS_PHASE, Ordering::Release);
-        while cpu.complete.load(Ordering::Acquire) == 2 { let _ = crate::system_clock::millis(); spin_loop(); }
+        while cpu.complete.load(Ordering::Acquire) == BOOT_QUEUE_HANDED_OFF { let _ = crate::system_clock::millis(); spin_loop(); }
         if cpu.complete.load(Ordering::Acquire) != PROCESSES_FINISHED { return Err(b"AP user processes"); }
     }
     serial(b"AGENTOS IDLE BEGIN TSC-HZ="); hex(tsc_hz); serial(b"\r\n");
