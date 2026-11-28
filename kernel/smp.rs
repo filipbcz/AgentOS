@@ -264,6 +264,13 @@ impl Lapic {
     }
 }
 
+// Permanent SMP storage. The allocator and the remaining boot workload are
+// independent objects in the same reserved frame; neither owns the other.
+struct SmpStorage {
+    frames: SharedFrames,
+    load: Load,
+}
+
 #[repr(C)]
 struct Cpu {
     self_address: usize,     // GS:0 on this processor
@@ -299,6 +306,7 @@ struct Cpu {
     queue: UnsafeCell<Queue>,
     boot_baseline: UnsafeCell<Option<crate::frames::BitmapSnapshot>>,
     terminal: UnsafeCell<*mut crate::tty::Terminal>,
+    shared_frames: &'static SharedFrames,
     load: &'static Load,
     released: [AtomicUsize; stress::TASKS],
 }
@@ -307,7 +315,7 @@ struct Cpu {
 // Boot-only raw accesses occur before runtime publication or after an explicit
 // completion barrier. Shared resources additionally require the Frames gate.
 unsafe impl Sync for Cpu {}
-const _: () = assert!(core::mem::size_of::<Cpu>() <= PAGE && core::mem::size_of::<Load>() <= PAGE);
+const _: () = assert!(core::mem::size_of::<Cpu>() <= PAGE && core::mem::size_of::<SmpStorage>() <= PAGE);
 
 impl Cpu {
     fn lockQueue(&self) -> QueueGuard<'_> {
@@ -332,7 +340,8 @@ impl Cpu {
     }
     unsafe fn create(frames: &mut Frames<'_>, apic: Lapic, roster: &CpuRoster, id: u32, interval: u32, tsc_hz: u64,
                      reference: BringupClock, legacy_pit_probe: bool,
-                     descriptors: Option<Descriptors>, load: &'static Load, programs: &'static Programs,
+                     descriptors: Option<Descriptors>, shared_frames: &'static SharedFrames,
+                     load: &'static Load, programs: &'static Programs,
                      rsp0: usize) -> Result<&'static Self, Error> {
         let slot = roster.slot(id).ok_or(b"CPU absent or disabled in MADT" as Error)?;
         let legacy_target = roster.legacy_target(id)?;
@@ -350,7 +359,7 @@ impl Cpu {
                          fHasSlot: AtomicBool::new(true), runtime_idle_irqs: AtomicUsize::new(0),
                          interrupts: AtomicU32::new(0), hlt_wakes: AtomicU32::new(0),
                          complete: AtomicU32::new(0), phase: AtomicU32::new(0), terminal: UnsafeCell::new(ptr::null_mut()),
-                         idle: UnsafeCell::new(IdleSample::default()), descriptors, load, queue: UnsafeCell::new(Queue::new()), boot_baseline: UnsafeCell::new(None),
+                         idle: UnsafeCell::new(IdleSample::default()), descriptors, shared_frames, load, queue: UnsafeCell::new(Queue::new()), boot_baseline: UnsafeCell::new(None),
                          released: core::array::from_fn(|_| AtomicUsize::new(0)) });
         for i in 0..stress::TASKS {
             (*(*cpu).queue.get()).spawn(frames, allocation_task, i).ok_or(b"task stack" as Error)?;
@@ -486,7 +495,7 @@ impl Cpu {
         loop {
             let mut pChanged = false;
             if pStatus.is_none() {
-                match self.load.frames.with(|pFrames| self.programs.fRegistry.collect(pFrames, 0, aRootPid)) {
+                match self.shared_frames.with(|pFrames| self.programs.fRegistry.collect(pFrames, 0, aRootPid)) {
                     Ok(pExit) => { pStatus = Some(pExit); pChanged = true; }
                     Err(-11) => (),
                     Err(_) => { serial(b"SMP FAILED: runtime root identity\r\n"); halt(); },
@@ -497,7 +506,7 @@ impl Cpu {
             // relying on a remote IPI to consume its final collected zombie.
             {
                 let mut pQueue = self.lockQueue();
-                self.load.frames.with(|pFrames| {
+                self.shared_frames.with(|pFrames| {
                     pChanged |= pQueue.processPendingKills(pFrames);
                     pChanged |= pQueue.collectRetired(pFrames) != 0;
                     pQueue.wake_io(pFrames);
@@ -507,7 +516,7 @@ impl Cpu {
             }
             if pChanged { notifyRemote(); }
             if let Some(pExit) = pStatus {
-                if self.load.frames.with(|pFrames| !self.programs.fRegistry.hasProcesses(pFrames)) {
+                if self.shared_frames.with(|pFrames| !self.programs.fRegistry.hasProcesses(pFrames)) {
                     let mut pQueue = self.lockQueue();
                     pQueue.setRuntimeIdle(false);
                     pQueue.active = false;
@@ -601,7 +610,7 @@ impl Cpu {
         if scheduled {
             let clock_error = (*self.timer_policy.get()).sample(self.apic.read(0x390), measured);
             if clock_error { crate::system_clock::expire_stalled_holdover(); }
-            self.load.frames.with(|pFrames| {
+            self.shared_frames.with(|pFrames| {
                 pChanged |= queue.processPendingKills(pFrames);
                 pChanged |= queue.collectRetired(pFrames) != 0;
                 queue.wake_io(pFrames);
@@ -641,14 +650,14 @@ impl Cpu {
         // BSP's first process is the actual numeric PID 1, retained through
         // the boot tests; AP tests still use independent finite sessions.
         let bsp_root = self.descriptors.is_none();
-        let baseline = self.load.frames.with(|f| f.snapshot()).ok_or(b"process snapshot" as Error)?;
-        let pid = self.load.frames.with(|f| (*self.queue.get()).spawn_process(f, self.programs, b"init", 0, 0))
+        let baseline = self.shared_frames.with(|f| f.snapshot()).ok_or(b"process snapshot" as Error)?;
+        let pid = self.shared_frames.with(|f| (*self.queue.get()).spawn_process(f, self.programs, b"init", 0, 0))
             .map_err(|_| b"user init ELF" as Error)?;
         let resident = if bsp_root {
-            Some(self.load.frames.with(|f| f.snapshot()).ok_or(b"PID1 test snapshot" as Error)?)
+            Some(self.shared_frames.with(|f| f.snapshot()).ok_or(b"PID1 test snapshot" as Error)?)
         } else { None };
         self.schedule();
-        let ok = self.load.frames.with(|f| {
+        let ok = self.shared_frames.with(|f| {
             let q = &mut *self.queue.get();
             if let Some(mut resident) = resident {
                 let valid = pid == 1 && q.parked_root() == Some(pid) &&
@@ -786,7 +795,7 @@ extern "C" fn screen_worker(arg:usize) {
 extern "C" fn allocation_task(slot: usize) {
     let cpu = unsafe { current_cpu() };
     let worker = cpu.slot.index() * stress::TASKS + slot;
-    let pages = cpu.load.exercise(worker, &cpu.interrupts);
+    let pages = cpu.load.exercise(cpu.shared_frames, worker, &cpu.interrupts);
     cpu.released[slot].store(pages, Ordering::Release);
 }
 
@@ -884,7 +893,7 @@ unsafe extern "C" fn finish_context_switch() {
     let pFreed = {
         let mut pQueue = pCpu.lockQueue();
         pQueue.completeSwitch();
-        pCpu.load.frames.with(|pFrames| pQueue.collectRetired(pFrames))
+        pCpu.shared_frames.with(|pFrames| pQueue.collectRetired(pFrames))
     };
     if pFreed != 0 { notifyRemote(); }
     balanceQueues();
@@ -898,7 +907,7 @@ pub unsafe fn userPageFault(aAddress: usize, aError: u64) -> bool {
     let pCpu = current_cpu();
     let pQueue = pCpu.lockQueue();
     let Some(pProcess) = pQueue.process() else { return false; };
-    let pResult = pCpu.load.frames.with(|pFrames| pProcess.space.resolveFault(pFrames, aAddress, aError));
+    let pResult = pCpu.shared_frames.with(|pFrames| pProcess.space.resolveFault(pFrames, aAddress, aError));
     if pResult == Err(-12) {
         let mut pLine = Diagnostic::new(b"AGENTOS PAGE OOM");
         pLine.field(b" PID=", pProcess.pid as u64);
@@ -912,12 +921,12 @@ pub unsafe fn user_fault(vector: u64, error: u64, addr: u64) -> usize {
     let mut pGuard = cpu.lockQueue();
     let q = &mut *pGuard;
     let p = q.process().unwrap();
-    let pParent = cpu.load.frames.with(|pFrames| cpu.programs.fRegistry.parentOf(pFrames, p.pid)).unwrap_or(0);
+    let pParent = cpu.shared_frames.with(|pFrames| cpu.programs.fRegistry.parentOf(pFrames, p.pid)).unwrap_or(0);
     let mut pLine = Diagnostic::new(b"AGENTOS USER FAULT");
     pLine.field(b" PID=", p.pid as u64); pLine.field(b" PARENT=", pParent as u64);
     pLine.field(b" CR3=", active_root() as u64); pLine.field(b" VECTOR=", vector);
     pLine.field(b" ERROR=", error); pLine.field(b" ADDRESS=", addr); pLine.publish(cpu);
-    cpu.load.frames.with(|f| q.terminate(256 + vector as usize, f));
+    cpu.shared_frames.with(|f| q.terminate(256 + vector as usize, f));
     drop(pGuard); notifyRemote();
     cpu.switch(0, false)
 }
@@ -929,7 +938,7 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
     if ctx.rsp >= 1usize << 47 { return user_fault(13, 0, 0); }
     let mut pGuard = cpu.lockQueue();
     let q = &mut *pGuard;
-    let pChanged = cpu.load.frames.with(|pFrames| {
+    let pChanged = cpu.shared_frames.with(|pFrames| {
         let pKilled = q.processPendingKills(pFrames);
         pKilled | (q.collectRetired(pFrames) != 0)
     });
@@ -965,7 +974,7 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
                 for (i, field) in fields.iter().enumerate() {
                     bytes[i*8..(i+1)*8].copy_from_slice(&field.to_le_bytes());
                 }
-                cpu.load.frames.with(|f| p.space.write(f, a, &bytes)).map_or_else(|e| e, |_| 0)
+                cpu.shared_frames.with(|f| p.space.write(f, a, &bytes)).map_or_else(|e| e, |_| 0)
             } else { -5 }
         }
         // Scheduling identity is sampled while this CPU owns the task gate.
@@ -974,7 +983,7 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
             else {
                 let pMigrations = q.currentMigrations();
                 let pProcess = q.process().unwrap();
-                cpu.load.frames.with(|pFrames| {
+                cpu.shared_frames.with(|pFrames| {
                     let pParent = cpu.programs.fRegistry.parentOf(pFrames, pid).ok_or(-3isize)?;
                     let pFields = [1u64, cpu.expected_id as u64, gOnlineCount.load(Ordering::Acquire) as u64,
                         pMigrations as u64, gMigrations.load(Ordering::Relaxed) as u64,
@@ -992,7 +1001,7 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
         0x1001a => {
             if b != 64 || c != 0 { -22 }
             else {
-                cpu.load.frames.with(|f| {
+                cpu.shared_frames.with(|f| {
                     p.space.writable(f, a, 64)?;
                     let pFields = p.space.stats();
                     let mut pBytes = [0u8; 64];
@@ -1008,7 +1017,7 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
         0x1001c => {
             if b != 0 || c != 0 { -22 }
             else {
-                match cpu.load.frames.with(|f| q.collect(f, pid, a)) {
+                match cpu.shared_frames.with(|f| q.collect(f, pid, a)) {
                     Ok(status) => status as isize,
                     Err(-11) => {
                         q.block_child_exit(a);
@@ -1026,7 +1035,7 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
             if b > isize::MAX as usize { -22 }
             else if q.take_clock_error() { -5 }
             else {
-                match cpu.load.frames.with(|f| q.collect(f, pid, a)) {
+                match cpu.shared_frames.with(|f| q.collect(f, pid, a)) {
                     Ok(status) => status as isize,
                     Err(-11) => match crate::system_clock::millis() {
                         None => -5,
@@ -1060,10 +1069,10 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
         }
         op @ (0x10002 | 0x10008 | 0x1000d | 0x1000e | 0x10015 | 0x10019) => {
             let io = match op {
-                0x10002 => cpu.load.frames.with(|f| p.files.write(f, &p.space, a, b, c)),
-                0x10008 => cpu.load.frames.with(|f| p.files.read(f, &p.space, a, b, c)),
-                0x1000d | 0x10019 => cpu.load.frames.with(|f| p.files.message(f, crate::ipc::Operation::Send, p, a, b, c)),
-                _ => cpu.load.frames.with(|f| p.files.message(f, crate::ipc::Operation::Receive, p, a, b, c)),
+                0x10002 => cpu.shared_frames.with(|f| p.files.write(f, &p.space, a, b, c)),
+                0x10008 => cpu.shared_frames.with(|f| p.files.read(f, &p.space, a, b, c)),
+                0x1000d | 0x10019 => cpu.shared_frames.with(|f| p.files.message(f, crate::ipc::Operation::Send, p, a, b, c)),
+                _ => cpu.shared_frames.with(|f| p.files.message(f, crate::ipc::Operation::Receive, p, a, b, c)),
             };
             // Lazy copy-in may allocate, but slow UART/GOP output must not
             // keep every other CPU waiting for the shared frame allocator.
@@ -1072,7 +1081,7 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
                 pOther => pOther,
             };
             match io {
-                Ok(crate::files::Io::Bytes(n)) => { cpu.load.frames.with(|f| q.wake_io(f)); n as isize }
+                Ok(crate::files::Io::Bytes(n)) => { cpu.shared_frames.with(|f| q.wake_io(f)); n as isize }
                 Ok(crate::files::Io::Output(_)) => unreachable!(),
                 Ok(crate::files::Io::Sleep(_)) if op == 0x10015 || op == 0x10019 => -11,
                 Ok(crate::files::Io::Sleep(wait)) => {
@@ -1082,12 +1091,12 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
                     q.block(wait);
                     switchNow!(ctx as *mut Context as usize);
                 }
-                Err(error) => { cpu.load.frames.with(|f| q.wake_io(f)); error }
+                Err(error) => { cpu.shared_frames.with(|f| q.wake_io(f)); error }
             }
         }
         // Bootstrap-only pause: not a general process or service control.
         0x10016 => {
-            if pid != 1 || cpu.load.frames.with(|f| q.park_boot_root(f, pid)).is_err() { -16 }
+            if pid != 1 || cpu.shared_frames.with(|f| q.park_boot_root(f, pid)).is_err() { -16 }
             else {
                 let mut pLine = Diagnostic::new(b"AGENTOS USER PARK");
                 pLine.field(b" PID=", pid as u64); pLine.field(b" CR3=", active_root() as u64);
@@ -1104,11 +1113,11 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
             if a > u32::MAX as usize || b > isize::MAX as usize || c != 0 { -22 }
             else if q.take_clock_error() { -5 }
             else {
-                match cpu.load.frames.with(|f| q.process().unwrap().files.ipc_ready_mask(f, a as u32)) {
+                match cpu.shared_frames.with(|f| q.process().unwrap().files.ipc_ready_mask(f, a as u32)) {
                     Err(error) => error,
                     Ok(mask) => {
                         let events = mask as usize |
-                            if cpu.load.frames.with(|f| q.has_exited_child(f, pid)) { 1usize << 32 } else { 0 };
+                            if cpu.shared_frames.with(|f| q.has_exited_child(f, pid)) { 1usize << 32 } else { 0 };
                         if events != 0 { events as isize }
                         else {
                             match crate::system_clock::millis() {
@@ -1129,7 +1138,7 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
             let mut pLine = Diagnostic::new(b"AGENTOS USER EXIT");
             pLine.field(b" PID=", pid as u64); pLine.field(b" CR3=", active_root() as u64);
             pLine.field(b" STATUS=", (a & 255) as u64); pLine.publish(cpu);
-            cpu.load.frames.with(|f| q.terminate(a & 255, f));
+            cpu.shared_frames.with(|f| q.terminate(a & 255, f));
             switchNow!(0);
         }
         op @ (crate::native_abi::SYS_SPAWN | crate::native_abi::SYS_SPAWN_FLAGS) => {
@@ -1137,24 +1146,24 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
             match crate::native_abi::spawn_flags(op, b, c, name.len()) {
                 Err(error) => error,
                 Ok(flags) => {
-                    if let Err(error) = cpu.load.frames.with(|f| p.space.read(f, a, &mut name[..b])) { error }
-                    else { cpu.load.frames.with(|f| q.spawn_process(f, cpu.programs, &name[..b], pid, flags))
+                    if let Err(error) = cpu.shared_frames.with(|f| p.space.read(f, a, &mut name[..b])) { error }
+                    else { cpu.shared_frames.with(|f| q.spawn_process(f, cpu.programs, &name[..b], pid, flags))
                                .map(|v| v as isize).unwrap_or_else(|e| e) }
                 }
             }
         }
-        0x10005 => cpu.load.frames.with(|f| q.collect(f, pid, a)).map(|v| v as isize).unwrap_or_else(|e| e),
+        0x10005 => cpu.shared_frames.with(|f| q.collect(f, pid, a)).map(|v| v as isize).unwrap_or_else(|e| e),
         // Parent gets the new PID. The child resumes at the same return RIP
         // with RAX=0, a private kernel stack and COW userspace pages.
-        0x10014 => cpu.load.frames.with(|f| q.fork_process(f, cpu.programs, ctx))
+        0x10014 => cpu.shared_frames.with(|f| q.fork_process(f, cpu.programs, ctx))
             .map(|v| v as isize).unwrap_or_else(|e| e),
         // Child enumeration is owner-scoped, never global. The zero cursor
         // returns the oldest living or zombie direct child (including
         // grandchildren adopted when their intermediate parent exited).
         0x10013 => if a > isize::MAX as usize { -22 }
-            else { cpu.load.frames.with(|f| q.child_after(f, pid, a)).map(|v| v as isize).unwrap_or_else(|e| e) },
+            else { cpu.shared_frames.with(|f| q.child_after(f, pid, a)).map(|v| v as isize).unwrap_or_else(|e| e) },
         0x1000f => {
-            let result = cpu.load.frames.with(|f| q.kill_child(f, pid, a));
+            let result = cpu.shared_frames.with(|f| q.kill_child(f, pid, a));
             if matches!(result, Ok(0)) {
                 let mut pLine = Diagnostic::new(b"AGENTOS USER KILL");
                 pLine.field(b" PID=", a as u64); pLine.field(b" PARENT=", pid as u64);
@@ -1166,18 +1175,18 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
         0x10007 => {
             let mut path = [0; crate::vfs::PATH_MAX];
             if c != 0 { -30 } else if b > path.len() { -36 }
-            else if let Err(error) = cpu.load.frames.with(|f| p.space.read(f, a, &mut path[..b])) { error }
+            else if let Err(error) = cpu.shared_frames.with(|f| p.space.read(f, a, &mut path[..b])) { error }
             else { cpu.programs.vfs.file(&path[..b]).and_then(|data|
-                cpu.load.frames.with(|f| p.files.open(f, data))).map(|n| n as isize).unwrap_or_else(|e| e) }
+                cpu.shared_frames.with(|f| p.files.open(f, data))).map(|n| n as isize).unwrap_or_else(|e| e) }
         }
         0x10009 | 0x1000b => {
-            let res = cpu.load.frames.with(|f| if ctx.registers[14] == 0x10009 {
+            let res = cpu.shared_frames.with(|f| if ctx.registers[14] == 0x10009 {
                 p.files.close(f, a)
             } else { p.files.dup2(f, a, b) });
-            cpu.load.frames.with(|f| q.wake_io(f));
+            cpu.shared_frames.with(|f| q.wake_io(f));
             res.map(|v| v as isize).unwrap_or_else(|e| e)
         }
-        op @ (0x1000a | 0x1000c) => cpu.load.frames.with(|f| p.files.pair(f, &p.space, a, op == 0x1000c)).map(|v| v as isize).unwrap_or_else(|e| e),
+        op @ (0x1000a | 0x1000c) => cpu.shared_frames.with(|f| p.files.pair(f, &p.space, a, op == 0x1000c)).map(|v| v as isize).unwrap_or_else(|e| e),
         _ => -38,
     };
     // A lifecycle operation may also have consumed a remote stop request for
@@ -1334,13 +1343,15 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
     log.event(1, clock.name());
     let (interval, tsc_hz) = apic.calibrate(&clock)?;
     log.event(2, b"APIC TIMER READY");
-    let storage = frames.alloc().ok_or(b"shared allocator storage" as Error)?.into_address() as *mut Load;
+    let storage = frames.alloc().ok_or(b"shared allocator storage" as Error)?.into_address() as *mut SmpStorage;
     let programs = frames.alloc().ok_or(b"program storage" as Error)?.into_address() as *mut Programs;
     programs.write(Programs::new(archive, root));
     let programs = &*programs;
-    storage.write(Load::new(SharedFrames::new(frames), ids.len()));
-    let load = &*storage;
-    let boot_cpu = load.frames.with(|f| Cpu::create(f, apic, roster, bsp, interval, tsc_hz, clock, platform.legacy_pit_probe, None, load, programs, bsp_rsp0))?;
+    storage.write(SmpStorage { frames: SharedFrames::new(frames), load: Load::new(ids.len()) });
+    let storage = &*storage;
+    let shared_frames = &storage.frames;
+    let load = &storage.load;
+    let boot_cpu = shared_frames.with(|f| Cpu::create(f, apic, roster, bsp, interval, tsc_hz, clock, platform.legacy_pit_probe, None, shared_frames, load, programs, bsp_rsp0))?;
     gCpus[bsp_slot.index()].store(boot_cpu.self_address, Ordering::Release);
     if let Some(rate)=boot_rate { boot_cpu.tsc.publish_rate(Some(rate)); }
     boot_cpu.initialize_local_cpu()?;
@@ -1360,12 +1371,12 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
     cpus[bsp_slot.index()] = Some(boot_cpu);
     for id in roster.firmware_order() {
         if id == bsp { continue; }
-        let cpu = load.frames.with(|f| {
+        let cpu = shared_frames.with(|f| {
             let descriptors = Descriptors::new(f).ok_or(b"AP descriptors" as Error)?;
             let rsp0 = descriptors.rsp0_slot();
-            Cpu::create(f, apic, roster, id, interval, tsc_hz, clock, platform.legacy_pit_probe, Some(descriptors), load, programs, rsp0)
+            Cpu::create(f, apic, roster, id, interval, tsc_hz, clock, platform.legacy_pit_probe, Some(descriptors), shared_frames, load, programs, rsp0)
         })?;
-        let stack = load.frames.with(crate::stack::KernelStack::allocate)
+        let stack = shared_frames.with(crate::stack::KernelStack::allocate)
             .ok_or(b"AP stack" as Error)?.into_top();
         gCpus[cpu.slot.index()].store(cpu.self_address, Ordering::Release);
         start_ap(cpu, root, base, stack, &clock)?;
@@ -1402,9 +1413,9 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
     // APs are initialized and still behind the ordinary startup barrier.
     // Timed device operations run only after a real epoch exists, and
     // before releasing the scheduler and user tasks.
-    load.frames.with(initialize_timed_devices)?;
+    shared_frames.with(initialize_timed_devices)?;
     if crate::system_clock::millis().is_none() { return Err(b"system clock unavailable before scheduler"); }
-    let baseline = load.frames.with(|f| f.snapshot()).ok_or(b"bitmap snapshot" as Error)?;
+    let baseline = shared_frames.with(|f| f.snapshot()).ok_or(b"bitmap snapshot" as Error)?;
     gStartupReady.store(true, Ordering::Release);
     boot_cpu.schedule();
     for cpu in cpus.iter().flatten() {
@@ -1421,11 +1432,11 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
             serial(b" PAGES="); hex(pages as u64); serial(b"\r\n");
         }
     }
-    if !load.frames.with(|f| baseline.matches(f)) { return Err(b"free bitmap changed"); }
+    if !shared_frames.with(|f| baseline.matches(f)) { return Err(b"free bitmap changed"); }
     serial(b"AGENTOS FRAME STRESS BITMAP OK HELD="); hex(load.overlapping_pages() as u64);
     serial(b" FREE-BEFORE="); hex(baseline.count as u64);
-    serial(b" FREE-AFTER="); hex(load.frames.with(|f| f.available()) as u64); serial(b"\r\n");
-    load.frames.with(|f| {
+    serial(b" FREE-AFTER="); hex(shared_frames.with(|f| f.available()) as u64); serial(b"\r\n");
+    shared_frames.with(|f| {
         baseline.release(f);
         for cpu in cpus.iter().flatten() { (*cpu.queue.get()).reap(f); }
     });
@@ -1489,8 +1500,8 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
 pub unsafe fn shell(platform: &Platform, info: &crate::BootInfo) -> Result<(), Error> {
     let cpu = current_cpu();
     let baseline = (*cpu.boot_baseline.get()).take().ok_or(b"PID1 baseline missing" as Error)?;
-    let Some(storage) = cpu.load.frames.with(|f| f.alloc()) else {
-        cpu.load.frames.with(|f| baseline.release(f));
+    let Some(storage) = cpu.shared_frames.with(|f| f.alloc()) else {
+        cpu.shared_frames.with(|f| baseline.release(f));
         return Err(b"TTY allocation");
     };
     let terminal = storage.address() as *mut crate::tty::Terminal;
@@ -1507,19 +1518,19 @@ pub unsafe fn shell(platform: &Platform, info: &crate::BootInfo) -> Result<(), E
                 info.framebuffer,info.width as usize,info.height as usize,
                 info.stride as usize,info.pixel_format)?;
             let pages=geometry.storage_bytes()?.checked_add(PAGE-1)?/PAGE;
-            let range=cpu.load.frames.with(|f|f.alloc_contiguous(pages,PAGE,0,u64::MAX))?;
+            let range=cpu.shared_frames.with(|f|f.alloc_contiguous(pages,PAGE,0,u64::MAX))?;
             let Some((model,renderer))=crate::fb_console::Console::new(
                 geometry,range.address() as *mut u8,range.byte_len()) else {
-                cpu.load.frames.with(|f|f.release_range(range));return None;
+                cpu.shared_frames.with(|f|f.release_range(range));return None;
             };
             display=Some(ScreenWork{terminal,renderer});
             let work=display.as_mut().unwrap() as *mut ScreenWork;
             // The runtime queue is not active or published yet. Allocate a
             // separate kernel-service stack without consuming a user slot.
-            if cpu.load.frames.with(|f|(*cpu.queue.get()).spawn_service(
+            if cpu.shared_frames.with(|f|(*cpu.queue.get()).spawn_service(
                 f,screen_worker,work as usize,(*terminal).screen_event())).is_none() {
                 display=None;
-                cpu.load.frames.with(|f|f.release_range(range));
+                cpu.shared_frames.with(|f|f.release_range(range));
                 return None;
             }
             // Outside every lock, before any IRQ or worker can see the TTY.
@@ -1558,7 +1569,7 @@ pub unsafe fn shell(platform: &Platform, info: &crate::BootInfo) -> Result<(), E
         if (*terminal).snapshot_screen(&mut work.renderer) {work.renderer.render();}
     }
     let mut pCleanupQueue = cpu.lockQueue();
-    let result = cpu.load.frames.with(|f| {
+    let result = cpu.shared_frames.with(|f| {
         let q = &mut *pCleanupQueue;
         let status = started;
         q.reap(f);

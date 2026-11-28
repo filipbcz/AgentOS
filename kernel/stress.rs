@@ -9,7 +9,6 @@ pub const PHASES: usize = BATCHES / SYNC_INTERVAL;
 extern "C" { fn check_preempted_registers(ticks: *const AtomicU32, token: usize) -> usize; }
 
 pub struct Load {
-    pub frames: SharedFrames,
     pages_at_barriers: AtomicUsize,
     checked: AtomicUsize,
     failed: AtomicBool,
@@ -17,8 +16,8 @@ pub struct Load {
 }
 
 impl Load {
-    pub fn new(frames: SharedFrames, cpus: usize) -> Self {
-        Self { frames, pages_at_barriers: AtomicUsize::new(0),
+    pub fn new(cpus: usize) -> Self {
+        Self { pages_at_barriers: AtomicUsize::new(0),
                checked: AtomicUsize::new(0), failed: AtomicBool::new(false), workers: TASKS * cpus }
     }
 
@@ -32,13 +31,13 @@ impl Load {
         self.pages_at_barriers.load(Ordering::Acquire) / PHASES
     }
 
-    pub fn exercise(&self, worker: usize, ticks: &AtomicU32) -> usize {
+    pub fn exercise(&self, frames: &SharedFrames, worker: usize, ticks: &AtomicU32) -> usize {
         let mut released = 0;
         for batch in 0..BATCHES {
             let mut owned: [Option<Frame>; BATCH] = core::array::from_fn(|_| None);
             let tag = 1 + ((worker * BATCHES + batch) * BATCH);
             for (i, slot) in owned.iter_mut().enumerate() {
-                let Some(frame) = self.frames.with(|f| f.alloc()) else {
+                let Some(frame) = frames.with(|f| f.alloc()) else {
                     self.failed.store(true, Ordering::Release); break;
                 };
                 let page = frame.address() as *mut usize;
@@ -67,7 +66,7 @@ impl Load {
             }
             if synchronized { self.rendezvous(&self.checked, 1, target); }
             for frame in owned.into_iter().rev().flatten() {
-                self.frames.with(|f| f.release(frame));
+                frames.with(|f| f.release(frame));
                 released += 1;
             }
             if self.failed.load(Ordering::Acquire) { return 0; }
