@@ -1,0 +1,87 @@
+name: QEMU sustained signed SMP 4/8 (supplementary)
+
+on:
+  pull_request:
+    paths:
+      - 'boot/**'
+      - 'kernel/**'
+      - 'user/**'
+      - 'scripts/**'
+      - '.github/workflows/qemu-smp-soak.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agentos-smp-soak-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sustained-smp:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Install pinned EFI build and software-emulation dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            binutils cpio gcc-13 gnu-efi rustc python3 openssl \
+            sbsigntool efitools gdisk mtools qemu-system-x86 ovmf python3-virt-firmware
+      - name: Build unchanged ordinary signed distribution once
+        run: bash scripts/build.sh
+      - name: Build separate signed SMP workload from unchanged distribution
+        run: python3 scripts/smp-soak-image.py
+      - name: Real sustained runtime progress on 4 then 8 actual guest CPUs
+        run: |
+          set -euo pipefail
+          code=/usr/share/OVMF/OVMF_CODE_4M.secboot.fd
+          vars=/usr/share/OVMF/OVMF_VARS_4M.fd
+          test -f "$code"
+          test -f "$vars"
+          for cpus in 4 8; do
+            python3 scripts/qemu-smoke.py --basic-smp-cpus "$cpus" --session --smp-soak \
+              --ovmf-code "$code" --ovmf-vars "$vars" --timeout 720
+          done
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          a,b=[json.loads(Path(f"build/check/qemu-cpu{n}-session-basic-smp-soak/smoke.json").read_text()) for n in (4,8)]
+          if [r["cpus"] for r in (a,b)]!=[4,8] or any(r["result"]!="pass" for r in (a,b)):
+              raise SystemExit("Missing distinct completed ordinary sessions")
+          if a["basic_smp"]["identity"]!=b["basic_smp"]["identity"]:
+              raise SystemExit("Soak sessions did not use the same signed test image")
+          for r in (a,b):
+              s=r["smp_soak"]
+              if s["duration_ms"]!=60000 or len(s["windows"])!=6 or s["samples"]!=30*(r["cpus"]+2):
+                  raise SystemExit("Incomplete sustained SMP proof")
+              print("Actual sustained SMP evidence:",json.dumps({k:s[k] for k in ("root_pid","worker_pids","duration_ms","samples","payload_bytes","windows","finish_ms")},sort_keys=True))
+          PY
+      - name: Preserve actual ESP, signatures, host and guest evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-sustained-smp-4-8
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            build/build-provenance.json
+            build/agentos.efi
+            build/agentos.unsigned.efi
+            build/kernel.elf
+            build/initramfs.cpio
+            build/db.cer
+            build/db.esl
+            build/smp-soak-staging/
+            build/check/qemu-cpu*-session-basic-smp-soak/*.log
+            build/check/qemu-cpu*-session-basic-smp-soak/*.json
+            build/check/qemu-cpu*-session-basic-smp-soak/*.bin
+            build/check/qemu-cpu*-session-basic-smp-soak/*.efi
+            build/check/qemu-cpu*-session-basic-smp-soak/*.pem
+            build/check/qemu-cpu*-session-basic-smp-soak/*.txt
+            build/check/qemu-cpu*-session-basic-smp-soak/*.ppm
+            build/check/qemu-cpu*-session-basic-smp-soak/*.fd
+            build/check/qemu-cpu*-session-basic-smp-soak/esp.raw

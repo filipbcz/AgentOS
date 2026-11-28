@@ -7,12 +7,19 @@ mod stack;
 mod paging;
 mod exceptions;
 mod acpi;
+mod cpu_topology;
 mod pci;
 mod pci_irq;
 mod dma;
 mod ahci;
 mod block;
-#[cfg(ahci_block_acceptance)]
+#[cfg(nvme_block_acceptance)]
+mod nvme;
+#[cfg(virtio_net_acceptance)]
+mod virtio_net;
+#[cfg(xhci_acceptance)]
+mod xhci;
+#[cfg(any(ahci_block_acceptance, nvme_block_acceptance))]
 mod block_acceptance;
 mod smp;
 mod scheduler;
@@ -20,6 +27,14 @@ mod stress;
 mod process;
 mod lifecycle;
 mod hpet;
+mod reference_clock;
+mod bringup_clock;
+mod clock_quorum;
+mod tsc_epoch;
+mod system_clock;
+mod tsc;
+mod pit;
+mod tsc_watchdog;
 mod native_abi;
 mod files;
 mod ipc;
@@ -27,6 +42,7 @@ mod vfs;
 mod line;
 mod ioapic;
 mod tty;
+mod legacy_uart;
 mod keyboard;
 mod ps2;
 mod log_policy;
@@ -96,18 +112,18 @@ unsafe fn input(port: u16) -> u8 {
 
 const COM: u16 = 0x3f8;
 static SERIAL_LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static SERIAL_PRESENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn serial_available() -> bool {
+    SERIAL_PRESENT.load(core::sync::atomic::Ordering::Acquire)
+}
 
 unsafe fn init_serial() {
-    out(COM + 1, 0);
-    out(COM + 3, 0x80);
-    out(COM, 1);
-    out(COM + 1, 0);
-    out(COM + 3, 3);
-    out(COM + 2, 7);
-    out(COM + 4, 3);
+    SERIAL_PRESENT.store(legacy_uart::initialize(COM), core::sync::atomic::Ordering::Release);
 }
 
 unsafe fn serial(message: &[u8]) {
+    if !serial_available() { return; }
     // Each call publishes one complete message. Mask local interrupts before
     // taking the SMP gate, so the UART IRQ cannot recursively wait on it.
     let flags: usize;
@@ -115,11 +131,7 @@ unsafe fn serial(message: &[u8]) {
     while SERIAL_LOCK.compare_exchange_weak(false, true, core::sync::atomic::Ordering::Acquire,
         core::sync::atomic::Ordering::Relaxed).is_err() { core::hint::spin_loop(); }
     for &byte in message {
-        for _ in 0..100_000 {
-            let status: u8;
-            asm!("in al, dx", in("dx") COM + 5, out("al") status, options(nomem, nostack));
-            if status & 0x20 != 0 { out(COM, byte); break; }
-        }
+        if !legacy_uart::transmit(COM, byte) { break; }
     }
     SERIAL_LOCK.store(false, core::sync::atomic::Ordering::Release);
     if flags & 0x200 != 0 { asm!("sti", options(nomem, nostack)); }
@@ -140,6 +152,14 @@ pub unsafe extern "sysv64" fn kernel_main(info: &BootInfo) -> ! {
     };
     if !frames.probe() { log.event(0, b"FRAME PROBE FAILED"); halt(); }
     log.event(1, b"PHYSICAL MEMORY READY");
+    // The linked addresses in kernel.elf are offsets. Record the real
+    // runtime base so a crash RIP can be symbolized on any machine.
+    let mut image = *b"KERNEL IMAGE BASE=0000000000000000";
+    let base = paging::image_base() as u64;
+    for (i, digit) in image[18..].iter_mut().enumerate() {
+        *digit = b"0123456789abcdef"[((base >> (60 - 4*i)) & 15) as usize];
+    }
+    log.event(1, &image);
     serial(b"AGENTOS PHYSICAL FRAMES OK\r\n");
     let Some(platform) = acpi::discover(info, map) else { log.event(0, b"ACPI DISCOVERY FAILED"); halt(); };
     log.event(2, b"ACPI TABLES READY");
@@ -151,40 +171,60 @@ pub unsafe extern "sysv64" fn kernel_main(info: &BootInfo) -> ! {
     // IST stacks use the guarded pool in the newly active kernel page tables.
     let Some(descriptors) = exceptions::Descriptors::new(&mut frames) else { log.event(0, b"IDT INIT FAILED"); halt(); };
     descriptors.load();
-    if let Err(reason) = hpet::init(platform.hpet) {
-        serial(b"GLOBAL CLOCK FAILED: "); serial(reason); serial(b"\r\n"); halt();
+    if platform.hpet != 0 {
+        if let Err(reason) = hpet::init(platform.hpet) {
+            log.event(0, reason);
+        }
     }
+    let source = match system_clock::init(platform.pm_timer, hpet::reference(), hpet::candidate()) {
+        Ok(source) => source,
+        Err(reason) => { log.event(0, reason); halt(); }
+    };
+    if let Some(source)=source { log.event(1, system_clock::name(source)); }
+    else { log.event(1,b"SYSTEM CLOCK: physical references unavailable; awaiting SMP qualification"); }
     serial(b"AGENTOS OWN CR3="); exceptions::hex(root as u64); serial(b"\r\n");
     if !exceptions::probe(info.stack_base) || !frames.probe() {
         log.event(0, b"EXCEPTION OR RAM PROBE FAILED"); halt();
     }
     serial(b"AGENTOS IDT OK: BP PF-NULL PF-GUARD PF-WP PF-NX\r\n");
     log.event(1, b"PAGING AND IDT READY");
-    if let Err(reason) = pci::inventory(windows).and_then(|devices| {
-        if let Some(device) = devices.oxford { device.bind(root, &mut frames)?; }
-        #[cfg(ahci_dma_acceptance)]
-        {
-            devices.ahci.ok_or(b"AHCI missing" as &[u8])?.exercise(root, &mut frames)?;
+    // Discovery and assigned BAR ownership do not need absolute time.
+    // Preserve BSP-exclusive CF8/CFC and mapping initialization.
+    let mut devices=match pci::inventory(windows) {
+        Ok(devices)=>devices,
+        Err(reason)=>{ serial(b"AGENTOS PCI FAILED: "); serial(reason); serial(b"\r\n"); halt(); }
+    };
+    if let Some(device)=devices.oxford.take() {
+        if let Err(reason)=device.bind(root,&mut frames) {
+            serial(b"AGENTOS PCI FAILED: "); serial(reason); serial(b"\r\n"); halt();
         }
-        #[cfg(ahci_block_acceptance)]
-        {
-            let mut disk = ahci::AhciDisk::open(devices.ahci.ok_or(b"AHCI missing" as &[u8])?, root, &mut frames)?;
-            let result = block_acceptance::run(&mut disk);
-            disk.close(&mut frames)?;
-            result?;
+    }
+    // A physical epoch can service timed device operations immediately.
+    // Otherwise defer them until every enabled CPU is synchronized and
+    // the independent TSC monitor has actually started.
+    let mut pending=Some(devices);
+    if source.is_some() {
+        if let Err(reason)=initialize_timed_devices(pending.take().unwrap(),root,&mut frames) {
+            serial(b"AGENTOS PCI FAILED: "); serial(reason); serial(b"\r\n"); halt();
         }
-        Ok(())
-    }) {
-        serial(b"AGENTOS PCI FAILED: "); serial(reason); serial(b"\r\n"); halt();
     }
     if info.initramfs < info.image_base || info.initramfs.checked_add(info.initramfs_size)
         .zip(info.image_base.checked_add(info.image_size)).map_or(true, |(end, limit)| end > limit) { log.event(0, b"INVALID INITRAMFS"); halt(); }
     let archive = core::slice::from_raw_parts(info.initramfs as *const u8, info.initramfs_size as usize);
     log.event(2, b"INITRAMFS LOCATED");
-    if let Err(reason) = smp::run(&platform, info.ap_boot, root, frames, descriptors.rsp0_slot(), archive, &mut log) {
+    if let Err(reason) = smp::run(&platform, info.ap_boot, root, frames, descriptors.rsp0_slot(), archive, &mut log,
+        source.is_some(), |frames| {
+            if let Some(devices)=pending.take() { initialize_timed_devices(devices,root,frames) }
+            else { Ok(()) }
+        }) {
         log.event(0, b"SMP FAILED");
+        log.event(0, reason);
         serial(b"SMP FAILED: "); serial(reason); serial(b"\r\n"); halt();
     }
+    // All direct boot calibration and INIT/SIPI reference users have
+    // completed. From now on only the shared clock owner may reset a
+    // quarantined HPET, under its IRQ-safe SMP gate.
+    system_clock::enable_hpet_recovery(|source| unsafe { hpet::restart_quarantined(source).is_ok() });
     log.event(1, b"BOOT COMPLETE");
     serial(MESSAGE);
     serial(b"\r\n");
@@ -196,6 +236,49 @@ pub unsafe extern "sysv64" fn kernel_main(info: &BootInfo) -> ! {
         serial(b"SHELL FAILED: "); serial(reason); serial(b"\r\n");
     } else { log.event(1, b"INTERACTIVE SHELL STOPPED"); }
     halt()
+}
+
+// Existing timed boot device operations. Their driver implementations
+// are unchanged. This owner is called only after clock publication.
+unsafe fn initialize_timed_devices(devices: pci::Devices, root: usize, frames: &mut frames::Frames<'_>)
+    -> Result<(), &'static [u8]> {
+    let _=(&devices,root,&frames);
+    #[cfg(ahci_dma_acceptance)]
+    {
+        devices.ahci.ok_or(b"AHCI missing" as &[u8])?.exercise(root, frames)?;
+    }
+    #[cfg(ahci_block_acceptance)]
+    {
+        let mut disk = ahci::AhciDisk::open(devices.ahci.ok_or(b"AHCI missing" as &[u8])?, root, frames)?;
+        let result = block_acceptance::run(&mut disk);
+        disk.close(frames)?;
+        result?;
+    }
+    #[cfg(nvme_block_acceptance)]
+    {
+        if devices.nvme_count != 1 { return Err(b"NVMe profile requires exactly one controller" as &[u8]); }
+        let mut disk = nvme::NvmeDisk::open(devices.nvme.ok_or(b"NVMe ECAM/BAR missing" as &[u8])?, root, frames)?;
+        let result = block_acceptance::run(&mut disk);
+        disk.close(frames)?;
+        result?;
+    }
+    #[cfg(virtio_net_acceptance)]
+    {
+        if devices.virtio_net_count != 1 { return Err(b"VirtIO profile requires exactly one network controller" as &[u8]); }
+        let mut net = virtio_net::VirtioNet::open(devices.virtio_net.ok_or(b"VirtIO modern ECAM missing" as &[u8])?, root, frames)?;
+        let result = virtio_net::exercise(&mut net);
+        net.close(frames)?;
+        result?;
+    }
+    #[cfg(xhci_acceptance)]
+    {
+        if devices.xhci_count != 1 { return Err(b"xHCI profile requires exactly one controller" as &[u8]); }
+        let mut hc = xhci::Xhci::open(devices.xhci.ok_or(b"xHCI ECAM/BAR missing" as &[u8])?, root, frames)?;
+        let result = hc.exercise();
+        hc.close(frames)?;
+        result?;
+    }
+    Ok(())
 }
 
 fn draw(info: &BootInfo, line: &[u8], left: usize, top: usize, scale: usize) {
@@ -240,8 +323,13 @@ impl<'a> BootLog<'a> {
         // performs UART/MMIO while holding its nonblocking SMP/IRQ gate.
         let _ = logger::LOGGER.record(0, 0, severity, message);
         let policy = log_policy::Policy::new(self.info.log_level);
-        let serial_enabled = policy.enabled(severity, log_policy::Sink::Serial);
-        let screen_enabled = policy.enabled(severity, log_policy::Sink::Screen);
+        let serial_requested = policy.enabled(severity, log_policy::Sink::Serial);
+        let serial_enabled = serial_requested && serial_available();
+        // A serial-only configuration must not discard diagnostics simply
+        // because the optional legacy UART is absent. Explicit none still
+        // suppresses ordinary output; the history above is always recorded.
+        let screen_enabled = policy.enabled(severity, log_policy::Sink::Screen)
+            || (serial_requested && !serial_available());
         if !serial_enabled && !screen_enabled { return; }
         let prefix = log_policy::Policy::prefix(severity);
         if serial_enabled {

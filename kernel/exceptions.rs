@@ -3,7 +3,8 @@ use core::{arch::global_asm, ptr};
 
 global_asm!(include_str!("traps.S"));
 extern "C" {
-    static vectors: [u64; 32];
+    // Signed offsets from the table itself, independent of the load address.
+    static vectors: [i32; 32];
     static after_break: u8;
     static read_site: u8;
     static write_site: u8;
@@ -60,7 +61,10 @@ impl Descriptors {
                        ((addr & 0xffff0000) << 32));
             gate.add(1).write(addr >> 32);
         };
-        for (i, &addr) in vectors.iter().enumerate() { install_gate(i, addr); }
+        let table = ptr::addr_of!(vectors) as usize;
+        for (i, &offset) in vectors.iter().enumerate() {
+            install_gate(i, table.wrapping_add_signed(offset as isize) as u64);
+        }
         install_gate(0xe0, timer_gate as usize as u64);
         install_gate(crate::tty::VECTOR as usize, serial_gate as usize as u64);
         install_gate(crate::tty::KEYBOARD_VECTOR as usize, keyboard_gate as usize as u64);

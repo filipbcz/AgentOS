@@ -1,0 +1,131 @@
+name: Isolated signed runtime SMP preemption continuation
+# Retired after the authorized successful bounded-window 4 -> 8 proof 46083246063. Do not re-enable without explicit authorization.
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  proof:
+    if: ${{ false }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 5
+          persist-credentials: false
+      - name: Deterministic verifier rejection cases before any guest
+        run: python3 tests/preemption-proof/proof.py
+      - name: Install existing pinned signed build and debugger dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends binutils cpio gcc-13 gnu-efi rustc python3 openssl sbsigntool efitools gdisk mtools qemu-system-x86 ovmf python3-virt-firmware gdb
+      - name: Build unchanged production and existing staging
+        run: bash scripts/build.sh --supervisor-staging
+      - name: Retrieve exact archived successful 2 CPU evidence (no boot)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p build
+          curl --fail --silent --show-error --location \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/filipbcz/AgentOS/actions/artifacts/15236044308/zip" \
+            --output build/preemption-proof-prior-2cpu.zip
+          echo 'cae8759a2decfa6092ab3b5cc983d3c74d5f3780b67a366353ebd3168ef64f94  build/preemption-proof-prior-2cpu.zip' | sha256sum --check
+      - name: Exact 4 CPU preflight and prior profile proof, no guest
+        id: preflight4
+        if: success()
+        run: python3 tests/preemption-proof/run.py --preflight 4
+      - name: Archive 4 CPU preflight before guest
+        if: always() && steps.preflight4.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: preemption-preflight-4cpu
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            build/preemption-proof-4cpu/preflight.json
+            build/preemption-proof-4cpu/startup-host.json
+            build/preemption-proof-4cpu/failure-host.json
+            build/preemption-proof-4cpu/baseline-client-disassembly.txt
+            build/preemption-proof-4cpu/client-disassembly.txt
+      - name: One signed staged TCG HPET 4 CPU guest
+        if: success() && steps.preflight4.outcome == 'success'
+        run: python3 tests/preemption-proof/run.py --guest 4
+      - name: Preserve actual 4 CPU evidence
+        if: always() && steps.preflight4.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: preemption-proof-4cpu
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            build/build-provenance.json
+            build/kernel.elf
+            build/initramfs.cpio
+            build/agentos.efi
+            build/agentos.unsigned.efi
+            build/db.cer
+            build/db.esl
+            build/preemption-proof-4cpu/*.json
+            build/preemption-proof-4cpu/*.jsonl
+            build/preemption-proof-4cpu/*.log
+            build/preemption-proof-4cpu/*.bin
+            build/preemption-proof-4cpu/*.elf
+            build/preemption-proof-4cpu/*.efi
+            build/preemption-proof-4cpu/*.cpio
+            build/preemption-proof-4cpu/*.txt
+            build/preemption-proof-4cpu/*.ppm
+            build/preemption-proof-4cpu/*.fd
+            build/preemption-proof-4cpu/preempt-runner
+            build/preemption-proof-4cpu/esp.raw
+      - name: Exact 8 CPU preflight and prior profile proof, no guest
+        id: preflight8
+        if: success()
+        run: python3 tests/preemption-proof/run.py --preflight 8
+      - name: Archive 8 CPU preflight before guest
+        if: always() && steps.preflight8.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: preemption-preflight-8cpu
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            build/preemption-proof-8cpu/preflight.json
+            build/preemption-proof-8cpu/startup-host.json
+            build/preemption-proof-8cpu/failure-host.json
+            build/preemption-proof-8cpu/baseline-client-disassembly.txt
+            build/preemption-proof-8cpu/client-disassembly.txt
+      - name: One signed staged TCG HPET 8 CPU guest
+        if: success() && steps.preflight8.outcome == 'success'
+        run: python3 tests/preemption-proof/run.py --guest 8
+      - name: Preserve actual 8 CPU evidence
+        if: always() && steps.preflight8.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: preemption-proof-8cpu
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            build/build-provenance.json
+            build/kernel.elf
+            build/initramfs.cpio
+            build/agentos.efi
+            build/agentos.unsigned.efi
+            build/db.cer
+            build/db.esl
+            build/preemption-proof-8cpu/*.json
+            build/preemption-proof-8cpu/*.jsonl
+            build/preemption-proof-8cpu/*.log
+            build/preemption-proof-8cpu/*.bin
+            build/preemption-proof-8cpu/*.elf
+            build/preemption-proof-8cpu/*.efi
+            build/preemption-proof-8cpu/*.cpio
+            build/preemption-proof-8cpu/*.txt
+            build/preemption-proof-8cpu/*.ppm
+            build/preemption-proof-8cpu/*.fd
+            build/preemption-proof-8cpu/preempt-runner
+            build/preemption-proof-8cpu/esp.raw

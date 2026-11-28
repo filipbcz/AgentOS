@@ -1,4 +1,4 @@
-use crate::BootInfo;
+use crate::{BootInfo, cpu_topology::CpuTopology, reference_clock::PmTimer};
 use core::slice;
 
 fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
@@ -97,11 +97,12 @@ impl PciWindows {
 pub struct Platform {
     pub pci: PciWindows,
     pub lapic: usize,
-    pub timer_port: u16,
+    pub pm_timer: Option<PmTimer>,
     pub hpet: usize,
-    pub ids: [u8; 255],
-    pub count: usize,
+    pub topology: CpuTopology,
     pub legacy_pic: bool,
+    pub legacy_pit_probe: bool,
+    pub ps2_controller: bool,
     pub io_apics: [IoApic; 8],
     pub io_count: usize,
     pub serial_irq: IsaInterrupt,
@@ -116,16 +117,93 @@ pub struct Platform {
 fn hpetAddress(aBytes: &[u8]) -> Option<usize> {
     if aBytes.len() < 56 || aBytes.get(..4)? != b"HPET" ||
        u32_at(aBytes, 4)? as usize != aBytes.len() || !checksum(aBytes) ||
-       aBytes[40] != 0 || !matches!(aBytes[41], 0 | 64) ||
-       aBytes[42] != 0 || !matches!(aBytes[43], 0 | 4) { return None; }
+       aBytes[40] != 0 || !matches!(aBytes[41], 0 | 32 | 64) ||
+       aBytes[42] != 0 || !matches!(aBytes[43], 0 | 3 | 4) { return None; }
     let pAddress = usize::try_from(u64_at(aBytes, 44)?).ok()?;
     // Keep hardware outside the sole user PML4 slot and canonical low half.
     (pAddress != 0 && pAddress & 4095 == 0 && pAddress < (1usize << 39))
         .then_some(pAddress)
 }
 
+/// FADT IA-PC Boot Architecture Flags, offset 109, bit 1 (ACPI §5.2.9).
+/// FADT revision 1/2 predates the 8042 flag; retain conventional legacy
+/// discovery there. A truncated modern FADT is invalid, not permission to
+/// probe an undeclared controller.
+pub(crate) fn fadt_8042(table: &[u8]) -> Option<bool> {
+    if table.len() < 36 || table.get(..4)? != b"FACP" ||
+       u32_at(table, 4)? as usize != table.len() || !checksum(table) {
+        return None;
+    }
+    if table[8] < 3 { return Some(true); }
+    let flags = u16::from_le_bytes(table.get(109..111)?.try_into().ok()?);
+    Some(flags & 2 != 0)
+}
+
+/// MADT PCAT_COMPAT declares the legacy dual 8259 interrupt model,
+/// not proof of an 8254. Permit only a bounded, validated legacy PIT
+/// probe on that compatibility path, with a valid non-reduced FADT.
+/// IA-PC LEGACY_DEVICES alone describes user-visible ISA/LPC devices,
+/// and is not a PIT presence flag. Never probe on reduced platforms.
+pub(crate) fn legacy_pit_probe(legacy_pic: bool, fadt: Option<&[u8]>) -> bool {
+    if !legacy_pic { return false; }
+    let Some(table) = fadt else { return false; };
+    table.len() >= 116 && table.get(..4) == Some(b"FACP") &&
+        u32_at(table, 4) == Some(table.len() as u32) && checksum(table) &&
+        u32_at(table, 112).map_or(false, |flags| flags & (1 << 20) == 0)
+}
+
+/// ACPI 6.6 FADT §5.2.9 and PM_TMR §4.8.3.3. Prefer a usable
+/// extended address, otherwise the legacy I/O address. HW_REDUCED_ACPI
+/// machines need not implement any of these registers.
+pub(crate) fn fadt_pm_timer(table: &[u8], mut usable: impl FnMut(PmTimer) -> bool) -> Option<PmTimer> {
+    if table.len() < 116 || table.get(..4)? != b"FACP" ||
+       u32_at(table, 4)? as usize != table.len() || !checksum(table) { return None; }
+    let flags = u32_at(table, 112)?;
+    if flags & (1 << 20) != 0 || table[91] != 4 { return None; }
+    let wide = flags & (1 << 8) != 0;
+    if let Some(gas) = table.get(208..220) {
+        // A declared 24-bit counter still occupies a 32-bit register.
+        // Access size 0 is the legacy unspecified encoding.
+        if gas[2] == 0 && matches!(gas[3], 0 | 3) &&
+           (matches!(gas[1], 0 | 32) || gas[1] == 24 && !wide) {
+            if let Some(timer) = PmTimer::from_address(gas[0], u64_at(gas, 4)?, wide) {
+                if usable(timer) { return Some(timer); }
+            }
+        }
+    }
+    let timer = PmTimer::from_address(1, u32_at(table, 76)? as u64, wide)?;
+    usable(timer).then_some(timer)
+}
+
+/// Only permit a UC device mapping if the containing page is not firmware
+/// data, loader data/code or conventional RAM. A firmware MMIO aperture
+/// need not appear in GetMemoryMap at all.
+pub(crate) fn timer_mmio_page_ok(map: &[u8], stride: usize, address: usize) -> bool {
+    if stride < 40 || map.len() % stride != 0 { return false; }
+    let first = (address & !4095) as u64;
+    for d in map.chunks_exact(stride) {
+        let Some(kind) = u32_at(d, 0) else { return false; };
+        let Some(start) = u64_at(d, 8) else { return false; };
+        let Some(end) = u64_at(d, 24).and_then(|n| n.checked_mul(4096))
+            .and_then(|n| start.checked_add(n)) else { return false; };
+        if first < end && start < first + 4096 && !matches!(kind, 0 | 11) {
+            return false;
+        }
+    }
+    true
+}
+
 impl Platform {
-    fn madt(&mut self, bytes: &[u8]) -> Option<()> {
+    pub(crate) fn new() -> Self {
+        Self { pci: PciWindows::new(), lapic: 0, pm_timer: None, hpet: 0, topology: CpuTopology::new(), legacy_pic: false, legacy_pit_probe: false, ps2_controller: true,
+        io_apics: [IoApic { address: 0, gsi: 0 }; 8], io_count: 0,
+        serial_irq: IsaInterrupt { gsi: 4, low: false, level: false }, serial_override: false,
+        keyboard_irq: IsaInterrupt { gsi: 1, low: false, level: false }, keyboard_override: false }
+    }
+
+    pub fn pm_timer_mmio(&self) -> Option<usize> { self.pm_timer.and_then(PmTimer::mmio) }
+
+    pub(crate) fn madt(&mut self, bytes: &[u8]) -> Option<()> {
         self.lapic = u32_at(bytes, 36)? as usize;
         self.legacy_pic = u32_at(bytes, 40)? & 1 != 0;
         let mut rest = bytes.get(44..)?;
@@ -133,8 +211,11 @@ impl Platform {
             let length = *rest.get(1)? as usize;
             if length < 2 { return None; }
             let e = rest.get(..length)?;
-            let id = match e[0] {
-                0 if u32_at(e, 4)? & 1 != 0 => Some(e[3] as u32),
+            match e[0] {
+                0 => {
+                    if e.len() != 8 { return None; }
+                    self.topology.add(u32::from(e[3]), u32_at(e, 4)?, true)?;
+                }
                 1 => {
                     let address = u32_at(e, 4)? as usize;
                     let gsi = u32_at(e, 8)?;
@@ -142,7 +223,6 @@ impl Platform {
                         self.io_apics[..self.io_count].iter().any(|io| io.address == address || io.gsi == gsi) { return None; }
                     *self.io_apics.get_mut(self.io_count)? = IoApic { address, gsi };
                     self.io_count += 1;
-                    None
                 }
                 2 if e.get(2) == Some(&0) && (e.get(3) == Some(&4) || e.get(3) == Some(&1)) => {
                     let keyboard = e[3] == 1;
@@ -153,20 +233,19 @@ impl Platform {
                                              level: (flags >> 2) & 3 == 3 };
                     if keyboard { self.keyboard_irq = irq; self.keyboard_override = true; }
                     else { self.serial_irq = irq; self.serial_override = true; }
-                    None
                 }
-                9 if u32_at(e, 8)? & 1 != 0 => Some(u32_at(e, 4)?),
-                5 => { self.lapic = u64_at(e, 4)? as usize; None }
-                _ => None,
-            };
-            if let Some(id) = id {
-                if id >= 255 || self.ids[..self.count].contains(&(id as u8)) { return None; }
-                *self.ids.get_mut(self.count)? = id as u8;
-                self.count += 1;
+                9 => {
+                    if e.len() != 16 { return None; }
+                    let flags = u32_at(e, 8)?;
+                    if flags & 3 != 0 && e[2..4] != [0, 0] { return None; }
+                    self.topology.add(u32_at(e, 4)?, flags, false)?;
+                }
+                5 => { self.lapic = u64_at(e, 4)? as usize; }
+                _ => (),
             }
             rest = &rest[length..];
         }
-        (self.count > 0 && self.lapic != 0 && self.lapic % 4096 == 0).then_some(())
+        (!self.topology.enabled().ids().is_empty() && self.lapic != 0 && self.lapic % 4096 == 0).then_some(())
     }
 }
 
@@ -184,34 +263,63 @@ pub unsafe fn discover(info: &BootInfo, map: &[u8]) -> Option<Platform> {
     };
     if &root[..4] != (if width == 8 { b"XSDT" } else { b"RSDT" }) ||
         (root.len()-36) % width != 0 { return None; }
-    let mut p = Platform { pci: PciWindows::new(), lapic: 0, timer_port: 0, hpet: 0, ids: [0; 255], count: 0, legacy_pic: false,
-        io_apics: [IoApic { address: 0, gsi: 0 }; 8], io_count: 0,
-        serial_irq: IsaInterrupt { gsi: 4, low: false, level: false }, serial_override: false,
-        keyboard_irq: IsaInterrupt { gsi: 1, low: false, level: false }, keyboard_override: false };
+    let mut p = Platform::new();
+    let mut fadt_table = None;
+    let mut hpet_seen = false;
     for entry in root[36..].chunks_exact(width) {
         let address = if width == 8 { u64_at(entry, 0)? } else { u32_at(entry, 0)? as u64 };
         match fw.bytes(address, 4)? {
             b"MCFG" => p.pci.parse(fw.table(address)?)?,
             b"APIC" => p.madt(fw.table(address)?)?,
             b"HPET" => {
-                if p.hpet != 0 { return None; }
-                p.hpet = hpetAddress(fw.table(address)?)?;
+                if hpet_seen { return None; }
+                hpet_seen = true;
+                // HPET is optional. An invalid table cannot authorize MMIO.
+                p.hpet = fw.table(address).and_then(hpetAddress).unwrap_or(0);
             }
             b"FACP" => {
+                if fadt_table.is_some() { return None; }
                 let fadt = fw.table(address)?;
-                let extended = u64_at(fadt, 212).unwrap_or(0);
-                let port = if extended != 0 {
-                    if fadt[208] != 1 || fadt[210] != 0 { return None; }
-                    extended
-                } else { u32_at(fadt, 76)? as u64 };
-                p.timer_port = u16::try_from(port).ok()?;
+                p.ps2_controller = fadt_8042(fadt)?;
+                fadt_table = Some(fadt);
             }
             _ => (),
         }
     }
-    if p.hpet != 0 && (p.hpet == p.lapic ||
-       p.io_apics[..p.io_count].iter().any(|pIo| pIo.address == p.hpet)) { return None; }
-    (p.lapic != 0 && p.timer_port != 0).then_some(p)
+    if p.hpet != 0 {
+        let fb_start = info.framebuffer as usize;
+        let fb_end = (info.stride as usize).checked_mul(info.height as usize)?
+            .checked_mul(4)?.checked_add(fb_start)?;
+        if !timer_mmio_page_ok(map, fw.stride, p.hpet) ||
+           (p.hpet < fb_end && fb_start < p.hpet + 4096) ||
+           p.hpet == p.lapic || p.io_apics[..p.io_count].iter().any(|io| io.address == p.hpet) ||
+           p.pci.windows().iter().any(|w| {
+               let (start, size) = w.mapping();
+               (start..start+size).contains(&p.hpet)
+           }) { p.hpet = 0; }
+    }
+    p.legacy_pit_probe = legacy_pit_probe(p.legacy_pic, fadt_table);
+    if let Some(fadt) = fadt_table {
+        p.pm_timer = fadt_pm_timer(fadt, |timer| {
+            let Some(address) = timer.mmio() else { return true; };
+            let page = address & !4095;
+            let fb_start = info.framebuffer as usize;
+            let Some(fb_end) = (info.stride as usize).checked_mul(info.height as usize)
+                .and_then(|pixels| pixels.checked_mul(4)).and_then(|size| fb_start.checked_add(size))
+                else { return false; };
+            // The framebuffer is also MMIO, often absent from the firmware
+            // map. Never remap any of its pages read-only as a timer.
+            !(page < fb_end && fb_start < page + 4096) &&
+                timer_mmio_page_ok(map, fw.stride, address) &&
+                page != p.lapic && page != p.hpet &&
+                !p.io_apics[..p.io_count].iter().any(|io| io.address == page) &&
+                !p.pci.windows().iter().any(|w| {
+                    let (start, size) = w.mapping();
+                    (start..start+size).contains(&page)
+                })
+        });
+    }
+    (p.lapic != 0).then_some(p)
 }
 
 #[cfg(test)]
@@ -239,6 +347,10 @@ mod tests {
     fn acceptsSystemMemoryWithDeclaredOrUnspecifiedRegisterWidth() {
         let mut pBytes = hpetTable();
         assert_eq!(hpetAddress(&pBytes), Some(0xfed0_0000));
+        pBytes[41] = 32;
+        pBytes[43] = 3;
+        fixChecksum(&mut pBytes);
+        assert_eq!(hpetAddress(&pBytes), Some(0xfed0_0000));
         pBytes[41] = 64;
         pBytes[43] = 4;
         fixChecksum(&mut pBytes);
@@ -250,7 +362,7 @@ mod tests {
         let pValid = hpetTable();
         for pLength in 0..56 { assert_eq!(hpetAddress(&pValid[..pLength]), None); }
         for (pOffset, pValue) in [(0, b'X'), (4, 55), (9, pValid[9].wrapping_add(1)),
-            (40, 1), (41, 32), (42, 1), (43, 3)] {
+            (40, 1), (41, 16), (42, 1), (43, 2)] {
             let mut pBytes = pValid.clone();
             pBytes[pOffset] = pValue;
             if pOffset != 9 { fixChecksum(&mut pBytes); }

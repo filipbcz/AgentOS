@@ -28,6 +28,9 @@ gAuth = re.compile(
     rf"UID=({gHex}) GID=({gHex}) SENDER=({gHex}) READER=({gHex}) FNV=({gHex})")
 gReap = re.compile(
     rf"AGENTOS MIGRATION REAP ROOT=({gHex}) CHILD=({gHex}) SLOT=({gHex}) STATUS=({gHex})")
+gReapForeground = re.compile(gReap.pattern + rf" AGAIN=({gHex})")
+gOwner = re.compile(rf"AGENTOS MIGRATION (OWNER|CLEAN) ROOT=({gHex}) PARENT=({gHex}) "
+                    rf"CPU=({gHex}) FDS=({gHex}) CHILD_AFTER=({gHex})")
 gKillProof = re.compile(
     rf"AGENTOS MIGRATION (KILL|COLLECT) ROOT=({gHex}) CHILD=({gHex}) SLOT=({gHex}) "
     rf"CPU=({gHex}) OWNER=({gHex}) TOTAL=({gHex}) NOW=({gHex}) UNTIL=({gHex})(?: STATUS=({gHex}))?")
@@ -51,7 +54,7 @@ def expectedDigest(aOffset):
     return pDigest
 
 
-def verify(aText, aCpus=None):
+def verify(aText, aCpus=None, *, foreground=None):
     pLines = aText.splitlines()
     pMarkers = [(pIndex, gBoundary.fullmatch(pLine)) for pIndex, pLine in enumerate(pLines)
                 if pLine.startswith(("AGENTOS MIGRATION BEGIN", "AGENTOS MIGRATION ENDED"))]
@@ -63,30 +66,37 @@ def verify(aText, aCpus=None):
         int(pValue, 16) for pValue in pBegin.groups()[1:])
     if aCpus is None:
         aCpus = pCount
-    require(aCpus in (1, 2) and pCount == aCpus and pRoot == 1 and
+    require(aCpus in (1, 2) and pCount == aCpus and pRoot == (1 if foreground is None else foreground[0]) and
             pWorkers == 4 and pObserved == 0 and pBeginAt < pEndAt and pStartTime <= 0x7fffffffffffffff,
             "Invalid migration root, CPU count, worker count or baseline")
-    pSessions = [(pIndex, gSession.fullmatch(pLine)) for pIndex, pLine in enumerate(pLines)
-                 if pLine.startswith("AGENTOS MANAGER SESSION START")]
-    require(len(pSessions) == 1 and pSessions[0][1] is not None and
-            int(pSessions[0][1][1], 16) == pRoot and pSessions[0][0] < pBeginAt,
-            "Migration must follow resumption of the original manager root")
-    pParks = [(pIndex, gPark.fullmatch(pLine)) for pIndex, pLine in enumerate(pLines[:pBeginAt])
-              if pLine.startswith("AGENTOS USER PARK")]
-    require(len(pParks) == 1 and pParks[0][1] is not None and
-            int(pParks[0][1][1], 16) == pRoot and int(pParks[0][1][2], 16) > 0 and
-            int(pParks[0][1][2], 16) % 4096 == 0 and pParks[0][0] < pSessions[0][0],
-            "Migration root was not retained from the boot acceptance session")
-    pManagers = [(pIndex, gManager.fullmatch(pLine)) for pIndex, pLine in enumerate(pLines)
-                 if pLine.startswith("AGENTOS MANAGER BEGIN")]
-    require(len(pManagers) == 1 and pManagers[0][1] is not None and
-            int(pManagers[0][1][1], 16) == pRoot and pManagers[0][0] > pEndAt,
-            "Service manager must begin only after migration acceptance")
-    pKnownCpus = {int(pMatch[1], 16) for pLine in pLines
-                  if (pMatch := gCpu.fullmatch(pLine))}
-    require(not pKnownCpus or len(pKnownCpus) == aCpus, "Boot CPU evidence disagrees with migration")
-    pPriorPids = {int(pMatch[1], 16) for pLine in pLines[:pBeginAt]
-                  if (pMatch := re.match(rf"AGENTOS USER (?:EXIT|FAULT|KILL) PID=({gHex})", pLine))}
+    if foreground is None:
+        pSessions = [(pIndex, gSession.fullmatch(pLine)) for pIndex, pLine in enumerate(pLines)
+                     if pLine.startswith("AGENTOS MANAGER SESSION START")]
+        require(len(pSessions) == 1 and pSessions[0][1] is not None and
+                int(pSessions[0][1][1], 16) == pRoot and pSessions[0][0] < pBeginAt,
+                "Migration must follow resumption of the original manager root")
+        pParks = [(pIndex, gPark.fullmatch(pLine)) for pIndex, pLine in enumerate(pLines[:pBeginAt])
+                  if pLine.startswith("AGENTOS USER PARK")]
+        require(len(pParks) == 1 and pParks[0][1] is not None and
+                int(pParks[0][1][1], 16) == pRoot and int(pParks[0][1][2], 16) > 0 and
+                int(pParks[0][1][2], 16) % 4096 == 0 and pParks[0][0] < pSessions[0][0],
+                "Migration root was not retained from the boot acceptance session")
+        pManagers = [(pIndex, gManager.fullmatch(pLine)) for pIndex, pLine in enumerate(pLines)
+                     if pLine.startswith("AGENTOS MANAGER BEGIN")]
+        require(len(pManagers) == 1 and pManagers[0][1] is not None and
+                int(pManagers[0][1][1], 16) == pRoot and pManagers[0][0] > pEndAt,
+                "Service manager must begin only after migration acceptance")
+        pKnownCpus = {int(pMatch[1], 16) for pLine in pLines
+                      if (pMatch := gCpu.fullmatch(pLine))}
+        require(not pKnownCpus or len(pKnownCpus) == aCpus, "Boot CPU evidence disagrees with migration")
+        pPriorPids = {int(pMatch[1], 16) for pLine in pLines[:pBeginAt]
+                      if (pMatch := re.match(rf"AGENTOS USER (?:EXIT|FAULT|KILL) PID=({gHex})", pLine))}
+    else:
+        _, pKnownCpus, pPriorPids = foreground
+        require(pBeginAt == 0 and pEndAt == len(pLines)-1 and
+                len(pKnownCpus) == aCpus and pRoot not in pPriorPids,
+                "Invalid foreground migration interval, identity or CPU roster")
+    pWorkerCpus, pWorkerCr3 = set(), {}
     pStates, pPids = {}, set()
     pMoveEvents, pWorkMoveEvents, pMaxArmTotal = 0, 0, pMoves
     pKill = None
@@ -110,6 +120,7 @@ def verify(aText, aCpus=None):
                     "Only I/O records carry offset and digest fields")
             require((pKind == "ARMED") == (pMatch[12] is not None),
                     "Only a fresh owner report carries the migration counter")
+            pWorkerCpus.add(pCpuId)
             if pKind == "START":
                 require(pSlot not in pStates and pChild not in pPids and pChild not in pPriorPids and
                         pUntil - pNow == 5000 and pWork == 1,
@@ -234,10 +245,13 @@ def verify(aText, aCpus=None):
                         for pValue in pStates.values()),
                     "Worker exited before successful completion or twice")
             pState["phase"] = "exited"
+            pWorkerCr3[pChild] = pRootPage
             continue
-        pMatch = gReap.fullmatch(pLine)
+        pMatch = (gReap if foreground is None else gReapForeground).fullmatch(pLine)
         if pMatch:
-            pOwner, pChild, pSlot, pStatus = (int(pValue, 16) for pValue in pMatch.groups())
+            pOwner, pChild, pSlot, pStatus = (int(pValue, 16) for pValue in pMatch.groups()[:4])
+            if foreground is not None:
+                require(pMatch[5] == "fffffffffffffff6", "Worker was not collected exactly once")
             require(pKill is not None and pOwner == pRoot and pSlot in pStates and
                     pStates[pSlot]["pid"] == pChild and
                     ((pSlot == pKill["slot"] and pStatus == 137 and pStates[pSlot]["phase"] == "collected") or
@@ -267,12 +281,76 @@ def verify(aText, aCpus=None):
     else:
         require(pWorkMoveEvents >= 2 and pEndMoves - pMoves >= pMoveEvents and pEndWakes > pWakeups,
                 "Two-CPU run lacks repeated actual migration and cross-CPU wakeups")
-    return {"root": pRoot, "cpus": aCpus, "workers": pWorkers, "observed_moves": pMoveEvents,
+    result = {"root": pRoot, "cpus": aCpus, "workers": pWorkers, "observed_moves": pMoveEvents,
             "work_observed_moves": pWorkMoveEvents, "killed_pid": pKill["pid"],
             "kill_parent_cpu": pKill["caller"], "kill_owner_cpu": pKill["owner"],
             "kill_migration_counter": pKill["total"], "remote_kill": aCpus == 2,
             "migrations": pEndMoves - pMoves, "cross_cpu_wakeups": pEndWakes - pWakeups,
             "begin_line": pBeginAt, "end_line": pEndAt}
+    if foreground is not None:
+        require(pWorkerCpus == pKnownCpus and len(pWorkerCr3) == 3,
+                "Actual worker execution did not cover the boot CPU roster")
+        result.update(worker_pids=sorted(pPids), worker_apics=sorted(pWorkerCpus),
+                      worker_exits=[{"pid": pid, "cr3": cr3} for pid,cr3 in sorted(pWorkerCr3.items())],
+                      worker_moves=[{"pid": state["pid"], "observed": state["observed"],
+                                     "moves": state["moves"]} for state in pStates.values()])
+    return result
+
+
+def verify_boot(text, *, allow_foreground=False):
+    """Current image contract; absence never selects the historical mode."""
+    if not allow_foreground:
+        require("AGENTOS MIGRATION" not in text, "Migration workload in ordinary distribution")
+        return
+    ready = list(re.finditer(r"(?m)^AGENTOS SHELL READY\r?$", text))
+    require(len(ready) == 1 and "AGENTOS MIGRATION" not in text[:ready[0].end()],
+            "Migration workload before the authenticated foreground phase")
+
+
+def verify_foreground(data, shell, shell_cr3, prior_pids, apics):
+    """Consume actual foreground bytes immediately after the command echo.
+
+    Legacy verify() remains bound to the original parked PID1. The current
+    interval uses the actual shell parent, process exits and boot CPU roster.
+    """
+    def line(offset):
+        end = data.find(b"\r\n", offset)
+        require(end >= 0, "Incomplete migration foreground line")
+        return data[offset:end].decode("ascii", errors="replace"), end + 2
+
+    owner, pos = line(0)
+    m = gOwner.fullmatch(owner)
+    require(m is not None and m[1] == "OWNER", "Missing foreground migration owner")
+    root, parent, cpu, fds, empty = (int(v, 16) for v in m.groups()[1:])
+    require(root > shell and root not in prior_pids and parent == shell and cpu in apics
+            and fds == 7 and empty == 0xfffffffffffffff6, "Invalid foreground owner, APIC or inherited FDs")
+    begin = pos
+    while True:
+        record, pos = line(pos)
+        if record.startswith("AGENTOS MIGRATION ENDED"):
+            break
+        require(record.startswith(("AGENTOS MIGRATION ", "AGENTOS USER ")),
+                "Unexpected foreground migration record")
+    result = verify(data[begin:pos].decode("ascii", errors="replace"), len(apics),
+                    foreground=(root, set(apics), set(prior_pids)))
+    clean, pos = line(pos)
+    m = gOwner.fullmatch(clean)
+    require(m is not None and m[1] == "CLEAN", "Missing foreground descriptor/child cleanup")
+    r, p, c, f, n = (int(v, 16) for v in m.groups()[1:])
+    require((r,p,f,n) == (root,shell,7,0xfffffffffffffff6) and c in apics,
+            "Incorrect foreground cleanup identity, FDs or remaining children")
+    exited, pos = line(pos)
+    m = gExit.fullmatch(exited)
+    require(m is not None, "Missing actual migration runner exit")
+    pid, cr3, status = (int(v, 16) for v in m.groups())
+    require(pid == root and status == 0 and cr3 > 0 and cr3 % 4096 == 0
+            and cr3 != shell_cr3 and cr3 not in {x["cr3"] for x in result["worker_exits"]}
+            and all(x["cr3"] != shell_cr3 for x in result["worker_exits"]),
+            "Invalid migration runner exit, status or address space")
+    prompt = b"exit status 0\r\nagentos> "
+    require(data[pos:pos+len(prompt)] == prompt, "Shell did not collect the actual runner status")
+    result.update(parent=parent, cr3=cr3, start_apic=cpu, end_apic=c, stdio_mask=fds)
+    return pos + len(prompt), result, set(result["worker_pids"]) | {root}
 
 
 def main():

@@ -16,6 +16,18 @@ impl Frame {
     pub fn into_address(self) -> usize { self.0 }
 }
 
+/// Exclusive ownership of one allocator reference for each page of a
+/// physically contiguous interval. Dropping this token without releasing it
+/// deliberately keeps the pages allocated (e.g. uncertain DMA ownership).
+#[must_use]
+pub struct FrameRange { first: usize, pages: usize }
+
+impl FrameRange {
+    pub fn address(&self) -> usize { self.first }
+    pub fn page_count(&self) -> usize { self.pages }
+    pub fn byte_len(&self) -> usize { self.pages * PAGE }
+}
+
 pub struct Frames<'a> {
     free: &'a mut [usize],
     // One reference for every allocated page, including page tables. Forked
@@ -44,12 +56,21 @@ impl SharedFrames {
     pub fn with<R>(&self, operation: impl FnOnce(&mut Frames<'static>) -> R) -> R {
         let flags: usize;
         unsafe { asm!("pushfq", "pop {}", "cli", out(reg) flags); }
+        let result = self.with_locked(operation);
+        if flags & (1 << 9) != 0 { unsafe { asm!("sti", options(nostack)); } }
+        result
+    }
+
+    // Serialization is independent of the architecture's local IRQ state.
+    // Kernel callers always enter through with(), which prevents preemption
+    // while waiting for or holding the same allocator lock.
+    #[inline]
+    fn with_locked<R>(&self, operation: impl FnOnce(&mut Frames<'static>) -> R) -> R {
         while self.locked.swap(true, Ordering::Acquire) {
             while self.locked.load(Ordering::Relaxed) { spin_loop(); }
         }
         let result = operation(unsafe { &mut *self.frames.get() });
         self.locked.store(false, Ordering::Release);
-        if flags & (1 << 9) != 0 { unsafe { asm!("sti", options(nostack)); } }
         result
     }
 }
@@ -144,13 +165,105 @@ impl Frames<'_> {
         Some(Frame(index * PAGE))
     }
 
+    /// Allocate a page whose *last byte* is no higher than max_address.
+    /// The unrestricted path retains its constant-time bitmap cursor.
+    pub fn alloc_below(&mut self, max_address: u64) -> Option<Frame> {
+        if max_address == u64::MAX { return self.alloc(); }
+        let range = self.alloc_contiguous(1, PAGE, 0, max_address)?;
+        Some(Frame(range.first))
+    }
+
+    /// Reserve all pages atomically under the existing allocator lock.
+    /// Addresses are physical; min_address and max_address are inclusive.
+    /// Alignment is in bytes, a power of two and at least PAGE. Only fully
+    /// contained pages count; partial pages, holes and retained pages do not.
+    /// A failed search never changes bitmap, refcounts, cursor or availability.
+    pub fn alloc_contiguous(&mut self, pages: usize, alignment: usize,
+                            min_address: u64, max_address: u64) -> Option<FrameRange> {
+        if pages == 0 || pages > self.available || alignment < PAGE ||
+           !alignment.is_power_of_two() || min_address > max_address {
+            return None;
+        }
+        // Divide before adding to avoid overflow for an inclusive u64::MAX.
+        let limit = self.refs.len().min(
+            (max_address / PAGE as u64 +
+             u64::from(max_address % PAGE as u64 == PAGE as u64 - 1)) as usize);
+        let last = limit.checked_sub(pages)?;
+        let align_pages = alignment / PAGE;
+        let align_up = |index: usize| {
+            index.checked_add(align_pages - 1).map(|v| v & !(align_pages - 1))
+        };
+        let first = (min_address / PAGE as u64 +
+                     u64::from(min_address % PAGE as u64 != 0)) as usize;
+        let mut candidate = align_up(first.max(self.next_word * WORD_BITS))?;
+        while candidate <= last {
+            let end = candidate + pages; // bounded by limit
+            let mut index = candidate;
+            // Scan words rather than individual unavailable pages. A blocked
+            // bit rules out every later start through that bit, as the whole
+            // original window would still overlap it. Advance monotonically.
+            while index < end {
+                let bit = index % WORD_BITS;
+                let count = (WORD_BITS - bit).min(end - index);
+                let mask = (usize::MAX >> (WORD_BITS - count)) << bit;
+                let blocked = !self.free[index / WORD_BITS] & mask;
+                if blocked != 0 {
+                    let last_blocked = index / WORD_BITS * WORD_BITS +
+                        WORD_BITS - 1 - blocked.leading_zeros() as usize;
+                    candidate = align_up(last_blocked + 1)?;
+                    break;
+                }
+                index += count;
+            }
+            if index != end { continue; }
+
+            // First establish the complete interval and all ownership
+            // invariants, then commit. No allocation or fallible step follows.
+            assert!(self.refs[candidate..end].iter().all(|&count| count == 0),
+                    "free range retained by another owner");
+            for i in candidate..end {
+                self.free[i / WORD_BITS] &= !(1usize << (i % WORD_BITS));
+                self.refs[i] = 1;
+            }
+            self.available -= pages;
+            // Do not advance past earlier free pages excluded by min/alignment.
+            // alloc() already advances its cursor over fully occupied words.
+            return Some(FrameRange { first: candidate * PAGE, pages });
+        }
+        None
+    }
+
+    fn zero_range(address: usize, pages: usize) {
+        // Allocated conventional RAM is identity mapped by the kernel.
+        // Clear only owned pages before returning the allocation to a caller.
+        unsafe { ptr::write_bytes(address as *mut u8, 0, pages * PAGE); }
+    }
+
     pub fn alloc_zeroed(&mut self) -> Option<Frame> {
         let frame = self.alloc()?;
-        let words = frame.0 as *mut usize;
-        for i in 0..PAGE / size_of::<usize>() {
-            unsafe { ptr::write_volatile(words.add(i), 0); }
-        }
+        Self::zero_range(frame.0, 1);
         Some(frame)
+    }
+
+    pub fn alloc_zeroed_below(&mut self, max_address: u64) -> Option<Frame> {
+        let frame = self.alloc_below(max_address)?;
+        Self::zero_range(frame.0, 1);
+        Some(frame)
+    }
+
+    pub fn alloc_zeroed_contiguous(&mut self, pages: usize, alignment: usize,
+                                   min_address: u64, max_address: u64) -> Option<FrameRange> {
+        let range = self.alloc_contiguous(pages, alignment, min_address, max_address)?;
+        Self::zero_range(range.first, range.pages);
+        Some(range)
+    }
+
+    /// Relinquish this owner's references, not necessarily all references.
+    /// Pages still pinned by a device or shared by another mapping stay owned.
+    pub fn release_range(&mut self, range: FrameRange) {
+        for i in 0..range.pages {
+            self.release(Frame(range.first + i * PAGE));
+        }
     }
 
     /// A page is free only when its final mapping/owner releases it. Caller
@@ -207,51 +320,6 @@ impl Frames<'_> {
     }
 }
 
-// Hold physical pages without requiring heap storage as memory runs out.
-// Each owned page stores the previous address in its first word.
-pub struct Exhaustion { head: usize, pub count: usize }
-
-impl Exhaustion {
-    pub fn drain(frames: &mut Frames<'_>) -> Self {
-        let mut held = Self { head: 0, count: 0 };
-        let initial = frames.available();
-        while held.count < initial {
-            let Some(frame) = frames.alloc() else { break; };
-            let address = frame.into_address();
-            unsafe { (address as *mut usize).write(held.head); }
-            held.head = address;
-            held.count += 1;
-        }
-        held
-    }
-
-    fn pop(&mut self) -> Option<Frame> {
-        if self.head == 0 { return None; }
-        let frame = Frame(self.head);
-        self.head = unsafe { (self.head as *const usize).read() };
-        Some(frame)
-    }
-
-    pub fn recover(mut self, frames: &mut Frames<'_>) -> bool {
-        let Some(spare) = self.pop() else { return false; };
-        let address = spare.address();
-        unsafe { ptr::write_bytes(address as *mut u8, 0xa5, PAGE); }
-        frames.release(spare);
-        // A two-page request must roll back cleanly with only one page left.
-        let partial_ok = !frames.probe() && frames.available() == 1;
-        let mut reused = false;
-        if let Some(frame) = frames.alloc_zeroed() {
-            reused = frame.address() == address && frames.available() == 0 &&
-                (0..PAGE / size_of::<usize>()).all(|i| unsafe {
-                    (frame.address() as *const usize).add(i).read_volatile() == 0
-                });
-            frames.release(frame);
-        }
-        while let Some(frame) = self.pop() { frames.release(frame); }
-        partial_ok && reused
-    }
-}
-
 const SNAPSHOT_WORDS: usize = PAGE / size_of::<usize>() - 1;
 pub struct BitmapSnapshot { first: usize, pub count: usize }
 
@@ -304,116 +372,8 @@ impl BitmapSnapshot {
 }
 
 
+// Host-only tests live outside the production implementation.
 #[cfg(test)]
 #[allow(non_snake_case)]
-mod snapshotTests {
-    use super::*;
-
-    #[repr(align(4096))]
-    struct SnapshotPage([usize; PAGE / size_of::<usize>()]);
-
-    // Use real bitmap/refcount and snapshot code with synthetic physical frame
-    // numbers. Only the snapshot's storage is host memory; no privileged I/O or
-    // allocation of a fictitious physical address is performed by these tests.
-    fn withSnapshot(aInitial: &[usize], aRun: impl FnOnce(&mut Frames<'_>, &mut BitmapSnapshot)) {
-        let mut pFree = aInitial.to_vec();
-        let mut pRefs = vec![0; pFree.len()*WORD_BITS];
-        let pCount = pFree.iter().map(|pWord| pWord.count_ones() as usize).sum();
-        let mut pPages: Vec<Box<SnapshotPage>> = (0..pFree.len().div_ceil(SNAPSHOT_WORDS))
-            .map(|_| Box::new(SnapshotPage([0; PAGE / size_of::<usize>()]))).collect();
-        for pIndex in 0..pPages.len() {
-            let pNext = if pIndex+1 < pPages.len() {
-                pPages[pIndex+1].0.as_ptr() as usize
-            } else { 0 };
-            pPages[pIndex].0[0] = pNext;
-        }
-        for (pPage,pWords) in pPages.iter_mut().zip(pFree.chunks(SNAPSHOT_WORDS)) {
-            pPage.0[1..1+pWords.len()].copy_from_slice(pWords);
-        }
-        let mut pSnapshot = BitmapSnapshot { first: pPages[0].0.as_ptr() as usize, count: pCount };
-        let mut pFrames = Frames { free: &mut pFree, refs: &mut pRefs, next_word: 0,
-                                  available: pCount, kernel_root: 0 };
-        aRun(&mut pFrames,&mut pSnapshot);
-    }
-
-    fn allocateNumber(aFrames: &mut Frames<'_>, aIndex: usize, aReferences: u16) {
-        let pMask = 1usize << (aIndex % WORD_BITS);
-        assert_ne!(aFrames.free[aIndex / WORD_BITS] & pMask,0);
-        aFrames.free[aIndex / WORD_BITS] &= !pMask;
-        aFrames.refs[aIndex] = aReferences;
-        aFrames.available -= 1;
-    }
-
-    #[test]
-    fn includesOnlyNewUniquelyOwnedFramesAndRejectsDuplicate() {
-        withSnapshot(&[(1<<4)|(1<<5)],|pFrames,pSnapshot| {
-            assert!(pSnapshot.matches(pFrames));
-            allocateNumber(pFrames,4,1);
-            assert!(!pSnapshot.matches(pFrames));
-            assert!(pSnapshot.includeAllocatedFrame(pFrames,4*PAGE));
-            assert_eq!(pSnapshot.count,1);
-            assert!(pSnapshot.matches(pFrames));
-            assert!(!pSnapshot.includeAllocatedFrame(pFrames,4*PAGE));
-            assert!(pSnapshot.matches(pFrames));
-        });
-    }
-
-    #[test]
-    fn rejectsOldFreeSharedUnalignedAndOutOfRangeFramesWithoutMutation() {
-        withSnapshot(&[(1<<4)|(1<<5)],|pFrames,pSnapshot| {
-            pFrames.refs[2]=1; // already owned before this snapshot
-            allocateNumber(pFrames,4,2); // new, but still shared with a child
-            let pSaved=unsafe { (pSnapshot.first as *const usize).add(1).read() };
-            for pAddress in [2*PAGE,4*PAGE,5*PAGE,6*PAGE,4*PAGE+1,WORD_BITS*PAGE,usize::MAX] {
-                assert!(!pSnapshot.includeAllocatedFrame(pFrames,pAddress));
-                assert_eq!(pSnapshot.count,2);
-                assert_eq!(unsafe { (pSnapshot.first as *const usize).add(1).read() },pSaved);
-            }
-            pFrames.refs[4]=1;
-            assert!(pSnapshot.includeAllocatedFrame(pFrames,4*PAGE));
-            assert!(pSnapshot.matches(pFrames));
-        });
-    }
-
-    #[test]
-    fn omittedLeakedFrameStillFailsExactBitmapAndCount() {
-        withSnapshot(&[(1<<4)|(1<<5)],|pFrames,pSnapshot| {
-            allocateNumber(pFrames,4,1); // reachable user page
-            allocateNumber(pFrames,5,1); // unrelated leaked frame
-            assert!(pSnapshot.includeAllocatedFrame(pFrames,4*PAGE));
-            assert!(!pSnapshot.matches(pFrames));
-            assert_eq!(pSnapshot.count,1);
-            assert_eq!(pFrames.available(),0);
-        });
-    }
-
-    #[test]
-    fn unexpectedFreeCannotHideBehindEqualAvailableCount() {
-        withSnapshot(&[(1<<4)|(1<<5)],|pFrames,pSnapshot| {
-            pFrames.refs[2]=1;
-            allocateNumber(pFrames,4,1);
-            pFrames.release(unsafe {Frame::from_owned_address(2*PAGE)});
-            assert_eq!(pFrames.available(),pSnapshot.count);
-            assert!(!pSnapshot.matches(pFrames));
-            assert!(pSnapshot.includeAllocatedFrame(pFrames,4*PAGE));
-            assert!(!pSnapshot.matches(pFrames));
-        });
-    }
-
-    #[test]
-    fn followsSnapshotChainAcrossBitmapPageBoundary() {
-        let mut pInitial=vec![0;SNAPSHOT_WORDS+1];
-        pInitial[0]=1<<4;
-        pInitial[SNAPSHOT_WORDS]=1<<5;
-        withSnapshot(&pInitial,|pFrames,pSnapshot| {
-            let pDistant=SNAPSHOT_WORDS*WORD_BITS+5;
-            allocateNumber(pFrames,4,1);
-            allocateNumber(pFrames,pDistant,1);
-            assert!(pSnapshot.includeAllocatedFrame(pFrames,pDistant*PAGE));
-            assert!(!pSnapshot.matches(pFrames));
-            assert!(pSnapshot.includeAllocatedFrame(pFrames,4*PAGE));
-            assert!(pSnapshot.matches(pFrames));
-            assert_eq!(pSnapshot.count,0);
-        });
-    }
-}
+#[path = "../scripts/tests/frame-allocator-cases.rs"]
+mod allocatorTests;

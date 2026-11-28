@@ -1,8 +1,10 @@
 #![allow(non_snake_case, non_upper_case_globals)]
-use crate::{acpi::Platform, exceptions::{hex, Descriptors}, frames::{Exhaustion, Frames, SharedFrames},
+use crate::{acpi::Platform, exceptions::{hex, Descriptors}, frames::{Frames, SharedFrames},
             halt, out, process::Programs, scheduler::{Context, Queue}, serial, stress::{self, Load}};
+use crate::{bringup_clock::BringupClock, reference_clock::{ReferenceClock, WaitError},
+            cpu_topology::{CpuRoster, CpuSlot, LegacyDestination, MAX_CPUS}};
 use core::{arch::{asm, x86_64::__cpuid}, cell::UnsafeCell, hint::spin_loop, ptr,
-           sync::atomic::{fence, AtomicBool, AtomicU32, AtomicUsize, Ordering}};
+           sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}};
 
 extern "C" {
     static ap_start: u8;
@@ -19,21 +21,24 @@ type Error = &'static [u8];
 const PAGE: usize = 4096;
 const TIMER: u32 = 0xe0;
 const MASK: u32 = 1 << 16;
-const PM_HZ: u32 = 3_579_545;
 const WAKEUPS: u32 = 3;
-const OOM_PHASE: u32 = 1;
+const AP_INITIALIZED: u32 = 1;
+const BOOT_QUEUE_HANDED_OFF: u32 = 2;
+const AP_FAILED: u32 = 3;
 const PROCESS_PHASE: u32 = 2;
 const IDLE_PHASE: u32 = 3;
-const OOM_CHECKED: u32 = 4;
 const IDLE_FINISHED: u32 = 5;
 const PROCESSES_FINISHED: u32 = 6;
 const RUNTIME_PHASE: u32 = 4;
 const RESCHEDULE: u32 = 0xe3;
 const EMPTY_CPU: AtomicUsize = AtomicUsize::new(0);
-static gCpus: [AtomicUsize; 255] = [EMPTY_CPU; 255];
+static gCpus: [AtomicUsize; MAX_CPUS] = [EMPTY_CPU; MAX_CPUS];
 static gOnlineCount: AtomicUsize = AtomicUsize::new(0);
+static gBspQualifiedTscHz: AtomicU64 = AtomicU64::new(0);
+// One release per loaded kernel: APs stay available for TSC synchronization
+// until the BSP has published the epoch and completed timed device startup.
+static gStartupReady: AtomicBool = AtomicBool::new(false);
 static gRuntimeEnabled: AtomicBool = AtomicBool::new(false);
-static gPmPort: AtomicUsize = AtomicUsize::new(0);
 static gTerminal: AtomicUsize = AtomicUsize::new(0);
 static gMigrations: AtomicUsize = AtomicUsize::new(0);
 static gRemoteWakeups: AtomicUsize = AtomicUsize::new(0);
@@ -79,6 +84,25 @@ impl Diagnostic {
     unsafe fn publish(mut self, aCpu: &Cpu) {
         self.text(b"\r\n"); aCpu.output(&self.fBytes[..self.fLength]);
     }
+}
+
+/// Report a completed, rejected independent qualification. The PIT owner
+/// has been released, and its gate/speaker cleanup has already been checked.
+/// Mandatory failures retain the native fatal serial diagnostic path; optional
+/// source failures are recorded in the normal kernel history only.
+unsafe fn pit_diagnostic(cpu:u32,mandatory:bool,level:crate::log_policy::Level,line:&[u8]) {
+    let _=crate::logger::LOGGER.record(0,cpu as u32,level,line);
+    if mandatory {
+        let mut record=Diagnostic::new(line);
+        record.text(b"\r\n");
+        serial(&record.fBytes[..record.fLength]);
+    }
+}
+unsafe fn report_pit_failure(cpu: u32, phase: &str, mandatory: bool, fault: crate::pit::QualificationFailure) {
+    fault.report(cpu,phase,|line|pit_diagnostic(cpu,mandatory,crate::log_policy::Level::Error,line));
+}
+unsafe fn report_pit_acquisition(cpu:u32,phase:&str,mandatory:bool,discarded:&crate::pit::AcquisitionEvidence) {
+    discarded.report(cpu,phase,|line|pit_diagnostic(cpu,mandatory,crate::log_policy::Level::Info,line));
 }
 
 unsafe fn registeredCpus() -> impl Iterator<Item = &'static Cpu> {
@@ -152,46 +176,31 @@ unsafe fn balanceQueues() {
 }
 
 
-unsafe fn timestamp() -> u64 {
-    let (lo, hi): (u32, u32);
-    asm!("lfence", "rdtsc", "lfence", out("eax") lo, out("edx") hi, options(nostack));
-    ((hi as u64) << 32) | lo as u64
-}
+unsafe fn timestamp() -> u64 { crate::tsc::read() }
 
 #[derive(Default)]
 struct IdleSample { wakes: u64, timers: u32, elapsed: u64, active: u64 }
-
-struct PmClock(u16);
-impl PmClock {
-    unsafe fn now(&self) -> u32 {
-        let value: u32;
-        asm!("in eax, dx", in("dx") self.0, out("eax") value, options(nomem, nostack));
-        value
-    }
-    unsafe fn elapsed(&self, start: u32) -> u32 {
-        // Intervals here are shorter than one wrap of the 24-bit ACPI timer.
-        self.now().wrapping_sub(start) & 0xff_ffff
-    }
-    unsafe fn delay(&self, ticks: u32) {
-        let start = self.now();
-        while self.elapsed(start) < ticks { spin_loop(); }
-    }
-}
 
 #[derive(Clone, Copy)]
 struct Lapic(usize);
 impl Lapic {
     unsafe fn read(self, offset: usize) -> u32 { ptr::read_volatile((self.0 + offset) as *const u32) }
     unsafe fn write(self, offset: usize, value: u32) { ptr::write_volatile((self.0 + offset) as *mut u32, value); }
-    unsafe fn id(self) -> u8 { (self.read(0x20) >> 24) as u8 }
+    unsafe fn id(self) -> u32 { self.read(0x20) >> 24 }
 
-    unsafe fn enable(self) -> Result<(), Error> {
+    unsafe fn validate_mode(self) -> Result<(), Error> {
         if __cpuid(1).edx & (1 << 9) == 0 { return Err(b"missing APIC"); }
         let (lo, hi): (u32, u32);
         asm!("rdmsr", in("ecx") 0x1bu32, out("eax") lo, out("edx") hi);
+        if lo & 0x400 != 0 { return Err(b"x2APIC mode active; xAPIC MMIO transport unsupported"); }
         if lo & 0xc00 != 0x800 || ((hi as usize) << 32 | (lo as usize & 0xfffff000)) != self.0 {
             return Err(b"xAPIC base or mode");
         }
+        Ok(())
+    }
+
+    unsafe fn enable(self) -> Result<(), Error> {
+        self.validate_mode()?;
         self.write(0x80, 0);             // task priority
         self.write(0x350, MASK);          // LINT0 (firmware ExtINT)
         self.write(0x360, MASK);          // LINT1
@@ -202,40 +211,67 @@ impl Lapic {
         Ok(())
     }
 
-    unsafe fn calibrate(self, clock: &PmClock) -> Result<(u32, u64), Error> {
+    unsafe fn calibrate(self, clock: &BringupClock) -> Result<(u32, u64), Error> {
         // VirtualBox Minimal advertises TSC and undivided APIC kHz. Use the
         // guest clocks' nominal rates rather than assuming a short PM-timer
         // calibration remains representative during virtual-clock catch-up.
-        if __cpuid(1).ecx & (1 << 31) != 0 && __cpuid(0x40000000).eax >= 0x40000010 {
+        if clock.tsc_hz().is_none() && __cpuid(1).ecx & (1 << 31) != 0 && __cpuid(0x40000000).eax >= 0x40000010 {
             let rates = __cpuid(0x40000010);
             let quantum = (rates.ebx as u64 * 1000 / (16 * 100)) as u32;
             if rates.eax != 0 && quantum != 0 { return Ok((quantum, rates.eax as u64 * 1000)); }
         }
         self.write(0x380, u32::MAX);
-        let start = clock.now();
         let tsc_start = timestamp();
-        clock.delay(PM_HZ / 10);
-        let tsc_delta = timestamp() - tsc_start;
-        let elapsed = clock.elapsed(start);
+        let delayed = clock.delay_ns(100_000_000);
+        let tsc_delta = timestamp().checked_sub(tsc_start);
         let counted = u32::MAX - self.read(0x390);
+        // Never leave the calibration timer armed on a failed reference.
         self.write(0x380, 0);
-        if elapsed == 0 || counted == 0 || counted == u32::MAX { return Err(b"timer calibration"); }
-        let per_10ms = (counted as u64 * PM_HZ as u64 / (100 * elapsed as u64)) as u32;
-        let tsc_hz = tsc_delta * PM_HZ as u64 / elapsed as u64;
+        let elapsed = delayed.map_err(|_| b"timer calibration reference stopped" as Error)?;
+        if elapsed < 100_000_000 { return Err(b"timer calibration interval"); }
+        let tsc_delta = tsc_delta.ok_or(b"TSC regression" as Error)?;
+        if counted == 0 || counted == u32::MAX { return Err(b"timer calibration"); }
+        let per_10ms = u32::try_from(counted as u128 * 10_000_000 / elapsed as u128)
+            .map_err(|_| b"LAPIC calibration overflow" as Error)?;
+        let tsc_hz = u64::try_from(tsc_delta as u128 * 1_000_000_000 / elapsed as u128)
+            .map_err(|_| b"TSC calibration overflow" as Error)?;
         if per_10ms == 0 || tsc_hz == 0 { return Err(b"zero timer interval"); }
-        Ok((per_10ms, tsc_hz))
+        Ok((per_10ms, clock.tsc_hz().unwrap_or(tsc_hz)))
     }
 
-    unsafe fn send(self, id: u8, command: u32, clock: &PmClock) -> Result<(), Error> {
-        self.write(0x310, (id as u32) << 24);
+    unsafe fn send_runtime(self, target: LegacyDestination, command: u32) -> Result<(), Error> {
+        let start = crate::system_clock::millis();
+        self.write(0x310, target.high());
         self.write(0x300, command);
-        let start = clock.now();
-        while self.read(0x300) & (1 << 12) != 0 {
-            if clock.elapsed(start) > PM_HZ { return Err(b"IPI delivery timeout"); }
+        // An already completed delivery does not depend on clock health.
+        // Bound a genuinely pending delivery even if all clocks stop.
+        for _ in 0..100_000_000u32 {
+            if self.read(0x300) & (1 << 12) == 0 { return Ok(()); }
+            let (Some(before), Some(now)) = (start, crate::system_clock::millis()) else {
+                return Err(b"IPI system clock unavailable");
+            };
+            if now.saturating_sub(before) >= 1000 { return Err(b"IPI delivery timeout"); }
             spin_loop();
         }
-        Ok(())
+        Err(b"IPI delivery polling limit")
     }
+
+    unsafe fn send(self, target: LegacyDestination, command: u32, clock: &BringupClock) -> Result<(), Error> {
+        self.write(0x310, target.high());
+        self.write(0x300, command);
+        clock.wait_until(1_000_000_000, || self.read(0x300) & (1 << 12) == 0)
+            .map_err(|error| match error {
+                WaitError::Timeout => b"IPI delivery timeout" as Error,
+                WaitError::Unresponsive => b"IPI reference clock stopped" as Error,
+            })
+    }
+}
+
+// Permanent SMP storage. The allocator and the remaining boot workload are
+// independent objects in the same reserved frame; neither owns the other.
+struct SmpStorage {
+    frames: SharedFrames,
+    load: Load,
 }
 
 #[repr(C)]
@@ -246,10 +282,15 @@ struct Cpu {
     rsp0: usize,
     programs: &'static Programs,
     apic: Lapic,
-    expected_id: u8,
+    expected_id: u32,
+    slot: CpuSlot,
+    legacy_target: LegacyDestination,
     interval: u32,
     tsc_hz: u64,
-    clock: crate::monotonic::Clock,
+    reference: BringupClock,
+    legacy_pit_probe: bool,
+    tsc: crate::tsc::Peer,
+    tsc_watchdog: UnsafeCell<crate::tsc_watchdog::Watchdog>,
     timer_policy: UnsafeCell<crate::timer::Timer>,
     runtime_timer_irqs: AtomicUsize,
     fTimerSequence: AtomicUsize,
@@ -268,6 +309,7 @@ struct Cpu {
     queue: UnsafeCell<Queue>,
     boot_baseline: UnsafeCell<Option<crate::frames::BitmapSnapshot>>,
     terminal: UnsafeCell<*mut crate::tty::Terminal>,
+    shared_frames: &'static SharedFrames,
     load: &'static Load,
     released: [AtomicUsize; stress::TASKS],
 }
@@ -276,7 +318,7 @@ struct Cpu {
 // Boot-only raw accesses occur before runtime publication or after an explicit
 // completion barrier. Shared resources additionally require the Frames gate.
 unsafe impl Sync for Cpu {}
-const _: () = assert!(core::mem::size_of::<Cpu>() <= PAGE && core::mem::size_of::<Load>() <= PAGE);
+const _: () = assert!(core::mem::size_of::<Cpu>() <= PAGE && core::mem::size_of::<SmpStorage>() <= PAGE);
 
 impl Cpu {
     fn lockQueue(&self) -> QueueGuard<'_> {
@@ -288,28 +330,39 @@ impl Cpu {
     }
     unsafe fn requestReschedule(&self, aTarget: &Cpu) {
         if aTarget.fWakePending.swap(true, Ordering::AcqRel) { return; }
-        let pClock = PmClock(gPmPort.load(Ordering::Relaxed) as u16);
-        if self.apic.send(aTarget.expected_id, RESCHEDULE, &pClock).is_err() {
+        // Runtime IPI waits follow the same resilient absolute clock as
+        // all other deadlines. Never retry the ICR command after timeout.
+        let delivery = if gRuntimeEnabled.load(Ordering::Acquire) {
+            self.apic.send_runtime(aTarget.legacy_target, RESCHEDULE)
+        } else { self.local_reference().ok_or(b"unqualified local TSC" as Error)
+            .and_then(|clock| self.apic.send(aTarget.legacy_target, RESCHEDULE, &clock)) };
+        if delivery.is_err() {
             serial(b"SMP FAILED: reschedule IPI delivery\r\n"); halt();
         }
         if aTarget.expected_id != self.expected_id { gRemoteWakeups.fetch_add(1, Ordering::Relaxed); }
     }
-    unsafe fn create(frames: &mut Frames<'_>, apic: Lapic, id: u8, interval: u32, tsc_hz: u64,
-                     descriptors: Option<Descriptors>, load: &'static Load, programs: &'static Programs,
+    unsafe fn create(frames: &mut Frames<'_>, apic: Lapic, roster: &CpuRoster, id: u32, interval: u32, tsc_hz: u64,
+                     reference: BringupClock, legacy_pit_probe: bool,
+                     descriptors: Option<Descriptors>, shared_frames: &'static SharedFrames,
+                     load: &'static Load, programs: &'static Programs,
                      rsp0: usize) -> Result<&'static Self, Error> {
+        let slot = roster.slot(id).ok_or(b"CPU absent or disabled in MADT" as Error)?;
+        let legacy_target = roster.legacy_target(id)?;
         let addr = frames.alloc().ok_or(b"CPU allocation" as Error)?.into_address();
         let cpu = addr as *mut Self;
         cpu.write(Self { self_address: addr, syscall_user_rsp: UnsafeCell::new(0), syscall_stack: UnsafeCell::new(0),
-                         rsp0, programs, apic, expected_id: id, interval, tsc_hz,
-                         clock: crate::monotonic::Clock::new(tsc_hz),
-                         timer_policy: UnsafeCell::new(crate::timer::Timer::new(interval)),
+                         rsp0, programs, apic, expected_id: id, slot, legacy_target, interval, tsc_hz, reference, legacy_pit_probe,
+                         tsc: crate::tsc::Peer::new(),
+                         tsc_watchdog: UnsafeCell::new(crate::tsc_watchdog::Watchdog::new()),
+                         timer_policy: UnsafeCell::new(crate::timer::Timer::new(interval,
+                             if descriptors.is_none() { crate::system_clock::maintenance_ms() } else { None })),
                          runtime_timer_irqs: AtomicUsize::new(0), fTimerSequence: AtomicUsize::new(0),
                          fQueueLocked: AtomicBool::new(false), fRuntimeReady: AtomicBool::new(false),
                          fWakePending: AtomicBool::new(false), fRunnable: AtomicUsize::new(0),
                          fHasSlot: AtomicBool::new(true), runtime_idle_irqs: AtomicUsize::new(0),
                          interrupts: AtomicU32::new(0), hlt_wakes: AtomicU32::new(0),
                          complete: AtomicU32::new(0), phase: AtomicU32::new(0), terminal: UnsafeCell::new(ptr::null_mut()),
-                         idle: UnsafeCell::new(IdleSample::default()), descriptors, load, queue: UnsafeCell::new(Queue::new()), boot_baseline: UnsafeCell::new(None),
+                         idle: UnsafeCell::new(IdleSample::default()), descriptors, shared_frames, load, queue: UnsafeCell::new(Queue::new()), boot_baseline: UnsafeCell::new(None),
                          released: core::array::from_fn(|_| AtomicUsize::new(0)) });
         for i in 0..stress::TASKS {
             (*(*cpu).queue.get()).spawn(frames, allocation_task, i).ok_or(b"task stack" as Error)?;
@@ -317,12 +370,66 @@ impl Cpu {
         Ok(&*cpu)
     }
 
-    unsafe fn run_task(&self) -> Result<(), Error> {
-        let id = self.apic.id();
-        if id != self.expected_id { return Err(b"wrong executing APIC ID"); }
-        if !self.clock.start(timestamp()) { return Err(b"monotonic clock initialization"); }
+    /// The PIT provides an independent finite interval when a direct
+    /// ACPI calibration reference has become unresponsive. A reference
+    /// that actually measured inconsistent rates must not be bypassed.
+    unsafe fn qualify_tsc(&self, phase: &str) -> Option<crate::tsc::QualifiedRate> {
+        let mut maintain = || { let _ = crate::system_clock::millis(); };
+        let mandatory=self.reference.tsc_hz().is_some();
+        if let BringupClock::Physical(reference)=self.reference {
+            match crate::tsc::qualify_reference(reference, &mut maintain) {
+                Ok(hz)=>return Some(hz),
+                Err(crate::tsc::QualificationError::ReferenceUnavailable)=>{},
+                Err(_)=>return None,
+            }
+        }
+        let mut discarded=crate::pit::AcquisitionEvidence::new();
+        let result=crate::pit::qualify(self.legacy_pit_probe,&mut maintain,&mut discarded);
+        report_pit_acquisition(self.expected_id,phase,mandatory,&discarded);
+        match result {
+            Ok(rate)=>Some(rate),
+            Err(fault)=>{
+                report_pit_failure(self.expected_id,phase,mandatory,fault);
+                None
+            }
+        }
+    }
+
+    fn local_reference(&self) -> Option<BringupClock> {
+        match self.reference {
+            BringupClock::Physical(_) => Some(self.reference),
+            BringupClock::LocalTsc { .. } =>
+                Some(BringupClock::LocalTsc { hz: self.tsc.rate()? }),
+        }
+    }
+
+    /// Install CPU-local kernel identity and the native syscall transport
+    /// before this processor is declared initialized. Neither a userspace
+    /// test program nor a scheduler/idle acceptance phase owns these MSRs.
+    unsafe fn initialize_local_cpu(&self) -> Result<(), Error> {
+        if self.apic.id() != self.expected_id { return Err(b"wrong executing APIC ID"); }
         asm!("wrmsr", in("ecx") 0xc0000101u32, in("eax") self.self_address as u32,
              in("edx") (self.self_address >> 32) as u32);
+        unsafe fn msr(index: u32, value: u64) {
+            asm!("wrmsr", in("ecx") index, in("eax") value as u32, in("edx") (value >> 32) as u32);
+        }
+        extern "C" { fn native_syscall(); }
+        // User threads currently own x87/SSE context and flat FS/GS selectors.
+        let cr4: usize;
+        asm!("mov {}, cr4", out(reg) cr4);
+        asm!("mov cr4, {}", in(reg) (cr4 & !((1<<16) | (1<<18) | (1<<8))));
+        msr(0xc0000100, 0);
+        msr(0xc0000102, 0);
+        if __cpuid(1).edx & (1 << 11) != 0 { msr(0x174, 0); } // disable legacy SYSENTER
+        msr(0xc0000081, (8u64 << 32) | (0x20u64 << 48));
+        msr(0xc0000082, native_syscall as usize as u64);
+        msr(0xc0000084, 0xffff_ffff);
+        asm!("rdmsr", "or eax, 1", "wrmsr", in("ecx") 0xc0000080u32, out("eax") _, out("edx") _);
+        Ok(())
+    }
+
+    unsafe fn run_task(&self) -> Result<(), Error> {
+        let id = self.apic.id();
         self.apic.write(0x320, TIMER);    // one-shot, unmasked
         for wakeup in 1..=WAKEUPS {
             self.apic.write(0x380, self.interval);
@@ -342,7 +449,8 @@ impl Cpu {
         serial(b" APIC="); hex(id as u64);
         serial(b" TIMER-WAKES="); hex(wakes as u64);
         serial(b"\r\n");
-        crate::pci_irq::exercise(id)
+        if id != self.expected_id { return Err(b"wrong executing APIC ID"); }
+        crate::pci_irq::exercise(self.legacy_target,self.local_reference().ok_or(b"unqualified local TSC" as Error)?)
     }
 
     unsafe fn schedule(&self) {
@@ -352,7 +460,7 @@ impl Cpu {
         // or a sparse independent-clock watchdog when every task is asleep.
         self.apic.write(0x320, MASK | TIMER);
         self.apic.write(0x380, 0);
-        let now = crate::hpet::millis();
+        let now = crate::system_clock::millis();
         (*self.timer_policy.get()).reset(now);
         self.arm_timer(true, None, now.unwrap_or(0));
         while ptr::addr_of!((*self.queue.get()).active).read_volatile() { wait_for_irq(); }
@@ -360,17 +468,57 @@ impl Cpu {
         self.apic.write(0x380, 0);
     }
 
+    /// Transfer the boot queue to the BSP until PROCESS_PHASE is published.
+    /// Called on this AP's original startup stack, after schedule returns
+    /// through wait_for_irq's CLI and the restore path acknowledges retirement.
+    unsafe fn handoffBootQueue(&self) -> Result<(), Error> {
+        let flags: usize;
+        asm!("pushfq", "pop {}", out(reg) flags, options(preserves_flags));
+        if flags & (1 << 9) != 0 { return Err(b"AP boot queue handoff with IRQs enabled"); }
+        // Remote queue acquisition is disabled before runtime publication.
+        // The BSP may not touch this queue until our Release below; with IF
+        // clear there is no local IRQ owner. Do not clear or wait on a held gate.
+        if gRuntimeEnabled.load(Ordering::Acquire) ||
+           self.fRuntimeReady.load(Ordering::Acquire) ||
+           self.fQueueLocked.load(Ordering::Acquire) ||
+           self.complete.load(Ordering::Acquire) != AP_INITIALIZED ||
+           self.phase.load(Ordering::Acquire) != 0 {
+            return Err(b"AP boot queue ownership not exclusive");
+        }
+        if !(&*self.queue.get()).bootHandoffReady() {
+            return Err(b"AP boot queue not quiescent");
+        }
+        self.complete.store(BOOT_QUEUE_HANDED_OFF, Ordering::Release);
+        // No access to the queue (including IRQ-driven access) until the BSP
+        // has finished its raw accesses and publishes the next phase.
+        while self.phase.load(Ordering::Acquire) < PROCESS_PHASE { spin_loop(); }
+        Ok(())
+    }
+
+    /// BSP acquires the AP's boot queue, or refuses to proceed on failure.
+    fn acquireBootQueue(&self) -> Result<(), Error> {
+        loop {
+            match self.complete.load(Ordering::Acquire) {
+                BOOT_QUEUE_HANDED_OFF => return Ok(()),
+                AP_INITIALIZED => { let _ = crate::system_clock::millis(); spin_loop(); }
+                _ => return Err(b"AP boot queue handoff failed"),
+            }
+        }
+    }
+
     unsafe fn runtimeWorker(&self) -> ! {
         {
             let mut pQueue = self.lockQueue();
             pQueue.setRuntimeIdle(true);
         }
-        (*self.timer_policy.get()).reset(crate::hpet::millis());
         self.apic.write(0x320, MASK | TIMER);
         self.apic.write(0x380, 0);
         self.fRuntimeReady.store(true, Ordering::Release);
-        // The first reschedule IPI records this kernel caller context before
-        // selecting incoming work. Empty AP queues keep IF-enabled HLT.
+        let now = self.runtime_clock();
+        (*self.timer_policy.get()).reset(now);
+        self.arm_timer(false, None, now.unwrap_or(0));
+        // The first IRQ records this kernel caller context before selecting
+        // incoming work. Idle queues need only a real maintenance deadline.
         loop { wait_for_irq(); }
     }
 
@@ -381,14 +529,14 @@ impl Cpu {
         }
         self.fRuntimeReady.store(true, Ordering::Release);
         gRuntimeEnabled.store(true, Ordering::Release);
-        let pNow = crate::hpet::millis();
+        let pNow = self.runtime_clock();
         (*self.timer_policy.get()).reset(pNow);
         self.arm_timer(true, None, pNow.unwrap_or(0));
         let mut pStatus = None;
         loop {
             let mut pChanged = false;
             if pStatus.is_none() {
-                match self.load.frames.with(|pFrames| self.programs.fRegistry.collect(pFrames, 0, aRootPid)) {
+                match self.shared_frames.with(|pFrames| self.programs.fRegistry.collect(pFrames, 0, aRootPid)) {
                     Ok(pExit) => { pStatus = Some(pExit); pChanged = true; }
                     Err(-11) => (),
                     Err(_) => { serial(b"SMP FAILED: runtime root identity\r\n"); halt(); },
@@ -399,17 +547,17 @@ impl Cpu {
             // relying on a remote IPI to consume its final collected zombie.
             {
                 let mut pQueue = self.lockQueue();
-                self.load.frames.with(|pFrames| {
+                self.shared_frames.with(|pFrames| {
                     pChanged |= pQueue.processPendingKills(pFrames);
                     pChanged |= pQueue.collectRetired(pFrames) != 0;
                     pQueue.wake_io(pFrames);
                 });
-                let pNow = crate::hpet::millis().unwrap_or(0);
-                self.arm_timer(pQueue.runnableCount() != 0, pQueue.next_deadline(), pNow);
+                let pNow = self.runtime_clock().unwrap_or(0);
+                self.arm_timer(pQueue.hasRunnable(), pQueue.next_deadline(), pNow);
             }
             if pChanged { notifyRemote(); }
             if let Some(pExit) = pStatus {
-                if self.load.frames.with(|pFrames| !self.programs.fRegistry.hasProcesses(pFrames)) {
+                if self.shared_frames.with(|pFrames| !self.programs.fRegistry.hasProcesses(pFrames)) {
                     let mut pQueue = self.lockQueue();
                     pQueue.setRuntimeIdle(false);
                     pQueue.active = false;
@@ -425,8 +573,62 @@ impl Cpu {
         }
     }
 
+    /// Use a single independent-clock sample for the scheduler and, when
+    /// eligible, the local invariant-TSC watchdog. IRQs are masked by the
+    /// scheduler/interrupt caller; the watchdog has exactly one CPU owner.
+    unsafe fn runtime_clock(&self) -> Option<u64> {
+        let now = self.runtime_clock_sample();
+        // The timekeeper publishes events while holding its own gate.
+        // Record them here after release, without a clock/log lock cycle.
+        if let Some(event) = crate::system_clock::take_event() {
+            let level = if event.error() { crate::log_policy::Level::Error }
+                        else { crate::log_policy::Level::Info };
+            let _ = crate::logger::LOGGER.record(crate::logger::ticks(),
+                self.expected_id, level, event.message());
+        }
+        now
+    }
+
+    unsafe fn runtime_clock_sample(&self) -> Option<u64> {
+        use crate::tsc_watchdog::{Health, Sample, MONITOR};
+        if !self.fRuntimeReady.load(Ordering::Acquire) || !MONITOR.active() {
+            return crate::system_clock::millis();
+        }
+        let (Some(rate), Some(alignment)) = (self.tsc.rate(), self.tsc.alignment()) else {
+            return crate::system_clock::millis();
+        };
+        let before = crate::tsc::read();
+        let now = crate::system_clock::snapshot();
+        let after = crate::tsc::read();
+        // Holdover supplies real ABI time, but it is derived from TSC.
+        // Feeding it back to the watchdog would falsely renew the lease
+        // from the very counter it is supposed to qualify independently.
+        if now.as_ref().map_or(false, |s| s.holdover) {
+            return now.map(|s| s.millis);
+        }
+        let sample = now.as_ref().and_then(|s| s.independent_ns)
+            .map(|reference_ns| Sample { reference_ns, before, after });
+        let watchdog = &mut *self.tsc_watchdog.get();
+        let previous = watchdog.health();
+        let generation = now.as_ref().map(|s| s.reference_generation);
+        let health = MONITOR.observe_at(generation, self.expected_id,
+                                        rate, alignment, watchdog, sample);
+        if previous != health && health != Health::Pending {
+            let level = if health == Health::Rejected { crate::log_policy::Level::Error }
+                        else { crate::log_policy::Level::Info };
+            let _ = crate::logger::LOGGER.record(after, self.expected_id, level, health.message());
+        }
+        now.map(|s| s.millis)
+    }
+
     unsafe fn arm_timer(&self, runnable: bool, deadline: Option<u64>, now: u64) {
-        match (*self.timer_policy.get()).plan(runnable, deadline, now) {
+        let base = if self.descriptors.is_none() { crate::system_clock::maintenance_ms() } else { None };
+        let maintenance = if self.fRuntimeReady.load(Ordering::Acquire) && crate::tsc_watchdog::MONITOR.active() {
+            Some(base.map_or(crate::tsc_watchdog::INTERVAL_MS, |ms| ms.min(crate::tsc_watchdog::INTERVAL_MS)))
+        } else { base };
+        let policy = &mut *self.timer_policy.get();
+        policy.set_maintenance(maintenance);
+        match policy.plan(runnable, deadline, now) {
             crate::timer::Action::Keep => (),
             crate::timer::Action::Disable => {
                 self.apic.write(0x320, MASK | TIMER);
@@ -443,12 +645,13 @@ impl Cpu {
         let mut pGuard = self.lockQueue();
         let queue = &mut *pGuard;
         let scheduled = queue.active;
-        let measured = crate::hpet::millis();
+        let measured = self.runtime_clock();
         let now = measured.unwrap_or(0);
         let mut pChanged = false;
         if scheduled {
             let clock_error = (*self.timer_policy.get()).sample(self.apic.read(0x390), measured);
-            self.load.frames.with(|pFrames| {
+            if clock_error { crate::system_clock::expire_stalled_holdover(); }
+            self.shared_frames.with(|pFrames| {
                 pChanged |= queue.processPendingKills(pFrames);
                 pChanged |= queue.collectRetired(pFrames) != 0;
                 queue.wake_io(pFrames);
@@ -485,32 +688,17 @@ impl Cpu {
 
     #[allow(non_snake_case)]
     unsafe fn process_test(&self) -> Result<(), Error> {
-        unsafe fn msr(index: u32, value: u64) {
-            asm!("wrmsr", in("ecx") index, in("eax") value as u32, in("edx") (value >> 32) as u32);
-        }
-        extern "C" { fn native_syscall(); }
-        // User threads currently own x87/SSE context and flat FS/GS selectors.
-        let cr4: usize;
-        asm!("mov {}, cr4", out(reg) cr4);
-        asm!("mov cr4, {}", in(reg) (cr4 & !((1<<16) | (1<<18) | (1<<8))));
-        msr(0xc0000100, 0);
-        msr(0xc0000102, 0);
-        if __cpuid(1).edx & (1 << 11) != 0 { msr(0x174, 0); } // disable legacy SYSENTER
-        msr(0xc0000081, (8u64 << 32) | (0x20u64 << 48));
-        msr(0xc0000082, native_syscall as usize as u64);
-        msr(0xc0000084, 0xffff_ffff);
-        asm!("rdmsr", "or eax, 1", "wrmsr", in("ecx") 0xc0000080u32, out("eax") _, out("edx") _);
         // BSP's first process is the actual numeric PID 1, retained through
         // the boot tests; AP tests still use independent finite sessions.
         let bsp_root = self.descriptors.is_none();
-        let baseline = self.load.frames.with(|f| f.snapshot()).ok_or(b"process snapshot" as Error)?;
-        let pid = self.load.frames.with(|f| (*self.queue.get()).spawn_process(f, self.programs, b"init", 0))
+        let baseline = self.shared_frames.with(|f| f.snapshot()).ok_or(b"process snapshot" as Error)?;
+        let pid = self.shared_frames.with(|f| (*self.queue.get()).spawn_process(f, self.programs, b"init", 0, 0))
             .map_err(|_| b"user init ELF" as Error)?;
         let resident = if bsp_root {
-            Some(self.load.frames.with(|f| f.snapshot()).ok_or(b"PID1 test snapshot" as Error)?)
+            Some(self.shared_frames.with(|f| f.snapshot()).ok_or(b"PID1 test snapshot" as Error)?)
         } else { None };
         self.schedule();
-        let ok = self.load.frames.with(|f| {
+        let ok = self.shared_frames.with(|f| {
             let q = &mut *self.queue.get();
             if let Some(mut resident) = resident {
                 let valid = pid == 1 && q.parked_root() == Some(pid) &&
@@ -538,17 +726,6 @@ impl Cpu {
         Ok(())
     }
 
-    fn check_empty(&self) -> bool {
-        self.load.frames.with(|frames| {
-            let before = frames.available();
-            let plain = frames.alloc();
-            let zeroed = frames.alloc_zeroed();
-            let rejected = plain.is_none() && zeroed.is_none();
-            for frame in [plain, zeroed].into_iter().flatten() { frames.release(frame); }
-            before == 0 && rejected && frames.available() == 0
-        })
-    }
-
     unsafe fn measure_idle(&self) -> Result<(), Error> {
         let baseline = self.interrupts.load(Ordering::Acquire);
         // 30 s at divide-by-128, using the 10 ms calibration at divide-by-16.
@@ -556,7 +733,14 @@ impl Cpu {
         self.apic.write(0x3e0, 0xa);
         self.apic.write(0x320, TIMER);
         let start = timestamp();
-        self.apic.write(0x380, count);
+        // Bound even long idle intervals by the real short-counter service
+        // requirement on the BSP. Wide sources preserve the original long arm.
+        let max_count = if self.descriptors.is_none() {
+            crate::system_clock::maintenance_ms().map(|ms|
+                (self.interval as u64 * ms / 80).clamp(1, count as u64) as u32)
+                .unwrap_or(count)
+        } else { count };
+        self.apic.write(0x380, max_count);
         let mut waiting = 0;
         let mut wakes = 0;
         let mut timers = 0;
@@ -576,7 +760,7 @@ impl Cpu {
             // A virtual APIC may advance faster than TSC while catching up.
             // Charge every early expiration and wait for the remaining time.
             let remaining_ms = (target - elapsed) * 1000 / self.tsc_hz;
-            self.apic.write(0x380, (count as u64 * remaining_ms / 30_000).max(1) as u32);
+            self.apic.write(0x380, (count as u64 * remaining_ms / 30_000).clamp(1, max_count as u64) as u32);
         };
         if waiting >= elapsed { return Err(b"invalid idle accounting"); }
         self.apic.write(0x320, MASK | TIMER);
@@ -592,16 +776,67 @@ unsafe fn current_cpu() -> &'static Cpu {
     &*cpu
 }
 
+/// Called only after SMP publishes CPU-local state and with local IRQs
+/// masked by the system clock gate. It does not acquire that gate again.
+fn clock_witness(generation: u64) -> Option<crate::clock_quorum::Witness> {
+    use crate::tsc_watchdog::MONITOR;
+    if !MONITOR.active() { return None; }
+    let cpu = unsafe { current_cpu() };
+    if !cpu.fRuntimeReady.load(Ordering::Acquire) { return None; }
+    let alignment = cpu.tsc.alignment()?;
+    MONITOR.witness_at(generation, cpu.expected_id, alignment, unsafe { crate::tsc::read() })
+}
+
+// Installed only after GS, rate and alignment are available on every
+// enabled CPU. No scheduler, global clock or watchdog lock recursion.
+fn local_tsc_sample() -> crate::tsc_epoch::Sample {
+    let cpu=unsafe { current_cpu() };
+    crate::tsc_epoch::Sample { id:cpu.expected_id, raw:unsafe { crate::tsc::read() } }
+}
+
+fn reject_clock_witness() {
+    crate::tsc_watchdog::MONITOR.reject();
+}
+
 unsafe fn active_root() -> usize {
     let root: usize;
     asm!("mov {}, cr3", out(reg) root, options(nomem, nostack));
     root
 }
 
+/// Runtime GOP owner, with an ordinary guarded kernel stack. This is not
+/// an IRQ callback or a syscall/IRET epilogue. Producers only update RAM.
+struct ScreenWork {
+    terminal: *mut crate::tty::Terminal,
+    renderer: crate::fb_console::Renderer,
+}
+extern "C" fn screen_worker(arg:usize) {
+    let work=arg as *mut ScreenWork;
+    unsafe {
+        loop {
+            // Never hold a mutable renderer borrow across a parked context.
+            if (*(*work).terminal).snapshot_screen(&mut (*work).renderer) {
+                (*work).renderer.render();
+            }
+            asm!("cli",options(nostack));
+            let cpu=current_cpu();
+            cpu.lockQueue().park_service_if_idle();
+            // Yield even if another batch arrived. On a clean screen the
+            // level-triggered IO scan/IPI wakes the blocked service.
+            cpu.requestReschedule(cpu);
+            loop {
+                wait_for_irq();
+                if cpu.lockQueue().service_runnable() {break;}
+            }
+            asm!("sti",options(nostack));
+        }
+    }
+}
+
 extern "C" fn allocation_task(slot: usize) {
     let cpu = unsafe { current_cpu() };
-    let worker = cpu.expected_id as usize * stress::TASKS + slot;
-    let pages = cpu.load.exercise(worker, &cpu.interrupts);
+    let worker = cpu.slot.index() * stress::TASKS + slot;
+    let pages = cpu.load.exercise(cpu.shared_frames, worker, &cpu.interrupts);
     cpu.released[slot].store(pages, Ordering::Release);
 }
 
@@ -699,7 +934,7 @@ unsafe extern "C" fn finish_context_switch() {
     let pFreed = {
         let mut pQueue = pCpu.lockQueue();
         pQueue.completeSwitch();
-        pCpu.load.frames.with(|pFrames| pQueue.collectRetired(pFrames))
+        pCpu.shared_frames.with(|pFrames| pQueue.collectRetired(pFrames))
     };
     if pFreed != 0 { notifyRemote(); }
     balanceQueues();
@@ -713,7 +948,7 @@ pub unsafe fn userPageFault(aAddress: usize, aError: u64) -> bool {
     let pCpu = current_cpu();
     let pQueue = pCpu.lockQueue();
     let Some(pProcess) = pQueue.process() else { return false; };
-    let pResult = pCpu.load.frames.with(|pFrames| pProcess.space.resolveFault(pFrames, aAddress, aError));
+    let pResult = pCpu.shared_frames.with(|pFrames| pProcess.space.resolveFault(pFrames, aAddress, aError));
     if pResult == Err(-12) {
         let mut pLine = Diagnostic::new(b"AGENTOS PAGE OOM");
         pLine.field(b" PID=", pProcess.pid as u64);
@@ -727,12 +962,12 @@ pub unsafe fn user_fault(vector: u64, error: u64, addr: u64) -> usize {
     let mut pGuard = cpu.lockQueue();
     let q = &mut *pGuard;
     let p = q.process().unwrap();
-    let pParent = cpu.load.frames.with(|pFrames| cpu.programs.fRegistry.parentOf(pFrames, p.pid)).unwrap_or(0);
+    let pParent = cpu.shared_frames.with(|pFrames| cpu.programs.fRegistry.parentOf(pFrames, p.pid)).unwrap_or(0);
     let mut pLine = Diagnostic::new(b"AGENTOS USER FAULT");
     pLine.field(b" PID=", p.pid as u64); pLine.field(b" PARENT=", pParent as u64);
     pLine.field(b" CR3=", active_root() as u64); pLine.field(b" VECTOR=", vector);
     pLine.field(b" ERROR=", error); pLine.field(b" ADDRESS=", addr); pLine.publish(cpu);
-    cpu.load.frames.with(|f| q.terminate(256 + vector as usize, f));
+    cpu.shared_frames.with(|f| q.terminate(256 + vector as usize, f));
     drop(pGuard); notifyRemote();
     cpu.switch(0, false)
 }
@@ -744,7 +979,7 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
     if ctx.rsp >= 1usize << 47 { return user_fault(13, 0, 0); }
     let mut pGuard = cpu.lockQueue();
     let q = &mut *pGuard;
-    let pChanged = cpu.load.frames.with(|pFrames| {
+    let pChanged = cpu.shared_frames.with(|pFrames| {
         let pKilled = q.processPendingKills(pFrames);
         pKilled | (q.collectRetired(pFrames) != 0)
     });
@@ -767,20 +1002,20 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
     let result: isize = match ctx.registers[14] {
         0x10001 => pid as isize,
         // Native ABI v2 uses one HPET boot epoch on every CPU.
-        0x10010 => crate::hpet::millis().map(|v| v as isize).unwrap_or(-5),
+        0x10010 => crate::system_clock::millis().map(|v| v as isize).unwrap_or(-5),
         // Read-only, versioned global timer diagnostics. All fields are
         // captured with IF=0, and the destination is validated before writing.
         // Counts cover scheduled operation, excluding boot/idle timer probes.
         0x10018 => {
             if b != 32 || c != 0 { -22 }
-            else if let Some(now) = crate::hpet::millis() {
+            else if let Some(now) = crate::system_clock::millis() {
                 let (pTimers, pIdle) = timerSnapshot();
                 let fields = [2u64, now, pTimers, pIdle];
                 let mut bytes = [0u8; 32];
                 for (i, field) in fields.iter().enumerate() {
                     bytes[i*8..(i+1)*8].copy_from_slice(&field.to_le_bytes());
                 }
-                cpu.load.frames.with(|f| p.space.write(f, a, &bytes)).map_or_else(|e| e, |_| 0)
+                cpu.shared_frames.with(|f| p.space.write(f, a, &bytes)).map_or_else(|e| e, |_| 0)
             } else { -5 }
         }
         // Scheduling identity is sampled while this CPU owns the task gate.
@@ -789,7 +1024,7 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
             else {
                 let pMigrations = q.currentMigrations();
                 let pProcess = q.process().unwrap();
-                cpu.load.frames.with(|pFrames| {
+                cpu.shared_frames.with(|pFrames| {
                     let pParent = cpu.programs.fRegistry.parentOf(pFrames, pid).ok_or(-3isize)?;
                     let pFields = [1u64, cpu.expected_id as u64, gOnlineCount.load(Ordering::Acquire) as u64,
                         pMigrations as u64, gMigrations.load(Ordering::Relaxed) as u64,
@@ -807,7 +1042,7 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
         0x1001a => {
             if b != 64 || c != 0 { -22 }
             else {
-                cpu.load.frames.with(|f| {
+                cpu.shared_frames.with(|f| {
                     p.space.writable(f, a, 64)?;
                     let pFields = p.space.stats();
                     let mut pBytes = [0u8; 64];
@@ -818,6 +1053,22 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
                 }).map_or_else(|e| e, |_| 0)
             }
         }
+        // SYS_WAIT_CHILD(child_pid, 0, 0): pure lifecycle wait, independent
+        // of the availability and progression of the monotonic clock.
+        0x1001c => {
+            if b != 0 || c != 0 { -22 }
+            else {
+                match cpu.shared_frames.with(|f| q.collect(f, pid, a)) {
+                    Ok(status) => status as isize,
+                    Err(-11) => {
+                        q.block_child_exit(a);
+                        ctx.rip -= 2;
+                        switchNow!(ctx as *mut Context as usize);
+                    }
+                    Err(error) => error,
+                }
+            }
+        }
         // SYS_WAIT_CHILD_UNTIL(child_pid, absolute_deadline_ms):
         // nonblocking if already reaped/finished, otherwise sleep until child
         // termination or the shared monotonic deadline. Reaps on success.
@@ -825,9 +1076,9 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
             if b > isize::MAX as usize { -22 }
             else if q.take_clock_error() { -5 }
             else {
-                match cpu.load.frames.with(|f| q.collect(f, pid, a)) {
+                match cpu.shared_frames.with(|f| q.collect(f, pid, a)) {
                     Ok(status) => status as isize,
-                    Err(-11) => match crate::hpet::millis() {
+                    Err(-11) => match crate::system_clock::millis() {
                         None => -5,
                         Some(now) if now >= b as u64 => -110,
                         Some(now) => {
@@ -846,7 +1097,7 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
             if a > isize::MAX as usize { -22 }
             else if q.take_clock_error() { -5 }
             else {
-                match crate::hpet::millis() {
+                match crate::system_clock::millis() {
                     None => -5,
                     Some(now) if now >= a as u64 => 0,
                     Some(now) => {
@@ -859,10 +1110,10 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
         }
         op @ (0x10002 | 0x10008 | 0x1000d | 0x1000e | 0x10015 | 0x10019) => {
             let io = match op {
-                0x10002 => cpu.load.frames.with(|f| p.files.write(f, &p.space, a, b, c)),
-                0x10008 => cpu.load.frames.with(|f| p.files.read(f, &p.space, a, b, c)),
-                0x1000d | 0x10019 => cpu.load.frames.with(|f| p.files.message(f, crate::ipc::Operation::Send, p, a, b, c)),
-                _ => cpu.load.frames.with(|f| p.files.message(f, crate::ipc::Operation::Receive, p, a, b, c)),
+                0x10002 => cpu.shared_frames.with(|f| p.files.write(f, &p.space, a, b, c)),
+                0x10008 => cpu.shared_frames.with(|f| p.files.read(f, &p.space, a, b, c)),
+                0x1000d | 0x10019 => cpu.shared_frames.with(|f| p.files.message(f, crate::ipc::Operation::Send, p, a, b, c)),
+                _ => cpu.shared_frames.with(|f| p.files.message(f, crate::ipc::Operation::Receive, p, a, b, c)),
             };
             // Lazy copy-in may allocate, but slow UART/GOP output must not
             // keep every other CPU waiting for the shared frame allocator.
@@ -871,7 +1122,7 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
                 pOther => pOther,
             };
             match io {
-                Ok(crate::files::Io::Bytes(n)) => { cpu.load.frames.with(|f| q.wake_io(f)); n as isize }
+                Ok(crate::files::Io::Bytes(n)) => { cpu.shared_frames.with(|f| q.wake_io(f)); n as isize }
                 Ok(crate::files::Io::Output(_)) => unreachable!(),
                 Ok(crate::files::Io::Sleep(_)) if op == 0x10015 || op == 0x10019 => -11,
                 Ok(crate::files::Io::Sleep(wait)) => {
@@ -881,12 +1132,12 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
                     q.block(wait);
                     switchNow!(ctx as *mut Context as usize);
                 }
-                Err(error) => { cpu.load.frames.with(|f| q.wake_io(f)); error }
+                Err(error) => { cpu.shared_frames.with(|f| q.wake_io(f)); error }
             }
         }
         // Bootstrap-only pause: not a general process or service control.
         0x10016 => {
-            if pid != 1 || cpu.load.frames.with(|f| q.park_boot_root(f, pid)).is_err() { -16 }
+            if pid != 1 || cpu.shared_frames.with(|f| q.park_boot_root(f, pid)).is_err() { -16 }
             else {
                 let mut pLine = Diagnostic::new(b"AGENTOS USER PARK");
                 pLine.field(b" PID=", pid as u64); pLine.field(b" CR3=", active_root() as u64);
@@ -903,14 +1154,14 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
             if a > u32::MAX as usize || b > isize::MAX as usize || c != 0 { -22 }
             else if q.take_clock_error() { -5 }
             else {
-                match cpu.load.frames.with(|f| q.process().unwrap().files.ipc_ready_mask(f, a as u32)) {
+                match cpu.shared_frames.with(|f| q.process().unwrap().files.ipc_ready_mask(f, a as u32)) {
                     Err(error) => error,
                     Ok(mask) => {
                         let events = mask as usize |
-                            if cpu.load.frames.with(|f| q.has_exited_child(f, pid)) { 1usize << 32 } else { 0 };
+                            if cpu.shared_frames.with(|f| q.has_exited_child(f, pid)) { 1usize << 32 } else { 0 };
                         if events != 0 { events as isize }
                         else {
-                            match crate::hpet::millis() {
+                            match crate::system_clock::millis() {
                                 None => -5,
                                 Some(now) if now >= b as u64 => 0,
                                 Some(now) => {
@@ -928,28 +1179,32 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
             let mut pLine = Diagnostic::new(b"AGENTOS USER EXIT");
             pLine.field(b" PID=", pid as u64); pLine.field(b" CR3=", active_root() as u64);
             pLine.field(b" STATUS=", (a & 255) as u64); pLine.publish(cpu);
-            cpu.load.frames.with(|f| q.terminate(a & 255, f));
+            cpu.shared_frames.with(|f| q.terminate(a & 255, f));
             switchNow!(0);
         }
-        0x10004 => {
-            let mut name = [0; 64];
-            if b == 0 || b > name.len() { -22 }
-            else if let Err(error) = cpu.load.frames.with(|f| p.space.read(f, a, &mut name[..b])) { error }
-            else { cpu.load.frames.with(|f| q.spawn_process(f, cpu.programs, &name[..b], pid))
-                       .map(|v| v as isize).unwrap_or_else(|e| e) }
+        op @ (crate::native_abi::SYS_SPAWN | crate::native_abi::SYS_SPAWN_FLAGS) => {
+            let mut name = [0; crate::vfs::PATH_MAX];
+            match crate::native_abi::spawn_flags(op, b, c, name.len()) {
+                Err(error) => error,
+                Ok(flags) => {
+                    if let Err(error) = cpu.shared_frames.with(|f| p.space.read(f, a, &mut name[..b])) { error }
+                    else { cpu.shared_frames.with(|f| q.spawn_process(f, cpu.programs, &name[..b], pid, flags))
+                               .map(|v| v as isize).unwrap_or_else(|e| e) }
+                }
+            }
         }
-        0x10005 => cpu.load.frames.with(|f| q.collect(f, pid, a)).map(|v| v as isize).unwrap_or_else(|e| e),
+        0x10005 => cpu.shared_frames.with(|f| q.collect(f, pid, a)).map(|v| v as isize).unwrap_or_else(|e| e),
         // Parent gets the new PID. The child resumes at the same return RIP
         // with RAX=0, a private kernel stack and COW userspace pages.
-        0x10014 => cpu.load.frames.with(|f| q.fork_process(f, cpu.programs, ctx))
+        0x10014 => cpu.shared_frames.with(|f| q.fork_process(f, cpu.programs, ctx))
             .map(|v| v as isize).unwrap_or_else(|e| e),
         // Child enumeration is owner-scoped, never global. The zero cursor
         // returns the oldest living or zombie direct child (including
         // grandchildren adopted when their intermediate parent exited).
         0x10013 => if a > isize::MAX as usize { -22 }
-            else { cpu.load.frames.with(|f| q.child_after(f, pid, a)).map(|v| v as isize).unwrap_or_else(|e| e) },
+            else { cpu.shared_frames.with(|f| q.child_after(f, pid, a)).map(|v| v as isize).unwrap_or_else(|e| e) },
         0x1000f => {
-            let result = cpu.load.frames.with(|f| q.kill_child(f, pid, a));
+            let result = cpu.shared_frames.with(|f| q.kill_child(f, pid, a));
             if matches!(result, Ok(0)) {
                 let mut pLine = Diagnostic::new(b"AGENTOS USER KILL");
                 pLine.field(b" PID=", a as u64); pLine.field(b" PARENT=", pid as u64);
@@ -961,18 +1216,18 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
         0x10007 => {
             let mut path = [0; crate::vfs::PATH_MAX];
             if c != 0 { -30 } else if b > path.len() { -36 }
-            else if let Err(error) = cpu.load.frames.with(|f| p.space.read(f, a, &mut path[..b])) { error }
+            else if let Err(error) = cpu.shared_frames.with(|f| p.space.read(f, a, &mut path[..b])) { error }
             else { cpu.programs.vfs.file(&path[..b]).and_then(|data|
-                cpu.load.frames.with(|f| p.files.open(f, data))).map(|n| n as isize).unwrap_or_else(|e| e) }
+                cpu.shared_frames.with(|f| p.files.open(f, data))).map(|n| n as isize).unwrap_or_else(|e| e) }
         }
         0x10009 | 0x1000b => {
-            let res = cpu.load.frames.with(|f| if ctx.registers[14] == 0x10009 {
+            let res = cpu.shared_frames.with(|f| if ctx.registers[14] == 0x10009 {
                 p.files.close(f, a)
             } else { p.files.dup2(f, a, b) });
-            cpu.load.frames.with(|f| q.wake_io(f));
+            cpu.shared_frames.with(|f| q.wake_io(f));
             res.map(|v| v as isize).unwrap_or_else(|e| e)
         }
-        op @ (0x1000a | 0x1000c) => cpu.load.frames.with(|f| p.files.pair(f, &p.space, a, op == 0x1000c)).map(|v| v as isize).unwrap_or_else(|e| e),
+        op @ (0x1000a | 0x1000c) => cpu.shared_frames.with(|f| p.files.pair(f, &p.space, a, op == 0x1000c)).map(|v| v as isize).unwrap_or_else(|e| e),
         _ => -38,
     };
     // A lifecycle operation may also have consumed a remote stop request for
@@ -989,19 +1244,44 @@ unsafe extern "C" fn dispatch_syscall(ctx: &mut Context) -> usize {
 #[no_mangle]
 unsafe extern "C" fn ap_main(cpu: &'static Cpu) -> ! {
     cpu.descriptors.as_ref().unwrap().load();
-    match cpu.apic.enable().and_then(|_| cpu.run_task()) {
+    match cpu.apic.enable().and_then(|_| {
+        cpu.initialize_local_cpu()?;
+        // On the TSC-only bring-up path each AP must first measure its
+        // own rate against PIT. Do not use the BSP's raw TSC as its clock.
+        if let Some(bsp_hz)=cpu.reference.tsc_hz() {
+            let rate=cpu.qualify_tsc("ap-start").ok_or(b"AP independent TSC calibration failed" as Error)?;
+            if rate.hz().abs_diff(bsp_hz) as u128*1000>rate.hz().min(bsp_hz) as u128 {
+                return Err(b"AP TSC rate mismatch" as Error);
+            }
+            cpu.tsc.publish_rate(Some(rate));
+        }
+        cpu.run_task()
+    }) {
         Ok(()) => {
-            cpu.complete.store(1, Ordering::Release);
-            while !cpu.load.started.load(Ordering::Acquire) { spin_loop(); }
+            cpu.complete.store(AP_INITIALIZED, Ordering::Release);
+            // With an independent ACPI epoch, TSC is optional. With
+            // TSC-only bring-up its local rate was qualified above.
+            if cpu.reference.tsc_hz().is_none() {
+                let rate = if gBspQualifiedTscHz.load(Ordering::Acquire) != 0 {
+                    cpu.qualify_tsc("ap-optional")
+                } else { None };
+                cpu.tsc.publish_rate(rate);
+            }
+            while !gStartupReady.load(Ordering::Acquire) {
+                cpu.tsc.respond(|| crate::tsc::read());
+                spin_loop();
+            }
             cpu.schedule();
-            cpu.complete.store(2, Ordering::Release);
-            while cpu.phase.load(Ordering::Acquire) < OOM_PHASE { spin_loop(); }
-            if !cpu.check_empty() { cpu.complete.store(3, Ordering::Release); halt(); }
-            cpu.complete.store(OOM_CHECKED, Ordering::Release);
-            while cpu.phase.load(Ordering::Acquire) < PROCESS_PHASE { spin_loop(); }
+            if let Err(reason) = cpu.handoffBootQueue() {
+                // Publish failure even if diagnostics cannot make progress.
+                // Never make a failed ownership check look like a handoff.
+                asm!("cli", options(nostack));
+                cpu.complete.store(AP_FAILED, Ordering::Release);
+                serial(b"SMP FAILED: "); serial(reason); serial(b"\r\n"); halt();
+            }
             if let Err(reason) = cpu.process_test() {
                 serial(b"SMP FAILED: "); serial(reason); serial(b"\r\n");
-                cpu.complete.store(3, Ordering::Release); halt();
+                cpu.complete.store(AP_FAILED, Ordering::Release); halt();
             }
             cpu.complete.store(PROCESSES_FINISHED, Ordering::Release);
             while cpu.phase.load(Ordering::Acquire) < IDLE_PHASE { spin_loop(); }
@@ -1013,13 +1293,13 @@ unsafe extern "C" fn ap_main(cpu: &'static Cpu) -> ! {
                 },
                 Err(reason) => {
                     serial(b"SMP FAILED: "); serial(reason); serial(b"\r\n");
-                    cpu.complete.store(3, Ordering::Release);
+                    cpu.complete.store(AP_FAILED, Ordering::Release);
                 }
             }
         }
         Err(reason) => {
             serial(b"SMP FAILED: "); serial(reason); serial(b"\r\n");
-            cpu.complete.store(3, Ordering::Release);
+            cpu.complete.store(AP_FAILED, Ordering::Release);
         }
     }
     halt()
@@ -1034,7 +1314,7 @@ pub unsafe fn copy_startup(base: usize) {
     }
 }
 
-unsafe fn start_ap(cpu: &Cpu, root: usize, base: usize, stack: usize, clock: &PmClock) -> Result<(), Error> {
+unsafe fn start_ap(cpu: &Cpu, root: usize, base: usize, stack: usize, clock: &BringupClock) -> Result<(), Error> {
     let mailbox = base + PAGE;
     let dest = |label: *const u8| (base + (label as usize - ptr::addr_of!(ap_start) as usize)) as u32;
     (mailbox as *mut u32).write(u32::try_from(root).map_err(|_| b"AP bootstrap CR3 above 4 GiB" as Error)?);
@@ -1046,24 +1326,30 @@ unsafe fn start_ap(cpu: &Cpu, root: usize, base: usize, stack: usize, clock: &Pm
     ((mailbox+36) as *mut u16).write(8);
     ((mailbox+40) as *mut u32).write(dest(ptr::addr_of!(ap_long)));
     ((mailbox+44) as *mut u16).write(24);
+    ((mailbox+48) as *mut usize).write(ap_main as *const () as usize);
     fence(Ordering::SeqCst);
-    cpu.apic.send(cpu.expected_id, 0xc500, clock)?; // level-triggered INIT, assert
-    clock.delay(PM_HZ / 100 + 1);
+    cpu.apic.send(cpu.legacy_target, 0xc500, clock)?; // level-triggered INIT, assert
+    clock.delay_ns(10_000_000).map_err(|_| b"AP INIT delay reference stopped" as Error)?;
     let sipi = 0x4600 | (base >> 12) as u32;
-    cpu.apic.send(cpu.expected_id, sipi, clock)?;
-    clock.delay(PM_HZ / 5000 + 1);
-    cpu.apic.send(cpu.expected_id, sipi, clock)?;
-    let start = clock.now();
-    while cpu.complete.load(Ordering::Acquire) == 0 {
-        if clock.elapsed(start) > 2 * PM_HZ { return Err(b"AP task timeout"); }
-        spin_loop();
-    }
-    if cpu.complete.load(Ordering::Acquire) != 1 { return Err(b"AP task failed"); }
+    cpu.apic.send(cpu.legacy_target, sipi, clock)?;
+    clock.delay_ns(200_000).map_err(|_| b"AP SIPI delay reference stopped" as Error)?;
+    cpu.apic.send(cpu.legacy_target, sipi, clock)?;
+    clock.wait_until(2_000_000_000, || {
+        let _ = crate::system_clock::millis();
+        cpu.complete.load(Ordering::Acquire) != 0
+    })
+        .map_err(|error| match error {
+            WaitError::Timeout => b"AP task timeout" as Error,
+            WaitError::Unresponsive => b"AP task reference clock stopped" as Error,
+        })?;
+    if cpu.complete.load(Ordering::Acquire) != AP_INITIALIZED { return Err(b"AP task failed"); }
     Ok(())
 }
 
 pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Frames<'static>,
-                  bsp_rsp0: usize, archive: &'static [u8], log: &mut crate::BootLog<'_>) -> Result<(), Error> {
+                  bsp_rsp0: usize, archive: &'static [u8], log: &mut crate::BootLog<'_>,
+                  physical_ready: bool,
+                  initialize_timed_devices: impl FnOnce(&mut Frames<'static>) -> Result<(),Error>) -> Result<(), Error> {
     let guard_probe = crate::stack::KernelStack::allocate(&mut frames).ok_or(b"kernel guard stack" as Error)?;
     let guarded = crate::exceptions::probe_guard(guard_probe.guard()) &&
         crate::exceptions::probe_guard(guard_probe.top());
@@ -1072,47 +1358,118 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
     serial(b"AGENTOS KERNEL STACK GUARD OK\r\n");
     if platform.legacy_pic { out(0x21, 0xff); out(0xa1, 0xff); }
     let apic = Lapic(platform.lapic);
+    // Validate the actual mode before reading the MMIO ID, then reject the
+    // entire unaddressable enabled topology before programming any IPI.
+    apic.validate_mode()?;
+    let bsp = apic.id();
+    let roster = platform.topology.enabled();
+    let bsp_slot = roster.validate_legacy(bsp)?;
+    if !platform.topology.online_capable().ids().is_empty() {
+        log.event(1, b"MADT: online-capable CPUs offline; CPU hotplug unsupported");
+    }
+    let ids = roster.ids();
     apic.enable()?;
-    let clock = PmClock(platform.timer_port);
-    gPmPort.store(platform.timer_port as usize, Ordering::Relaxed);
+    let (clock,boot_rate) = if physical_ready {
+        (BringupClock::Physical(ReferenceClock::select(platform.pm_timer,crate::hpet::reference())
+            .ok_or(b"no progressing hardware reference clock" as Error)?),None)
+    } else {
+        // An enumerated crystal ratio is useful for diagnosing the
+        // platform, but cannot authorize a public epoch by itself.
+        let mut discarded=crate::pit::AcquisitionEvidence::new();
+        let result=crate::pit::qualify(platform.legacy_pit_probe,||{},&mut discarded);
+        report_pit_acquisition(apic.id(),"bsp-start",true,&discarded);
+        let rate=result.map_err(|fault| {
+                report_pit_failure(apic.id(),"bsp-start",true,fault);
+                if crate::tsc::detect().nominal_hz.is_some() {
+                    b"enumerated TSC rate but no independent bootstrap reference" as Error
+                } else { b"no independent TSC bootstrap calibration" as Error }
+            })?;
+        (BringupClock::LocalTsc { hz:rate.hz() },Some(rate))
+    };
+    log.event(1, clock.name());
     let (interval, tsc_hz) = apic.calibrate(&clock)?;
     log.event(2, b"APIC TIMER READY");
-    let bsp = apic.id();
-    let ids = &platform.ids[..platform.count];
-    if !ids.contains(&bsp) { return Err(b"BSP absent from MADT"); }
-    let storage = frames.alloc().ok_or(b"shared allocator storage" as Error)?.into_address() as *mut Load;
+    let storage = frames.alloc().ok_or(b"shared allocator storage" as Error)?.into_address() as *mut SmpStorage;
     let programs = frames.alloc().ok_or(b"program storage" as Error)?.into_address() as *mut Programs;
     programs.write(Programs::new(archive, root));
     let programs = &*programs;
-    storage.write(Load::new(SharedFrames::new(frames), ids.len()));
-    let load = &*storage;
-    let boot_cpu = load.frames.with(|f| Cpu::create(f, apic, bsp, interval, tsc_hz, None, load, programs, bsp_rsp0))?;
-    gCpus[bsp as usize].store(boot_cpu.self_address, Ordering::Release);
+    storage.write(SmpStorage { frames: SharedFrames::new(frames), load: Load::new(ids.len()) });
+    let storage = &*storage;
+    let shared_frames = &storage.frames;
+    let load = &storage.load;
+    let boot_cpu = shared_frames.with(|f| Cpu::create(f, apic, roster, bsp, interval, tsc_hz, clock, platform.legacy_pit_probe, None, shared_frames, load, programs, bsp_rsp0))?;
+    gCpus[bsp_slot.index()].store(boot_cpu.self_address, Ordering::Release);
+    if let Some(rate)=boot_rate { boot_cpu.tsc.publish_rate(Some(rate)); }
+    boot_cpu.initialize_local_cpu()?;
     boot_cpu.run_task()?;
-    let mut cpus = [None; 255];
-    cpus[bsp as usize] = Some(boot_cpu);
-    for &id in ids {
+    let bsp_proof = if let Some(rate)=boot_rate { Some(rate) } else {
+        let rate=boot_cpu.qualify_tsc("bsp-optional");
+        boot_cpu.tsc.publish_rate(rate);
+        rate
+    };
+    let bsp_rate=bsp_proof.map(crate::tsc::QualifiedRate::hz);
+    if let Some(hz) = bsp_rate {
+        boot_cpu.tsc.publish_alignment(crate::tsc::Alignment { offset: 0, uncertainty_ticks: 0 });
+        gBspQualifiedTscHz.store(hz, Ordering::Release);
+    }
+    log.event(1, crate::tsc::Diagnostic::new(bsp, &boot_cpu.tsc).bytes());
+    let mut cpus = [None; MAX_CPUS];
+    cpus[bsp_slot.index()] = Some(boot_cpu);
+    for id in roster.firmware_order() {
         if id == bsp { continue; }
-        let cpu = load.frames.with(|f| {
+        let cpu = shared_frames.with(|f| {
             let descriptors = Descriptors::new(f).ok_or(b"AP descriptors" as Error)?;
             let rsp0 = descriptors.rsp0_slot();
-            Cpu::create(f, apic, id, interval, tsc_hz, Some(descriptors), load, programs, rsp0)
+            Cpu::create(f, apic, roster, id, interval, tsc_hz, clock, platform.legacy_pit_probe, Some(descriptors), shared_frames, load, programs, rsp0)
         })?;
-        let stack = load.frames.with(crate::stack::KernelStack::allocate)
+        let stack = shared_frames.with(crate::stack::KernelStack::allocate)
             .ok_or(b"AP stack" as Error)?.into_top();
-        gCpus[id as usize].store(cpu.self_address, Ordering::Release);
+        gCpus[cpu.slot.index()].store(cpu.self_address, Ordering::Release);
         start_ap(cpu, root, base, stack, &clock)?;
-        cpus[id as usize] = Some(cpu);
+        if let Some(hz) = bsp_rate {
+            let alignment=clock.synchronize(&cpu.tsc,hz,||{ let _=crate::system_clock::millis(); });
+            if !physical_ready && alignment.is_none() { return Err(b"AP TSC alignment failed"); }
+        }
+        log.event(1, crate::tsc::Diagnostic::new(id, &cpu.tsc).bytes());
+        cpus[cpu.slot.index()] = Some(cpu);
     }
     gOnlineCount.store(ids.len(), Ordering::Release);
     log.event(1, b"PROCESSORS ONLINE");
-    let baseline = load.frames.with(|f| f.snapshot()).ok_or(b"bitmap snapshot" as Error)?;
-    load.started.store(true, Ordering::Release);
-    boot_cpu.schedule();
-    for cpu in cpus.iter().flatten() {
-        if cpu.expected_id != bsp {
-            while cpu.complete.load(Ordering::Acquire) != 2 { spin_loop(); }
+    if !physical_ready {
+        // Independent BSP measurements separate the two alignment rounds.
+        // Each AP already passed its own independent calibration.
+        let first=bsp_proof.ok_or(b"unqualified BSP TSC" as Error)?;
+        let again=boot_cpu.qualify_tsc("bsp-confirm").ok_or(b"BSP TSC stability qualification failed" as Error)?;
+        if !boot_cpu.tsc.confirm_rate(again) { return Err(b"BSP TSC frequency or raw time changed"); }
+        for cpu in cpus.iter().flatten().filter(|cpu|cpu.expected_id!=bsp) {
+            clock.synchronize(&cpu.tsc,first.hz(),||{})
+                .ok_or(b"AP TSC alignment changed during qualification" as Error)?;
+            log.event(1,crate::tsc::Diagnostic::new(cpu.expected_id,&cpu.tsc).bytes());
         }
+    }
+    match crate::tsc_epoch::select(physical_ready,||
+        crate::system_clock::publish_tsc(bsp,ids,
+            cpus.iter().flatten().map(|cpu|{let cpu=*cpu;(cpu.expected_id,&cpu.tsc)}),
+            local_tsc_sample))? {
+        crate::tsc_epoch::BootSource::Physical=>(),
+        crate::tsc_epoch::BootSource::Tsc=>{
+            log.event(1,b"SYSTEM CLOCK: TSC (qualified invariant clocksource)");
+        }
+    }
+    // APs are initialized and still behind the ordinary startup barrier.
+    // Timed device operations run only after a real epoch exists, and
+    // before releasing the scheduler and user tasks.
+    shared_frames.with(initialize_timed_devices)?;
+    if crate::system_clock::millis().is_none() { return Err(b"system clock unavailable before scheduler"); }
+    let baseline = shared_frames.with(|f| f.snapshot()).ok_or(b"bitmap snapshot" as Error)?;
+    gStartupReady.store(true, Ordering::Release);
+    boot_cpu.schedule();
+    // Acquire every AP queue independently of what the BSP will do with it.
+    // Ownership remains with the BSP until PROCESS_PHASE below.
+    for cpu in cpus.iter().flatten().filter(|cpu| cpu.expected_id != bsp) {
+        cpu.acquireBootQueue()?;
+    }
+    for cpu in cpus.iter().flatten() {
         for slot in 0..stress::TASKS {
             let switches = (*cpu.queue.get()).preemptions(slot);
             let pages = cpu.released[slot].load(Ordering::Acquire);
@@ -1123,26 +1480,11 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
             serial(b" PAGES="); hex(pages as u64); serial(b"\r\n");
         }
     }
-    if !load.frames.with(|f| baseline.matches(f)) { return Err(b"free bitmap changed"); }
+    if !shared_frames.with(|f| baseline.matches(f)) { return Err(b"free bitmap changed"); }
     serial(b"AGENTOS FRAME STRESS BITMAP OK HELD="); hex(load.overlapping_pages() as u64);
     serial(b" FREE-BEFORE="); hex(baseline.count as u64);
-    serial(b" FREE-AFTER="); hex(load.frames.with(|f| f.available()) as u64); serial(b"\r\n");
-    let held = load.frames.with(Exhaustion::drain);
-    let drained = held.count;
-    for cpu in cpus.iter().flatten() { cpu.phase.store(OOM_PHASE, Ordering::Release); }
-    let mut rejected = boot_cpu.check_empty() as usize;
-    for cpu in cpus.iter().flatten().filter(|c| c.expected_id != bsp) {
-        while cpu.complete.load(Ordering::Acquire) == 2 { spin_loop(); }
-        if cpu.complete.load(Ordering::Acquire) == OOM_CHECKED { rejected += 1; }
-    }
-    let restored = load.frames.with(|f| held.recover(f) && baseline.matches(f) && f.probe() && baseline.matches(f));
-    if !restored || drained != baseline.count || rejected != ids.len() {
-        return Err(b"physical memory exhaustion or recovery");
-    }
-    serial(b"AGENTOS OOM OK DRAINED="); hex(drained as u64);
-    serial(b" REJECT-CPUS="); hex(rejected as u64);
-    serial(b" RESTORED="); hex(load.frames.with(|f| f.available()) as u64); serial(b"\r\n");
-    load.frames.with(|f| {
+    serial(b" FREE-AFTER="); hex(shared_frames.with(|f| f.available()) as u64); serial(b"\r\n");
+    shared_frames.with(|f| {
         baseline.release(f);
         for cpu in cpus.iter().flatten() { (*cpu.queue.get()).reap(f); }
     });
@@ -1150,7 +1492,7 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
     boot_cpu.process_test()?;
     for cpu in cpus.iter().flatten().filter(|c| c.expected_id != bsp) {
         cpu.phase.store(PROCESS_PHASE, Ordering::Release);
-        while cpu.complete.load(Ordering::Acquire) == OOM_CHECKED { spin_loop(); }
+        while cpu.complete.load(Ordering::Acquire) == BOOT_QUEUE_HANDED_OFF { let _ = crate::system_clock::millis(); spin_loop(); }
         if cpu.complete.load(Ordering::Acquire) != PROCESSES_FINISHED { return Err(b"AP user processes"); }
     }
     serial(b"AGENTOS IDLE BEGIN TSC-HZ="); hex(tsc_hz); serial(b"\r\n");
@@ -1158,7 +1500,7 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
     boot_cpu.measure_idle()?;
     for cpu in cpus.iter().flatten() {
         if cpu.expected_id != bsp {
-            while cpu.complete.load(Ordering::Acquire) == PROCESSES_FINISHED { spin_loop(); }
+            while cpu.complete.load(Ordering::Acquire) == PROCESSES_FINISHED { let _ = crate::system_clock::millis(); spin_loop(); }
             if cpu.complete.load(Ordering::Acquire) != IDLE_FINISHED { return Err(b"AP idle sample"); }
         }
         let sample = &*cpu.idle.get();
@@ -1168,15 +1510,34 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
         serial(b" TSC-TOTAL="); hex(sample.elapsed);
         serial(b" TSC-ACTIVE="); hex(sample.active); serial(b"\r\n");
     }
+    // An invariant TSC cannot be a system-wide candidate unless every
+    // enabled CPU has a qualified rate and bounded alignment. Monitor
+    // continuously from ordinary runtime startup, including idle CPUs.
+    if let Some(hz) = bsp_rate.filter(|_| physical_ready) {
+        if cpus.iter().flatten().all(|cpu| cpu.tsc.rate().is_some() && cpu.tsc.alignment().is_some()) {
+            if crate::tsc_watchdog::MONITOR.start(bsp, hz,
+                cpus.iter().flatten().map(|cpu| cpu.expected_id)) {
+                log.event(1, b"TSC runtime watchdog enabled");
+                if crate::system_clock::attach_witness(clock_witness, reject_clock_witness) {
+                    log.event(1, b"TSC witness registered for independent clock comparison");
+                }
+            }
+        }
+    }
     for pCpu in cpus.iter().flatten().filter(|pCpu| pCpu.expected_id != bsp) {
         pCpu.phase.store(RUNTIME_PHASE, Ordering::Release);
     }
-    let pStart = clock.now();
-    for pCpu in cpus.iter().flatten().filter(|pCpu| pCpu.expected_id != bsp) {
-        while !pCpu.fRuntimeReady.load(Ordering::Acquire) {
-            if clock.elapsed(pStart) > 2 * PM_HZ { return Err(b"runtime CPU startup timeout"); }
-            spin_loop();
-        }
+    clock.wait_until(2_000_000_000, || {
+        let _=crate::system_clock::millis();
+        cpus.iter().flatten().filter(|cpu| cpu.expected_id != bsp)
+            .all(|cpu| cpu.fRuntimeReady.load(Ordering::Acquire))
+    })
+        .map_err(|error| match error {
+            WaitError::Timeout => b"runtime CPU startup timeout" as Error,
+            WaitError::Unresponsive => b"runtime CPU startup reference clock stopped" as Error,
+        })?;
+    if crate::system_clock::millis().is_none() {
+        return Err(b"system clock unavailable at runtime publication");
     }
 
     Ok(())
@@ -1187,32 +1548,56 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
 pub unsafe fn shell(platform: &Platform, info: &crate::BootInfo) -> Result<(), Error> {
     let cpu = current_cpu();
     let baseline = (*cpu.boot_baseline.get()).take().ok_or(b"PID1 baseline missing" as Error)?;
-    let Some(storage) = cpu.load.frames.with(|f| f.alloc()) else {
-        cpu.load.frames.with(|f| baseline.release(f));
+    let Some(storage) = cpu.shared_frames.with(|f| f.alloc()) else {
+        cpu.shared_frames.with(|f| baseline.release(f));
         return Err(b"TTY allocation");
     };
     let terminal = storage.address() as *mut crate::tty::Terminal;
     let mut initialized = false;
+    let mut display: Option<ScreenWork> = None;
+    let mut display_storage: Option<crate::frames::FrameRange> = None;
     let started = (|| -> Result<usize, Error> {
-        terminal.write(crate::tty::Terminal::new(platform, cpu.expected_id)?);
+        terminal.write(crate::tty::Terminal::new(platform, cpu.expected_id, crate::serial_available()));
         initialized = true;
         // The BSP TTY owns the mapped GOP framebuffer for the entire shell
         // session; the serial path remains available if GOP validation fails.
-        if let Some(screen) = crate::fb_console::Console::below_boot_status(
-            info.framebuffer, info.width as usize, info.height as usize,
-            info.stride as usize, info.pixel_format
-        ) {
-            (*terminal).attach_screen(screen);
-        } else {
-            let _ = crate::logger::LOGGER.record(timestamp(), cpu.expected_id as u32,
+        let configured = (|| -> Option<()> {
+            let geometry=crate::fb_console::Geometry::below_boot_status(
+                info.framebuffer,info.width as usize,info.height as usize,
+                info.stride as usize,info.pixel_format)?;
+            let pages=geometry.storage_bytes()?.checked_add(PAGE-1)?/PAGE;
+            let range=cpu.shared_frames.with(|f|f.alloc_contiguous(pages,PAGE,0,u64::MAX))?;
+            let Some((model,renderer))=crate::fb_console::Console::new(
+                geometry,range.address() as *mut u8,range.byte_len()) else {
+                cpu.shared_frames.with(|f|f.release_range(range));return None;
+            };
+            display=Some(ScreenWork{terminal,renderer});
+            let work=display.as_mut().unwrap() as *mut ScreenWork;
+            // The runtime queue is not active or published yet. Allocate a
+            // separate kernel-service stack without consuming a user slot.
+            if cpu.shared_frames.with(|f|(*cpu.queue.get()).spawn_service(
+                f,screen_worker,work as usize,(*terminal).screen_event())).is_none() {
+                display=None;
+                cpu.shared_frames.with(|f|f.release_range(range));
+                return None;
+            }
+            // Outside every lock, before any IRQ or worker can see the TTY.
+            (*work).renderer.initialize();
+            (*terminal).attach_screen(model);
+            display_storage=Some(range);
+            Some(())
+        })();
+        if configured.is_none() {
+            let _ = crate::logger::LOGGER.record(timestamp(), cpu.expected_id,
                 crate::log_policy::Level::Error, b"TTY GOP unavailable");
+            if !crate::serial_available() {return Err(b"TTY output unavailable");}
         }
         let queue = &mut *cpu.queue.get();
         let pid = queue.parked_root().ok_or(b"PID1 not parked" as Error)?;
         if pid != 1 { return Err(b"invalid PID1 identity"); }
         queue.terminal(pid, terminal).map_err(|_| b"PID1 terminal descriptors" as Error)?;
         queue.resume_boot_root(pid).map_err(|_| b"PID1 resume" as Error)?;
-        let _ = crate::logger::LOGGER.record(timestamp(), cpu.expected_id as u32,
+        let _ = crate::logger::LOGGER.record(timestamp(), cpu.expected_id,
             crate::log_policy::Level::Info, b"service manager session started");
         serial(b"AGENTOS MANAGER SESSION START PID="); hex(pid as u64); serial(b"\r\n");
         cpu.terminal.get().write(terminal);
@@ -1225,11 +1610,18 @@ pub unsafe fn shell(platform: &Platform, info: &crate::BootInfo) -> Result<(), E
     if initialized { (*terminal).disable(); }
     cpu.terminal.get().write(ptr::null_mut());
     gTerminal.store(0, Ordering::Release);
+    // The runtime caller can only be selected when the display task is
+    // parked, not halfway through painting a snapshot. Finish final echo
+    // or disable diagnostics before releasing its separately owned RAM.
+    if let Some(work)=display.as_mut() {
+        if (*terminal).snapshot_screen(&mut work.renderer) {work.renderer.render();}
+    }
     let mut pCleanupQueue = cpu.lockQueue();
-    let result = cpu.load.frames.with(|f| {
+    let result = cpu.shared_frames.with(|f| {
         let q = &mut *pCleanupQueue;
         let status = started;
         q.reap(f);
+        if let Some(range)=display_storage.take() {f.release_range(range);}
         f.release(storage);
         let matched = baseline.matches(f);
         baseline.release(f);
@@ -1237,7 +1629,7 @@ pub unsafe fn shell(platform: &Platform, info: &crate::BootInfo) -> Result<(), E
     });
     drop(pCleanupQueue);
     let pid = result?;
-    let _ = crate::logger::LOGGER.record(timestamp(), cpu.expected_id as u32,
+    let _ = crate::logger::LOGGER.record(timestamp(), cpu.expected_id,
         crate::log_policy::Level::Info, b"service manager session stopped");
     serial(b"AGENTOS MANAGER SESSION STOP PID="); hex(pid as u64);
     serial(b" STATUS=0000000000000000 FRAMES=OK\r\n");

@@ -43,19 +43,40 @@ demand = load("qemu_demand_evidence", "verify-demand-paging.py")
 migration = load("qemu_migration_evidence", "verify-migration.py")
 service_manager = load("qemu_service_manager_evidence", "verify-service-manager.py")
 boot_log = load("qemu_boot_log_evidence", "verify-boot-log.py")
+physical_oom = load("physical_oom_evidence", "physical_oom_evidence.py")
 session = load("qemu_stage3_session", "verify-stage3-session.py")
 console = load("qemu_console_image", "verify-console-image.py")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--cpus", type=int, choices=(1, 2), required=True)
+    cpu_profile=parser.add_mutually_exclusive_group(required=True)
+    cpu_profile.add_argument("--cpus", type=int, choices=(1, 2))
+    cpu_profile.add_argument("--basic-smp-cpus", type=int, choices=(4, 8),
+                             help="Explicit ordinary signed SMP session, not the staged 1/2 CPU gate")
+    parser.add_argument("--memory-mib", type=int, choices=(256, 512), default=256)
+    parser.add_argument("--no-hpet", action="store_true", help="Disable HPET in actual QEMU hardware")
+    parser.add_argument("--accel", choices=("tcg","kvm"), default="tcg",
+                        help="Use real KVM for matching control runs; ordinary regression defaults to TCG")
     parser.add_argument("--session", action="store_true",
                         help="Drive UART/PS2 editing, service control, runtime idle and shutdown")
+    parser.add_argument("--runtime-process-regression", action="store_true",
+                        help="Separate foreground ELF/fault regression through the ordinary shell")
+    parser.add_argument("--supervisor-image", choices=("control","test"),
+                        help="Host-only paired signed image regression")
+    parser.add_argument("--guest-oom",action="store_true",help="Explicit bounded 256 MiB HPET TCG signed pair only")
+    parser.add_argument("--smp-soak",action="store_true",help="Explicit separate signed 60-second runtime test, only with --basic-smp-cpus")
     parser.add_argument("--timeout", type=int, default=720)
     parser.add_argument("--ovmf-code", type=Path, required=True)
     parser.add_argument("--ovmf-vars", type=Path, required=True)
     args = parser.parse_args()
+    args.basic_smp=args.basic_smp_cpus is not None
+    if args.basic_smp:
+        args.cpus=args.basic_smp_cpus
+    if args.runtime_process_regression and not args.session:
+        parser.error("--runtime-process-regression requires --session")
+    if args.supervisor_image and not args.runtime_process_regression:
+        parser.error("--supervisor-image requires --session --runtime-process-regression")
     try:
         return boot(args)
     except Exception as error:
@@ -228,12 +249,73 @@ def wait_session(process, capture, serial, predicate, description, seconds=30):
     raise TimeoutError(f"Interactive guest did not complete {description}")
 
 
-def run_session(process, capture, qmp, destination):
+def run_session(process, capture, qmp, destination, runtime_process_regression=False,
+                supervisor_image=None, guest_oom=False, smp_soak=False):
     serial = destination / "com1.log"
     children = list(session.SHELL_START.finditer(serial.read_bytes()))
     if len(children) != 1:
         raise RuntimeError("Cannot identify the real managed shell")
     shell = int(children[0][1], 16)
+    if smp_soak:
+        offset=serial.stat().st_size
+        print("QEMU separate sustained SMP: run /smp-soak",flush=True)
+        capture.send(session.SMP_SOAK_INPUT)
+        reply=re.compile(rb"exit status ([0-9]+)\r\nagentos> ")
+        wait_session(process,capture,serial,lambda data:reply.search(data[offset:]),
+                     "bounded sustained SMP workload",150)
+        status=reply.search(serial.read_bytes()[offset:])
+        if status is None or status[1]!=b"0":
+            raise RuntimeError("SMP soak runner did not exit normally")
+    if runtime_process_regression:
+        for command, status in session.RUNTIME_PROGRAMS:
+            offset = serial.stat().st_size
+            print(f"QEMU separate runtime process regression: {command!r}", flush=True)
+            capture.send((command+"\r").encode("ascii"))
+            reply = f"exit status {status}\r\nagentos> ".encode("ascii")
+            wait_session(process, capture, serial,
+                         lambda data: reply in data[offset:], command, 30)
+    if supervisor_image is not None:
+        for command,request in ((session.MIGRATION_COMMAND,session.MIGRATION_INPUT),
+                                (session.SUPERVISOR_COMMAND,session.SUPERVISOR_INPUT),
+                                (session.PIPE_COMMAND,session.PIPE_INPUT),
+                                *((command,(command+"\r").encode("ascii"))
+                                  for command in session.MEMORY_COMMANDS),
+                                (session.IPC_COMMAND,session.IPC_INPUT),
+                                (session.FAULT_COMMAND,session.FAULT_INPUT)):
+            offset = serial.stat().st_size
+            print(f"QEMU {supervisor_image} signed image: {command!r}", flush=True)
+            capture.send(request)
+            reply = (session.SUPERVISOR_MISSING if supervisor_image=="control"
+                     else b"exit status 0\r\nagentos> ")
+            wait_session(process, capture, serial,
+                         lambda data: reply in data[offset:], command, 30)
+        if guest_oom:
+            offset=serial.stat().st_size
+            capture.send(session.OOM_INPUT)
+            reply=(session.SUPERVISOR_MISSING if supervisor_image=="control"
+                   else b"exit status 0\r\nagentos> ")
+            wait_session(process,capture,serial,lambda data: reply in data[offset:],session.OOM_COMMAND,30)
+        offset=serial.stat().st_size
+        print(f"QEMU {supervisor_image} signed image: {session.ADOPTION_COMMAND!r}",flush=True)
+        capture.send(session.ADOPTION_INPUT)
+        if supervisor_image=="test":
+            for step,status in ((1,57),(2,58),(3,59)):
+                wait=re.compile(rb"AGENTOS ADOPTION TEST WAIT STEP="+f"{step:016x}".encode()+
+                                rb" PID=([0-9a-f]{16})\r\n")
+                def collected(data):
+                    view=data[offset:]
+                    match=wait.search(view)
+                    if not match:
+                        return False
+                    record=(b"AGENTOS MANAGER REAP ROOT=0000000000000001 PID="+match[1]+
+                            b" STATUS="+f"{status:016x}".encode()+b"\r\n")
+                    return record in view
+                wait_session(process,capture,serial,collected,f"actual PID1 collection at adoption gate {step}",30)
+                capture.send(session.ADOPTION_BYTES[2*(step-1):2*step])
+        reply=(session.SUPERVISOR_MISSING if supervisor_image=="control"
+               else b"exit status 0\r\nagentos> ")
+        wait_session(process,capture,serial,lambda data: reply in data[offset:],
+                     session.ADOPTION_COMMAND,30)
     for step in session.steps(shell, True):
         if step["screenshot"]:
             qmp.screenshot(destination / "keyboard-before.ppm")
@@ -264,18 +346,81 @@ def run_session(process, capture, qmp, destination):
 
 
 def boot(args):
+    basic_smp=getattr(args,"basic_smp",False)
+    smp_soak=getattr(args,"smp_soak",False)
+    if smp_soak and not basic_smp:
+        raise ValueError("SMP soak requires the explicit 4/8 CPU session profile")
+    if basic_smp:
+        if (args.cpus not in (4,8) or not args.session or args.memory_mib!=256 or args.no_hpet or
+            args.accel!="tcg" or getattr(args,"runtime_process_regression",False) or
+            getattr(args,"supervisor_image",None) is not None or getattr(args,"guest_oom",False)):
+            raise ValueError("Basic SMP requires an ordinary 4/8 CPU, 256 MiB HPET TCG session; no staged workload")
+        basic=load("basic_smp_evidence","verify-basic-smp.py")
+    elif args.cpus not in (1,2):
+        raise ValueError("The existing smoke contract requires 1/2 CPUs")
     root = ROOT
     commit = subprocess.check_output(["git", "rev-parse", "--verify", "HEAD"],
                                      cwd=root, text=True).strip()
     image = evidence.verify_build(root, commit)
-    destination = root / "build/check" / (
-        f"qemu-cpu{args.cpus}-session" if args.session else f"qemu-cpu{args.cpus}")
+    image_path = "build/agentos.efi"
+    image_sha = image["artifacts"]["agentos.efi"]
+    supervisor_image = getattr(args, "supervisor_image", None)
+    guest_oom=getattr(args,"guest_oom",False)
+    oom_layout=None
+    if guest_oom and (supervisor_image not in ("control","test") or args.memory_mib!=256 or args.no_hpet or args.accel!="tcg"):
+        raise ValueError("Guest OOM requires the explicit 256 MiB HPET TCG signed pair")
+    if supervisor_image is not None:
+        if not args.session or not getattr(args, "runtime_process_regression", False):
+            raise ValueError("Supervisor pair requires the full foreground and shell regressions")
+        paired = load("supervisor_image_evidence", "verify-supervisor-image.py")
+        identity = paired.verify_identity(root)
+        if guest_oom:
+            oom_layout=identity["oom_layout"]
+        if supervisor_image=="test":
+            image_path = "build/supervisor-staging/test.efi"
+            image_sha = identity["test"]["signed_sha256"]
+    if smp_soak:
+        soak_image=load("smp_soak_image","smp-soak-image.py")
+        image_path="build/smp-soak-staging/test.efi"
+        identity=soak_image.verify_image(root,root/image_path,commit)
+        image_sha=identity["signed_sha256"]
+    profile = f"qemu-cpu{args.cpus}"
+    if args.memory_mib != 256:
+        profile += f"-ram{args.memory_mib}"
+    if args.no_hpet:
+        profile += "-no-hpet"
+    if args.accel != "tcg":
+        profile += "-"+args.accel
+    if args.session:
+        profile += "-session"
+    if supervisor_image is not None:
+        profile += "-sv-"+supervisor_image
+    elif getattr(args, "runtime_process_regression", False):
+        profile += "-runtime-process-regression"
+    if basic_smp:
+        profile += "-basic-smp"
+    if smp_soak:
+        profile += "-soak"
+    destination = root / "build/check" / profile
     destination.mkdir(parents=True, exist_ok=True)
+    for name in ("smoke.json", "failure.json"):
+        (destination/name).unlink(missing_ok=True)
+    oom_proof = physical_oom.run(root, destination, commit)
+    if basic_smp:
+        for name in ("smoke.json","failure.json","basic-smp.json","qmp-basic-smp.json"):
+            (destination/name).unlink(missing_ok=True)
+        host=basic.host_capacity()
+        (destination/"host-capacity.json").write_text(json.dumps(host,indent=2,sort_keys=True)+"\n")
+        if image.get("profile")!="default":
+            raise ValueError("Basic SMP must use the ordinary distribution build")
+    if supervisor_image is not None:
+        for name in ("smoke.json", "failure.json"):
+            (destination/name).unlink(missing_ok=True)
     raw = destination / "esp.raw"
     if raw.exists():
         raw.unlink()
     subprocess.run(["bash", "scripts/disk.sh", str(destination),
-                    "build/agentos.efi", "info both"], cwd=root, check=True)
+                    image_path, "info both"], cwd=root, check=True)
     # Independently re-read the exact signed EFI from the ESP. A GPT image
     # that merely exists is not evidence its fallback boot file was copied.
     copied = destination / "esp-bootx64.efi"
@@ -283,8 +428,11 @@ def boot(args):
         copied.unlink()
     subprocess.run(["mcopy", "-i", f"{raw}@@1048576",
                     "::EFI/BOOT/BOOTX64.EFI", str(copied)], check=True)
-    if evidence.sha256(copied) != image["artifacts"]["agentos.efi"]:
+    if evidence.sha256(copied) != image_sha:
         raise RuntimeError("EFI on QEMU ESP differs from the signed build output")
+    if basic_smp:
+        identity=(soak_image.verify_image(root,copied,commit) if smp_soak
+                  else basic.verify_image(root,copied,commit))
     vm_vars = destination / "OVMF_VARS.secboot.fd"
     if vm_vars.exists():
         vm_vars.unlink()
@@ -334,8 +482,9 @@ def boot(args):
         serial_options = ["-serial", f"file:{serial}"]
     qemu = [
         "qemu-system-x86_64",
-        "-machine", "q35,accel=tcg,smm=on,hpet=on",
-        "-cpu", "max", "-smp", str(args.cpus), "-m", "256",
+        "-machine", f"q35,accel={args.accel},smm=on,hpet=" + ("off" if args.no_hpet else "on"),
+        "-cpu", "host,x2apic=off,invtsc=on,enforce=on" if args.accel=="kvm" else "max",
+        "-smp", str(args.cpus), "-m", str(args.memory_mib),
         "-global", "driver=cfi.pflash01,property=secure,value=on",
         "-drive", f"if=pflash,format=raw,unit=0,readonly=on,file={args.ovmf_code}",
         "-drive", f"if=pflash,format=raw,unit=1,file={vm_vars}",
@@ -354,7 +503,10 @@ def boot(args):
     last_progress = start
     last_size = -1
     run_succeeded = False
+    actual_kvm = None
+    qmp_roster = None
     qmp = None
+    (destination / "qemu-command.json").write_text(json.dumps(qemu,indent=2)+"\n")
     serial_capture = None
     with stdout.open("wb") as diagnostic:
         process = subprocess.Popen(qemu, cwd=root, stdin=subprocess.DEVNULL,
@@ -373,10 +525,17 @@ def boot(args):
                     raise RuntimeError("Guest reported critical kernel failure; see COM1")
                 if b"AGENTOS SHELL READY\r\nagentos> " in content:
                     qmp = Qmp(qmp_socket)
+                    actual_kvm=qmp.execute("query-kvm")
+                    if bool(actual_kvm["enabled"]) != (args.accel=="kvm"):
+                        raise RuntimeError("Unexpected actual accelerator")
+                    if basic_smp:
+                        qmp_roster=basic.capture_cpus(qmp,args.cpus,actual_kvm)
+                        (destination/"qmp-basic-smp.json").write_text(json.dumps(qmp_roster,indent=2,sort_keys=True)+"\n")
                     qmp.screenshot(destination / "shell-screen.ppm")
                     console.verify(destination / "shell-screen.ppm", aLevel="info", aOutput="both")
                     if args.session:
-                        run_session(process, serial_capture, qmp, destination)
+                        run_session(process, serial_capture, qmp, destination,
+                                    getattr(args, "runtime_process_regression", False), supervisor_image,guest_oom,smp_soak)
                     run_succeeded = True
                     break
                 if process.poll() is not None:
@@ -395,10 +554,12 @@ def boot(args):
                     if serial.exists() else "")
             failure = {
                 "schema": 1, "result": "fail", "source_commit": commit,
-                "cpu_count": args.cpus, "failure": str(error),
+                "cpu_count": args.cpus, "memory_mib": args.memory_mib,
+                "hpet_enabled": not args.no_hpet, "accelerator":args.accel,
+                "failure": str(error),
                 "last_com1_bytes": tail,
                 "host_elapsed_seconds": round(time.monotonic() - start, 3),
-                "signed_efi_sha256": image["artifacts"]["agentos.efi"],
+                "signed_efi_sha256": image_sha,
             }
             (destination / "failure.json").write_text(
                 json.dumps(failure, indent=2, sort_keys=True) + "\n",
@@ -409,14 +570,21 @@ def boot(args):
             fatal = re.search(r"FATAL VECTOR=[0-9a-f]{16} ERROR=[0-9a-f]{16} "
                               r"RIP=([0-9a-f]{16})", tail)
             kernel_elf = root / "build/kernel.elf"
-            if fatal and kernel_elf.is_file():
-                rip = int(fatal[1], 16)
-                disasm = subprocess.run(
-                    ["objdump", "-drwC", f"--start-address={max(0,rip-128)}",
-                     f"--stop-address={rip+192}", str(kernel_elf)],
-                    capture_output=True, text=True, check=False)
-                print("Kernel ELF instructions near fatal RIP:\n" + disasm.stdout,
-                      file=sys.stderr, flush=True)
+            base_match = None
+            if serial.exists():
+                with serial.open("rb") as captured:
+                    base_match = re.search(rb"\[INFO\] KERNEL IMAGE BASE=([0-9a-f]{16})\r?\n",
+                                           captured.read(65536))
+            if fatal and kernel_elf.is_file() and base_match:
+                rip, base = int(fatal[1], 16), int(base_match[1], 16)
+                if base <= rip < base + 16*1024*1024:
+                    disasm = subprocess.run(
+                        ["objdump", "-drwC", f"--adjust-vma={base}",
+                         f"--start-address={max(base,rip-128)}",
+                         f"--stop-address={rip+192}", str(kernel_elf)],
+                        capture_output=True, text=True, check=False)
+                    print("Relocated kernel ELF instructions near fatal RIP:\n" + disasm.stdout,
+                          file=sys.stderr, flush=True)
             raise
         finally:
             if qmp is not None:
@@ -431,7 +599,10 @@ def boot(args):
                     process.kill()
                     process.wait(timeout=10)
     text = serial.read_text(encoding="ascii", errors="replace")
-    boot_log.verify(text.encode("ascii", errors="replace"), "info", "both")
+    if not guest_oom and ("AGENTOS PAGE OOM" in text or "AGENTOS TEST OOM " in text):
+        raise RuntimeError("Unexpected runtime OOM outside explicit pressure scenario")
+    boot_log.verify(text.encode("ascii", errors="replace"), "info", "both",
+                    physical_oom_dir=destination, source_commit=commit)
     if text.splitlines().count("AGENTOS KERNEL STACK GUARD OK") != 1:
         raise RuntimeError("Missing actual guarded kernel stack fault-probe evidence")
     marker = re.compile(r"(?m)^AGENTOS TASK (?:BSP|AP) APIC=([0-9a-f]{16}) "
@@ -439,36 +610,106 @@ def boot(args):
     apics = [int(x, 16) for x in marker.findall(text)]
     if len(apics) != args.cpus or len(set(apics)) != args.cpus:
         raise RuntimeError(f"Missing per-CPU APIC timer evidence: {apics}")
-    processes.verify(text, apics)
-    supervisor.verify(text, args.cpus)
-    orphans.verify(text, args.cpus)
-    cow.verify(text, args.cpus)
-    demand.verify(text, args.cpus)
-    migration_result = migration.verify(text, args.cpus)
-    service_manager.verify(text)
+    boot_roots=processes.verify(text, apics, ipc_staged=True, allow_ipc_workload=supervisor_image=="test",
+                                root_orphan_v1=True, require_shutdown=args.session)
+    if supervisor_image!="test" and not smp_soak:
+        supervisor.verify_absent(text)
+    # The test image must pass the full authenticated runtime session below.
+    orphans.verify(text, args.cpus, basic_smp=basic_smp)
+    # Staged memory evidence belongs exclusively to the strict foreground
+    # verifier below. Every other profile must lack it entirely.
+    if supervisor_image!="test":
+        cow.verify_absent(text)
+        demand.verify_absent(text)
+    migration.verify_boot(text, allow_foreground=supervisor_image=="test")
+    service_manager.verify(text, migration_staged=True, allow_migration_workload=supervisor_image=="test")
+    migration_result = {"absent":True}
     session_result = None
+    soak_interval=None
     if args.session:
         session_result = session.verify(serial.read_bytes(), (destination / "com1-input.bin").read_bytes(),
-                                        True, args.cpus)
+                                        True, args.cpus,
+                                        aRuntimeProcess=getattr(args,"runtime_process_regression",False),
+                                        aSupervisorImage=supervisor_image,aMigrationStaged=True,aFaultStaged=True,aOomLayout=oom_layout,
+                                        aBasicSmp=basic_smp,aSmpSoak=smp_soak)
+        if supervisor_image is not None:
+            migration_result = session_result["runtime_migration"]
+        if smp_soak:
+            # Only the exact authenticated foreground interval may contain the
+            # new test markers. All original absence checks remain mandatory.
+            lo,hi=session_result["runtime_smp_soak"]["interval_bytes"]
+            raw_log=serial.read_bytes()
+            supervisor.verify_absent((raw_log[:lo]+raw_log[hi:]).decode("ascii"))
+            soak_interval=raw_log[lo:hi].decode("ascii").replace("\r\n","\n")
+    bases = re.findall(r"(?m)^\[INFO\] KERNEL IMAGE BASE=([0-9a-f]{16})\r?$", text)
+    if len(bases) != 1:
+        raise RuntimeError(f"Expected one actual runtime kernel image address: {bases}")
+    image_base = int(bases[0], 16)
+    if image_base < 4096 or image_base % 4096 or image_base >= 1 << 39:
+        raise RuntimeError(f"Invalid runtime kernel image address: {image_base:#x}")
+    clocks = re.findall(r"(?m)^\[INFO\] SYSTEM CLOCK: (HPET64|HPET32|ACPI PM24|ACPI PM32)\r?$", text)
+    if len(clocks) != 1:
+        raise RuntimeError(f"Missing unique system clock selection: {clocks}")
+    if args.no_hpet and not clocks[0].startswith("ACPI PM"):
+        raise RuntimeError("Actual no-HPET guest did not use the ACPI PM timer")
     receipt = {
         "schema": 1,
         "result": "pass",
-        "emulator": "QEMU TCG with OVMF Secure Boot",
+        "emulator": f"QEMU {args.accel.upper()} with OVMF Secure Boot",
+        "accelerator":args.accel,"qmp_kvm":actual_kvm,
+        "qemu_version":subprocess.check_output(["qemu-system-x86_64","--version"],text=True).splitlines()[0],
         "source_commit": commit,
+        "physical_oom": oom_proof,
         "cpus": args.cpus,
+        "memory_mib": args.memory_mib,
+        "kernel_image_base": image_base,
+        "hpet_enabled": not args.no_hpet,
+        "system_clock": clocks[0],
         "interactive_com1_manager_session": args.session,
         "ps2_keyboard_session": args.session,
         "runtime_session": session_result,
+        "boot_process_contract": "root-orphan-v1",
+        "boot_roots": boot_roots,
+        "migration_contract": "foreground-v1",
         "migration": migration_result,
+        "fault_contract": "staged-v1",
+        "fault": session_result["runtime_fault"] if supervisor_image is not None else {"absent":True},
         "gop_sha256": evidence.sha256(destination / "shell-screen.ppm"),
         "host_elapsed_seconds": round(time.monotonic()-start, 3),
-        "signed_efi_sha256": image["artifacts"]["agentos.efi"],
+        "signed_efi_sha256": image_sha,
         "ovmf_code_sha256": evidence.sha256(args.ovmf_code),
         "esp_sha256": evidence.sha256(raw),
         "esp_boot_efi_sha256": evidence.sha256(copied),
         "com1_sha256": evidence.sha256(serial),
         "firmware_vars_sha256_after_boot": evidence.sha256(vm_vars),
     }
+    if basic_smp:
+        # Re-read the actual on-disk EFI after the completed guest, not merely
+        # the copy made before boot. The same public certificate verifies it.
+        after=destination/"esp-after.efi"
+        after.unlink(missing_ok=True)
+        subprocess.run(["mcopy","-i",f"{raw}@@1048576","::EFI/BOOT/BOOTX64.EFI",str(after)],check=True)
+        after_identity=(soak_image.verify_image(root,after,commit) if smp_soak
+                        else basic.verify_image(root,after,commit))
+        if after_identity!=identity:
+            raise RuntimeError("Distribution EFI identity changed during basic SMP session")
+        progress=basic.verify_progress(text,args.cpus,qmp_roster,soak_interval=soak_interval,
+                                       physical_oom_dir=destination,source_commit=commit)
+        if progress["boot_roots"]!=boot_roots:
+            raise RuntimeError("Basic SMP boot root replay differs")
+        receipt["basic_smp"]={"contract":"staged-smp-soak-v1" if smp_soak else "ordinary-smp-v1","host":host,"qmp":qmp_roster,
+                              "identity":identity,"progress":progress,
+                              "oversubscribed":args.cpus>host["effective_cpu_capacity"]}
+        (destination/"basic-smp.json").write_text(json.dumps(receipt["basic_smp"],indent=2,sort_keys=True)+"\n")
+    if smp_soak:
+        receipt["smp_soak_contract"]="sustained-smp-v1"
+        receipt["smp_soak"]=session_result["runtime_smp_soak"]
+        (destination/"smp-soak.json").write_text(json.dumps(receipt["smp_soak"],indent=2,sort_keys=True)+"\n")
+    if guest_oom:
+        receipt["guest_oom_contract"]="bounded-demand-oom-v1"
+        receipt["guest_oom"]=session_result["runtime_oom"]
+    if supervisor_image is not None:
+        receipt["supervisor_image"] = supervisor_image
     if args.session:
         receipt["com1_input_sha256"] = evidence.sha256(destination / "com1-input.bin")
         receipt["ps2_before_sha256"] = evidence.sha256(destination / "keyboard-before.ppm")

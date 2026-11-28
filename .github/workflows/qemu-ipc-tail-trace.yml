@@ -1,0 +1,66 @@
+name: Isolated supervisor peer tail trace
+
+# Archived supervisor attempt 46061031235; do not rerun on PR updates.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  trace:
+    if: github.repository == 'filipbcz/AgentOS' && github.ref == 'refs/heads/dev/stage4-nvme'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Existing signed build and debugger dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            binutils cpio gcc-13 gnu-efi rustc python3 openssl \
+            sbsigntool efitools gdisk mtools qemu-system-x86 ovmf python3-virt-firmware gdb
+      - name: Build unchanged ordinary and separately signed staged images
+        run: bash scripts/build.sh --supervisor-staging
+      - name: Preflight real harness, dependencies, signed inputs and GDB API (no guest)
+        id: preflight
+        run: python3 tests/ipc-tail-trace/run.py --preflight
+      - name: Archive evaluated preflight before any guest
+        if: always() && steps.preflight.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: supervisor-tail-trace-preflight
+          retention-days: 14
+          if-no-files-found: error
+          path: build/check/qemu-cpu2-session-sv-test/trace-preflight.json
+      - name: One signed TCG HPET staged 2 CPU supervisor session with host debugger
+        if: success() && steps.preflight.outcome == 'success'
+        run: python3 tests/ipc-tail-trace/run.py
+      - name: Preserve actual signed images, full session and debugger evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: supervisor-tail-trace-2cpu-hpet
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            build/build-provenance.json
+            build/agentos.efi
+            build/agentos.unsigned.efi
+            build/kernel.elf
+            build/initramfs.cpio
+            build/db.cer
+            build/db.esl
+            build/supervisor-staging/
+            build/check/qemu-cpu2-session-sv-test/*.log
+            build/check/qemu-cpu2-session-sv-test/*.json
+            build/check/qemu-cpu2-session-sv-test/*.jsonl
+            build/check/qemu-cpu2-session-sv-test/*.bin
+            build/check/qemu-cpu2-session-sv-test/*.ppm
+            build/check/qemu-cpu2-session-sv-test/*.txt
+            build/check/qemu-cpu2-session-sv-test/esp-bootx64.efi
+            build/check/qemu-cpu2-session-sv-test/OVMF_VARS.secboot.fd
+            build/check/qemu-cpu2-session-sv-test/esp.raw

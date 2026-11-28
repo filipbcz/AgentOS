@@ -418,23 +418,28 @@ static void dependency_failure_and_restart_window(void) {
 static void adopted_orphan_reaping(void) {
     reset();
     owner_pid=100;
-    // First child is a live abandoned grandchild, second a legitimate
-    // registered service: only the adopted unknown child may be killed.
+    // One live unknown child, one registered service and one already-exited
+    // adopted zombie. A living child must not obstruct collection of a
+    // later PID, nor be killed by repeated normal passes.
     workers[0]=(struct worker){201,0,99,0,0,0,0,0};
     workers[1]=(struct worker){202,0,SVC_CORE,0,0,0,0,0};
-    count=2;
+    workers[2]=(struct worker){203,0,99,0,0,1,0,0};
+    count=3;
     registry[SVC_CORE].pid=202;
     assert(reap_unmanaged());
-    assert(total_kills==1 && kill_order[0]==201 &&
-           workers[0].reaped && !workers[1].reaped);
-    assert(reap_unmanaged() && total_kills==1); // idempotent
-    reset();
-    owner_pid=100;
-    // A zombie adopted by PID 1 is reaped with its original exit status.
-    // No extra kill syscall is issued to an already-exited process.
-    workers[0]=(struct worker){301,0,99,0,0,1,0,0};
-    count=1;
-    assert(reap_unmanaged() && workers[0].reaped && total_kills==0);
+    assert(!workers[0].reaped && !workers[1].reaped && workers[2].reaped);
+    assert(total_kills==0 && gChildWaitCalls==0 && total_exits==1);
+    assert(strstr(log_text,"PID=00000000000000cb STATUS=000000000000002a\r\n"));
+    unsigned pLogged=chars;
+    for (unsigned pPass=0;pPass<3;pPass++) assert(reap_unmanaged());
+    assert(total_kills==0 && gChildWaitCalls==0 && total_exits==1 && chars==pLogged);
+    assert(!workers[0].reaped && !workers[0].killed && !workers[1].reaped);
+    gNaturalStatus[0]=59;
+    assert(reap_unmanaged() && workers[0].reaped && !workers[1].reaped);
+    assert(total_kills==0 && gChildWaitCalls==0 && total_exits==2);
+    assert(strstr(log_text,"PID=00000000000000c9 STATUS=000000000000003b\r\n"));
+    pLogged=chars;
+    assert(reap_unmanaged() && total_exits==2 && chars==pLogged);
 }
 static void dependency_graph_and_leaf_first_shutdown(void) {
     reset();
@@ -476,13 +481,16 @@ static void dependency_graph_and_leaf_first_shutdown(void) {
     workers[0]=(struct worker){201,0,SVC_CORE,0,1,1,0,0};
     workers[1]=(struct worker){202,0,SVC_SHELL,0,1,1,0,0};
     workers[2]=(struct worker){203,0,SVC_FLAKY,0,1,1,0,0};
-    count=3;
+    workers[3]=(struct worker){204,0,99,0,0,0,0,0};
+    count=4;
     registry[SVC_CORE].pid=201;
     registry[SVC_SHELL].pid=202;
     registry[SVC_FLAKY].pid=203;
     assert(stop_all());
-    assert(total_kills==3 && kill_order[0]==203 && kill_order[1]==202 &&
-           kill_order[2]==201);
+    assert(total_kills==4 && kill_order[0]==203 && kill_order[1]==202 &&
+           kill_order[2]==201 && kill_order[3]==204);
+    assert(total_exits==4 && workers[3].reaped);
+    assert(strstr(log_text,"PID=00000000000000cc STATUS=0000000000000089\r\n"));
 }
 static void command_authorization_and_dependency(void) {
     reset();
@@ -671,17 +679,24 @@ static void naturalExitWinsAcceptedKillWithoutStatusRewrite(void) {
 static void remoteOrphanKillUsesBoundedOwnerWait(void) {
     reset();owner_pid=100;
     workers[0]=(struct worker){201,0,99,0,0,0,0,0};
-    workers[1]=(struct worker){202,0,SVC_CORE,0,0,0,0,0};
-    count=2;registry[SVC_CORE].pid=202;gKillDelayMs=25;
-    assert(reap_unmanaged());
-    assert(gChildWaitCalls==1 && workers[0].reaped && !workers[1].reaped &&
+    count=1;gKillDelayMs=25;
+    assert(reap_unmanaged() && !workers[0].reaped && !total_kills && !gChildWaitCalls);
+    assert(stop_unmanaged());
+    assert(gChildWaitCalls==1 && workers[0].reaped &&
            total_kills==1 && ticks==25);
+    assert(strstr(log_text,"PID=00000000000000c9 STATUS=0000000000000089\r\n"));
 
     reset();owner_pid=100;
     workers[0]=(struct worker){201,0,99,0,0,0,0,0};
     count=1;gKillDelayMs=6000;
-    assert(!reap_unmanaged());
-    assert(gChildWaitCalls==1 && !workers[0].reaped && ticks==5000);
+    assert(!stop_unmanaged());
+    assert(gChildWaitCalls==1 && !workers[0].reaped && ticks==5000 && chars==0);
+
+    reset();owner_pid=100;
+    workers[0]=(struct worker){201,0,99,0,0,0,0,0};
+    count=1;gKillDelayMs=25;gWaitNaturalStatus=57;
+    assert(stop_unmanaged() && workers[0].reaped && total_kills==1);
+    assert(strstr(log_text,"PID=00000000000000c9 STATUS=0000000000000039\r\n"));
 }
 static void shellExitBetweenStatusProbeAndEofShutsDown(void) {
     reset();

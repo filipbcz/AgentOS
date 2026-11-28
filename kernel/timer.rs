@@ -15,15 +15,22 @@ pub enum Action { Keep, Disable, Arm(u32) }
 
 pub struct Timer {
     fQuantumCounts: u32,
+    fMaintenanceMs: Option<u64>,
     fRemaining: u32,
     fLastClockMs: Option<u64>,
     fStalledCounts: u64,
 }
 
 impl Timer {
-    pub const fn new(aQuantumCounts: u32) -> Self {
-        Self { fQuantumCounts: aQuantumCounts, fRemaining: 0,
+    pub const fn new(aQuantumCounts: u32, aMaintenanceMs: Option<u64>) -> Self {
+        Self { fQuantumCounts: aQuantumCounts, fMaintenanceMs: aMaintenanceMs, fRemaining: 0,
                fLastClockMs: None, fStalledCounts: 0 }
+    }
+
+    /// Change a maintenance requirement without resetting consumed ticks or
+    /// extending a pending earlier hardware deadline.
+    pub fn set_maintenance(&mut self, interval_ms: Option<u64>) {
+        self.fMaintenanceMs = interval_ms;
     }
 
     /// Begin a new scheduler session after disarming any boot-owned timer.
@@ -57,10 +64,11 @@ impl Timer {
     /// never extends a deadline or claims that process-clock time actually elapsed.
     pub fn plan(&mut self, aRunnable: bool, aDeadline: Option<u64>, aNow: u64) -> Action {
         let pLimit = if aRunnable { QUANTUM_MS } else { WATCHDOG_MS };
+        let pLimit = self.fMaintenanceMs.map_or(pLimit, |ms| pLimit.min(ms.max(1)));
         let pMs = if let Some(pDeadline) = aDeadline {
             pDeadline.saturating_sub(aNow).clamp(1, pLimit)
-        } else if aRunnable {
-            QUANTUM_MS
+        } else if aRunnable || self.fMaintenanceMs.is_some() {
+            pLimit
         } else {
             self.fRemaining = 0;
             return Action::Disable;
@@ -82,7 +90,7 @@ mod tests {
 
     #[test]
     fn idleWithoutDeadlineDisarmsAndRunnableWorkGetsQuantum() {
-        let mut pTimer = Timer::new(1000);
+        let mut pTimer = Timer::new(1000, None);
         pTimer.reset(Some(0));
         assert_eq!(pTimer.plan(false, None, 0), Action::Disable);
         assert_eq!(pTimer.plan(true, None, 0), Action::Arm(1000));
@@ -93,7 +101,7 @@ mod tests {
 
     #[test]
     fn allBlockedUsesRealDeadlineInsteadOfTenMillisecondPolling() {
-        let mut pTimer = Timer::new(1000);
+        let mut pTimer = Timer::new(1000, None);
         pTimer.reset(Some(100));
         assert_eq!(pTimer.plan(false, Some(850), 100), Action::Arm(75_000));
         assert!(!pTimer.sample(0, Some(850)));
@@ -102,7 +110,7 @@ mod tests {
 
     #[test]
     fn longIdleKeepsOnlySparseClockWatchdog() {
-        let mut pTimer = Timer::new(1000);
+        let mut pTimer = Timer::new(1000, None);
         pTimer.reset(Some(0));
         for pSecond in 0..5 {
             assert_eq!(pTimer.plan(false, Some(60_000), pSecond*1000), Action::Arm(100_000));
@@ -112,7 +120,7 @@ mod tests {
 
     #[test]
     fn unrelatedIoDoesNotPostponeIdleDeadlineOrWatchdog() {
-        let mut pTimer = Timer::new(1000);
+        let mut pTimer = Timer::new(1000, None);
         pTimer.reset(Some(0));
         assert_eq!(pTimer.plan(false, Some(60_000), 0), Action::Arm(100_000));
         for pRemaining in (1..100).rev() {
@@ -125,7 +133,7 @@ mod tests {
 
     #[test]
     fn earlierTimeoutAndIoWakeShortenPendingIdleTimer() {
-        let mut pTimer = Timer::new(1000);
+        let mut pTimer = Timer::new(1000, None);
         pTimer.reset(Some(100));
         assert_eq!(pTimer.plan(false, Some(60_000), 100), Action::Arm(100_000));
         assert!(!pTimer.sample(90_000, Some(200)));
@@ -136,7 +144,7 @@ mod tests {
 
     #[test]
     fn pendingEarlierDeadlineIsNotExtendedByRunnableWork() {
-        let mut pTimer = Timer::new(1000);
+        let mut pTimer = Timer::new(1000, None);
         pTimer.reset(Some(0));
         assert_eq!(pTimer.plan(false, Some(3), 0), Action::Arm(300));
         assert!(!pTimer.sample(200, Some(1)));
@@ -145,7 +153,7 @@ mod tests {
 
     #[test]
     fn runnableTaskCannotDelayNewDeadlineUntilEndOfQuantum() {
-        let mut pTimer = Timer::new(1000);
+        let mut pTimer = Timer::new(1000, None);
         pTimer.reset(Some(0));
         assert_eq!(pTimer.plan(true, Some(2), 0), Action::Arm(200));
         pTimer.reset(Some(0));
@@ -158,7 +166,7 @@ mod tests {
 
     #[test]
     fn fiveWatchdogsDetectFrozenClockWithoutFabricatingTime() {
-        let mut pTimer = Timer::new(1000);
+        let mut pTimer = Timer::new(1000, None);
         pTimer.reset(Some(10));
         for pSecond in 1..=5 {
             assert_eq!(pTimer.plan(false, Some(60_010), 10), Action::Arm(100_000));
@@ -169,7 +177,7 @@ mod tests {
 
     #[test]
     fn fiveHundredBusyQuantaUseSameFrozenClockBudget() {
-        let mut pTimer = Timer::new(1000);
+        let mut pTimer = Timer::new(1000, None);
         pTimer.reset(Some(0));
         for pTick in 1..=500 {
             assert_eq!(pTimer.plan(true, None, 0), Action::Arm(1000));
@@ -179,7 +187,7 @@ mod tests {
 
     #[test]
     fn fragmentedCountdownConsumptionCountsWithoutDoubleChargingExpiry() {
-        let mut pTimer = Timer::new(1000);
+        let mut pTimer = Timer::new(1000, None);
         pTimer.reset(Some(0));
         assert_eq!(pTimer.plan(false, Some(60_000), 0), Action::Arm(100_000));
         assert!(!pTimer.sample(50_000, Some(0)));
@@ -195,7 +203,7 @@ mod tests {
 
     #[test]
     fn advancingClockCannotAccumulateStaleWatchdogBudget() {
-        let mut pTimer = Timer::new(1000);
+        let mut pTimer = Timer::new(1000, None);
         pTimer.reset(Some(0));
         for pNow in 0..1000 {
             pTimer.plan(true, None, pNow);
@@ -205,21 +213,21 @@ mod tests {
 
     #[test]
     fn deadlineArithmeticHandlesPastValuesMaximumAndHardwareWidth() {
-        let mut pTimer = Timer::new(u32::MAX);
+        let mut pTimer = Timer::new(u32::MAX, None);
         pTimer.reset(Some(u64::MAX));
         assert_eq!(pTimer.plan(false, Some(1), u64::MAX), Action::Arm(429_496_730));
         pTimer.reset(Some(0));
         assert_eq!(pTimer.plan(false, Some(u64::MAX), 0), Action::Arm(u32::MAX));
-        let mut pSmall = Timer::new(1);
+        let mut pSmall = Timer::new(1, None);
         assert_eq!(pSmall.plan(false, Some(0), 0), Action::Arm(1));
     }
 
     #[test]
     fn unavailableClockAndInvalidCalibrationFailClosed() {
-        let mut pTimer = Timer::new(1000);
+        let mut pTimer = Timer::new(1000, None);
         pTimer.reset(None);
         assert!(pTimer.sample(0,None));
         assert!(!pTimer.sample(0,Some(0)));
-        assert!(Timer::new(0).sample(0,Some(0)));
+        assert!(Timer::new(0, None).sample(0,Some(0)));
     }
 }

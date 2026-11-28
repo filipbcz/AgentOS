@@ -15,7 +15,7 @@ def imported(path, module):
 orphans=imported("verify-orphans.py","orphan_verifier")
 processes=imported("verify-processes.py","process_verifier")
 supervisor=imported("verify-supervisor.py","supervisor_verifier")
-fixtures=imported("test-verify-supervisor.py","supervisor_fixtures")
+fixtures=imported("test-verify-processes.py","process_fixtures")
 
 
 def orphan_interval(root):
@@ -32,7 +32,7 @@ def orphan_interval(root):
 
 
 def scenario(root=1, apic=0):
-    baseline=fixtures.scenario(root,apic).splitlines()
+    baseline=fixtures.scenario(apic,root).splitlines()
     root_exit=f"AGENTOS USER EXIT PID={root:016x}"
     index=next(i for i,line in enumerate(baseline) if line.startswith(root_exit))
     baseline[index:index]=orphan_interval(root)
@@ -40,14 +40,14 @@ def scenario(root=1, apic=0):
 
 
 class OrphanEvidenceTests(unittest.TestCase):
-    def test_one_and_two_cpu_are_consistent_with_legacy_verifiers(self):
+    def test_one_and_two_cpu_are_consistent_without_boot_supervisor(self):
         log=scenario()
         self.assertEqual(orphans.verify(log,1),1)
-        supervisor.verify(log,1)
+        supervisor.verify_absent(log)
         processes.verify(log,[0])
         log=scenario(1,0)+scenario(20,1)
         self.assertEqual(orphans.verify(log,2),2)
-        supervisor.verify(log,2)
+        supervisor.verify_absent(log)
         processes.verify(log,[0,1])
 
     def rejects(self, log):
@@ -90,7 +90,20 @@ class OrphanEvidenceTests(unittest.TestCase):
         with self.assertRaises(orphans.VerificationError):
             orphans.verify(scenario(),2)
         with self.assertRaises(orphans.VerificationError):
-            orphans.verify(scenario()+fixtures.scenario(20,1),2)
+            orphans.verify(scenario()+fixtures.scenario(1,20),2)
+
+    def test_orphan_must_follow_its_actual_authenticated_ipc_root(self):
+        log=scenario()
+        begin="AGENTOS ORPHAN BEGIN ROOT=0000000000000001"
+        for bad in (log.replace(begin,"AGENTOS ORPHAN BEGIN ROOT=0000000000000002"),
+                    log.replace(begin,begin+"\n"+begin)):
+            with self.assertRaises(processes.VerificationError):
+                processes.verify(bad,[0])
+        lines=log.splitlines()
+        index=next(i for i,line in enumerate(lines) if line==begin)
+        lines[index-1],lines[index]=lines[index],lines[index-1]
+        with self.assertRaises(processes.VerificationError):
+            processes.verify("\n".join(lines),[0])
 
     def test_legacy_verifier_rejects_broken_orphan_boundaries(self):
         log=scenario()

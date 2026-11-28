@@ -34,3 +34,17 @@ jobs:
           RUSTC: /usr/bin/rustc
           CC: /usr/bin/gcc-13
         run: bash scripts/check-build.sh
+      - name: Run separate production physical allocator exhaustion proof
+        env:
+          RUSTC: /usr/bin/rustc
+        run: python3 scripts/physical_oom_evidence.py --directory build/check/physical-oom --commit "$(git rev-parse HEAD)"
+      - name: Preserve physical allocator evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: physical-allocator-oom-host
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            build/check/physical-oom/physical-oom.json
+            build/check/physical-oom/physical-oom.log

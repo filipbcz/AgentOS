@@ -27,6 +27,26 @@ def require(condition, message):
         raise VerificationError(message)
 
 
+def verify_absent(text):
+    require("AGENTOS COW " not in text, "Historical COW workload present in ordinary boot/session")
+
+
+def verify_interval(root, events, seen):
+    """Validate the actual child evidence independently of the placement mechanism."""
+    require(tuple(k for k, _ in events) == EXPECTED,
+            f"Invalid COW child/exit/reap/end ordering for root {root}")
+    name, exit_status, reaped, ended = (fields for _, fields in events)
+    child = name[1]
+    require(name[0] == root and child not in seen and child > 0 and child != root,
+            "COW child identity inconsistent")
+    require(exit_status[0] == child and exit_status[1] != 0 and
+            exit_status[1] % 4096 == 0 and exit_status[2] == 0,
+            "Forked child did not exit successfully in its own address space")
+    require(reaped == (root, child) and ended == (root, child),
+            "COW parent did not reap successful child or preserve its identity")
+    return child, exit_status[1]
+
+
 def verify(text, cpus):
     require(cpus in (1, 2), "Expected one or two CPU-local fork scenarios")
     phases = []
@@ -71,17 +91,7 @@ def verify(text, cpus):
             f"Missing or duplicated COW phases: expected {cpus}, found {len(phases)}")
     seen = set()
     for index, (root, events) in enumerate(phases):
-        require(tuple(k for k, _ in events) == EXPECTED,
-                f"Invalid COW child/exit/reap/end ordering for root {root}")
-        name, exit_status, reaped, ended = (fields for _, fields in events)
-        child = name[1]
-        require(name[0] == root and child not in seen and child > 0 and child != root,
-                "COW child identity inconsistent")
-        require(exit_status[0] == child and exit_status[1] != 0 and
-                exit_status[1] % 4096 == 0 and exit_status[2] == 0,
-                "Forked child did not exit successfully in its own address space")
-        require(reaped == (root, child) and ended == (root, child),
-                "COW parent did not reap successful child or preserve its identity")
+        child,cr3 = verify_interval(root,events,seen)
         require(roots[index][1] == root,
                 "COW parent PID disagrees with CPU process completion")
         seen.update((root, child))

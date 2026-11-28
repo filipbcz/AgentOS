@@ -1,6 +1,9 @@
 #include <efi.h>
 #include <efilib.h>
 #include <elf.h>
+#include "gop-select.h"
+#include "boot-map.h"
+#include "kernel-elf.h"
 
 extern UINT8 elf_start[], elf_end[], archive_start[], archive_end[];
 typedef struct {
@@ -19,29 +22,26 @@ static BOOLEAN flag(CHAR16 *name, UINT8 expected) {
            n == 1 && value == expected;
 }
 
-// Stage 1 link script produces exactly one aligned, executable load segment.
-static EFI_STATUS load_kernel(UINT64 *entry) {
-    UINTN n = elf_end - elf_start;
-    Elf64_Ehdr *e = (void *)elf_start;
-    if (n < sizeof(*e) || CompareMem(e->e_ident, ELFMAG, SELFMAG) ||
-        e->e_ident[EI_CLASS] != ELFCLASS64 || e->e_ident[EI_DATA] != ELFDATA2LSB ||
-        e->e_machine != EM_X86_64 || e->e_type != ET_EXEC || e->e_phnum != 1 ||
-        e->e_phentsize != sizeof(Elf64_Phdr) || e->e_phoff > n - sizeof(Elf64_Phdr))
+// Load the signed, self-contained static PIE into any suitable available
+// identity-mapped memory below the user PML4 slot. No preferred physical
+// address, external dynamic linker or writable executable segment in ELF.
+static EFI_STATUS load_kernel(UINT64 *entry, EFI_PHYSICAL_ADDRESS *base, UINTN *pages) {
+    size_t length = elf_end - elf_start;
+    KernelElf elf;
+    if (!kernel_elf_parse(elf_start, length, &elf)) return EFI_LOAD_ERROR;
+    UINTN count = elf.size / KERNEL_PAGE;
+    EFI_PHYSICAL_ADDRESS address = KERNEL_LIMIT - 1;
+    EFI_STATUS status = BS->AllocatePages(AllocateMaxAddress, EfiLoaderCode, count, &address);
+    if (EFI_ERROR(status)) return status;
+    uint64_t relocated_entry;
+    if (!kernel_elf_load(elf_start, length, (void *)(UINTN)address, address,
+                         elf.size, &relocated_entry)) {
+        BS->FreePages(address, count);
         return EFI_LOAD_ERROR;
-    Elf64_Phdr *p = (void *)(elf_start + e->e_phoff);
-    if (p->p_type != PT_LOAD || p->p_flags != (PF_R|PF_X) ||
-        p->p_paddr != 0x02000000 || p->p_paddr != p->p_vaddr ||
-        p->p_offset > n || p->p_filesz > n-p->p_offset ||
-        p->p_filesz > p->p_memsz || p->p_memsz > 16*1024*1024 ||
-        e->e_entry < p->p_vaddr || e->e_entry-p->p_vaddr >= p->p_filesz)
-        return EFI_LOAD_ERROR;
-    EFI_PHYSICAL_ADDRESS address = p->p_paddr;
-    EFI_STATUS s = BS->AllocatePages(AllocateAddress, EfiLoaderCode,
-                                     EFI_SIZE_TO_PAGES(p->p_memsz), &address);
-    if (EFI_ERROR(s)) return s;
-    SetMem((void *)address, p->p_memsz, 0);
-    CopyMem((void *)address, elf_start+p->p_offset, p->p_filesz);
-    *entry = e->e_entry;
+    }
+    *entry = relocated_entry;
+    *base = address;
+    *pages = count;
     return EFI_SUCCESS;
 }
 
@@ -80,6 +80,106 @@ static UINT64 boot_log_level(EFI_HANDLE device) {
     return 1 | LOG_SERIAL | LOG_SCREEN;
 }
 
+static GopMode gop_mode(const EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *mode) {
+    return (GopMode){mode->HorizontalResolution, mode->VerticalResolution,
+        mode->PixelsPerScanLine, mode->PixelFormat, mode->PixelInformation.RedMask,
+        mode->PixelInformation.GreenMask, mode->PixelInformation.BlueMask,
+        mode->PixelInformation.ReservedMask};
+}
+
+static int gop_current(void *context, GopFramebuffer *out) {
+    EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = context;
+    if (!gop->Mode || !gop->Mode->Info ||
+        gop->Mode->SizeOfInfo < sizeof(EFI_GRAPHICS_OUTPUT_MODE_INFORMATION) ||
+        gop->Mode->Mode >= gop->Mode->MaxMode) return 0;
+    *out = (GopFramebuffer){gop_mode(gop->Mode->Info),
+        gop->Mode->FrameBufferBase, gop->Mode->FrameBufferSize};
+    return 1;
+}
+
+static int gop_query(void *context, uint32_t index, GopMode *out) {
+    EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = context;
+    EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *mode = NULL;
+    UINTN size = 0;
+    EFI_STATUS status = gop->QueryMode(gop, index, &size, &mode);
+    if (EFI_ERROR(status)) return status == EFI_NOT_STARTED ?
+        GOP_QUERY_NOT_STARTED : GOP_QUERY_FAILED;
+    int valid = mode && size >= sizeof(*mode);
+    if (valid) *out = gop_mode(mode);
+    if (mode) BS->FreePool(mode);
+    return valid ? GOP_QUERY_OK : GOP_QUERY_FAILED;
+}
+
+static int gop_activate(void *context, uint32_t index) {
+    EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = context;
+    return !EFI_ERROR(gop->SetMode(gop, index));
+}
+
+// Identity-mapped loader-owned data must stay out of the user PML4
+// slot beginning at 512 GiB. This is a kernel VA-layout constraint, not
+// a machine-specific memory address.
+#define BOOT_DATA_LIMIT ((UINT64_C(1) << 39) - 1)
+
+static BootMapResult firmware_map_read(void *context, void *buffer, size_t *size,
+                                       size_t *key, size_t *descriptor, uint32_t *version) {
+    (void)context;
+    UINTN n = *size, map_key = 0, stride = 0;
+    UINT32 revision = 0;
+    EFI_STATUS status = BS->GetMemoryMap(&n, buffer, &map_key, &stride, &revision);
+    *size = n;
+    *key = map_key;
+    *descriptor = stride;
+    *version = revision;
+    if (status == EFI_SUCCESS) return BOOT_MAP_OK;
+    if (status == EFI_BUFFER_TOO_SMALL) return BOOT_MAP_GROW;
+    return BOOT_MAP_ERROR;
+}
+
+static EFI_STATUS allocate_data_pages(UINTN pages, EFI_PHYSICAL_ADDRESS limit,
+                                      EFI_PHYSICAL_ADDRESS *base) {
+    EFI_PHYSICAL_ADDRESS address = limit;
+    EFI_STATUS status = BS->AllocatePages(AllocateMaxAddress, EfiLoaderData, pages, &address);
+    if (EFI_ERROR(status)) return status;
+    // Free even an unusable allocation before returning an error.
+    if (address < EFI_PAGE_SIZE || address % EFI_PAGE_SIZE || address > limit ||
+        pages > (limit - address + 1) / EFI_PAGE_SIZE) {
+        BS->FreePages(address, pages);
+        return EFI_LOAD_ERROR;
+    }
+    *base = address;
+    return EFI_SUCCESS;
+}
+
+static BootMapResult firmware_map_allocate(void *context, size_t capacity, void **buffer) {
+    (void)context;
+    EFI_PHYSICAL_ADDRESS address;
+    EFI_STATUS status = allocate_data_pages(capacity / EFI_PAGE_SIZE, BOOT_DATA_LIMIT, &address);
+    if (status == EFI_OUT_OF_RESOURCES) return BOOT_MAP_NO_MEMORY;
+    if (EFI_ERROR(status)) return BOOT_MAP_ERROR;
+    *buffer = (void *)(UINTN)address;
+    return BOOT_MAP_OK;
+}
+
+static BootMapResult firmware_map_release(void *context, void *buffer, size_t capacity) {
+    (void)context;
+    return BS->FreePages((UINTN)buffer, capacity / EFI_PAGE_SIZE) == EFI_SUCCESS ?
+        BOOT_MAP_OK : BOOT_MAP_ERROR;
+}
+
+static BootMapResult firmware_exit_services(void *context, size_t key) {
+    EFI_STATUS status = BS->ExitBootServices((EFI_HANDLE)context, key);
+    if (status == EFI_SUCCESS) return BOOT_MAP_OK;
+    if (status == EFI_INVALID_PARAMETER) return BOOT_MAP_STALE;
+    return BOOT_MAP_ERROR;
+}
+
+// A failed ExitBootServices may already have partially shut down firmware.
+// Do not return to the boot manager or use firmware consoles in that state.
+static __attribute__((noreturn)) void halt_failed_handoff(void) {
+    __asm__ volatile("cli" ::: "memory");
+    for (;;) __asm__ volatile("hlt" ::: "memory");
+}
+
 static BootInfo info = {.version = 3};
 
 EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *table) {
@@ -88,15 +188,15 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *table) {
     EFI_GRAPHICS_OUTPUT_PROTOCOL *gop;
     EFI_STATUS s = BS->LocateProtocol(&GraphicsOutputProtocol, NULL, (void **)&gop);
     if (EFI_ERROR(s)) return s;
-    EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *mode = gop->Mode->Info;
-    info.fb = gop->Mode->FrameBufferBase;
-    info.width = mode->HorizontalResolution;
-    info.height = mode->VerticalResolution;
-    info.stride = mode->PixelsPerScanLine;
-    info.format = mode->PixelFormat;
-    if (!info.fb || info.width < 200 || info.height < 64 || info.format > 1 ||
-        info.stride < info.width || (UINT64)info.stride*info.height > gop->Mode->FrameBufferSize/4)
-        return EFI_UNSUPPORTED;
+    if (!gop || !gop->Mode || !gop->QueryMode || !gop->SetMode) return EFI_UNSUPPORTED;
+    GopAccess access = {gop, gop->Mode->MaxMode, gop_current, gop_query, gop_activate};
+    GopFramebuffer framebuffer;
+    if (!gop_select(&access, &framebuffer)) return EFI_UNSUPPORTED;
+    info.fb = framebuffer.base;
+    info.width = framebuffer.mode.width;
+    info.height = framebuffer.mode.height;
+    info.stride = framebuffer.mode.stride;
+    info.format = framebuffer.mode.format;
     EFI_LOADED_IMAGE *loaded;
     s = BS->HandleProtocol(image, &LoadedImageProtocol, (void **)&loaded);
     if (EFI_ERROR(s)) return s;
@@ -111,33 +211,43 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *table) {
         if (!CompareGuid(&table->ConfigurationTable[i].VendorGuid, &acpi))
             info.rsdp = (UINTN)table->ConfigurationTable[i].VendorTable;
     UINT64 entry;
-    s=load_kernel(&entry);
+    EFI_PHYSICAL_ADDRESS kernel_base = 0, stack_base = 0, ap_base = 0;
+    UINTN kernel_pages = 0;
+    BootMap map = {0};
+    BootMapAccess access_map = {image, firmware_map_read, firmware_map_allocate,
+                                firmware_map_release, firmware_exit_services};
+    s = load_kernel(&entry, &kernel_base, &kernel_pages);
     if (EFI_ERROR(s)) return s;
     if ((info.log_level & LOG_SERIAL) && (info.log_level & 3)) Print(L"[INFO] KERNEL ELF LOADED\r\n");
-    s=BS->AllocatePages(AllocateAnyPages, EfiLoaderData, 8, &info.stack_base);
-    if (EFI_ERROR(s)) return s;
-    // SIPI vector names a 4 KiB page below 1 MiB. Reserve its mailbox too.
-    info.ap_boot = 0x9ffff;
-    s=BS->AllocatePages(AllocateMaxAddress, EfiLoaderData, 2, &info.ap_boot);
-    if (EFI_ERROR(s) || info.ap_boot < EFI_PAGE_SIZE) return EFI_OUT_OF_RESOURCES;
-    UINTN capacity=0, key=0;
-    UINT32 version;
-    s = BS->GetMemoryMap(&capacity, NULL, &key, &info.desc, &version);
-    if (s != EFI_BUFFER_TOO_SMALL) return EFI_LOAD_ERROR;
-    capacity += 32*info.desc;
-    s=BS->AllocatePool(EfiLoaderData, capacity, (void **)&info.map);
-    if (EFI_ERROR(s)) return s;
-    for (UINTN attempt=0; attempt<8; attempt++) {
-        info.size=capacity;
-        s=BS->GetMemoryMap(&info.size, (void *)info.map, &key, &info.desc, &version);
-        if (EFI_ERROR(s)) return s;
-        info.desc_version=version;
-        s=BS->ExitBootServices(image,key);
-        if (s == EFI_INVALID_PARAMETER) continue;
-        if (EFI_ERROR(s)) return s;
-        __asm__ volatile("cli; cld; mov %0, %%rsp; call *%1; ud2"
-                         :: "r"(info.stack_base+8*4096), "r"(entry), "D"(&info) : "memory");
-        __builtin_unreachable();
+    s = allocate_data_pages(8, BOOT_DATA_LIMIT, &stack_base);
+    if (EFI_ERROR(s)) goto fail;
+    info.stack_base = stack_base;
+    // Both the SIPI page and its mailbox must fit below 1 MiB.
+    s = allocate_data_pages(2, 0xfffff, &ap_base);
+    if (EFI_ERROR(s)) goto fail;
+    info.ap_boot = ap_base;
+
+    BootMapResult result = boot_map_capture(&access_map, &map);
+    if (result != BOOT_MAP_OK) {
+        if (map.exit_attempted) halt_failed_handoff();
+        s = result == BOOT_MAP_NO_MEMORY ? EFI_OUT_OF_RESOURCES :
+            result == BOOT_MAP_LIMIT ? EFI_ABORTED : EFI_LOAD_ERROR;
+        goto fail;
     }
-    return EFI_ABORTED;
+    // Boot services are gone. Publish only the successful final snapshot.
+    info.map = (UINTN)map.buffer;
+    info.size = map.size;
+    info.desc = map.descriptor_size;
+    info.desc_version = map.version;
+    __asm__ volatile("cli; cld; mov %0, %%rsp; call *%1; ud2"
+                     :: "r"(info.stack_base+8*4096), "r"(entry), "D"(&info) : "memory");
+    __builtin_unreachable();
+
+fail:
+    // Only reached before the first ExitBootServices call.
+    boot_map_release(&access_map, &map);
+    if (ap_base) BS->FreePages(ap_base, 2);
+    if (stack_base) BS->FreePages(stack_base, 8);
+    BS->FreePages(kernel_base, kernel_pages);
+    return s;
 }

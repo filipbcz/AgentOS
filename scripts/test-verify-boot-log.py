@@ -25,21 +25,21 @@ class BootLogTests(unittest.TestCase):
                         data += INFO
                     if serial and level == "debug":
                         data += DEBUG
-                    mod.verify(data, level, output)
+                    mod.verify(data, level, output, historical_boot_oom=True)
 
     def test_missing_raw_marker_is_never_accepted(self):
         for level in mod.LEVELS:
             for sink in mod.SINKS:
                 with self.subTest(level=level, sink=sink):
                     with self.assertRaises(mod.VerificationError):
-                        mod.verify(INFO + DEBUG, level, sink)
+                        mod.verify(INFO + DEBUG, level, sink, historical_boot_oom=True)
 
     def test_nonserial_sinks_reject_structured_markers(self):
         for sink in ("none", "screen"):
             for line in (INFO, DEBUG, b"[ERROR] FAILED\r\n"):
                 with self.subTest(sink=sink, line=line):
                     with self.assertRaises(mod.VerificationError):
-                        mod.verify(BOOT + line, "debug", sink)
+                        mod.verify(BOOT + line, "debug", sink, historical_boot_oom=True)
 
     def test_severity_enforced_and_no_forged_lifecycle(self):
         for level, payload in (
@@ -52,7 +52,7 @@ class BootLogTests(unittest.TestCase):
         ):
             with self.subTest(level=level, payload=payload):
                 with self.assertRaises(mod.VerificationError):
-                    mod.verify(BOOT + payload, level, "serial")
+                    mod.verify(BOOT + payload, level, "serial", historical_boot_oom=True)
 
     def test_unrelated_critical_serial_markers_are_allowed(self):
         for level in mod.LEVELS:
@@ -61,7 +61,7 @@ class BootLogTests(unittest.TestCase):
                 content += INFO
             if level == "debug":
                 content += DEBUG
-            mod.verify(content, level, "serial")
+            mod.verify(content, level, "serial", historical_boot_oom=True)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 import re
 import sys
+import subprocess
 
 # An offline receipt check must not dirty the source checkout it verifies.
 sys.dont_write_bytecode = True
@@ -28,11 +29,16 @@ VBox_VERSION = re.compile(r"7\.1\.12(?:r[0-9]+)?\Z")
 BLOCK_ARTIFACTS = frozenset({"block.raw", "block-after.raw", "block.vdi", "block-restart.txt", "block-db.esl",
                              "block-write-com1.log", "block-write-vbox.log", "block-read-vbox.log"})
 
+NVME_ARTIFACTS = frozenset({"block-write-pci.txt", "block-read-poweroff.txt", "block-read-after.raw"})
+
+PHYSICAL_OOM_CONTRACT = "host-shared-allocator-v1"
+PHYSICAL_OOM_ARTIFACTS = frozenset({"physical-oom.log", "physical-oom.json"})
+
 ARTIFACTS = frozenset({
     "esp.raw", "esp.vdi", "changed.efi", "serial-com1.log", "com1-input.bin",
     "display.png", "shell-before.png", "shell-keyboard.png", "idle.csv", "failure.png", "vbox-pci.txt",
     "dma.raw", "dma.vdi", "vbox-ahci.log"
-}) | BLOCK_ARTIFACTS
+}) | BLOCK_ARTIFACTS | NVME_ARTIFACTS | PHYSICAL_OOM_ARTIFACTS
 BUILD_ARTIFACTS = frozenset({
     "agentos.unsigned.efi", "agentos.efi", "db.cer", "db.esl"
 })
@@ -94,7 +100,7 @@ def verify_build(root, commit=None):
     return data
 
 
-def verify_run(root, run_dir, require_pass=True, *, legacy_traces=False):
+def verify_run(root, run_dir, require_pass=True, *, legacy_traces=False, historical_boot_oom=False):
     root, run_dir = Path(root), Path(run_dir)
     data = json_file(run_dir / "acceptance.json")
     require(data.get("schema") == 1, "Unsupported VM receipt schema")
@@ -102,6 +108,8 @@ def verify_run(root, run_dir, require_pass=True, *, legacy_traces=False):
     if require_pass:
         require(data["result"] == "pass", "VM run did not pass acceptance checks")
     image = verify_build(root, data.get("source_commit"))
+    require(image.get("profile", "default") in ("default", "ahci-dma", "ahci-block", "nvme-block"),
+            "Unsupported VirtualBox acceptance build profile")
     require(data.get("build_provenance_sha256") ==
             sha256(root / "build/build-provenance.json"),
             "VM run references a changed build provenance receipt")
@@ -131,10 +139,26 @@ def verify_run(root, run_dir, require_pass=True, *, legacy_traces=False):
     require(isinstance(artifacts, dict) and set(artifacts) <= ARTIFACTS,
             "Run contains invalid artifact names")
     expected = {"esp.raw", "esp.vdi", "serial-com1.log", "display.png"}
-    if image.get("profile") == "ahci-block" or "ahci_block" in data or BLOCK_ARTIFACTS & set(artifacts):
-        require(image.get("profile") == "ahci-block" and data.get("ahci_block") is True and
-                data.get("pci_chipset") == "ich9", "Missing or inconsistent AHCI block profile")
+    historical = historical_boot_oom or legacy_traces
+    if case == "signed" and not historical:
+        require(data.get("physical_oom_contract") == PHYSICAL_OOM_CONTRACT,
+                "Missing current separate physical OOM contract")
+        expected.update(PHYSICAL_OOM_ARTIFACTS)
+    else:
+        require("physical_oom_contract" not in data and not (PHYSICAL_OOM_ARTIFACTS & set(artifacts)),
+                "Historical or negative VM evidence cannot claim current physical OOM proof")
+    block_profile = image.get("profile") in ("ahci-block", "nvme-block")
+    if (block_profile or "ahci_block" in data or "nvme_block" in data or
+            (BLOCK_ARTIFACTS | NVME_ARTIFACTS) & set(artifacts)):
+        ahci = image.get("profile") == "ahci-block" and data.get("ahci_block") is True and "nvme_block" not in data
+        nvme = image.get("profile") == "nvme-block" and data.get("nvme_block") is True and "ahci_block" not in data
+        require((ahci or nvme) and data.get("pci_chipset") == "ich9" and case == "signed" and
+                "ahci_dma" not in data and "device_irqs" not in data, "Missing or inconsistent block profile")
         expected.update(BLOCK_ARTIFACTS)
+        if nvme:
+            expected.update(NVME_ARTIFACTS)
+        else:
+            require(not (NVME_ARTIFACTS & set(artifacts)), "NVMe artifacts in AHCI run")
         require(artifacts.get("block-db.esl") == image["artifacts"]["db.esl"], "Cold boot trust database changed")
     dma_artifacts = {"dma.raw", "dma.vdi", "vbox-ahci.log"}
     if image.get("profile") == "ahci-dma" or "ahci_dma" in data or dma_artifacts & set(artifacts):
@@ -170,12 +194,24 @@ def verify_run(root, run_dir, require_pass=True, *, legacy_traces=False):
         require(data.get("boot_image_sha256") == image["artifacts"]["agentos.efi"],
                 "VM boot image is not the signed build artifact")
         log = (run_dir / "serial-com1.log").read_bytes()
+        if not historical:
+            import physical_oom_evidence as physical_oom
+            try:
+                physical_oom.verify_boot(log, root, run_dir, data["source_commit"])
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                raise EvidenceError(f"Invalid separate physical OOM evidence: {error}") from error
         if data.get("ahci_block"):
             from ahci_block_evidence import verify as verify_block
             try:
                 verify_block(run_dir, cpus)
             except ValueError as error:
                 raise EvidenceError(f"Invalid AHCI block evidence: {error}") from error
+        if data.get("nvme_block"):
+            from nvme_block_evidence import verify as verify_nvme
+            try:
+                verify_nvme(run_dir, cpus)
+            except ValueError as error:
+                raise EvidenceError(f"Invalid NVMe block evidence: {error}") from error
         if data.get("ahci_dma"):
             from ahci_dma_evidence import verify
             try:
@@ -209,6 +245,17 @@ def verify_run(root, run_dir, require_pass=True, *, legacy_traces=False):
                 pVerifier.verify(log.decode("ascii", errors="replace"), cpus)
             except pVerifier.VerificationError as pError:
                 raise EvidenceError(f"Invalid demand-paging evidence: {pError}") from pError
+            # Keep the old VM acceptance gate fail-closed. This reader still
+            # verifies historical boot COW/demand receipts; the future final
+            # VirtualBox matrix must explicitly exercise the separate images.
+            pSpec = importlib.util.spec_from_file_location(
+                "receiptCowEvidence", Path(__file__).with_name("verify-cow.py"))
+            pCow = importlib.util.module_from_spec(pSpec)
+            pSpec.loader.exec_module(pCow)
+            try:
+                pCow.verify(log.decode("ascii", errors="replace"), cpus)
+            except pCow.VerificationError as pError:
+                raise EvidenceError(f"Invalid COW evidence: {pError}") from pError
         if has_migration:
             pSpec = importlib.util.spec_from_file_location(
                 "receiptMigrationEvidence", Path(__file__).with_name("verify-migration.py"))
@@ -231,7 +278,8 @@ def verify_run(root, run_dir, require_pass=True, *, legacy_traces=False):
                 pVerifier = importlib.util.module_from_spec(pSpec)
                 pSpec.loader.exec_module(pVerifier)
                 try:
-                    pVerifier.verify(log,(run_dir / "com1-input.bin").read_bytes(),keyboard,cpus)
+                    pVerifier.verify(log,(run_dir / "com1-input.bin").read_bytes(),keyboard,cpus,
+                                     aHistoricalBootMemory=has_demand)
                 except pVerifier.VerificationError as pError:
                     raise EvidenceError(f"Invalid native-v2 session evidence: {pError}") from pError
     else:
@@ -252,14 +300,17 @@ def main():
     parser.add_argument("--run-dir", type=Path)
     parser.add_argument("--legacy-traces", action="store_true",
                         help="Inspect a historical receipt that predates demand paging or migration")
+    parser.add_argument("--historical-boot-oom", action="store_true",
+                        help="Inspect a historical receipt under its original boot OOM contract")
     parser.add_argument("--commit")
     args = parser.parse_args()
-    if args.legacy_traces and not args.run_dir:
-        parser.error("--legacy-traces requires --run-dir")
+    if (args.legacy_traces or args.historical_boot_oom) and not args.run_dir:
+        parser.error("Historical inspection requires --run-dir")
     try:
         if args.run_dir:
-            data = verify_run(args.root, args.run_dir, legacy_traces=args.legacy_traces)
-            label = "Historical VM receipt" if args.legacy_traces else "VM acceptance receipt"
+            data = verify_run(args.root, args.run_dir, legacy_traces=args.legacy_traces,
+                              historical_boot_oom=args.historical_boot_oom)
+            label = "Historical VM receipt" if (args.legacy_traces or args.historical_boot_oom) else "VM acceptance receipt"
             print(f"{label} verified: {data['vm']}, "
                   f"commit {data['source_commit']}, {data['cpus']} vCPU")
         else:

@@ -2,7 +2,15 @@
 
 Vlastní operační systém pro x86-64 podle [technického zadání](ZADANI.md). Aktuální stav, přesné ověřené revize a otevřená přejímka jsou v [plánu implementace](PLAN_IMPLEMENTACE.md). Starší výsledky se nevztahují automaticky na nový obraz.
 
-Etapa 3 obsahuje izolované procesy, nativní ELF ABI, COW, VFS nad initramfs, roury, autentizované lokální IPC, původní PID 1 se správou služeb a interaktivní TTY přes COM1 i PS/2/GOP. Milník 3.1 přidává demand paging procesů a řízenou migraci mezi CPU. Vývoj probíhá ve větvi `dev/stage3-ipc-validation`. Povinné převzetí této verze ve VirtualBoxu zůstává otevřené; QEMU poskytuje samostatný integrační důkaz konkrétní ověřené revize.
+**Závazné instrukce pro vývojáře a AI agenty:** nejprve přečtěte [AGENTS.md](AGENTS.md). Cílem je plnohodnotný OS na standardním fyzickém hardware i ve VirtualBoxu, nikoliv implementace pro QEMU. Produkční kód nesmí obsahovat logiku přejímky. Testy musí být oddělené a ověřovat skutečné běžné funkce. Dosavadní speciální přejímací buildy a bootovací testovací scénáře jsou technický dluh, nikoliv vzor dalšího vývoje; jejich níže uvedené příkazy slouží pouze k reprodukci dosavadního stavu. Závazná náprava základů je vedena v milníku 3.2 a dokončení obecných ovladačů v etapě 4 [plánu implementace](PLAN_IMPLEMENTACE.md).
+
+Etapa 3 obsahuje izolované procesy, nativní ELF ABI, COW, VFS nad initramfs, roury, autentizované lokální IPC, původní PID 1 se správou služeb a interaktivní TTY přes COM1 i PS/2/GOP. Milník 3.1 přidává demand paging procesů a řízenou migraci mezi CPU. Vývojová větev `dev/stage3-ipc-validation` byla 23. 11. 2026 sloučena do `main` (PR #1); samotné sloučení nenahrazuje úplnou přejímku všech profilů dle plánu. Etapa 4 nyní navazuje na ověřené AHCI a rozpracovává NVMe ve větvi `dev/stage4-nvme` (PR #2).
+
+Milník 3.2 začal odstraňováním závislosti na COM1: konvenční UART je volitelný, PS/2 se řídí údaji FADT a lokální GOP/klávesnice není podmíněna sériovým IRQ. Samostatný hostitelský test `scripts/qemu-console-no-uart.py` používá stejný podepsaný výchozí obraz a skutečné PS/2/GOP bez UARTu. Toto dosud neznamená dokončení běžného startu bez přejímacích scénářů ani fyzickou přejímku.
+
+Běžný shell podporuje `run PATH` pro nativní ELF ve VFS. Potomek dědí jen stdin/stdout/stderr; shell čeká na skutečný exit status prostřednictvím `SYS_WAIT_CHILD`, nezávisle na časovači. Argumenty a job control dosud nejsou implementovány. Toto je obecné rozhraní, nikoliv přejímací příkaz.
+
+Alokátor fyzické paměti poskytuje také alokace s adresním limitem a fyzicky souvislé zarovnané oblasti s explicitním vlastnictvím. Bootstrap CR3 využívá stránku pod 4 GiB; AHCI a xHCI volí DMA stránky podle skutečných adresních schopností řadiče. Jde o základ obecné hardwarové podpory, nikoliv potvrzení fyzické přejímky.
 
 ## Sestavení
 
@@ -46,10 +54,10 @@ Při prvním sestavení vznikne místní testovací podpisový klíč v `~/.loca
 
 ## Dokončení přejímky etapy 3 ve VirtualBoxu
 
-Po aktualizaci vývojové větve stačí spustit připravenou matici:
+Pro přejímku aktuálního stabilního základu použijte výchozí build na `main` (historická větev je zachována pro reprodukci starších důkazů):
 
 ```powershell
-git switch dev/stage3-ipc-validation
+git switch main
 git pull --ff-only
 .\scripts\accept-stage3.ps1
 ```
@@ -88,6 +96,58 @@ Jednotlivý profil lze zopakovat samostatně:
 
 Pozitivní profil čeká na skutečný prompt shellu. Kontrola obrazovky porovnává glyphy aktuálního fontu, zachovanou bootovací identitu a pravidla `BOOT.LOG`. Klávesnicová odpověď musí vzniknout až po vstupu a tvořit samostatný celý řádek; pouhé echo nebo změněný pixel nestačí. VBox klávesnicové API dostává PC/XT Set 1 kódy pro Backspace a Enter. Negativní podpisový test vyžaduje `Access Denied` nebo `Security Violation`; samotný timeout není úspěch.
 
+## Etapa 4 — bloková zařízení
+
+AHCI čtení/zápis/flush a studený restart jsou ověřeny na revizi `af9ceca`; podrobnosti viz [plán etapy 4](PLAN_IMPLEMENTACE.md#4-ovladače-a-bloková-zařízení-na-obou-platformách). NVMe se vyvíjí ve větvi `dev/stage4-nvme`. Volitelný `bash scripts/build.sh --nvme-block` sestavuje izolovanou zkoušku NVMe; běžný obraz NVMe řadič neaktivuje. NVMe zatím není akceptováno, nepoužívat k zápisu na fyzické disky.
+
+Pro izolovanou zkoušku je nutný **Oracle VirtualBox Extension Pack 7.1.12** (ověřit `VBoxManage list extpacks`). VDI se vytvoří v novém adresáři běhu; nepředává se existující disk ani fyzické zařízení.
+
+```powershell
+git switch dev/stage4-nvme
+git pull --ff-only
+wsl -d Ubuntu-24.04 -- bash scripts/check-build.sh
+wsl -d Ubuntu-24.04 -- bash scripts/build.sh --nvme-block
+.\scripts\test-vbox.ps1 -NvmeBlock -Cpus 1
+.\scripts\test-vbox.ps1 -NvmeBlock -Cpus 2
+```
+
+Oba běhy vyžadují vlastní platný `VM_ACCEPTANCE_JSON`. Nezávislá kontrola porovná PCI config dump obou startů, záznamy NVMe CQ dokončení zápisů a flush, UUID téže VM a VDI, dvě potvrzená vypnutí a celý export disku před a po čtecím startu. Pro etapu 3 nebo běžný boot pak znovu sestavit bez `--nvme-block`.
+
+Pro doplňkové ověření na QEMU (bez VirtualBox Extension Packu) použijte na Ubuntu připravený podepsaný `--nvme-block` build:
+
+```bash
+python3 scripts/qemu-nvme.py --cpus 1 --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd
+python3 scripts/qemu-nvme.py --cpus 2 --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd
+```
+
+NVMe i další časné ovladače mohou použít supervisor-only `paging::map_device_window` pro 64bitové BARy nad 512 GiB bez kolize se soukromým uživatelským adresním prostorem. Samostatná CI matice QEMU používá skutečný emulovaný NVMe řadič, QMP PCI identitu, počitadla čtení/zápisu jeho blokového backendu a skutečný emulátorový trace NVMe Flush a CQ completion (QEMU 8.2.2 NVMe flush neúčtuje do QMP flush_operations). Po dvou nezávislých procesech QEMU ověří všechny bajty nového RAW disku a kernelové záznamy dokončení, při druhém bootu navíc běžné jádro a procesové zkoušky. Úspěch QEMU nenahrazuje VirtualBox ani fyzickou přejímku.
+
+### VirtIO-net (etapa 4, rozpracováno)
+
+`scripts/build.sh --virtio-net` zapíná izolovaný moderní VirtIO PCI síťový profil. Vyžaduje ECAM a jedno zařízení, vyjednává VERSION_1/MAC, používá dvě split fronty a DMA. Není to ještě runtime síťová vrstva; výchozí build kartu neaktivuje. QEMU přejímka rámců a VirtualBox přejímka jsou vedeny odděleně v plánu.
+
+```bash
+bash scripts/check-build.sh
+bash scripts/build.sh --virtio-net
+python3 scripts/qemu-virtio-net.py --cpus 1 --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd
+python3 scripts/qemu-virtio-net.py --cpus 2 --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd
+```
+
+Matice používá privátní socketpair a skutečný QEMU VirtIO-net NIC (bez připojení k hostitelské síti). Každý hostitelský rámec má náhodný payload, skutečný RX/TX se porovnává bajt po bajtu se samostatnou PCAP zachycenou filtrem QEMU, PCI BARy s QMP a used indexy s výstupem jádra. Po resetu NIC musí naběhnout běžný shell a projít procesové regrese. VirtualBox profil zatím není připraven.
+
+### xHCI (etapa 4, první přírůstek)
+
+`bash scripts/build.sh --xhci` sestaví samostatný profil pro inicializaci řadiče, DMA command/event ring a port/slot lifecycle. Tento profil očekává řízené připojení a odpojení jednoho USB2 zařízení; nepoužívat na fyzickém HP. Nejde dosud o adresování zařízení, enumeraci, USB HID ani Mass Storage. Běžný build xHCI neaktivuje.
+
+```bash
+bash scripts/check-build.sh
+bash scripts/build.sh --xhci
+python3 scripts/qemu-xhci.py --cpus 1 --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd
+python3 scripts/qemu-xhci.py --cpus 2 --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd
+```
+
+QEMU za běhu připojí a odpojí emulovanou USB klávesnici přes QMP, porovná skutečný trace řadiče (fetch TRB, command/event cycle, reset portu, slot, zastavení/reset) se sériovými záznamy a po uvolnění DMA ověří běžný start jádra. Dosud nejde o test přenosu klávesnice. Úspěch nového profilu zatím nepotvrzen.
+
 ## Jádro, paměť a plánování
 
 Loader předá konečnou mapu paměti, framebuffer a initramfs a korektně opustí UEFI Boot Services. Rustové `no_std` jádro vytvoří vlastní čtyřúrovňové stránkování, alokátor fyzických rámců a GDT/IDT/TSS. Kód je RX, konstanty RO/NX, data RW/NX; nulová stránka a loaderový stack guard nejsou mapované.
@@ -125,7 +185,7 @@ Instrukce `syscall` přijímá číslo v RAX a tři argumenty v RDI/RSI/RDX. RAX
 | `0x10001` | `getpid` | Identita volajícího |
 | `0x10002` | `write` | COM1, TTY nebo roura; možné dílčí zápisy |
 | `0x10003` | `exit` | Ukončení a uzavření všech fd |
-| `0x10004` | `spawn` | Nový ELF proces se zděděnými fd |
+| `0x10004` | `spawn` | Původní dvouargumentové ABI, zděděné všechny fd; RDX ignorován |
 | `0x10005` | `try_wait` | Převzetí vlastního potomka; běžící vrací −11 |
 | `0x10006` | `yield` | Dobrovolné předání CPU |
 | `0x10007` | `open` | Soubor initramfs pouze ke čtení |
@@ -149,6 +209,8 @@ Instrukce `syscall` přijímá číslo v RAX a tři argumenty v RDI/RSI/RDX. RAX
 | `0x10019` | `ipc_try_send` | Plná schránka vrací −11 bez uspání a bez odeslání |
 | `0x1001a` | `vm_stats` | Osm u64: verze 1, rezervované/rezidentní stránky, tabulky, metadata, demand/COW čítače |
 | `0x1001b` | `sched_stats` | Osm u64: verze 1, APIC ID, počet CPU, migrace procesu/celku, vzdálené IPI notifikace, PID, PPID |
+| `0x1001c` | `wait_child` | Blokující převzetí potomka bez časovače |
+| `0x1001d` | `spawn_flags` | ELF z VFS, volitelně zdědí pouze fd 0–2; cesta do 128 B |
 
 `timer_stats(buffer,32,0)` je pouze čtecí diagnostika verze 2; čítače se čtením nenulují. Čas i absolutní lhůty jsou srovnatelné mezi CPU a při migraci se nemění; nejde o UTC. IRQ/idle čítače jsou součtem konzistentních párů z každého CPU, čtených pomocí sekvenčního čítače. `sched_stats(buffer,64,0)` zachytí identitu a stav aktuálního procesu; špatná velikost/flags vrací −22, neplatný buffer −14 a OOM −12. Počet vzdálených probouzení znamená odeslané IPI notifikace, nikoli počet probuzených procesů nebo self-IPI.
 

@@ -1,0 +1,132 @@
+//! Bounded three-source clock comparison and normalized TSC intervals.
+//! An absolute time epoch must be anchored to independently verified time.
+//! This module contains no hardware accesses.
+const NS_PER_SECOND: u128 = 1_000_000_000;
+pub(crate) const MAX_GAP_NS: u128 = 2_000_000_000;
+const MAX_BRACKET_NS: u128 = 200_000;
+const MAX_UNCERTAINTY_NS: u128 = 10_000_000;
+const QUANTIZATION_NS: u128 = 100_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Witness {
+    pub cpu: u32,
+    pub ticks: u64,
+    pub hz: u64,
+    pub uncertainty_ticks: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TscBracket {
+    low: u64,
+    high: u64,
+    hz: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Span { pub low: u128, pub high: u128 }
+
+impl Span {
+    /// Both readings are intervals enclosing the actual sample time.
+    pub fn elapsed(first: Self, last: Self) -> Option<Self> {
+        if first.low > first.high || last.low > last.high { return None; }
+        Some(Self { low: last.low.saturating_sub(first.high),
+                    high: last.high.checked_sub(first.low)? })
+    }
+
+    pub fn exact(ns: u128) -> Self { Self { low: ns, high: ns } }
+
+    pub(crate) fn agrees(self, other: Self) -> bool {
+        // Account for the independently calibrated rates and reference
+        // quantization, in addition to the explicit endpoint uncertainty.
+        let budget = self.high.max(other.high) / 100 + QUANTIZATION_NS;
+        self.low <= self.high && other.low <= other.high &&
+            self.low <= other.high.saturating_add(budget) &&
+            other.low <= self.high.saturating_add(budget)
+    }
+}
+
+/// The exact first rejected condition, shared by every clock provider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BracketError {
+    CpuMismatch, ZeroRate, RateMismatch, Regression, Width, Uncertainty,
+    LowerUnderflow, UpperOverflow,
+}
+
+impl TscBracket {
+    pub fn new(before: Witness, after: Witness) -> Option<Self> {
+        Self::checked(before, after).ok()
+    }
+
+    pub(crate) fn checked(before: Witness, after: Witness) -> Result<Self, BracketError> {
+        if before.cpu != after.cpu { return Err(BracketError::CpuMismatch); }
+        if before.hz == 0 { return Err(BracketError::ZeroRate); }
+        if before.hz != after.hz { return Err(BracketError::RateMismatch); }
+        let hz = before.hz as u128;
+        let delta = after.ticks.checked_sub(before.ticks).ok_or(BracketError::Regression)?;
+        if delta as u128 * NS_PER_SECOND > hz * MAX_BRACKET_NS {
+            return Err(BracketError::Width);
+        }
+        if before.uncertainty_ticks.max(after.uncertainty_ticks) as u128 * NS_PER_SECOND >
+                hz * MAX_UNCERTAINTY_NS {
+            return Err(BracketError::Uncertainty);
+        }
+        Ok(Self {
+            low: before.ticks.checked_sub(before.uncertainty_ticks).ok_or(BracketError::LowerUnderflow)?,
+            high: after.ticks.checked_add(after.uncertainty_ticks).ok_or(BracketError::UpperOverflow)?,
+            hz: before.hz,
+        })
+    }
+
+    /// Retain the greatest established lower bound, so a series of
+    /// overlapping reads on different CPUs cannot gradually hide a
+    /// regression. Neither a rate change nor disjoint backward movement
+    /// is a valid continuation.
+    pub fn advance(self, next: Self) -> Option<Self> {
+        if self.hz != next.hz || next.high < self.low { return None; }
+        Some(if next.low >= self.low { next } else { self })
+    }
+
+    pub fn elapsed(self, last: Self) -> Option<Span> {
+        if self.hz != last.hz { return None; }
+        let low = last.low.saturating_sub(self.high) as u128;
+        let high = last.high.checked_sub(self.low)? as u128;
+        // Outward rounding: the result must enclose the real interval.
+        let hz = self.hz as u128;
+        Some(Span { low: low * NS_PER_SECOND / hz,
+                    high: (high * NS_PER_SECOND + hz - 1) / hz })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Verdict {
+    AllAgree,
+    ActiveAndTsc,
+    StandbyAndTsc,
+    PhysicalAgree,
+    TscRejected,
+    Inconclusive,
+    Ambiguous,
+}
+
+/// None is missing/invalid evidence, not a zero-length interval. A
+/// non-transitive overlap with both physical counters in agreement cannot
+/// prove a faulty TSC. Conversely, if both disagree but overlap TSC,
+/// its uncertainty is too large to choose either one.
+pub(crate) fn decide(active: Option<Span>, standby: Option<Span>,
+                     tsc: Option<Span>) -> Verdict {
+    let agrees = |a: Option<Span>, b: Option<Span>| {
+        match (a, b) { (Some(a), Some(b)) => a.agrees(b), _ => false }
+    };
+    if tsc.is_none() {
+        return if agrees(active, standby) { Verdict::PhysicalAgree } else { Verdict::Ambiguous };
+    }
+    match (agrees(active, standby), agrees(active, tsc), agrees(standby, tsc)) {
+        (true, true, true) => Verdict::AllAgree,
+        (true, false, false) => Verdict::TscRejected,
+        (true, _, _) => Verdict::PhysicalAgree,
+        (false, true, false) => Verdict::ActiveAndTsc,
+        (false, false, true) => Verdict::StandbyAndTsc,
+        (false, true, true) => Verdict::Inconclusive,
+        _ => Verdict::Ambiguous,
+    }
+}

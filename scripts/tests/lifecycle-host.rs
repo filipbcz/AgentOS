@@ -299,3 +299,40 @@ fn simultaneousKillExitAndCollectPreserveOneStatusUntilOwnerRelease() {
         assert_eq!(pFrames.used(), 0);
     }
 }
+
+// Preserve the existing explicit-kill and independent-family tests. This
+// case independently checks the ordinary natural-exit adoption policy.
+#[test]
+fn adoptedNaturalExitsRemainCollectableOnlyOnceByOriginalRoot() {
+    let pRegistry = lifecycle::Registry::new();
+    let mut pFrames = frames::Frames::new(8);
+    let pRoot = unsafe { pRegistry.register(&mut pFrames, 1, 0) }.unwrap();
+    let pParent = unsafe { pRegistry.register(&mut pFrames, 2, 1) }.unwrap();
+    let pLive = unsafe { pRegistry.register(&mut pFrames, 3, 2) }.unwrap();
+    let pZombie = unsafe { pRegistry.register(&mut pFrames, 4, 2) }.unwrap();
+    let pOther = unsafe { pRegistry.register(&mut pFrames, 5, 0) }.unwrap();
+    pZombie.finish(&mut pFrames, 57);
+    pParent.finish(&mut pFrames, 0);
+    assert_eq!(pRegistry.collect(&mut pFrames, 1, 2), Ok(0));
+    assert_eq!(pRegistry.collect(&mut pFrames, 1, 4), Ok(57));
+    assert_eq!(pRegistry.collect(&mut pFrames, 1, 4), Err(-10));
+    for _ in 0..3 {
+        let pState = pLive.snapshot(&mut pFrames);
+        assert_eq!((pState.fParent, pState.fReaper, pState.fStatus), (1, 1, None));
+        assert!(!pState.fKillPending && !pState.fCollected);
+        assert_eq!(pRegistry.collect(&mut pFrames, 1, 3), Err(-11));
+        assert_eq!(pRegistry.collect(&mut pFrames, 5, 3), Err(-10));
+        assert_eq!(pRegistry.requestKill(&mut pFrames, 5, 3), Err(-1));
+    }
+    pLive.finish(&mut pFrames, 59);
+    assert_eq!(pRegistry.collect(&mut pFrames, 1, 3), Ok(59));
+    assert_eq!(pRegistry.collect(&mut pFrames, 1, 3), Err(-10));
+    assert_eq!(pRegistry.requestKill(&mut pFrames, 1, 3), Err(-3));
+    pLive.release(&mut pFrames);
+    pZombie.release(&mut pFrames);
+    pParent.release(&mut pFrames);
+    assert!(!pRegistry.sessionChildrenRemain(&mut pFrames, 1));
+    pOther.release(&mut pFrames);
+    pRoot.release(&mut pFrames);
+    assert_eq!(pFrames.used(), 0);
+}

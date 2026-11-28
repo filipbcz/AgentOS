@@ -25,6 +25,7 @@ pub struct BootInfo {
 mod acpi {
     pub struct Io { pub address: usize }
     pub struct Platform { pub lapic: usize, pub io_apics: [Io; 1], pub io_count: usize, pub hpet: usize }
+    impl Platform { pub fn pm_timer_mmio(&self) -> Option<usize> { None } }
 }
 
 mod frames {
@@ -70,6 +71,16 @@ mod frames {
             let pFrame = self.alloc()?;
             unsafe { ptr::write_bytes(pFrame.0 as *mut u8, 0, gPage); }
             Some(pFrame)
+        }
+        // Bootstrap paging install is not invoked by these pointer-walk
+        // host tests. Respect the real address constraint if called.
+        pub fn alloc_zeroed_below(&mut self, max_address:u64)->Option<Frame> {
+            let frame=self.alloc_zeroed()?;
+            if (frame.address() as u64).checked_add(4095).map_or(true,|end|end>max_address) {
+                self.release(frame);
+                return None;
+            }
+            Some(frame)
         }
         fn index(&self, aAddress: usize) -> Option<usize> {
             self.fPool.iter().position(|pPage| pPage.0.as_ptr() as usize == aAddress)
@@ -289,6 +300,47 @@ fn loaderReservesLargeElfBssAndStackWithoutAllocatingTheirPages() {
     assert_eq!(pStats[5], 4);
     assert_eq!(pStats[2] + pStats[3] + pStats[4] + 3, pHarness.fFrames.used() as u64);
     releaseProcess(&mut pHarness.fFrames, pProcess);
+    pHarness.finish();
+}
+
+
+#[test]
+#[ignore = "Run with the actual freshly linked staged OOM pressure ELF"]
+fn loaderAcceptsActualOomPressureElf() {
+    let pElf=std::fs::read(std::env::var_os("AGENTOS_OOM_ELF").expect("actual pressure ELF path")).unwrap();
+    assert!(pElf.len()<65536);
+    let pWord=|aAt:usize| u64::from_le_bytes(pElf[aAt..aAt+8].try_into().unwrap()) as usize;
+    let pPhOff=pWord(32);
+    let pCount=u16::from_le_bytes(pElf[56..58].try_into().unwrap()) as usize;
+    let mut pRw=Vec::new();
+    for i in 0..pCount {
+        let pAt=pPhOff+i*56;
+        if pElf[pAt..pAt+8]==[1,0,0,0,6,0,0,0] {
+            pRw.push((pWord(pAt+16),pWord(pAt+32),pWord(pAt+40)));
+        }
+    }
+    assert_eq!(pRw.len(),1);
+    let (pBase,pFile,pSize)=pRw[0];
+    assert_eq!((pFile,pSize),(0,320*1024*1024));
+    let pBytes=pElf.len();
+    let mut pHarness=Harness::new(pElf);
+    let pProcess=pHarness.load().ok().expect("production loader rejected actual pressure ELF");
+    let pStats=pProcess.space.stats();
+    assert!(pStats[1]>=81920+4);
+    assert_eq!(pStats[2],0);
+    assert_eq!(pStats[5],0);
+    assert_eq!(pHarness.fFrames.used(),5);
+    for pAddress in [pBase,pBase+pSize-gPage] {
+        assert_eq!(unsafe { pProcess.space.resolveFault(&mut pHarness.fFrames,pAddress,6) },Ok(()));
+        let mut pByte=[0xff];
+        pProcess.space.read(&mut pHarness.fFrames,pAddress,&mut pByte).unwrap();
+        assert_eq!(pByte,[0]);
+        pProcess.space.write(&mut pHarness.fFrames,pAddress,b"x").unwrap();
+    }
+    assert_eq!(pProcess.space.stats()[2],2);
+    assert_eq!(pProcess.space.stats()[5],2);
+    println!("Actual pressure ELF accepted by production loader: file={} base={:#x} reserve={} resident-at-load=0",pBytes,pBase,pSize);
+    releaseProcess(&mut pHarness.fFrames,pProcess);
     pHarness.finish();
 }
 
@@ -718,4 +770,35 @@ fn ipcAcrossMovedOwnersKeepsAuthenticatedIdentityAndPeerCloseReadiness() {
         pSenderThread.join().unwrap();
     });
     finishMovedProcesses(pFrames.into_inner().unwrap(), pHarness.fKernelRoot);
+}
+
+#[test]
+fn stdioOnlySpawnInheritanceDoesNotRetainPrivateHandlesOrInventClosedStdio() {
+    let mut pHarness = Harness::new(programImage());
+    let mut pParent = pHarness.load().unwrap();
+    let mut pChild = pHarness.load().unwrap();
+    let (pRead, pWrite) = pair(&mut pParent, &mut pHarness.fFrames, false);
+    assert_eq!((pRead,pWrite),(0,2));
+    pParent.files.close(&mut pHarness.fFrames, 1).unwrap();
+    let pPrivate = pParent.files.open(&mut pHarness.fFrames, gFileData).unwrap();
+    assert_eq!(pPrivate, 1);
+    pParent.files.dup2(&mut pHarness.fFrames, pPrivate, 9).unwrap();
+    pParent.files.close(&mut pHarness.fFrames, 1).unwrap();
+    let pPrivateFrames = pHarness.fFrames.used();
+    pChild.files.inherit_stdio(&mut pHarness.fFrames, &pParent.files);
+    assert_eq!(pHarness.fFrames.used(), pPrivateFrames);
+    pChild.space.write(&mut pHarness.fFrames, gData, b"ABC").unwrap();
+    assert_eq!(count(pChild.files.write(&mut pHarness.fFrames, &pChild.space, 2, gData, 3)), Ok(3));
+    assert_eq!(count(pParent.files.read(&mut pHarness.fFrames, &pParent.space, 0, gData, 3)), Ok(3));
+    let mut bytes=[0u8;3];
+    pParent.space.read(&mut pHarness.fFrames,gData,&mut bytes).unwrap();
+    assert_eq!(&bytes,b"ABC");
+    assert_eq!(count(pChild.files.write(&mut pHarness.fFrames, &pChild.space, 1, gData, 3)), Err(-9));
+    assert_eq!(count(pChild.files.read(&mut pHarness.fFrames, &pChild.space, 9, gData, 3)), Err(-9));
+    let before = pHarness.fFrames.used();
+    assert_eq!(pParent.files.close(&mut pHarness.fFrames,9),Ok(0));
+    assert_eq!(pHarness.fFrames.used()+1,before,"private file retained by child");
+    releaseProcess(&mut pHarness.fFrames,pChild);
+    releaseProcess(&mut pHarness.fFrames,pParent);
+    pHarness.finish();
 }

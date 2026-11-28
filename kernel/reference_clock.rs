@@ -1,0 +1,246 @@
+//! Shared hardware reference for short boot, calibration and IPI intervals.
+//! Unlike a process clock, samples are not an absolute ABI epoch. All
+//! accesses use the ACPI-declared transport and actual counter width.
+//! No scheduler, interrupt delivery or allocator is required.
+use core::{arch::asm, hint::spin_loop, ptr};
+
+const PM_HZ: u64 = 3_579_545;
+const NS_PER_SECOND: u64 = 1_000_000_000;
+const FS_PER_NS: u64 = 1_000_000;
+const MAX_POLLS: u32 = 100_000_000;
+const MAX_STALLED_POLLS: u32 = 1_000_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PmAccess { Io(u16), Memory(usize) }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PmTimer { pub access: PmAccess, pub wide: bool }
+
+impl PmTimer {
+    /// ACPI PM_TMR is always read as a DWORD. Counter width is from
+    /// FADT TMR_VAL_EXT, not from the Generic Address Structure.
+    pub fn from_address(space: u8, address: u64, wide: bool) -> Option<Self> {
+        let access = match space {
+            0 if address >= 4096 && address % 4 == 0 &&
+                address <= (1u64 << 39) - 4 => PmAccess::Memory(address as usize),
+            1 if address != 0 && address <= u16::MAX as u64 - 3 =>
+                PmAccess::Io(address as u16),
+            _ => return None,
+        };
+        Some(Self { access, wide })
+    }
+
+    pub fn mmio(self) -> Option<usize> {
+        match self.access { PmAccess::Memory(address) => Some(address), _ => None }
+    }
+
+    unsafe fn read(self) -> u32 {
+        match self.access {
+            PmAccess::Io(port) => {
+                let value: u32;
+                asm!("in eax, dx", in("dx") port, out("eax") value,
+                     options(nomem, nostack, preserves_flags));
+                value
+            }
+            PmAccess::Memory(address) => ptr::read_volatile(address as *const u32),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReferenceClock {
+    Pm(PmTimer),
+    Hpet { base: usize, period_fs: u64, wide: bool },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitError { Timeout, Unresponsive }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PollOutcome { Complete, Elapsed(u64) }
+
+impl ReferenceClock {
+    pub fn name(self) -> &'static [u8] {
+        match self {
+            Self::Pm(PmTimer { access: PmAccess::Io(_), .. }) => b"REFERENCE CLOCK: ACPI PM TIMER I/O",
+            Self::Pm(PmTimer { access: PmAccess::Memory(_), .. }) => b"REFERENCE CLOCK: ACPI PM TIMER MMIO",
+            Self::Hpet { .. } => b"REFERENCE CLOCK: HPET",
+        }
+    }
+
+    pub(crate) fn mask(self) -> u64 {
+        match self {
+            Self::Pm(timer) => if timer.wide { u32::MAX as u64 } else { 0xff_ffff },
+            Self::Hpet { wide, .. } => if wide { u64::MAX } else { u32::MAX as u64 },
+        }
+    }
+
+    fn ticks_to_ns(self, ticks: u64) -> u64 {
+        let ns = match self {
+            Self::Pm(_) => ticks as u128 * NS_PER_SECOND as u128 / PM_HZ as u128,
+            Self::Hpet { period_fs, .. } => ticks as u128 * period_fs as u128 / FS_PER_NS as u128,
+        };
+        ns.min(u64::MAX as u128) as u64
+    }
+
+    pub(crate) fn delta(self, before: u64, after: u64) -> Option<u64> {
+        let mask = self.mask();
+        let delta = after.wrapping_sub(before) & mask;
+        // Successive samples in these short waits must be less than half
+        // a wrap apart. Reject ambiguous jumps/reset rather than treating
+        // a regressed clock as a completed hardware delay.
+        (delta <= mask / 2).then_some(delta)
+    }
+
+    /// Exact conversion of accumulated ticks, saturating only at the signed
+    /// native ABI limit. Fractional milliseconds survive repeated reads.
+    pub(crate) fn ticks_to_ms(self, ticks: u128) -> u64 {
+        let ms = match self {
+            Self::Pm(_) => ticks.saturating_mul(1000) / PM_HZ as u128,
+            Self::Hpet { period_fs, .. } =>
+                ticks.saturating_mul(period_fs as u128) / 1_000_000_000_000u128,
+        };
+        ms.min(isize::MAX as u128) as u64
+    }
+
+    /// Accumulated elapsed nanoseconds, retaining a wider range than the
+    /// signed native millisecond ABI. No conversion on each increment.
+    pub(crate) fn wide_ns(self, ticks: u128) -> u128 {
+        match self {
+            Self::Pm(_) => ticks.saturating_mul(NS_PER_SECOND as u128) / PM_HZ as u128,
+            Self::Hpet { period_fs, .. } =>
+                ticks.saturating_mul(period_fs as u128) / FS_PER_NS as u128,
+        }
+    }
+
+    /// Exact nanoseconds for a clock comparison. An interval outside the
+    /// u64 nanosecond range is unavailable, not truncated or wrapped.
+    pub(crate) fn total_ns(self, ticks: u128) -> Option<u64> {
+        u64::try_from(self.wide_ns(ticks)).ok()
+    }
+
+    /// Elapsed-time bound for an unambiguous modulo-counter observation.
+    pub(crate) fn half_span_ns(self) -> u128 {
+        self.wide_ns((self.mask() / 2) as u128)
+    }
+
+    /// Sample before a quarter of a short counter's wrap, including during
+    /// idle. The scheduler supports millisecond maintenance deadlines.
+    pub(crate) fn maintenance_ms(self) -> Option<u64> {
+        if self.mask() == u64::MAX { return None; }
+        Some(self.ticks_to_ms((self.mask() as u128 + 1) / 4).min(1000))
+    }
+
+    pub fn elapsed_ns(self, before: u64, after: u64) -> Option<u64> {
+        Some(self.ticks_to_ns(self.delta(before, after)?))
+    }
+
+    /// Safety: every MMIO source must be mapped UC and owned by its driver;
+    /// the PM I/O port is taken from a validated FADT.
+    pub unsafe fn sample(self) -> u64 {
+        let value = match self {
+            Self::Pm(timer) => timer.read() as u64,
+            Self::Hpet { base, wide: true, .. } => ptr::read_volatile((base + 0xf0) as *const u64),
+            Self::Hpet { base, wide: false, .. } =>
+                ptr::read_volatile((base + 0xf0) as *const u32) as u64,
+        };
+        value & self.mask()
+    }
+
+    /// Select a progressing ACPI reference, retaining the established PM
+    /// calibration preference. An absent/frozen PM timer must not block a
+    /// machine with a usable HPET. Both are already discovered and mapped.
+    pub(crate) fn choose(pm: Option<PmTimer>, hpet: Option<ReferenceClock>,
+                         mut progressing: impl FnMut(Self) -> bool) -> Option<Self> {
+        if let Some(timer) = pm {
+            let clock = Self::Pm(timer);
+            if progressing(clock) { return Some(clock); }
+        }
+        if let Some(clock @ Self::Hpet { base, period_fs, .. }) = hpet {
+            if base != 0 && base % 4096 == 0 &&
+               period_fs != 0 && period_fs <= 100_000_000 &&
+               progressing(clock) { return Some(clock); }
+        }
+        None
+    }
+
+    pub unsafe fn progressing(self) -> bool {
+        let start = self.sample();
+        for _ in 0..MAX_STALLED_POLLS {
+            match self.delta(start, self.sample()) {
+                Some(0) => spin_loop(),
+                Some(_) => return true,
+                None => return false,
+            }
+        }
+        false
+    }
+
+    pub unsafe fn select(pm: Option<PmTimer>, hpet: Option<ReferenceClock>) -> Option<Self> {
+        Self::choose(pm, hpet, |clock| clock.progressing())
+    }
+
+    /// Pure polling engine with injectable hardware reads for host tests.
+    /// Extend short counters between consecutive observations, retaining
+    /// fractional ticks by converting accumulated ticks only when needed.
+    /// The iteration bounds are last-resort failure guards, never a
+    /// replacement for elapsed time or a source of synthetic clock time.
+    fn poll_elapsed(self, timeout_ns: u64, max_polls: u32, max_stalled: u32,
+                    mut read: impl FnMut() -> u64,
+                    mut complete: impl FnMut() -> bool) -> Result<PollOutcome, WaitError> {
+        if complete() { return Ok(PollOutcome::Complete); }
+        if timeout_ns == 0 { return Ok(PollOutcome::Elapsed(0)); }
+        let mut previous = read();
+        let mut total_ticks = 0u64;
+        let mut stalled = 0u32;
+        for _ in 0..max_polls {
+            let now = read();
+            let delta = self.delta(previous, now).ok_or(WaitError::Unresponsive)?;
+            previous = now;
+            total_ticks = total_ticks.checked_add(delta).ok_or(WaitError::Unresponsive)?;
+            let elapsed = self.ticks_to_ns(total_ticks);
+            if elapsed >= timeout_ns { return Ok(PollOutcome::Elapsed(elapsed)); }
+            if complete() { return Ok(PollOutcome::Complete); }
+            if delta == 0 {
+                stalled += 1;
+                if stalled >= max_stalled { return Err(WaitError::Unresponsive); }
+            } else {
+                stalled = 0;
+            }
+            spin_loop();
+        }
+        Err(WaitError::Unresponsive)
+    }
+
+    pub(crate) fn poll(self, timeout_ns: u64, max_polls: u32, max_stalled: u32,
+                       read: impl FnMut() -> u64,
+                       complete: impl FnMut() -> bool) -> Result<(), WaitError> {
+        match self.poll_elapsed(timeout_ns, max_polls, max_stalled, read, complete)? {
+            PollOutcome::Complete => Ok(()),
+            PollOutcome::Elapsed(_) => Err(WaitError::Timeout),
+        }
+    }
+
+    pub unsafe fn wait_until(self, timeout_ns: u64,
+                             complete: impl FnMut() -> bool) -> Result<(), WaitError> {
+        self.poll(timeout_ns, MAX_POLLS, MAX_STALLED_POLLS, || self.sample(), complete)
+    }
+
+    /// Actual elapsed time, including wraps and overshoot. Calibration must
+    /// not subtract two endpoints of a short counter after a long delay.
+    pub unsafe fn delay_ns(self, duration_ns: u64) -> Result<u64, WaitError> {
+        self.delay_ns_with(duration_ns, || {})
+    }
+
+    /// Maintain independent clocks or other nonblocking timekeeping state
+    /// while polling a hardware interval. The callback cannot declare the
+    /// delay finished or advance the hardware counter.
+    pub unsafe fn delay_ns_with(self, duration_ns: u64, mut maintain: impl FnMut())
+        -> Result<u64, WaitError> {
+        match self.poll_elapsed(duration_ns, MAX_POLLS, MAX_STALLED_POLLS,
+                                || self.sample(), || { maintain(); false })? {
+            PollOutcome::Elapsed(elapsed) => Ok(elapsed),
+            PollOutcome::Complete => Err(WaitError::Unresponsive),
+        }
+    }
+}

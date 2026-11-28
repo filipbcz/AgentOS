@@ -42,8 +42,9 @@ def parse_event(line):
     return None
 
 
-def verify(text, cpus):
-    require(cpus in (1, 2), "Only 1 or 2 CPU boot scenarios supported")
+def verify(text, cpus, *, basic_smp=False):
+    require(cpus in ((4,8) if basic_smp else (1,2)),
+            "CPU count outside explicit orphan verification profile")
     opened = None
     sections = []
     checks = []

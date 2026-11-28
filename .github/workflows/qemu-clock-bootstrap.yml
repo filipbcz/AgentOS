@@ -1,0 +1,171 @@
+name: QEMU absent ACPI timers (supplementary)
+
+on:
+  pull_request:
+    paths:
+      - 'boot/**'
+      - 'kernel/**'
+      - 'user/**'
+      - 'scripts/**'
+      - '.github/workflows/qemu-clock-bootstrap.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agentos-qemu-clock-bootstrap-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  no-acpi-timers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        # Verify the new clocksource on both BSP-only and SMP guests.
+        # The full profile matrix remains available by workflow_dispatch.
+        cpus: [1, 2]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install EFI build and emulator dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            binutils cpio gcc-13 gnu-efi rustc python3 openssl \
+            sbsigntool efitools gdisk mtools qemu-system-x86 ovmf \
+            python3-virt-firmware gdb
+      - name: Build ordinary and separately signed supervisor images once
+        run: bash scripts/build.sh --supervisor-staging
+      - name: Record host accelerator capabilities
+        run: |
+          qemu-system-x86_64 --version
+          qemu-system-x86_64 -accel help
+          if test -c /dev/kvm; then
+            ls -l /dev/kvm
+            # This is an isolated ephemeral runner. Grant access to its
+            # existing KVM device, not to a fabricated CPU capability.
+            sudo chmod a+rw /dev/kvm
+          else
+            echo 'No /dev/kvm on this runner; TCG must prove its own capabilities.'
+          fi
+      - name: Boot and exercise the ordinary signed image
+        env:
+          CPU_COUNT: ${{ matrix.cpus }}
+        run: |
+          python3 scripts/qemu-smoke.py --cpus "$CPU_COUNT" --session \
+            --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd \
+            --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd --timeout 720
+      - name: Matching KVM controls and fault profiles, same signed EFI
+        env:
+          CPU_COUNT: ${{ matrix.cpus }}
+          CLOCK_PROFILES: ${{ github.event_name == 'workflow_dispatch' && 'chain hidden deferred' || 'deferred' }}
+        run: |
+          set -uo pipefail
+          code=/usr/share/OVMF/OVMF_CODE_4M.secboot.fd
+          vars=/usr/share/OVMF/OVMF_VARS_4M.fd
+          if ! test -r /dev/kvm || ! test -w /dev/kvm; then
+            echo 'Matching KVM controls unavailable; not substituting TCG.'
+            exit 1
+          fi
+          status=0
+          python3 scripts/qemu-smoke.py --cpus "$CPU_COUNT" --accel kvm --no-hpet --session \
+            --ovmf-code "$code" --ovmf-vars "$vars" --timeout 180 || status=1
+          for profile in $CLOCK_PROFILES; do
+            python3 scripts/qemu-no-acpi-timers.py --cpus "$CPU_COUNT" --accel kvm \
+              --profile "$profile" --ovmf-code "$code" --ovmf-vars "$vars" --timeout 180 || status=1
+          done
+          exit "$status"
+      - name: Verify local supervisor workloads on the matched signed staged image
+        env:
+          CPU_COUNT: ${{ matrix.cpus }}
+        run: |
+          set -euo pipefail
+          code=/usr/share/OVMF/OVMF_CODE_4M.secboot.fd
+          vars=/usr/share/OVMF/OVMF_VARS_4M.fd
+          python3 scripts/qemu-smoke.py --cpus "$CPU_COUNT" --session \
+            --runtime-process-regression --supervisor-image test \
+            --ovmf-code "$code" --ovmf-vars "$vars" --timeout 720
+          python3 scripts/qemu-smoke.py --cpus "$CPU_COUNT" --accel kvm --no-hpet --session \
+            --runtime-process-regression --supervisor-image test \
+            --ovmf-code "$code" --ovmf-vars "$vars" --timeout 180
+          python3 scripts/qemu-no-acpi-timers.py --cpus "$CPU_COUNT" --accel kvm \
+            --profile deferred --supervisor-image test \
+            --ovmf-code "$code" --ovmf-vars "$vars" --timeout 180
+      - name: Preserve real platform, boot and failure evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-no-acpi-timers-${{ matrix.cpus }}cpu
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            build/build-provenance.json
+            build/agentos.efi
+            build/db.esl
+            build/check/qemu-cpu${{ matrix.cpus }}-session/physical-oom.json
+            build/check/qemu-cpu${{ matrix.cpus }}-session/physical-oom.log
+            build/check/qemu-cpu${{ matrix.cpus }}-session/smoke.json
+            build/check/qemu-cpu${{ matrix.cpus }}-session/com1.log
+            build/check/qemu-cpu${{ matrix.cpus }}-session/com1-input.bin
+            build/check/qemu-cpu${{ matrix.cpus }}-session/esp-bootx64.efi
+            build/check/qemu-cpu${{ matrix.cpus }}-session/esp.raw
+            build/check/qemu-cpu${{ matrix.cpus }}-no-acpi-timers-session/*.json
+            build/check/qemu-cpu${{ matrix.cpus }}-no-acpi-timers-session/*.txt
+            build/check/qemu-cpu${{ matrix.cpus }}-no-acpi-timers-session/*.log
+            build/check/qemu-cpu${{ matrix.cpus }}-no-acpi-timers-session/*.bin
+            build/check/qemu-cpu${{ matrix.cpus }}-no-acpi-timers-session/*.ppm
+            build/check/qemu-cpu${{ matrix.cpus }}-no-acpi-timers-session/*.efi
+            build/check/qemu-cpu${{ matrix.cpus }}-no-acpi-timers-session/OVMF_VARS.secboot.fd
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-kvm-session/*.json
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-kvm-session/*.log
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-kvm-session/*.ppm
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-kvm-session/com1-input.bin
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-kvm-session/esp-bootx64.efi
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-kvm-session/esp.raw
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session/*.json
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session/*.txt
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session/*.log
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session/*.bin
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session/*.ppm
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session/*.efi
+            build/agentos.unsigned.efi
+            build/kernel.elf
+            build/initramfs.cpio
+            build/db.cer
+            build/supervisor-staging/
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-test/*.json
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-test/*.log
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-test/*.bin
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-test/*.ppm
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-test/*.efi
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-test/*.txt
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-test/OVMF_VARS.secboot.fd
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-test/esp.raw
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-kvm-session-sv-test/*.json
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-kvm-session-sv-test/*.log
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-kvm-session-sv-test/*.bin
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-kvm-session-sv-test/*.ppm
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-kvm-session-sv-test/*.efi
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-kvm-session-sv-test/*.txt
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-kvm-session-sv-test/OVMF_VARS.secboot.fd
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-kvm-session-sv-test/esp.raw
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session-sv-test/*.json
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session-sv-test/*.log
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session-sv-test/*.bin
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session-sv-test/*.ppm
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session-sv-test/*.efi
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session-sv-test/*.txt
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session-sv-test/OVMF_VARS.secboot.fd
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session-sv-test/esp.raw
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session/*.json
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session/*.log
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session/*.bin
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session/*.ppm
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session/*.efi
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session/*.txt
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session/OVMF_VARS.secboot.fd
+            build/check/qemu-cpu${{ matrix.cpus }}-clock-*-session/esp.raw

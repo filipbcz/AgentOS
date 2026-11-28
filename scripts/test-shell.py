@@ -140,6 +140,32 @@ class ShellTests(unittest.TestCase):
         self.assertIn(b"pid: failed (-5)", pOutput)
         self.assertIn(b"recovered\r\n", pOutput)
 
+    def test_run_waits_for_real_status_and_does_not_read_child_input(self):
+        for pMode,pStatus in (("normal",0),("child-exit",42),("child-fault",270)):
+            with self.subTest(mode=pMode):
+                pOutput,pStats=self.runShell(b"run /program\necho recovered\nexit\n",aMode=pMode)
+                self.assertIn(f"exit status {pStatus}\r\nagentos> recovered\r\n".encode(),pOutput)
+                self.assertEqual((pStats["spawns"],pStats["waits"]),(1,1))
+        pOutput,pStats=self.runShell(b"run /program\nXecho next\nexit\n",aMode="child-stdin")
+        self.assertIn(b"exit status 0\r\nagentos> next\r\n",pOutput)
+        self.assertEqual((pStats["spawns"],pStats["waits"]),(1,1))
+
+    def test_run_invalid_path_and_failed_spawn_recover(self):
+        pOutput,pStats=self.runShell(b"run\nrun /program extra\nrun /missing\necho recovered\nexit\n")
+        self.assertEqual(pOutput.count(b"usage: run PATH\r\n"),2)
+        self.assertIn(b"run: spawn failed (-2)",pOutput)
+        self.assertIn(b"recovered\r\n",pOutput)
+        self.assertEqual((pStats["spawns"],pStats["waits"]),(1,0))
+        pOutput,pStats=self.runShell(b"run /program\necho recovered\nexit\n",aMode="spawn-oom")
+        self.assertIn(b"run: spawn failed (-12)",pOutput)
+        self.assertEqual((pStats["spawns"],pStats["waits"]),(1,0))
+
+    def test_run_wait_error_never_resumes_shell_input(self):
+        pOutput,pStats=self.runShell(b"run /program\necho unsafe\nexit\n",aMode="wait-error",aStatus=2)
+        self.assertIn(b"run: wait failed (-10)",pOutput)
+        self.assertNotIn(b"unsafe",pOutput)
+        self.assertEqual((pStats["spawns"],pStats["waits"]),(1,1))
+
     def test_idle_reports_measured_deltas(self):
         pOutput, _ = self.runShell(b"idle\nexit\n", aRead=3, aWrite=5)
         self.assertIn(b"AGENTOS RUNTIME IDLE MS=0000000000001388 "

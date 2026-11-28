@@ -18,15 +18,16 @@ unsafe fn write(aBase: usize, aRegister: u32, aValue: u32) {
 }
 
 impl Route {
-    pub unsafe fn serial(aPlatform: &Platform, aDestination: u8, aVector: u32) -> Result<Self, &'static [u8]> {
+    pub unsafe fn serial(aPlatform: &Platform, aDestination: u32, aVector: u32) -> Result<Self, &'static [u8]> {
         Self::irq(aPlatform, aPlatform.serial_irq, aDestination, aVector)
     }
 
-    pub unsafe fn keyboard(aPlatform: &Platform, aDestination: u8, aVector: u32) -> Result<Self, &'static [u8]> {
+    pub unsafe fn keyboard(aPlatform: &Platform, aDestination: u32, aVector: u32) -> Result<Self, &'static [u8]> {
         Self::irq(aPlatform, aPlatform.keyboard_irq, aDestination, aVector)
     }
 
-    unsafe fn irq(aPlatform: &Platform, aIrq: IsaInterrupt, aDestination: u8, aVector: u32) -> Result<Self, &'static [u8]> {
+    unsafe fn irq(aPlatform: &Platform, aIrq: IsaInterrupt, aDestination: u32, aVector: u32) -> Result<Self, &'static [u8]> {
+        let target = aPlatform.topology.enabled().legacy_target(aDestination)?;
         let mut pRoute = None;
         for pIo in &aPlatform.io_apics[..aPlatform.io_count] {
             let pVersion = read(pIo.address, 1);
@@ -43,10 +44,10 @@ impl Route {
         // Mask the old route before changing its destination, then leave it
         // masked until the UART, IDT, TTY and owning process are ready.
         write(pRoute.fBase, pRoute.fRegister, read(pRoute.fBase, pRoute.fRegister) | MASK);
-        write(pRoute.fBase, pRoute.fRegister + 1, (aDestination as u32) << 24);
+        write(pRoute.fBase, pRoute.fRegister + 1, target.high());
         write(pRoute.fBase, pRoute.fRegister, pRoute.fLow | MASK);
         if read(pRoute.fBase, pRoute.fRegister) & 0x1afff != (pRoute.fLow | MASK) ||
-            read(pRoute.fBase, pRoute.fRegister + 1) >> 24 != aDestination as u32 { return Err(b"IOAPIC route readback"); }
+            read(pRoute.fBase, pRoute.fRegister + 1) >> 24 != u32::from(target.id()) { return Err(b"IOAPIC route readback"); }
         Ok(pRoute)
     }
 

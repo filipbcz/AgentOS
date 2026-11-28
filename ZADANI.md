@@ -15,6 +15,12 @@ Cílem je vytvořit vlastní moderní 64bitový operační systém s vlastním j
 
 Systém nemá být kopií Linuxu ani univerzální náhradou všech současných desktopových systémů. Má mít vlastní vnitřní architekturu a pouze samostatnou kompatibilní vrstvu pro linuxové uživatelské ABI.
 
+### Závazné zásady implementace
+
+Pro všechny etapy platí [AGENTS.md](AGENTS.md). Požadujeme plnohodnotný nativní OS, nikoli implementaci přizpůsobenou přejímce. Standardní hardwarová rozhraní se implementují v celém rozsahu potřebném pro schválené funkce, se všemi relevantními standardními variantami a stavy hardware; využívají dynamickou detekci a vyjednání schopností. Rozsah podpory nelze zúžit bez výslovného souhlasu zadavatele.
+
+Produkční bootloader, jádro, ovladače, služby a dodávané programy nesmějí obsahovat logiku přejímky. Testy jsou oddělené a ověřují stejnou funkční implementaci přes běžná rozhraní. Diagnostika a bezpečnostní kontroly s vlastním provozním účelem jsou součástí OS, přejímací scénáře nikoliv. Každá funkce musí být plnohodnotná včetně provozních, hraničních a chybových stavů; rozpracované kroky nenahrazují úplné řešení.
+
 ## 2. Základní rozhodnutí
 
 | Oblast | Rozhodnutí |
@@ -203,6 +209,8 @@ Schválení vrátí stav `granted` s přesným rozsahem. Vlastní akci agent pro
 
 Ovladače budou implementovat veřejné specifikace zařízení. Nebudou přebírány binární linuxové ovladače ani napodobováno nestabilní interní API linuxového jádra.
 
+Cílem je nativní běh na obou referenčních platformách z § 3, včetně fyzického HP, nikoliv závislost na konkrétním emulátoru. Obecné ovladače se řídí specifikacemi zařízení, skutečnou enumerací a schopnostmi hardware. Podmínky izolovaných testů (počty CPU/řadičů, typ a identita fixture, sériové/QMP řízení, velikost RAM, počet a časování operací) nesmějí omezovat běžnou implementaci. Ověření v QEMU je doplňkové; nenahrazuje VirtualBox ani fyzickou přejímku požadovaných funkcí. Hardware mimo rozsah zadání lze odmítnout s diagnostikou, nelze však bez schválení zúžit podporu referenčního HP na schopnosti emulovaného zařízení.
+
 Každý ovladač musí být oddělen na:
 
 1. hardwarově nezávislou logiku,
@@ -382,7 +390,7 @@ Projekt musí od začátku obsahovat:
 - strukturovaný kernelový log dostupný přes sériovou konzoli,
 - panic výpis s registry CPU a zásobníkem, pokud jsou dostupné.
 
-VirtualBox slouží pro automatizované testy. Stejný kernelový obraz musí projít také akceptační zkouškou na referenčním notebooku.
+VirtualBox slouží pro automatizované testy; QEMU poskytuje doplňkové integrační důkazy. Stejná produkční implementace musí projít také akceptační zkouškou na referenčním notebooku. Přejímací scénáře, zátěžové testy, testovací data, očekávané výsledky a řízení testů patří výhradně do oddělených testovacích nástrojů a klientů. Nesmějí být v produkčním kódu ani vyžadovat zvláštní funkční kernelový build. Běžný distribuční obraz neobsahuje testovací klienty a běžný start nespouští přejímku. Obecné logování, metriky a diagnostika mají nezávislý provozní účel; sériová konzole je volitelný výstup, nikoliv podmínka fungování OS.
 
 ## 11. Realizační celky a akceptační kritéria
 
@@ -478,6 +486,8 @@ Vydání splní celky A až F, výkonové limity podle § 9 ve VM a funkční zk
 - Nesmí vzniknout nezdokumentované systémové volání nebo nestabilní veřejné ABI.
 - Nesmí se optimalizovat bez měření ani přidávat subsystém bez konkrétního použití.
 - Bezpečnostní kontroly se nesmějí vypínat kvůli dosažení benchmarku.
+- Produkční kód nesmí obsahovat přejímací scénáře, testovací markery či fixture, test-only přepínače nebo speciální chování určené k průchodu testem.
+- Nesmí se nahrazovat plnohodnotná funkce bootovací demonstrací nebo zástupným řešením, ani zúžit požadovaná standardní hardwarová podpora na konfiguraci emulátoru.
 - Do první stabilní verze se nesmějí přidávat funkce mimo stanovený rozsah na úkor dokončení základních celků.
 
 ## 13. Definice úspěchu projektu

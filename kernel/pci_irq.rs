@@ -1,6 +1,7 @@
 //! Boot-time owner of the Oxford PCIe UART and its PCI message interrupts.
 //! CPU startup is serialized. A route is quiesced before the next CPU owns it.
-use crate::{frames::Frames, hpet, paging, pci::Console};
+use crate::{bringup_clock::BringupClock, frames::Frames, system_clock, paging, pci::Console,
+    cpu_topology::LegacyDestination};
 use core::{arch::asm, fmt::Write, ptr, sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering}};
 
 type Error = &'static [u8];
@@ -30,8 +31,8 @@ impl Messages {
         }
     }
 
-    unsafe fn route(&self, vector: u8, dest: u8) -> Result<(), Error> {
-        let addr = 0xfee0_0000u32 | (u32::from(dest) << 12);
+    unsafe fn route(&self, vector: u8, dest: LegacyDestination) -> Result<(), Error> {
+        let addr = dest.msi_address();
         self.disable();
         if vector == MSI {
             let ctrl = rd::<u16>(self.msi + 2) & !0x71; // one fixed-delivery message
@@ -124,12 +125,12 @@ impl Oxford {
         Ok(())
     }
 
-    unsafe fn exchange(&self, vector: u8, cpu: u8, byte: u8) -> Result<(), Error> {
+    unsafe fn exchange(&self, vector: u8, cpu: u8, byte: u8, clock: BringupClock) -> Result<(), Error> {
         let uart = self.base + 4096;
         let before = RECEIVED.load(Ordering::Acquire);
         // Wait for the previous transmit shift register to drain with the
         // receiver's loopback disconnected. Only the ISR can consume RX.
-        until(|| rd::<u8>(uart + 5) & 0x40 != 0, b"Oxford transmitter busy")?;
+        until(clock, || rd::<u8>(uart + 5) & 0x40 != 0, b"Oxford transmitter busy")?;
         if rd::<u32>(self.base + 8) & 1 != 0 { return Err(b"Oxford RX already asserted"); }
         let msix = vector == MSIX;
         if msix {
@@ -144,11 +145,11 @@ impl Oxford {
         asm!("sti", options(nostack));
         let result = (|| {
             if msix {
-                until(|| rd::<u32>(self.messages.pending) & 1 != 0, b"MSI-X masked message timeout")?;
+                until(clock, || rd::<u32>(self.messages.pending) & 1 != 0, b"MSI-X masked message timeout")?;
                 if RECEIVED.load(Ordering::Acquire) != before { return Err(b"masked MSI-X delivered" as Error); }
                 wr(self.messages.entry + 12, 0u32);
             }
-            until(|| RECEIVED.load(Ordering::Acquire) != before, b"Oxford message delivery timeout")
+            until(clock, || RECEIVED.load(Ordering::Acquire) != before, b"Oxford message delivery timeout")
         })();
         asm!("cli", options(nostack));
         result?;
@@ -156,11 +157,11 @@ impl Oxford {
         let rx = sample as u8;
         let iir = (sample >> 8) as u8;
         let delivered = (sample >> 16) as u8;
-        let apic = (sample >> 24) as u8;
-        let service = sample >> 32;
+        let apic = (sample >> 32) as u32;
+        let service = (sample >> 24) & 3;
         let count = RECEIVED.load(Ordering::Acquire);
         if count != before + 1 || rx != byte || iir & 15 != 4 || delivered != vector ||
-            apic != cpu || service != 3 || (msix && rd::<u32>(self.messages.pending) & 1 != 0) {
+            apic != u32::from(cpu) || service != 3 || (msix && rd::<u32>(self.messages.pending) & 1 != 0) {
             let _ = writeln!(Console, "DEVICE IRQ MISMATCH vector={vector:02x} cpu={cpu} tx={byte:02x} sample={sample:016x} before={before} after={count}\r");
             return Err(b"Oxford interrupt source, vector, CPU, data or EOI mismatch");
         }
@@ -171,7 +172,8 @@ impl Oxford {
         Ok(())
     }
 
-    unsafe fn run(&self, cpu: u8) -> Result<(), Error> {
+    unsafe fn run(&self, target: LegacyDestination, clock: BringupClock) -> Result<(), Error> {
+        let cpu = target.id();
         let cmd = rd::<u16>(self.cfg + 4);
         let m = &self.messages;
         if (m.msi != 0 && rd::<u16>(m.msi + 2) & 1 != 0) ||
@@ -190,9 +192,9 @@ impl Oxford {
             wr(self.base + 0x10, 1u32); // arm the source separately for each transfer
             for (vector, cap) in [(MSI, m.msi), (MSIX, m.msix)] {
                 if cap == 0 { continue; }
-                m.route(vector, cpu)?;
+                m.route(vector, target)?;
                 wr(uart + 1, 1u8); // received-data interrupts only
-                for payload in [0x53, 0xa6] { self.exchange(vector, cpu, payload ^ cpu ^ vector)?; }
+                for payload in [0x53, 0xa6] { self.exchange(vector, cpu, payload ^ cpu ^ vector, clock)?; }
                 wr(uart + 1, 0u8);
             }
             Ok(())
@@ -206,18 +208,18 @@ impl Oxford {
     }
 }
 
-fn until(mut condition: impl FnMut() -> bool, timeout: Error) -> Result<(), Error> {
-    let start = hpet::millis().ok_or(b"missing IRQ deadline clock" as Error)?;
-    for _ in 0..10_000_000 {
-        if condition() { return Ok(()); }
-        if hpet::millis().map_or(true, |now| now - start >= 750) { break; }
-        core::hint::spin_loop();
-    }
-    Err(timeout)
+// The IRQ owner runs on one boot CPU at a time, before user timers
+// need a global epoch. Its local deadline must not depend on a public
+// clock which may still be waiting for the full SMP roster.
+unsafe fn until(clock: BringupClock, mut condition: impl FnMut() -> bool, timeout: Error) -> Result<(), Error> {
+    clock.wait_until(750_000_000, || {
+        let _ = system_clock::millis();
+        condition()
+    }).map_err(|_| timeout)
 }
 
-pub unsafe fn exercise(cpu: u8) -> Result<(), Error> {
-    match PORT.load(Ordering::Acquire).as_ref() { Some(port) => port.run(cpu), None => Ok(()) }
+pub unsafe fn exercise(target: LegacyDestination, clock: BringupClock) -> Result<(), Error> {
+    match PORT.load(Ordering::Acquire).as_ref() { Some(port) => port.run(target, clock), None => Ok(()) }
 }
 
 // Called exclusively from the two device IDT gates. Reading RBR consumes
@@ -240,8 +242,11 @@ pub unsafe fn acknowledge() -> u64 {
     u64::from(byte) | (u64::from(iir) << 8) | (u64::from(cleared) << 32)
 }
 
-pub fn record(vector: u8, apic: u8, eoi: bool, sample: u64) {
-    SAMPLE.store(sample | (u64::from(vector) << 16) | (u64::from(apic) << 24) |
-                 (u64::from(eoi) << 33), Ordering::Release);
+pub fn record(vector: u8, apic: u32, eoi: bool, sample: u64) {
+    // Preserve full observed identity, not just the legacy route encoding.
+    // RX/IIR, vector, source-ack/EOI, then the full APIC ID.
+    SAMPLE.store((sample & 0xffff) | (u64::from(vector) << 16) |
+                 (((sample >> 32) & 1) << 24) | (u64::from(eoi) << 25) |
+                 (u64::from(apic) << 32), Ordering::Release);
     RECEIVED.fetch_add(1, Ordering::Release);
 }

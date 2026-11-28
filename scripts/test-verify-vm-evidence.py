@@ -120,6 +120,16 @@ class VmEvidenceTests(unittest.TestCase):
         self.save_manifest()
         self.rejected()
 
+    def test_nvme_receipt_cannot_use_default_image_or_missing_cold_artifacts(self):
+        self.manifest.update({"nvme_block": True, "pci_chipset": "ich9"})
+        self.save_manifest()
+        self.rejected()
+        self.provenance["profile"] = "nvme-block"
+        self.save_provenance()
+        self.manifest["build_provenance_sha256"] = evidence.sha256(self.build / "build-provenance.json")
+        self.save_manifest()
+        self.rejected()
+
     def test_valid_mutation_rejected_by_firmware(self):
         self.manifest.update({"case": "loader", "shell": False, "keyboard": False})
         self.write(self.run / "changed.efi", b"altered signed EFI")
@@ -208,10 +218,20 @@ class VmEvidenceTests(unittest.TestCase):
                     self.manifest["artifacts"][path.name] = evidence.sha256(path)
                     self.save_manifest()
                     if reason is None:
-                        self.assertEqual(evidence.verify_run(self.root, self.run)["result"], "pass")
+                        self.assertEqual(evidence.verify_run(self.root, self.run, historical_boot_oom=True)["result"], "pass")
                     else:
                         with self.assertRaisesRegex(evidence.EvidenceError, f"Missing required {reason}"):
-                            evidence.verify_run(self.root, self.run)
+                            evidence.verify_run(self.root, self.run, historical_boot_oom=True)
+
+    def test_current_signed_requires_separate_oom_contract_and_artifacts(self):
+        with self.assertRaisesRegex(evidence.EvidenceError, "Missing current separate physical OOM contract"):
+            evidence.verify_run(self.root, self.run)
+        self.manifest["physical_oom_contract"] = evidence.PHYSICAL_OOM_CONTRACT
+        self.save_manifest()
+        with self.assertRaisesRegex(evidence.EvidenceError, "Missing required VM artifacts"):
+            evidence.verify_run(self.root, self.run)
+        with self.assertRaisesRegex(evidence.EvidenceError, "Historical or negative VM evidence"):
+            self.verify_legacy()
 
     def testRehashedPartialOrFabricatedMigrationIsRejected(self):
         pOriginal = self.migrationLog()

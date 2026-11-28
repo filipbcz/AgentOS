@@ -1,7 +1,7 @@
 //! Polled, non-NCQ AHCI. Each issued command owns its descriptors until completion.
 mod disk;
 pub use disk::AhciDisk;
-use crate::{dma::{BusAddress, Mapping, PAGE}, frames::{Frame, Frames}, hpet, paging, pci::Console};
+use crate::{dma::{BusAddress, Mapping, PAGE}, frames::{Frame, Frames}, system_clock, paging, pci::Console};
 use core::{fmt::Write, ptr, sync::atomic::{fence, Ordering}};
 
 type Error = &'static [u8];
@@ -26,7 +26,7 @@ unsafe fn address(reg: usize, bus: u64) {
     write(reg, bus as u32);
     write(reg + 4, (bus >> 32) as u32);
 }
-fn now() -> Result<u64, Error> { hpet::millis().ok_or(b"AHCI clock") }
+fn now() -> Result<u64, Error> { system_clock::millis().ok_or(b"AHCI clock") }
 fn wait(mut ready: impl FnMut() -> bool, ms: u64, error: Error) -> Result<(), Error> {
     let start = now()?;
     for _ in 0..50_000_000 {
@@ -148,7 +148,7 @@ impl Controller {
     pub unsafe fn exercise(self, root: usize, frames: &mut Frames<'_>) -> Result<(), Error> {
         let mask = self.prepare(root, frames)?;
         let baseline = frames.available();
-        let control = frames.alloc_zeroed().ok_or(b"AHCI control allocation" as Error)?;
+        let control = frames.alloc_zeroed_below(mask).ok_or(b"AHCI addressable control allocation" as Error)?;
         let Some(bus) = BusAddress::of(&control, mask) else { frames.release(control); return Err(b"AHCI DMA mask"); };
         // Command list, received FIS and command table occupy aligned, disjoint
         // ranges in one owned frame, held until both engines have stopped.
@@ -302,9 +302,9 @@ enum Outcome { Done(u32), Stopped([Frame; 2]) }
 // A live spacer forces two distinct scatter/gather regions. Release all CPU
 // owners before the doorbell: only the driver's mapping can keep either page.
 fn buffer(frames: &mut Frames<'_>, mask: u64) -> Result<(Mapping<2>, Frame), Error> {
-    let a = frames.alloc_zeroed().ok_or(b"AHCI buffer allocation" as Error)?;
-    let Some(gap) = frames.alloc() else { frames.release(a); return Err(b"AHCI spacer allocation"); };
-    let Some(b) = frames.alloc_zeroed() else {
+    let a = frames.alloc_zeroed_below(mask).ok_or(b"AHCI buffer allocation" as Error)?;
+    let Some(gap) = frames.alloc_below(mask) else { frames.release(a); return Err(b"AHCI spacer allocation"); };
+    let Some(b) = frames.alloc_zeroed_below(mask) else {
         frames.release(gap); frames.release(a); return Err(b"AHCI buffer allocation");
     };
     let owners = [a, b];

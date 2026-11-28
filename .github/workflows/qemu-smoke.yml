@@ -58,6 +58,75 @@ jobs:
           python3 scripts/qemu-smoke.py --cpus "$CPU_COUNT" --session \
             --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd \
             --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd --timeout 720
+      - name: Separate foreground ELF and fault regression after real shell readiness
+        env:
+          CPU_COUNT: ${{ matrix.cpus }}
+        run: |
+          set -euo pipefail
+          python3 scripts/qemu-smoke.py --cpus "$CPU_COUNT" --session --runtime-process-regression \
+            --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd \
+            --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd --timeout 720
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          cpu=os.environ["CPU_COUNT"]
+          base=Path("build/check")
+          normal=json.loads((base/f"qemu-cpu{cpu}-session/smoke.json").read_text())
+          separate=json.loads((base/f"qemu-cpu{cpu}-session-runtime-process-regression/smoke.json").read_text())
+          if normal["result"]!=separate["result"] or separate["result"]!="pass":
+              raise SystemExit("Missing real control or separate process session")
+          for field in ("source_commit","signed_efi_sha256","esp_boot_efi_sha256","ovmf_code_sha256","cpus"):
+              if normal[field]!=separate[field]:
+                  raise SystemExit("Different production image or platform: "+field)
+          if [r["status"] for r in separate["runtime_session"]["runtime_process_regression"]]!=[0,42,270]:
+              raise SystemExit("Missing actual foreground process results")
+          PY
+      - name: Verify the same signed kernel relocates with different physical RAM
+        if: matrix.cpus == 1
+        run: |
+          set -euo pipefail
+          python3 scripts/qemu-smoke.py --cpus 1 --memory-mib 512 \
+            --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd \
+            --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd --timeout 720
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          def read(profile):
+              return json.loads(Path("build/check", profile, "smoke.json").read_text())
+          a, b = read("qemu-cpu1"), read("qemu-cpu1-ram512")
+          if (a["result"], b["result"], a["memory_mib"], b["memory_mib"]) != ("pass", "pass", 256, 512):
+              raise SystemExit("Missing successful boots at both RAM sizes")
+          if a["source_commit"] != b["source_commit"] or a["signed_efi_sha256"] != b["signed_efi_sha256"]:
+              raise SystemExit("Boots did not use the same signed kernel")
+          if a["kernel_image_base"] == b["kernel_image_base"]:
+              raise SystemExit("Both boots used the same physical kernel address")
+          print("Actual relocated guest image bases:", hex(a["kernel_image_base"]), hex(b["kernel_image_base"]))
+          PY
+      - name: Boot and exercise the identical signed image without HPET
+        env:
+          CPU_COUNT: ${{ matrix.cpus }}
+        run: |
+          set -euo pipefail
+          python3 scripts/qemu-smoke.py --cpus "$CPU_COUNT" --no-hpet --session \
+            --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd \
+            --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd --timeout 720
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          cpu = os.environ["CPU_COUNT"]
+          def read(profile):
+              return json.loads(Path("build/check", profile, "smoke.json").read_text())
+          a, b = read(f"qemu-cpu{cpu}-session"), read(f"qemu-cpu{cpu}-no-hpet-session")
+          if a["result"] != "pass" or b["result"] != "pass":
+              raise SystemExit("Missing successful interactive boot")
+          if a["source_commit"] != b["source_commit"] or a["signed_efi_sha256"] != b["signed_efi_sha256"]:
+              raise SystemExit("Different signed kernels were used")
+          if b["hpet_enabled"] or b["system_clock"] not in ("ACPI PM24", "ACPI PM32"):
+              raise SystemExit("No actual PM timer fallback")
+          if b["runtime_session"]["idle"]["milliseconds"] < 5000:
+              raise SystemExit("Missing real timed wait across a PM24 wrap interval")
+          print("Actual no-HPET interactive boot:", b["system_clock"], b["runtime_session"]["idle"])
+          PY
       - name: Preserve boot evidence even if the guest fails
         if: always()
         uses: actions/upload-artifact@v4
@@ -72,6 +141,10 @@ jobs:
             build/kernel.elf
             build/initramfs.cpio
             build/db.esl
+            build/check/qemu-cpu${{ matrix.cpus }}*/physical-oom.json
+            build/check/qemu-cpu${{ matrix.cpus }}*/physical-oom.log
+            build/check/qemu-cpu${{ matrix.cpus }}*/esp.raw
+            build/check/qemu-cpu${{ matrix.cpus }}*/esp-bootx64.efi
             build/check/qemu-cpu${{ matrix.cpus }}/com1.log
             build/check/qemu-cpu${{ matrix.cpus }}/qemu-stderr.log
             build/check/qemu-cpu${{ matrix.cpus }}/smoke.json
@@ -80,14 +153,281 @@ jobs:
             build/check/qemu-cpu${{ matrix.cpus }}/OVMF_VARS.secboot.fd
             build/check/qemu-cpu${{ matrix.cpus }}/failed-screen.ppm
             build/check/qemu-cpu${{ matrix.cpus }}/shell-screen.ppm
+            build/check/qemu-cpu${{ matrix.cpus }}-ram512/com1.log
+            build/check/qemu-cpu${{ matrix.cpus }}-ram512/qemu-stderr.log
+            build/check/qemu-cpu${{ matrix.cpus }}-ram512/smoke.json
+            build/check/qemu-cpu${{ matrix.cpus }}-ram512/failure.json
+            build/check/qemu-cpu${{ matrix.cpus }}-ram512/shell-screen.ppm
+            build/check/qemu-cpu${{ matrix.cpus }}-ram512/failed-screen.ppm
             build/check/qemu-cpu${{ matrix.cpus }}-session/com1.log
             build/check/qemu-cpu${{ matrix.cpus }}-session/qemu-stderr.log
             build/check/qemu-cpu${{ matrix.cpus }}-session/smoke.json
             build/check/qemu-cpu${{ matrix.cpus }}-session/failure.json
             build/check/qemu-cpu${{ matrix.cpus }}-session/failed-screen.ppm
             build/check/qemu-cpu${{ matrix.cpus }}-session/shell-screen.ppm
+            build/check/qemu-cpu${{ matrix.cpus }}-session-runtime-process-regression/*.log
+            build/check/qemu-cpu${{ matrix.cpus }}-session-runtime-process-regression/*.json
+            build/check/qemu-cpu${{ matrix.cpus }}-session-runtime-process-regression/*.bin
+            build/check/qemu-cpu${{ matrix.cpus }}-session-runtime-process-regression/*.ppm
+            build/check/qemu-cpu${{ matrix.cpus }}-session-runtime-process-regression/esp-bootx64.efi
             build/check/qemu-cpu${{ matrix.cpus }}-session/com1-input.bin
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session/com1.log
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session/qemu-stderr.log
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session/smoke.json
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session/failure.json
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session/com1-input.bin
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session/shell-screen.ppm
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session/failed-screen.ppm
             build/check/qemu-cpu${{ matrix.cpus }}-session/keyboard-before.ppm
             build/check/qemu-cpu${{ matrix.cpus }}-session/keyboard-after.ppm
             build/check/qemu-cpu${{ matrix.cpus }}-session/secureboot-vars.txt
             build/check/qemu-cpu${{ matrix.cpus }}-session/OVMF_VARS.secboot.fd
+
+  nvme:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        cpus: [1, 2]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install pinned EFI build and QEMU dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            binutils cpio gcc-13 gnu-efi rustc python3 openssl \
+            sbsigntool efitools gdisk mtools qemu-system-x86 ovmf \
+            python3-virt-firmware
+      - name: Build signed NVMe test image
+        run: bash scripts/build.sh --nvme-block
+      - name: Real NVMe writes, flush, cold restart and readback
+        env:
+          CPU_COUNT: ${{ matrix.cpus }}
+        run: |
+          python3 scripts/qemu-nvme.py --cpus "$CPU_COUNT" \
+            --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd \
+            --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd --timeout 300
+      - name: Preserve actual NVMe evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-nvme-${{ matrix.cpus }}cpu
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            build/build-provenance.json
+            build/agentos.efi
+            build/agentos.unsigned.efi
+            build/db.esl
+            build/check/qemu-nvme-cpu${{ matrix.cpus }}/run-*/**
+
+  virtio-net:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        cpus: [1, 2]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install pinned EFI build and QEMU dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            binutils cpio gcc-13 gnu-efi rustc python3 openssl \
+            sbsigntool efitools gdisk mtools qemu-system-x86 ovmf \
+            python3-virt-firmware
+      - name: Build signed modern VirtIO-net test image
+        run: bash scripts/build.sh --virtio-net
+      - name: Exchange real Ethernet frames over an isolated QEMU socket
+        env:
+          CPU_COUNT: ${{ matrix.cpus }}
+        run: |
+          python3 scripts/qemu-virtio-net.py --cpus "$CPU_COUNT" \
+            --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd \
+            --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd --timeout 300
+      - name: Preserve actual VirtIO-net Ethernet evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-virtio-net-${{ matrix.cpus }}cpu
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            build/build-provenance.json
+            build/agentos.efi
+            build/agentos.unsigned.efi
+            build/db.esl
+            build/check/qemu-virtio-net-cpu${{ matrix.cpus }}/run-*/**
+
+  xhci:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        cpus: [1, 2]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install pinned EFI build and QEMU dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            binutils cpio gcc-13 gnu-efi rustc python3 openssl \
+            sbsigntool efitools gdisk mtools qemu-system-x86 ovmf \
+            python3-virt-firmware
+      - name: Build signed xHCI test image
+        run: bash scripts/build.sh --xhci
+      - name: Real xHCI TRBs, USB hotplug, reset and slot lifecycle
+        env:
+          CPU_COUNT: ${{ matrix.cpus }}
+        run: |
+          python3 scripts/qemu-xhci.py --cpus "$CPU_COUNT" \
+            --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd \
+            --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd --timeout 300
+      - name: Preserve actual xHCI and USB evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-xhci-${{ matrix.cpus }}cpu
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            build/build-provenance.json
+            build/agentos.efi
+            build/agentos.unsigned.efi
+            build/db.esl
+            build/check/qemu-xhci-cpu${{ matrix.cpus }}/run-*/**
+
+  console-no-uart:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        cpus: [1, 2]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install pinned EFI build and QEMU dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            binutils cpio gcc-13 gnu-efi rustc python3 openssl \
+            sbsigntool efitools gdisk mtools qemu-system-x86 ovmf \
+            python3-virt-firmware
+      - name: Build unchanged signed default image
+        run: bash scripts/build.sh
+      - name: Verify real PS2 and GOP without a UART
+        env:
+          CPU_COUNT: ${{ matrix.cpus }}
+        run: |
+          python3 scripts/qemu-console-no-uart.py --cpus "$CPU_COUNT" \
+            --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd \
+            --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd --timeout 300
+      - name: Preserve real console evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-no-uart-${{ matrix.cpus }}cpu
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            build/build-provenance.json
+            build/agentos.efi
+            build/agentos.unsigned.efi
+            build/db.esl
+            build/check/qemu-no-uart-cpu${{ matrix.cpus }}/run-*/**
+
+  supervisor-staging:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        cpus: [1, 2]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install pinned EFI and QEMU dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            binutils cpio gcc-13 gnu-efi rustc python3 openssl \
+            sbsigntool efitools gdisk mtools qemu-system-x86 ovmf python3-virt-firmware
+      - name: Build ordinary distribution and separately signed runner image
+        run: bash scripts/build.sh --supervisor-staging
+      - name: Boot both signed images and drive the same full session
+        env:
+          CPU_COUNT: ${{ matrix.cpus }}
+        run: |
+          set -euo pipefail
+          # The HPET pair is the prerequisite for the PM pair.
+          for clock in hpet pm; do
+            options=(--guest-oom)
+            if [[ "$clock" == pm ]]; then options=(--no-hpet); fi
+            for variant in control test; do
+              python3 scripts/qemu-smoke.py --cpus "$CPU_COUNT" --session \
+                --runtime-process-regression --supervisor-image "$variant" "${options[@]}" \
+                --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.secboot.fd \
+                --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd --timeout 720
+            done
+            python3 scripts/verify-supervisor-image.py --cpus "$CPU_COUNT" "${options[@]}"
+          done
+      - name: Preserve paired signed images and independent evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-supervisor-staging-${{ matrix.cpus }}cpu
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            build/build-provenance.json
+            build/agentos.efi
+            build/agentos.unsigned.efi
+            build/kernel.elf
+            build/initramfs.cpio
+            build/db.cer
+            build/db.esl
+            build/supervisor-staging/
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-control/*.log
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-control/*.json
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-control/*.bin
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-control/*.ppm
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-control/esp-bootx64.efi
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-control/secureboot-vars.txt
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-control/OVMF_VARS.secboot.fd
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-control/esp.raw
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-test/*.log
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-test/*.json
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-test/*.bin
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-test/*.ppm
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-test/esp-bootx64.efi
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-test/secureboot-vars.txt
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-test/OVMF_VARS.secboot.fd
+            build/check/qemu-cpu${{ matrix.cpus }}-session-sv-test/esp.raw
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session-sv-control/*.log
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session-sv-control/*.json
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session-sv-control/*.bin
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session-sv-control/*.ppm
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session-sv-control/esp-bootx64.efi
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session-sv-control/secureboot-vars.txt
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session-sv-control/OVMF_VARS.secboot.fd
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session-sv-control/esp.raw
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session-sv-test/*.log
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session-sv-test/*.json
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session-sv-test/*.bin
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session-sv-test/*.ppm
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session-sv-test/esp-bootx64.efi
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session-sv-test/secureboot-vars.txt
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session-sv-test/OVMF_VARS.secboot.fd
+            build/check/qemu-cpu${{ matrix.cpus }}-no-hpet-session-sv-test/esp.raw

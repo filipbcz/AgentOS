@@ -32,10 +32,18 @@ class VerificationError(ValueError):
 def require(value,message):
     if not value: raise VerificationError(message)
 
-def verify(text):
+def verify(text, *, migration_staged=False, allow_migration_workload=False):
     lines=text.splitlines()
     pMigration = None
-    if "AGENTOS MIGRATION" in text:
+    require(not allow_migration_workload or migration_staged,"Mixed migration contracts")
+    if migration_staged:
+        if allow_migration_workload:
+            ready=[i for i,v in enumerate(lines) if v=="AGENTOS SHELL READY"]
+            require(len(ready)==1 and not any("AGENTOS MIGRATION" in v for v in lines[:ready[0]+1]),
+                    "Migration workload during ordinary boot")
+        else:
+            require("AGENTOS MIGRATION" not in text,"Migration workload in ordinary distribution")
+    elif "AGENTOS MIGRATION" in text:
         pSpec = importlib.util.spec_from_file_location(
             "managerMigrationEvidence", Path(__file__).with_name("verify-migration.py"))
         pModule = importlib.util.module_from_spec(pSpec)

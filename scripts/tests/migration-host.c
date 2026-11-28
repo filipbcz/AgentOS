@@ -7,7 +7,7 @@
 
 static long mock_call(long, long, long, long);
 #define os_call mock_call
-#include "../../user/migration.c"
+#include "migration-workload.c"
 #undef os_call
 
 static long clockMs, wakeOffset[2], targets[2];

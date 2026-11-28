@@ -1,5 +1,5 @@
 /*
- * Run the real user/supervisor.c against a deterministic syscall boundary.
+ * Run the real scripts/tests/supervisor-workload.c against a deterministic syscall boundary.
  * Checks restart limits, child reaping, stalled-worker kill and error paths.
  * This is a host harness, not an AgentOS VM or scheduler simulation.
  */
@@ -11,7 +11,7 @@
 
 static long mock_call(long op,long a,long b,long c);
 #define os_call mock_call
-#include "../../user/supervisor.c"
+#include "supervisor-workload.c"
 #undef os_call
 
 enum { MAX_CHILDREN=16, LOG_BYTES=4096 };

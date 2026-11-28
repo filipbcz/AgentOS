@@ -1,5 +1,5 @@
 //! Two cold boots, each explicitly selected by the host after device discovery.
-use crate::{block::{BlockDevice, Error}, hpet, pci::Console};
+use crate::{block::{BlockDevice, Error}, system_clock, pci::Console};
 use core::fmt::Write;
 
 pub unsafe fn run(disk: &mut impl BlockDevice) -> Result<(), Error> {
@@ -16,10 +16,10 @@ pub unsafe fn run(disk: &mut impl BlockDevice) -> Result<(), Error> {
     let mut actual = [0; 4608];
     if disk.read_blocks(u64::MAX, &mut header).is_ok() { return Err(b"block range overflow accepted"); }
     let _ = writeln!(Console, "AGENTOS BLOCK READY BLOCKS={} SIZE={}\r", geo.blocks, geo.block_size);
-    let start = hpet::millis().ok_or(b"block clock" as Error)?;
+    let start = system_clock::millis().ok_or(b"block clock" as Error)?;
     let mode = loop {
         if crate::input(crate::COM + 5) & 1 != 0 { break crate::input(crate::COM); }
-        if hpet::millis().ok_or(b"block clock" as Error)? - start >= 30000 { return Err(b"missing block phase"); }
+        if system_clock::millis().ok_or(b"block clock" as Error)? - start >= 30000 { return Err(b"missing block phase"); }
         core::hint::spin_loop();
     };
     disk.read_blocks(lba, &mut actual)?;

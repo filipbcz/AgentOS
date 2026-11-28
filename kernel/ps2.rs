@@ -1,6 +1,6 @@
 //! Bounded 8042 first-port PS/2 initialization, set-1 translation.
 //! All functions are BSP-only and must be called with interrupts disabled.
-//! Failure is nonfatal: caller keeps the COM1 console available.
+//! Failure is nonfatal: the caller retains any independent input/output devices.
 use crate::{input, out};
 
 const DATA: u16 = 0x60;
