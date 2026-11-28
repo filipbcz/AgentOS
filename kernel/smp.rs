@@ -32,6 +32,9 @@ const EMPTY_CPU: AtomicUsize = AtomicUsize::new(0);
 static gCpus: [AtomicUsize; MAX_CPUS] = [EMPTY_CPU; MAX_CPUS];
 static gOnlineCount: AtomicUsize = AtomicUsize::new(0);
 static gBspQualifiedTscHz: AtomicU64 = AtomicU64::new(0);
+// One release per loaded kernel: APs stay available for TSC synchronization
+// until the BSP has published the epoch and completed timed device startup.
+static gStartupReady: AtomicBool = AtomicBool::new(false);
 static gRuntimeEnabled: AtomicBool = AtomicBool::new(false);
 static gTerminal: AtomicUsize = AtomicUsize::new(0);
 static gMigrations: AtomicUsize = AtomicUsize::new(0);
@@ -1214,7 +1217,7 @@ unsafe extern "C" fn ap_main(cpu: &'static Cpu) -> ! {
                 } else { None };
                 cpu.tsc.publish_rate(rate);
             }
-            while !cpu.load.started.load(Ordering::Acquire) {
+            while !gStartupReady.load(Ordering::Acquire) {
                 cpu.tsc.respond(|| crate::tsc::read());
                 spin_loop();
             }
@@ -1402,7 +1405,7 @@ pub unsafe fn run(platform: &Platform, base: usize, root: usize, mut frames: Fra
     load.frames.with(initialize_timed_devices)?;
     if crate::system_clock::millis().is_none() { return Err(b"system clock unavailable before scheduler"); }
     let baseline = load.frames.with(|f| f.snapshot()).ok_or(b"bitmap snapshot" as Error)?;
-    load.started.store(true, Ordering::Release);
+    gStartupReady.store(true, Ordering::Release);
     boot_cpu.schedule();
     for cpu in cpus.iter().flatten() {
         if cpu.expected_id != bsp {

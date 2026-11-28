@@ -10,7 +10,6 @@ extern "C" { fn check_preempted_registers(ticks: *const AtomicU32, token: usize)
 
 pub struct Load {
     pub frames: SharedFrames,
-    pub started: AtomicBool,
     pages_at_barriers: AtomicUsize,
     checked: AtomicUsize,
     failed: AtomicBool,
@@ -19,7 +18,7 @@ pub struct Load {
 
 impl Load {
     pub fn new(frames: SharedFrames, cpus: usize) -> Self {
-        Self { frames, started: AtomicBool::new(false), pages_at_barriers: AtomicUsize::new(0),
+        Self { frames, pages_at_barriers: AtomicUsize::new(0),
                checked: AtomicUsize::new(0), failed: AtomicBool::new(false), workers: TASKS * cpus }
     }
 
